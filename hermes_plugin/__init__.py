@@ -16,6 +16,7 @@ sys.path.insert(0, str(plugin_dir.parent))
 from mnemosyne.core.memory import Mnemosyne
 from mnemosyne.core.token_counter import estimate_tokens, estimate_cost
 from mnemosyne.core.cost_log import log_cost, get_cost_stats
+from mnemosyne.core.aaak import encode as aaak_encode
 
 # Global memory instance
 _memory_instance = None
@@ -87,29 +88,10 @@ def _on_session_start(session_id, model, platform, **kwargs):
 
 def _compress_memory(content: str) -> str:
     """
-    Lightweight AAAK-style compression for memory context.
-    Reduces token overhead by abbreviating common patterns.
+    Full AAAK dialect compression for memory context.
+    Reduces token overhead via structured shorthand.
     """
-    # Common substitutions
-    replacements = [
-        ("User prefers ", "PREF: "),
-        ("User is ", "IS: "),
-        ("User has ", "HAS: "),
-        ("User likes ", "LIKES: "),
-        ("User dislikes ", "DISLIKES: "),
-        ("Project: ", "PROJ: "),
-        ("Location: ", "LOC: "),
-        ("Family: ", "FAM: "),
-        ("Occupation: ", "OCC: "),
-        (" Trait", ""),
-        ("Preference: ", "PREF: "),
-    ]
-    
-    compressed = content
-    for old, new in replacements:
-        compressed = compressed.replace(old, new)
-    
-    return compressed
+    return aaak_encode(content)
 
 
 def _on_pre_llm_call(session_id, history, **kwargs):
