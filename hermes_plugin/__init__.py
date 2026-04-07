@@ -14,6 +14,8 @@ plugin_dir = Path(__file__).parent
 sys.path.insert(0, str(plugin_dir.parent))
 
 from mnemosyne.core.memory import Mnemosyne
+from mnemosyne.core.token_counter import estimate_tokens, estimate_cost
+from mnemosyne.core.cost_log import log_cost, get_cost_stats
 
 # Global memory instance
 _memory_instance = None
@@ -50,6 +52,24 @@ def register(ctx):
         schema=tools.STATS_SCHEMA,
         handler=tools.mnemosyne_stats
     )
+    ctx.register_tool(
+        name="mnemosyne_cost_stats",
+        toolset="mnemosyne",
+        schema=tools.COST_STATS_SCHEMA,
+        handler=tools.mnemosyne_cost_stats
+    )
+    ctx.register_tool(
+        name="mnemosyne_triple_add",
+        toolset="mnemosyne",
+        schema=tools.TRIPLE_ADD_SCHEMA,
+        handler=tools.mnemosyne_triple_add
+    )
+    ctx.register_tool(
+        name="mnemosyne_triple_query",
+        toolset="mnemosyne",
+        schema=tools.TRIPLE_QUERY_SCHEMA,
+        handler=tools.mnemosyne_triple_query
+    )
     
     # Register hooks for automatic context injection
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
@@ -65,12 +85,40 @@ def _on_session_start(session_id, model, platform, **kwargs):
     _memory_instance = Mnemosyne(session_id=f"hermes_{session_id}")
 
 
+def _compress_memory(content: str) -> str:
+    """
+    Lightweight AAAK-style compression for memory context.
+    Reduces token overhead by abbreviating common patterns.
+    """
+    # Common substitutions
+    replacements = [
+        ("User prefers ", "PREF: "),
+        ("User is ", "IS: "),
+        ("User has ", "HAS: "),
+        ("User likes ", "LIKES: "),
+        ("User dislikes ", "DISLIKES: "),
+        ("Project: ", "PROJ: "),
+        ("Location: ", "LOC: "),
+        ("Family: ", "FAM: "),
+        ("Occupation: ", "OCC: "),
+        (" Trait", ""),
+        ("Preference: ", "PREF: "),
+    ]
+    
+    compressed = content
+    for old, new in replacements:
+        compressed = compressed.replace(old, new)
+    
+    return compressed
+
+
 def _on_pre_llm_call(session_id, history, **kwargs):
     """
     Inject Mnemosyne memory context into system prompt.
     
     This runs BEFORE every LLM call, automatically surfacing
     relevant memories to provide conversational continuity.
+    Now includes token cost estimation and lightweight compression.
     """
     try:
         mem = _get_memory()
@@ -88,16 +136,30 @@ def _on_pre_llm_call(session_id, history, **kwargs):
         context_lines.append("")
         
         for m in context_memories:
-            content = m['content'][:150] if len(m['content']) > 150 else m['content']
+            raw_content = m['content'][:150] if len(m['content']) > 150 else m['content']
+            content = _compress_memory(raw_content)
             ts = m['timestamp'][:16] if len(m['timestamp']) > 16 else m['timestamp']
             context_lines.append(f"[{ts}] {content}")
         
         context_lines.append("═══════════════════════════════════════════════════════════════")
         context_block = "\n".join(context_lines)
+        full_context = f"\n\n{context_block}\n"
+        
+        # Token cost estimation
+        token_count = estimate_tokens(full_context)
+        cost_info = estimate_cost(token_count)
+        
+        log_cost(
+            session_id=str(session_id) if session_id else mem.session_id,
+            memory_count=len(context_memories),
+            token_count=token_count,
+            estimated_cost_usd=cost_info["cost_usd"],
+            model=cost_info["model"]
+        )
         
         # Return context to inject into system prompt
         return {
-            "context": f"\n\n{context_block}\n"
+            "context": full_context
         }
         
     except Exception as e:
