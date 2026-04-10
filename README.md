@@ -30,26 +30,32 @@ While other agents rely on cloud memory services like Honcho (external HTTP API)
 
 Mnemosyne recently underwent a major upgrade to compete with state-of-the-art memory systems:
 
-### 1. Dense Retrieval via `fastembed`
-We integrated `BAAI/bge-small-en-v1.5` (ONNX, no PyTorch) to generate 384-dimensional embeddings at `remember()` time. `recall()` now uses **hybrid scoring**: 45% cosine similarity + 35% keyword overlap + 20% importance. This raised our LongMemEval score from **0% to 98.9%**.
+### 1. BEAM Architecture
+**Bilevel Episodic-Associative Memory** splits storage into three tiers:
+- **`working_memory`** — hot, recent context auto-injected into prompts
+- **`episodic_memory`** — long-term storage retrieved via semantic + full-text search
+- **`scratchpad`** — temporary agent reasoning workspace
 
-### 2. AAAK-Style Context Compression
-A lightweight AAAK dialect compresses common memory patterns before context injection:
-- `PREFERENCE: Imperial units for GPS` → `PREF|Imperial units→GPS`
-- `User asked for demo` → `ASK demo`
+This eliminates the old `LIMIT 1000` flat scan and scales memory well beyond 100K tokens.
 
-Real-world savings: **14.9% fewer tokens** across the existing memory corpus.
+### 2. Native Vector Search (`sqlite-vec`)
+Episodic memory uses `sqlite-vec` for native HNSW-style vector search inside SQLite. No external vector DB. No Python loops over embeddings at query time.
 
-### 3. Temporal Triples (Knowledge Graph)
-A time-aware SQLite graph tracks *when* facts were true:
-```python
-kg.add("Maya", "assigned_to", "auth-migration", valid_from="2026-01-15")
-kg.query("Maya", as_of="2026-02-01")  # returns auth-migration
-```
-Auto-invalidates previous triples and supports contradiction detection.
+### 3. FTS5 Full-Text Hybrid Search
+Every episodic memory is indexed with FTS5. `recall()` now runs a true hybrid rank:
+**50% vector similarity + 30% FTS rank + 20% importance**.
 
-### 4. Thread-Safe Connection Fix
-Fixed a thread-local bug where `_get_connection()` ignored `db_path` after the first connection in a thread.
+### 4. Sleep / Consolidation Cycle
+Old working memories are automatically summarized and compressed into episodic summaries. Call `mnemosyne_sleep()` or `beam.sleep()` to compact memory without losing knowledge.
+
+### 5. Dense Retrieval via `fastembed`
+We integrated `BAAI/bge-small-en-v1.5` (ONNX, no PyTorch) to generate 384-dimensional embeddings at `remember()` time. This raised our LongMemEval score from **0% to 98.9%**.
+
+### 6. AAAK-Style Context Compression
+A lightweight AAAK dialect compresses common memory patterns before context injection, saving **14.9% fewer tokens**.
+
+### 7. Temporal Triples (Knowledge Graph)
+A time-aware SQLite graph tracks *when* facts were true with automatic invalidation and contradiction detection.
 
 ---
 
@@ -116,11 +122,15 @@ Use this to answer questions about the user and prior work.
 | Tool | Purpose |
 |------|---------|
 | `mnemosyne_remember` | Store facts, preferences, context |
-| `mnemosyne_recall` | Search stored memories (hybrid dense + keyword) |
+| `mnemosyne_recall` | Search stored memories (hybrid vec + FTS5) |
 | `mnemosyne_update` | Update existing memory content/importance |
 | `mnemosyne_stats` | Check memory system health |
 | `mnemosyne_triple_add` | Add a temporal triple to the knowledge graph |
 | `mnemosyne_triple_query` | Query historical truth with `as_of` date |
+| `mnemosyne_sleep` | Consolidate old working memories into episodic summaries |
+| `mnemosyne_scratchpad_write` | Write temporary reasoning to scratchpad |
+| `mnemosyne_scratchpad_read` | Read scratchpad entries |
+| `mnemosyne_scratchpad_clear` | Clear scratchpad |
 
 ---
 
@@ -221,7 +231,7 @@ python -m mnemosyne.cli stats
 
 ## 🏗️ Architecture
 
-### Native SQLite + Optional Dense Retrieval
+### BEAM: Native SQLite + sqlite-vec + FTS5
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -230,8 +240,8 @@ python -m mnemosyne.cli stats
 │                                                                  │
 │  ┌─────────────┐     ┌──────────────┐     ┌──────────────┐     │
 │  │   Hermes    │────▶│   pre_llm    │────▶│  Mnemosyne   │     │
-│  │    Agent    │     │    _call     │     │    Core      │     │
-│  │             │◄────│    Hook      │◄────│              │     │
+│  │    Agent    │     │    _call     │     │    BEAM      │     │
+│  │             │◄────│    Hook      │◄────│   Engine     │     │
 │  └─────────────┘     └──────────────┘     └──────┬───────┘     │
 │         │                                        │              │
 │         │         Auto-injected context          │              │
@@ -239,12 +249,15 @@ python -m mnemosyne.cli stats
 │                                                   │              │
 │                                         ┌─────────▼─────────┐   │
 │                                         │      SQLite       │   │
-│                                         │   memories        │   │
-│                                         │   embeddings      │   │
-│                                         │   triples         │   │
+│                                         │  working_memory   │   │
+│                                         │  episodic_memory  │   │
+│                                         │  vec_episodes     │   │
+│                                         │  fts_episodes     │   │
+│                                         │  scratchpad       │   │
+│                                         │  triples          │   │
 │                                         └───────────────────┘   │
 │                                                                  │
-│  No HTTP. No Cloud. Optional ONNX embeddings. 100% local.       │
+│  No HTTP. No Cloud. sqlite-vec + FTS5. 100% local.              │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -336,10 +349,13 @@ python -m mnemosyne.benchmark
 
 Mnemosyne is the default memory system for Hermes. Contributions welcome:
 
+- [x] BEAM architecture (working + episodic + scratchpad)
+- [x] Native vector search with `sqlite-vec`
+- [x] FTS5 full-text hybrid retrieval
+- [x] Sleep / consolidation cycle
 - [x] Dense retrieval with fastembed
 - [x] Temporal triples
 - [x] AAAK-style compression
-- [ ] HNSW / faiss index for >100K memories
 - [ ] Encrypted cloud sync (optional)
 - [ ] Browser extension for web context capture
 

@@ -63,7 +63,31 @@ def register(ctx):
         schema=tools.TRIPLE_QUERY_SCHEMA,
         handler=tools.mnemosyne_triple_query
     )
-    
+    ctx.register_tool(
+        name="mnemosyne_sleep",
+        toolset="mnemosyne",
+        schema=tools.SLEEP_SCHEMA,
+        handler=tools.mnemosyne_sleep
+    )
+    ctx.register_tool(
+        name="mnemosyne_scratchpad_write",
+        toolset="mnemosyne",
+        schema=tools.SCRATCHPAD_WRITE_SCHEMA,
+        handler=tools.mnemosyne_scratchpad_write
+    )
+    ctx.register_tool(
+        name="mnemosyne_scratchpad_read",
+        toolset="mnemosyne",
+        schema=tools.SCRATCHPAD_READ_SCHEMA,
+        handler=tools.mnemosyne_scratchpad_read
+    )
+    ctx.register_tool(
+        name="mnemosyne_scratchpad_clear",
+        toolset="mnemosyne",
+        schema=tools.SCRATCHPAD_CLEAR_SCHEMA,
+        handler=tools.mnemosyne_scratchpad_clear
+    )
+
     # Register hooks for automatic context injection
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_hook("on_session_start", _on_session_start)

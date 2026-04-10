@@ -4,6 +4,11 @@ No HTTP, no server, just pure Python + SQLite
 
 This is the heart of Mnemosyne — a zero-dependency memory system
 that delivers sub-millisecond performance through direct SQLite access.
+
+Now upgraded with BEAM architecture:
+- working_memory: hot context auto-injected into prompts
+- episodic_memory: long-term storage with sqlite-vec + FTS5
+- scratchpad: temporary agent reasoning workspace
 """
 
 import sqlite3
@@ -15,8 +20,9 @@ from typing import List, Dict, Optional, Any
 from pathlib import Path
 
 from mnemosyne.core import embeddings as _embeddings
+from mnemosyne.core.beam import BeamMemory, init_beam, _get_connection as _beam_get_connection
 
-# Single shared connection per thread
+# Single shared connection per thread (legacy path)
 _thread_local = threading.local()
 
 # Default data directory
@@ -42,10 +48,11 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
 
 
 def init_db(db_path: Path = None):
-    """Initialize database schema"""
+    """Initialize legacy database schema + BEAM schema"""
     conn = _get_connection(db_path)
     cursor = conn.cursor()
-    
+
+    # Legacy memories table (kept for backward compatibility)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS memories (
             id TEXT PRIMARY KEY,
@@ -58,13 +65,11 @@ def init_db(db_path: Path = None):
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    
-    # Indexes for fast queries
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_session ON memories(session_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON memories(timestamp)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_source ON memories(source)")
-    
-    # Embeddings table for dense retrieval
+
+    # Legacy embeddings table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS memory_embeddings (
             memory_id TEXT PRIMARY KEY,
@@ -74,8 +79,11 @@ def init_db(db_path: Path = None):
             FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
         )
     """)
-    
+
     conn.commit()
+
+    # Initialize BEAM schema on same DB
+    init_beam(db_path)
 
 
 # Initialize on module load
@@ -88,73 +96,44 @@ def generate_id(content: str) -> str:
 
 
 def calculate_relevance(query_words: List[str], content: str) -> float:
-    """
-    Calculate relevance score between query and content.
-    
-    Uses a combination of:
-    - Exact word matches (higher weight)
-    - Partial word matches
-    - Word frequency
-    """
+    """Calculate relevance score between query and content."""
     content_lower = content.lower()
     content_words = set(content_lower.split())
-    
+
     exact_matches = sum(1 for word in query_words if word.lower() in content_words)
     partial_matches = sum(
-        1 for word in query_words 
+        1 for word in query_words
         for content_word in content_words
         if word.lower() in content_word or content_word in word.lower()
     )
-    
-    # Exact matches count more
+
     score = (exact_matches * 1.0 + partial_matches * 0.3) / max(len(query_words), 1)
-    return min(score, 1.0)  # Cap at 1.0
+    return min(score, 1.0)
 
 
 class Mnemosyne:
     """
     Native memory interface - no HTTP, direct SQLite.
-    
-    This class provides the main interface to the Mnemosyne memory system.
-    Each instance can have its own session_id for multi-tenant scenarios.
-    
-    Args:
-        session_id: Unique identifier for this memory session
-        db_path: Optional custom database path
-    
-    Example:
-        >>> mem = Mnemosyne(session_id="user_123")
-        >>> mem.remember("Likes Python", importance=0.8)
-        >>> results = mem.recall("programming preferences")
+    Now backed by BEAM architecture for scalable retrieval.
     """
-    
+
     def __init__(self, session_id: str = "default", db_path: Path = None):
         self.session_id = session_id
         self.db_path = db_path or DEFAULT_DB_PATH
         self.conn = _get_connection(self.db_path)
         init_db(self.db_path)
-    
+        self.beam = BeamMemory(session_id=session_id, db_path=db_path)
+
     def remember(self, content: str, source: str = "conversation",
                  importance: float = 0.5, metadata: Dict = None) -> str:
         """
         Store a memory directly to SQLite.
-        
-        Args:
-            content: The information to remember
-            source: Origin of the memory ('conversation', 'preference', 'fact')
-            importance: Priority from 0.0 to 1.0 (0.9+ for critical facts)
-            metadata: Optional structured data as a dictionary
-            
-        Returns:
-            memory_id: Unique identifier for the stored memory
-            
-        Example:
-            >>> mem.remember("User prefers dark mode", importance=0.9)
-            'a1b2c3d4e5f67890'
+        Writes to both BEAM working_memory and legacy memories table.
         """
         memory_id = generate_id(content)
         timestamp = datetime.now().isoformat()
-        
+
+        # Legacy dual-write
         cursor = self.conn.cursor()
         cursor.execute("""
             INSERT INTO memories (id, content, source, timestamp, session_id, importance, metadata_json)
@@ -163,8 +142,8 @@ class Mnemosyne:
             memory_id, content, source, timestamp, self.session_id,
             importance, json.dumps(metadata or {})
         ))
-        
-        # Generate and store embedding if dense retrieval is available
+
+        # Legacy embedding store
         if _embeddings.available():
             vec = _embeddings.embed([content])
             if vec is not None:
@@ -172,209 +151,88 @@ class Mnemosyne:
                     INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model)
                     VALUES (?, ?, ?)
                 """, (memory_id, _embeddings.serialize(vec[0]), _embeddings._DEFAULT_MODEL))
-        
+
         self.conn.commit()
+
+        # BEAM write
+        self.beam.remember(content, source=source, importance=importance, metadata=metadata)
+
         return memory_id
-    
+
     def recall(self, query: str, top_k: int = 5) -> List[Dict]:
         """
         Search memories with hybrid relevance scoring.
-        
-        Uses a custom scoring algorithm combining:
-        - Dense embedding similarity (45%)
-        - Keyword relevance (35%)
-        - Importance boost (20%)
-        
-        Args:
-            query: Search query string
-            top_k: Maximum number of results to return
-            
-        Returns:
-            List of memory dictionaries with relevance scores
-            
-        Example:
-            >>> results = mem.recall("dark mode")
-            >>> results[0]['content']
-            'User prefers dark mode'
-            >>> results[0]['score']
-            0.95
+        Uses BEAM episodic + working memory retrieval (sqlite-vec + FTS5).
         """
-        query_words = query.split()
-        cursor = self.conn.cursor()
-        
-        # Get recent memories (limit to prevent memory bloat)
-        cursor.execute("""
-            SELECT id, content, source, timestamp, session_id, importance
-            FROM memories
-            WHERE session_id = ?
-            ORDER BY timestamp DESC
-            LIMIT 1000
-        """, (self.session_id,))
-        
-        rows = cursor.fetchall()
-        row_ids = [row['id'] for row in rows]
-        
-        # Fetch embeddings for these memories
-        query_embedding = None
-        memory_embeddings = {}
-        if _embeddings.available():
-            emb_result = _embeddings.embed([query])
-            if emb_result is not None:
-                query_embedding = emb_result[0]
-            
-            if row_ids:
-                placeholders = ','.join('?' * len(row_ids))
-                cursor.execute(f"""
-                    SELECT memory_id, embedding_json FROM memory_embeddings
-                    WHERE memory_id IN ({placeholders})
-                """, row_ids)
-                for e_row in cursor.fetchall():
-                    vec = _embeddings.deserialize(e_row['embedding_json'])
-                    if vec is not None:
-                        memory_embeddings[e_row['memory_id']] = vec
-        
-        results = []
-        
-        for row in rows:
-            relevance = calculate_relevance(query_words, row['content'])
-            
-            # Dense similarity score
-            sim_score = 0.0
-            if query_embedding is not None and row['id'] in memory_embeddings:
-                sim_score = float(_embeddings.cosine_similarity(
-                    query_embedding, memory_embeddings[row['id']].reshape(1, -1)
-                )[0])
-            
-            # Hybrid score: require at least some keyword match OR similarity > threshold
-            if relevance > 0 or sim_score > 0.65:
-                # Normalize and combine
-                keyword_component = relevance * 0.35
-                dense_component = max(0, sim_score) * 0.45
-                importance_component = row['importance'] * 0.2
-                
-                final_score = keyword_component + dense_component + importance_component
-                
-                results.append({
-                    "id": row['id'],
-                    "content": row['content'][:500],  # Limit content length
-                    "source": row['source'],
-                    "timestamp": row['timestamp'],
-                    "session_id": row['session_id'],
-                    "score": round(final_score, 3),
-                    "importance": row['importance'],
-                    "keyword_score": round(relevance, 3),
-                    "dense_score": round(sim_score, 3)
-                })
-        
-        # Sort by score descending
-        results.sort(key=lambda x: x['score'], reverse=True)
-        return results[:top_k]
-    
+        return self.beam.recall(query, top_k=top_k)
+
     def get_context(self, limit: int = 10) -> List[Dict]:
         """
         Get recent memories from current session for context injection.
-        
-        This is used by the Hermes plugin to auto-inject memories
-        before LLM calls.
-        
-        Args:
-            limit: Maximum number of memories to retrieve
-            
-        Returns:
-            List of recent memory dictionaries
+        Pulls from BEAM working_memory.
         """
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT id, content, source, timestamp, importance
-            FROM memories
-            WHERE session_id = ?
-            ORDER BY timestamp DESC
-            LIMIT ?
-        """, (self.session_id, limit))
-        
-        return [dict(row) for row in cursor.fetchall()]
-    
+        return self.beam.get_context(limit=limit)
+
     def get_stats(self) -> Dict:
-        """
-        Get memory system statistics.
-        
-        Returns:
-            Dictionary containing:
-            - total_memories: Total count of stored memories
-            - total_sessions: Number of unique sessions
-            - sources: Breakdown by source type
-            - last_memory: Timestamp of most recent memory
-            - database: Path to database file
-            - mode: Storage mode (always 'native_sqlite')
-        """
+        """Get memory system statistics (legacy + BEAM)."""
         cursor = self.conn.cursor()
-        
+
         cursor.execute("SELECT COUNT(*) FROM memories")
-        total = cursor.fetchone()[0]
-        
+        total_legacy = cursor.fetchone()[0]
+
         cursor.execute("SELECT COUNT(DISTINCT session_id) FROM memories")
         sessions = cursor.fetchone()[0]
-        
+
         cursor.execute("SELECT source, COUNT(*) FROM memories GROUP BY source")
         sources = {row[0]: row[1] for row in cursor.fetchall()}
-        
+
         cursor.execute("SELECT timestamp FROM memories ORDER BY timestamp DESC LIMIT 1")
         last = cursor.fetchone()
-        
+
+        beam_wm = self.beam.get_working_stats()
+        beam_ep = self.beam.get_episodic_stats()
+
         return {
-            "total_memories": total,
+            "total_memories": total_legacy,
             "total_sessions": sessions,
             "sources": sources,
             "last_memory": last[0] if last else None,
             "database": str(self.db_path),
-            "mode": "native_sqlite"
+            "mode": "beam",
+            "beam": {
+                "working_memory": beam_wm,
+                "episodic_memory": beam_ep
+            }
         }
-    
+
     def forget(self, memory_id: str) -> bool:
-        """
-        Delete a memory by ID.
-        
-        Args:
-            memory_id: The unique identifier of the memory to delete
-            
-        Returns:
-            True if memory was found and deleted, False otherwise
-        """
+        """Delete a memory by ID from legacy table and working_memory."""
         cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM memories WHERE id = ? AND session_id = ?", 
+        cursor.execute("DELETE FROM memories WHERE id = ? AND session_id = ?",
                       (memory_id, self.session_id))
         self.conn.commit()
+        self.beam.forget_working(memory_id)
         return cursor.rowcount > 0
-    
-    def update(self, memory_id: str, content: str = None, 
+
+    def update(self, memory_id: str, content: str = None,
                importance: float = None) -> bool:
-        """
-        Update an existing memory.
-        
-        Args:
-            memory_id: The unique identifier of the memory to update
-            content: New content (optional)
-            importance: New importance score (optional)
-            
-        Returns:
-            True if memory was found and updated, False otherwise
-        """
+        """Update an existing memory in legacy table."""
         cursor = self.conn.cursor()
-        
+
         updates = []
         params = []
-        
+
         if content is not None:
             updates.append("content = ?")
             params.append(content)
-        
+
         if importance is not None:
             updates.append("importance = ?")
             params.append(importance)
-        
+
         if not updates:
             return False
-        
+
         params.extend([memory_id, self.session_id])
         cursor.execute(
             f"UPDATE memories SET {', '.join(updates)} WHERE id = ? AND session_id = ?",
@@ -383,9 +241,33 @@ class Mnemosyne:
         self.conn.commit()
         return cursor.rowcount > 0
 
+    # ------------------------------------------------------------------
+    # BEAM-specific public methods
+    # ------------------------------------------------------------------
+    def sleep(self, dry_run: bool = False) -> Dict:
+        """Run consolidation sleep cycle."""
+        return self.beam.sleep(dry_run=dry_run)
+
+    def scratchpad_write(self, content: str) -> str:
+        """Write to scratchpad."""
+        return self.beam.scratchpad_write(content)
+
+    def scratchpad_read(self) -> List[Dict]:
+        """Read scratchpad entries."""
+        return self.beam.scratchpad_read()
+
+    def scratchpad_clear(self):
+        """Clear scratchpad."""
+        self.beam.scratchpad_clear()
+
+    def consolidation_log(self, limit: int = 10) -> List[Dict]:
+        """Get consolidation history."""
+        return self.beam.get_consolidation_log(limit=limit)
+
 
 # Global instance for module-level convenience functions
 _default_instance = None
+
 
 def _get_default():
     """Get or create the default Mnemosyne instance"""
@@ -396,7 +278,7 @@ def _get_default():
 
 
 # Module-level convenience functions
-def remember(content: str, source: str = "conversation", 
+def remember(content: str, source: str = "conversation",
              importance: float = 0.5, metadata: Dict = None) -> str:
     """Store a memory using the global instance"""
     return _get_default().remember(content, source, importance, metadata)
@@ -425,3 +307,23 @@ def forget(memory_id: str) -> bool:
 def update(memory_id: str, content: str = None, importance: float = None) -> bool:
     """Update memory using the global instance"""
     return _get_default().update(memory_id, content, importance)
+
+
+def sleep(dry_run: bool = False) -> Dict:
+    """Run consolidation sleep cycle using the global instance"""
+    return _get_default().sleep(dry_run=dry_run)
+
+
+def scratchpad_write(content: str) -> str:
+    """Write to scratchpad using the global instance"""
+    return _get_default().scratchpad_write(content)
+
+
+def scratchpad_read() -> List[Dict]:
+    """Read scratchpad using the global instance"""
+    return _get_default().scratchpad_read()
+
+
+def scratchpad_clear():
+    """Clear scratchpad using the global instance"""
+    return _get_default().scratchpad_clear()
