@@ -6,6 +6,12 @@ provides_tools:
   - mnemosyne_remember
   - mnemosyne_recall
   - mnemosyne_stats
+  - mnemosyne_triple_add
+  - mnemosyne_triple_query
+  - mnemosyne_sleep
+  - mnemosyne_scratchpad_write
+  - mnemosyne_scratchpad_read
+  - mnemosyne_scratchpad_clear
 provides_hooks:
   - pre_llm_call
   - on_session_start

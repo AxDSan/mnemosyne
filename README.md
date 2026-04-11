@@ -59,6 +59,36 @@ A time-aware SQLite graph tracks *when* facts were true with automatic invalidat
 
 ---
 
+## 🔄 Upgrading from Earlier Mnemosyne Versions
+
+If you started with Mnemosyne before the BEAM architecture (pre-April 2026), your memories may still be in the legacy database path:
+
+```bash
+# Old path: ~/.hermes/mnemosyne/data/mnemosyne_native.db
+# New path: ~/.mnemosyne/data/mnemosyne.db
+```
+
+Run the built-in migration script to safely merge everything into the current canonical database:
+
+```bash
+cd ~/.hermes/plugins/mnemosyne  # or wherever you cloned the repo
+python scripts/migrate_from_legacy.py
+```
+
+**What the migration does:**
+- Copies all missing memories from legacy DBs into the new one
+- Migrates meaningful non-tool memories into `episodic_memory` (searchable via FTS5 + vectors)
+- Promotes high-importance facts into `working_memory` for prompt injection
+- Is idempotent — safe to run multiple times
+
+Preview changes first with `--dry-run`:
+
+```bash
+python scripts/migrate_from_legacy.py --dry-run
+```
+
+---
+
 ## 📊 Benchmarks: Mnemosyne vs. The Field
 
 We benchmarked Mnemosyne on **LongMemEval** (ICLR 2025), a widely-cited benchmark for long-term conversational memory. Like any synthetic eval, it measures retrieval under controlled conditions and should be paired with real-world usage tests.

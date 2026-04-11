@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 # Add parent directory to path
-plugin_dir = Path(__file__).parent
+plugin_dir = Path(__file__).resolve().parent
 sys.path.insert(0, str(plugin_dir.parent))
 
 from mnemosyne.core.memory import Mnemosyne
