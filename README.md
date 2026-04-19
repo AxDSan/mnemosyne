@@ -75,6 +75,21 @@ With `bit`, you can store **millions of episodic memories** on a 4GB RAM machine
 - `remember_batch()` for high-throughput working-memory writes (5,000 items in ~0.3s).
 - The Hermes plugin now imports `mnemosyne` robustly whether it is installed via pip, cloned, or loaded as a skill. No more `sys.path` guesswork in production.
 
+### 12. Recall Tracking & Behavioral Scoring (v2)
+Every memory now tracks `recall_count` and `last_recalled`. Frequently accessed memories surface higher; memories that have been recalled too many times recently are naturally deprioritized (saturation avoidance). Recency decay scoring (`base_score * (0.7 + 0.3 * decay)`) makes recent context float up unless high-importance memories override it.
+
+### 13. Exact-Match Deduplication
+Storing the same credential three times is now impossible. `remember()` checks for exact content matches within the session and updates the existing row (bumping importance and timestamp) instead of creating a duplicate.
+
+### 14. Local LLM Consolidation (v2)
+The sleep cycle now uses a **local TinyLlama-1.1B-Chat** model (~640MB) for actual semantic summarization instead of lossy AAAK compression. Falls back to AAAK encoding if the model is unavailable. Zero cloud API calls. Fully offline after initial download.
+
+### 15. Temporal Validity & Invalidation (v2)
+Memories have a shelf life. Set `valid_until="2026-12-31"` and the memory auto-expires — `recall()` filters it out. Use `mnemosyne_invalidate` to mark facts as superseded by newer knowledge (e.g., "User moved from Miami to Austin").
+
+### 16. Cross-Session Global Memory (v2)
+User preferences should travel everywhere. `remember(..., scope="global")` makes a memory visible in **every** Hermes session. `recall()` searches both the current session and global memories. `get_context()` prioritizes globals first so preferences always surface.
+
 ---
 
 ## 🔄 Upgrading from Earlier Mnemosyne Versions
@@ -203,28 +218,30 @@ At 10,000 working memories, recall is still **sub-10ms**. The old architecture w
 
 ### Zero-Config Auto-Context
 
-Mnemosyne registers hooks with Hermes for seamless operation:
+Mnemosyne registers hooks with Hermes for seamless operation. The plugin uses Hermes's `pre_llm_call` hook (plugin-level, no core changes needed) to inject relevant context before every LLM call:
 
 ```python
 # Mnemosyne automatically injects this before EVERY LLM call:
 
-═══════════════════════════════════════════════════════════════
+════════════════════════════════════════════════════════════════
 MNEMOSYNE MEMORY (persistent local context)
 Use this to answer questions about the user and prior work.
 
 [2026-04-05 10:23] PREF|Neovim>Vim
 [2026-04-05 09:15] PROJ|FluxSpeak AI
 [2026-04-05 08:42] LOC|America/New_York
-═══════════════════════════════════════════════════════════════
+════════════════════════════════════════════════════════════════
 ```
+
+Global memories are injected first, followed by session-specific context. Expired and superseded memories are automatically filtered out.
 
 ### Hermes Tools Provided
 
 | Tool | Purpose |
 |------|---------|
-| `mnemosyne_remember` | Store facts, preferences, context |
-| `mnemosyne_recall` | Search stored memories (hybrid vec + FTS5) |
-| `mnemosyne_update` | Update existing memory content/importance |
+| `mnemosyne_remember` | Store facts, preferences, context (supports `valid_until`, `scope`) |
+| `mnemosyne_recall` | Search stored memories (hybrid vec + FTS5 + recency decay) |
+| `mnemosyne_invalidate` | Mark a memory as expired or superseded |
 | `mnemosyne_stats` | Check memory system health |
 | `mnemosyne_triple_add` | Add a temporal triple to the knowledge graph |
 | `mnemosyne_triple_query` | Query historical truth with `as_of` date |
@@ -294,6 +311,13 @@ export MNEMOSYNE_VEC_TYPE=float32
 pip install mnemosyne-memory
 ```
 
+For local LLM consolidation (optional):
+```bash
+pip install mnemosyne-memory[llm]
+# or manually:
+pip install ctransformers huggingface-hub
+```
+
 ---
 
 ## 🔧 Usage in Hermes
@@ -325,15 +349,29 @@ remember(
     source="preference"
 )
 
+# Store a global preference that survives across sessions
+remember(
+    content="User email is abdi.moya@gmail.com",
+    importance=0.95,
+    source="preference",
+    scope="global"  # visible in every session
+)
+
+# Store a temporary fact with expiry
+remember(
+    content="Cartesia API key: sk-abc123",
+    importance=0.8,
+    source="credential",
+    valid_until="2026-12-31T00:00:00"  # auto-expires
+)
+
 # Recall with semantic relevance (uses dense embeddings if available)
 results = recall("interface preferences", top_k=3)
 
-# Update an existing memory
-update(
-    memory_id="abc123...",
-    content="User prefers Neovim with AstroNvim config",
-    importance=0.95
-)
+# Invalidate outdated knowledge
+from mnemosyne.core.beam import BeamMemory
+beam = BeamMemory()
+beam.invalidate(old_memory_id, replacement_id=new_memory_id)
 
 # Temporal knowledge graph
 from mnemosyne.core.triples import TripleStore
@@ -437,7 +475,11 @@ cp ~/backups/mnemosyne_20260405.db ~/.hermes/mnemosyne/data/mnemosyne.db
 | **Latency** | 10-50ms | ~5-20ms | **0.8ms** |
 | **Dense Retrieval** | ✅ Yes (pgvector) | ✅ Yes (Contriever/GTE) | **✅ Yes (fastembed / bge-small-en)** |
 | **Temporal Graph** | ❌ No | ✅ Yes | **✅ Yes** |
-| **Context Compression** | ❌ No | ✅ AAAK dialect | **✅ Lightweight AAAK** |
+| **Context Compression** | ❌ No | ✅ AAAK dialect | **✅ AAAK + local LLM summarization** |
+| **Recall Tracking** | ❌ No | ❌ No | **✅ Yes (recall_count, last_recalled)** |
+| **Recency Decay** | ❌ No | ❌ No | **✅ Yes (time-weighted scoring)** |
+| **Temporal Validity** | ❌ No | ❌ No | **✅ Yes (valid_until, invalidation)** |
+| **Global Scope** | ❌ No | ❌ No | **✅ Yes (cross-session memories)** |
 | **Offline Operation** | ⚠️ Self-hostable | ✅ Yes | **✅ Yes** |
 | **Setup for Hermes** | API key + config | `pip install` + CLI | **Zero config** |
 | **Privacy** | ⚠️ Hosted option available | ✅ Local | **✅ 100% local** |
@@ -494,6 +536,11 @@ Mnemosyne is the default memory system for Hermes. Contributions welcome:
 - [x] Query embedding LRU cache
 - [x] Configurable vector compression (`int8` / `bit`)
 - [x] Batch ingestion (`remember_batch`)
+- [x] Recall tracking + recency decay scoring
+- [x] Exact-match deduplication on write
+- [x] Local LLM consolidation (TinyLlama)
+- [x] Temporal validity + invalidation
+- [x] Cross-session global memory
 - [ ] Encrypted cloud sync (optional)
 - [ ] Browser extension for web context capture
 
