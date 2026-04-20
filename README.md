@@ -12,8 +12,10 @@
 ## ⚡ Quick Start
 
 ```bash
-# 1. Install Mnemosyne
-pip install mnemosyne-memory
+# 1. Clone and install Mnemosyne
+git clone https://github.com/AxDSan/mnemosyne.git
+cd mnemosyne
+pip install -e .
 
 # 2. Connect to Hermes (one command)
 python -m mnemosyne.install
@@ -119,7 +121,7 @@ With `bit`, you can store **millions of episodic memories** on a 4GB RAM machine
 
 ### 11. Batch Ingestion & Robust Plugin
 - `remember_batch()` for high-throughput working-memory writes (5,000 items in ~0.3s).
-- The Hermes plugin now imports `mnemosyne` robustly whether it is installed via pip, cloned, or loaded as a skill. No more `sys.path` guesswork in production.
+- The Hermes plugin now imports `mnemosyne` robustly whether it is cloned, installed in editable mode, or loaded as a skill. No more `sys.path` guesswork in production.
 
 ### 12. Recall Tracking & Behavioral Scoring (v2)
 Every memory now tracks `recall_count` and `last_recalled`. Frequently accessed memories surface higher; memories that have been recalled too many times recently are naturally deprioritized (saturation avoidance). Recency decay scoring (`base_score * (0.7 + 0.3 * decay)`) makes recent context float up unless high-importance memories override it.
@@ -310,13 +312,17 @@ Global memories are injected first, followed by session-specific context. Expire
 
 **One-line install:**
 ```bash
-pip install mnemosyne-memory && python -m mnemosyne.install
+git clone https://github.com/AxDSan/mnemosyne.git && cd mnemosyne && pip install -e . && python -m mnemosyne.install
 ```
 
 **Or step by step:**
 ```bash
-# Install the package
-pip install mnemosyne-memory
+# Clone the repository
+git clone https://github.com/AxDSan/mnemosyne.git
+cd mnemosyne
+
+# Install in editable mode
+pip install -e .
 
 # Deploy the MemoryProvider into Hermes
 python -m mnemosyne.install
@@ -343,13 +349,13 @@ python -m mnemosyne.install
 
 ```bash
 # For dense retrieval (recommended)
-pip install mnemosyne-memory[embeddings]
+pip install sentence-transformers>=2.3
 
 # For local LLM consolidation
-pip install mnemosyne-memory[llm]
+pip install ctransformers>=0.2.27 huggingface-hub>=0.20
 
 # Everything
-pip install mnemosyne-memory[all]
+pip install sentence-transformers>=2.3 ctransformers>=0.2.27 huggingface-hub>=0.20
 ```
 
 ### Vector Compression
@@ -533,7 +539,7 @@ cp ~/backups/mnemosyne_20260405.db ~/.hermes/mnemosyne/data/mnemosyne.db
 | **Temporal Validity** | ❌ No | ❌ No | **✅ Yes (valid_until, invalidation)** |
 | **Global Scope** | ❌ No | ❌ No | **✅ Yes (cross-session memories)** |
 | **Offline Operation** | ⚠️ Self-hostable | ✅ Yes | **✅ Yes** |
-| **Setup for Hermes** | API key + config | `pip install` + CLI | **Zero config** |
+| **Setup for Hermes** | API key + config | Clone + install | **Zero config** |
 | **Privacy** | ⚠️ Hosted option available | ✅ Local | **✅ 100% local** |
 | **Cost** | Freemium hosted / Free self-hosted | Free | **🆓 Free** |
 | **LongMemEval Score** | N/A | 96.6% R@5 (project claim) | **98.9% R@All@5** (oracle, n=100) |
