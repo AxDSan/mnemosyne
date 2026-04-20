@@ -882,3 +882,207 @@ class BeamMemory:
             LIMIT ?
         """, (self.session_id, limit))
         return [dict(row) for row in cursor.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Export / Import
+    # ------------------------------------------------------------------
+    def export_to_dict(self) -> Dict:
+        """
+        Export all BEAM data to a portable dictionary.
+        Includes working_memory, episodic_memory, embeddings, scratchpad,
+        and consolidation_log across ALL sessions (not just current).
+        """
+        cursor = self.conn.cursor()
+        export = {
+            "mnemosyne_export": {
+                "version": "1.0",
+                "export_date": datetime.now().isoformat(),
+                "source_db": str(self.db_path),
+                "component": "beam"
+            }
+        }
+
+        # Working memory (all sessions)
+        cursor.execute("""
+            SELECT id, content, source, timestamp, session_id, importance,
+                   metadata_json, valid_until, superseded_by, scope,
+                   recall_count, last_recalled, created_at
+            FROM working_memory
+            ORDER BY session_id, timestamp
+        """)
+        export["working_memory"] = [dict(row) for row in cursor.fetchall()]
+
+        # Episodic memory (all sessions)
+        cursor.execute("""
+            SELECT rowid, id, content, source, timestamp, session_id, importance,
+                   metadata_json, summary_of, valid_until, superseded_by, scope,
+                   recall_count, last_recalled, created_at
+            FROM episodic_memory
+            ORDER BY session_id, timestamp
+        """)
+        export["episodic_memory"] = [dict(row) for row in cursor.fetchall()]
+
+        # Episodic embeddings from vec_episodes
+        export["episodic_embeddings"] = []
+        if _vec_available(self.conn):
+            try:
+                cursor.execute("SELECT rowid, embedding FROM vec_episodes")
+                for row in cursor.fetchall():
+                    emb = row["embedding"]
+                    if isinstance(emb, bytes):
+                        emb = list(emb)
+                    elif isinstance(emb, str):
+                        try:
+                            emb = json.loads(emb)
+                        except Exception:
+                            pass
+                    export["episodic_embeddings"].append({
+                        "rowid": row["rowid"],
+                        "embedding": emb
+                    })
+            except Exception:
+                pass
+
+        # Scratchpad (all sessions)
+        cursor.execute("""
+            SELECT id, content, session_id, created_at, updated_at
+            FROM scratchpad
+            ORDER BY session_id, updated_at
+        """)
+        export["scratchpad"] = [dict(row) for row in cursor.fetchall()]
+
+        # Consolidation log (all sessions)
+        cursor.execute("""
+            SELECT id, session_id, items_consolidated, summary_preview, created_at
+            FROM consolidation_log
+            ORDER BY session_id, created_at
+        """)
+        export["consolidation_log"] = [dict(row) for row in cursor.fetchall()]
+
+        return export
+
+    def import_from_dict(self, data: Dict, force: bool = False) -> Dict:
+        """
+        Import BEAM data from a dictionary produced by export_to_dict().
+        Idempotent by default: skips records whose id already exists.
+        Set force=True to overwrite existing records.
+        Returns import statistics.
+        """
+        stats = {
+            "working_memory": {"inserted": 0, "skipped": 0, "overwritten": 0},
+            "episodic_memory": {"inserted": 0, "skipped": 0, "overwritten": 0, "embeddings_inserted": 0},
+            "scratchpad": {"inserted": 0, "updated": 0},
+            "consolidation_log": {"inserted": 0},
+        }
+        cursor = self.conn.cursor()
+
+        # -- Working memory --
+        for item in data.get("working_memory", []):
+            mid = item.get("id")
+            cursor.execute("SELECT 1 FROM working_memory WHERE id = ?", (mid,))
+            exists = cursor.fetchone() is not None
+            if exists and not force:
+                stats["working_memory"]["skipped"] += 1
+                continue
+            if exists and force:
+                cursor.execute("DELETE FROM working_memory WHERE id = ?", (mid,))
+                stats["working_memory"]["overwritten"] += 1
+            else:
+                stats["working_memory"]["inserted"] += 1
+            cursor.execute("""
+                INSERT INTO working_memory
+                (id, content, source, timestamp, session_id, importance, metadata_json,
+                 valid_until, superseded_by, scope, recall_count, last_recalled, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                mid, item.get("content"), item.get("source"), item.get("timestamp"),
+                item.get("session_id", "default"), item.get("importance", 0.5),
+                item.get("metadata_json", "{}"), item.get("valid_until"),
+                item.get("superseded_by"), item.get("scope", "session"),
+                item.get("recall_count", 0), item.get("last_recalled"), item.get("created_at")
+            ))
+        self.conn.commit()
+
+        # -- Episodic memory --
+        old_to_new_rowid = {}
+        for item in data.get("episodic_memory", []):
+            mid = item.get("id")
+            cursor.execute("SELECT rowid FROM episodic_memory WHERE id = ?", (mid,))
+            existing = cursor.fetchone()
+            if existing and not force:
+                stats["episodic_memory"]["skipped"] += 1
+                old_to_new_rowid[item.get("rowid")] = existing["rowid"]
+                continue
+            if existing and force:
+                cursor.execute("DELETE FROM episodic_memory WHERE id = ?", (mid,))
+                stats["episodic_memory"]["overwritten"] += 1
+            else:
+                stats["episodic_memory"]["inserted"] += 1
+            cursor.execute("""
+                INSERT INTO episodic_memory
+                (id, content, source, timestamp, session_id, importance, metadata_json,
+                 summary_of, valid_until, superseded_by, scope, recall_count, last_recalled, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                mid, item.get("content"), item.get("source"), item.get("timestamp"),
+                item.get("session_id", "default"), item.get("importance", 0.5),
+                item.get("metadata_json", "{}"), item.get("summary_of", ""),
+                item.get("valid_until"), item.get("superseded_by"),
+                item.get("scope", "session"), item.get("recall_count", 0),
+                item.get("last_recalled"), item.get("created_at")
+            ))
+            new_rowid = cursor.lastrowid
+            old_to_new_rowid[item.get("rowid")] = new_rowid
+        self.conn.commit()
+
+        # -- Episodic embeddings --
+        vec_ok = _vec_available(self.conn)
+        for emb_item in data.get("episodic_embeddings", []):
+            old_rowid = emb_item.get("rowid")
+            new_rowid = old_to_new_rowid.get(old_rowid)
+            if not new_rowid:
+                continue
+            embedding = emb_item.get("embedding")
+            if not embedding:
+                continue
+            if vec_ok:
+                try:
+                    _vec_insert(self.conn, new_rowid, embedding)
+                    stats["episodic_memory"]["embeddings_inserted"] += 1
+                except Exception:
+                    pass
+        if vec_ok:
+            self.conn.commit()
+
+        # -- Scratchpad --
+        for item in data.get("scratchpad", []):
+            pid = item.get("id")
+            cursor.execute("SELECT 1 FROM scratchpad WHERE id = ?", (pid,))
+            exists = cursor.fetchone() is not None
+            if exists:
+                cursor.execute("""
+                    UPDATE scratchpad SET content=?, session_id=?, created_at=?, updated_at=?
+                    WHERE id=?
+                """, (item.get("content"), item.get("session_id", "default"),
+                      item.get("created_at"), item.get("updated_at"), pid))
+                stats["scratchpad"]["updated"] += 1
+            else:
+                cursor.execute("""
+                    INSERT INTO scratchpad (id, content, session_id, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (pid, item.get("content"), item.get("session_id", "default"),
+                      item.get("created_at"), item.get("updated_at")))
+                stats["scratchpad"]["inserted"] += 1
+        self.conn.commit()
+
+        # -- Consolidation log --
+        for item in data.get("consolidation_log", []):
+            cursor.execute("""
+                INSERT INTO consolidation_log (session_id, items_consolidated, summary_preview, created_at)
+                VALUES (?, ?, ?, ?)
+            """, (item.get("session_id", "default"), item.get("items_consolidated", 0),
+                  item.get("summary_preview", ""), item.get("created_at")))
+            stats["consolidation_log"]["inserted"] += 1
+        self.conn.commit()
+
+        return stats

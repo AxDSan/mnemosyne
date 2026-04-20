@@ -31,6 +31,14 @@ def register_cli(subparser):
     inspect_cmd.add_argument("--limit", type=int, default=10, help="Max results")
 
     mn_cmds.add_parser("clear", help="Clear scratchpad")
+
+    export_cmd = mn_cmds.add_parser("export", help="Export all memories to a JSON file")
+    export_cmd.add_argument("--output", "-o", type=str, required=True, help="Output JSON file path")
+
+    import_cmd = mn_cmds.add_parser("import", help="Import memories from a JSON file")
+    import_cmd.add_argument("--input", "-i", type=str, required=True, help="Input JSON file path")
+    import_cmd.add_argument("--force", action="store_true", help="Overwrite existing records")
+
     mnemosyne_parser.set_defaults(func=mnemosyne_command)
 
 
@@ -78,5 +86,43 @@ def mnemosyne_command(args):
             print("Scratchpad cleared.")
         else:
             print("Cancelled.")
+
+    elif cmd == "export":
+        output_path = getattr(args, "output", None)
+        if not output_path:
+            print("Usage: hermes mnemosyne export --output <path>")
+            return 1
+        try:
+            from mnemosyne.core.memory import Mnemosyne
+            mem = Mnemosyne(session_id="hermes_default")
+            result = mem.export_to_file(output_path)
+            print(f"Exported {result['working_memory_count']} working, {result['episodic_memory_count']} episodic, {result['legacy_memories_count']} legacy, {result['triples_count']} triples to {output_path}")
+        except Exception as e:
+            print(f"Export failed: {e}")
+            return 1
+
+    elif cmd == "import":
+        input_path = getattr(args, "input", None)
+        force = getattr(args, "force", False)
+        if not input_path:
+            print("Usage: hermes mnemosyne import --input <path> [--force]")
+            return 1
+        try:
+            from mnemosyne.core.memory import Mnemosyne
+            mem = Mnemosyne(session_id="hermes_default")
+            stats = mem.import_from_file(input_path, force=force)
+            beam_stats = stats.get("beam", {})
+            legacy_stats = stats.get("legacy", {})
+            triples_stats = stats.get("triples", {})
+            print(f"Import complete:")
+            print(f"  Working: +{beam_stats.get('working_memory', {}).get('inserted', 0)}")
+            print(f"  Episodic: +{beam_stats.get('episodic_memory', {}).get('inserted', 0)}")
+            print(f"  Legacy: +{legacy_stats.get('inserted', 0)}")
+            print(f"  Triples: +{triples_stats.get('inserted', 0)}")
+            if force:
+                print(f"  (force mode: overwrites applied)")
+        except Exception as e:
+            print(f"Import failed: {e}")
+            return 1
 
     return 0
