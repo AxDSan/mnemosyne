@@ -165,3 +165,59 @@ class TestMnemosyneIntegration:
         assert "beam" in stats
         assert "working_memory" in stats["beam"]
         assert "episodic_memory" in stats["beam"]
+
+
+class TestExportImport:
+    def test_beam_export_to_dict(self, temp_db):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        beam.remember("Prefers dark mode", source="preference", importance=0.9)
+        beam.scratchpad_write("todo item")
+        beam.consolidate_to_episodic("User likes dark mode", ["wm1"], importance=0.8)
+
+        data = beam.export_to_dict()
+        assert "mnemosyne_export" in data
+        assert data["mnemosyne_export"]["version"] == "1.0"
+        assert len(data["working_memory"]) >= 1
+        assert len(data["scratchpad"]) >= 1
+        assert len(data["episodic_memory"]) >= 1
+
+    def test_beam_import_from_dict_idempotent(self, temp_db):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        mid = beam.remember("Prefers dark mode", source="preference", importance=0.9)
+        data = beam.export_to_dict()
+
+        # Import into fresh DB
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fresh_db = Path(tmpdir) / "fresh.db"
+            fresh_beam = BeamMemory(session_id="s1", db_path=fresh_db)
+            stats = fresh_beam.import_from_dict(data)
+            assert stats["working_memory"]["inserted"] >= 1
+
+            # Verify
+            ctx = fresh_beam.get_context(limit=5)
+            assert any("dark mode" in c["content"] for c in ctx)
+
+            # Second import should skip
+            stats2 = fresh_beam.import_from_dict(data)
+            assert stats2["working_memory"]["skipped"] >= 1
+
+    def test_mnemosyne_export_import_roundtrip(self, temp_db):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Source
+            src = Mnemosyne(session_id="s1", db_path=temp_db)
+            src.remember("Likes pizza", source="preference", importance=0.8)
+            src.scratchpad_write("note")
+            export_path = Path(tmpdir) / "export.json"
+            src.export_to_file(str(export_path))
+            assert export_path.exists()
+
+            # Target
+            target_db = Path(tmpdir) / "target.db"
+            target = Mnemosyne(session_id="s1", db_path=target_db)
+            stats = target.import_from_file(str(export_path))
+            assert stats["legacy"]["inserted"] >= 1
+            assert stats["beam"]["working_memory"]["inserted"] >= 1
+
+            # Verify recall works
+            results = target.recall("pizza")
+            assert len(results) >= 1

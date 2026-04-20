@@ -209,6 +209,41 @@ SCRATCHPAD_CLEAR_SCHEMA = {
     }
 }
 
+EXPORT_SCHEMA = {
+    "name": "mnemosyne_export",
+    "description": "Export all Mnemosyne memories to a JSON file for backup or migration to another machine.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "output_path": {
+                "type": "string",
+                "description": "File path to write the export JSON (e.g., /tmp/mnemosyne_backup.json)"
+            }
+        },
+        "required": ["output_path"]
+    }
+}
+
+IMPORT_SCHEMA = {
+    "name": "mnemosyne_import",
+    "description": "Import Mnemosyne memories from a JSON file. Idempotent by default.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "input_path": {
+                "type": "string",
+                "description": "File path to read the export JSON from"
+            },
+            "force": {
+                "type": "boolean",
+                "description": "If true, overwrite existing records instead of skipping",
+                "default": False
+            }
+        },
+        "required": ["input_path"]
+    }
+}
+
 
 # Tool Handlers
 def mnemosyne_remember(args: dict, **kwargs) -> str:
@@ -365,6 +400,38 @@ def mnemosyne_invalidate(args: dict, **kwargs) -> str:
             "status": "invalidated" if ok else "not_found",
             "memory_id": memory_id,
             "replacement_id": replacement_id
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+def mnemosyne_export(args: dict, **kwargs) -> str:
+    """Export all memories to a JSON file"""
+    try:
+        output_path = args.get("output_path", "").strip()
+        if not output_path:
+            return json.dumps({"error": "output_path is required"})
+
+        mem = _get_memory()
+        result = mem.export_to_file(output_path)
+        return json.dumps(result)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+def mnemosyne_import(args: dict, **kwargs) -> str:
+    """Import memories from a JSON file"""
+    try:
+        input_path = args.get("input_path", "").strip()
+        force = args.get("force", False)
+        if not input_path:
+            return json.dumps({"error": "input_path is required"})
+
+        mem = _get_memory()
+        stats = mem.import_from_file(input_path, force=force)
+        return json.dumps({
+            "status": "imported",
+            "stats": stats
         })
     except Exception as e:
         return json.dumps({"error": str(e)})
