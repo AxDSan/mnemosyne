@@ -8,6 +8,12 @@ given a version number **MAJOR.MINOR**, increment the:
 
 ---
 
+## 1.6
+
+- Feature request issue template
+- Documentation improvement issue template
+- Issue template config with links to Discussions and Security advisories
+
 ## 1.5
 
 - Fix 6 critical bugs from issue #6 (stats, recall tracking, vector similarity, missing methods, hardcoded session_id)
