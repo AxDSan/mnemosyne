@@ -127,7 +127,8 @@ class Mnemosyne:
         self.beam = BeamMemory(session_id=session_id, db_path=db_path)
 
     def remember(self, content: str, source: str = "conversation",
-                 importance: float = 0.5, metadata: Dict = None) -> str:
+                 importance: float = 0.5, metadata: Dict = None,
+                 valid_until: str = None, scope: str = "session") -> str:
         """
         Store a memory directly to SQLite.
         Writes to both BEAM working_memory and legacy memories table.
@@ -157,7 +158,8 @@ class Mnemosyne:
         self.conn.commit()
 
         # BEAM write
-        self.beam.remember(content, source=source, importance=importance, metadata=metadata)
+        self.beam.remember(content, source=source, importance=importance, metadata=metadata,
+                           valid_until=valid_until, scope=scope)
 
         return memory_id
 
@@ -242,6 +244,10 @@ class Mnemosyne:
         )
         self.conn.commit()
         return cursor.rowcount > 0
+
+    def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
+        """Mark a memory as expired or superseded. Delegates to BEAM."""
+        return self.beam.invalidate(memory_id, replacement_id=replacement_id)
 
     # ------------------------------------------------------------------
     # BEAM-specific public methods

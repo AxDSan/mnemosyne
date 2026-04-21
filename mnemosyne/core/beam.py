@@ -660,13 +660,16 @@ class BeamMemory:
 
         # ---- Episodic memory (vec + FTS5 hybrid) ----
         vec_results = {}
+        max_distance = 0.0
         if _embeddings.available() and _vec_available(self.conn):
             emb_result = _embeddings.embed_query(query)
             if emb_result is not None:
                 vec_rows = _vec_search(self.conn, emb_result.tolist(), k=max(top_k * 3, 20))
-                for vr in vec_rows:
-                    sim = max(0.0, 1.0 - vr["distance"])
-                    vec_results[vr["rowid"]] = sim
+                if vec_rows:
+                    max_distance = max(vr["distance"] for vr in vec_rows)
+                    for vr in vec_rows:
+                        sim = max(0.0, 1.0 - (vr["distance"] / max_distance)) if max_distance > 0 else 1.0
+                        vec_results[vr["rowid"]] = sim
 
         fts_results = {}
         fts_rows = _fts_search(self.conn, query, k=max(top_k * 3, 20))
@@ -736,7 +739,7 @@ class BeamMemory:
             cursor.execute(f"""
                 UPDATE episodic_memory
                 SET recall_count = recall_count + 1, last_recalled = ?
-                WHERE id IN ({placeholders}) AND session_id = ?
+                WHERE id IN ({placeholders}) AND (session_id = ? OR scope = 'global')
             """, (now_iso, *tuple(em_ids), self.session_id))
         self.conn.commit()
 
@@ -744,9 +747,9 @@ class BeamMemory:
 
     def get_episodic_stats(self) -> Dict:
         cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM episodic_memory WHERE session_id = ?", (self.session_id,))
+        cursor.execute("SELECT COUNT(*) FROM episodic_memory")
         total = cursor.fetchone()[0]
-        cursor.execute("SELECT timestamp FROM episodic_memory WHERE session_id = ? ORDER BY timestamp DESC LIMIT 1", (self.session_id,))
+        cursor.execute("SELECT timestamp FROM episodic_memory ORDER BY timestamp DESC LIMIT 1")
         last = cursor.fetchone()
         vec_count = 0
         vec_type = "none"
