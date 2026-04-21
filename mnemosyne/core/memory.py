@@ -26,7 +26,9 @@ from mnemosyne.core.beam import BeamMemory, init_beam, _get_connection as _beam_
 _thread_local = threading.local()
 
 # Default data directory
-DEFAULT_DATA_DIR = Path.home() / ".mnemosyne" / "data"
+# NOTE: On Fly.io and ephemeral VMs, only ~/.hermes is persisted.
+# This MUST match beam.py's DEFAULT_DATA_DIR to avoid split-brain.
+DEFAULT_DATA_DIR = Path.home() / ".hermes" / "mnemosyne" / "data"
 DEFAULT_DB_PATH = DEFAULT_DATA_DIR / "mnemosyne.db"
 
 # Allow override via environment
@@ -36,9 +38,9 @@ if os.environ.get("MNEMOSYNE_DATA_DIR"):
     DEFAULT_DB_PATH = DEFAULT_DATA_DIR / "mnemosyne.db"
 
 
-def _get_connection(db_path: Path = None) -> sqlite3.Connection:
+def _get_connection(db_path = None) -> sqlite3.Connection:
     """Get thread-local database connection"""
-    path = db_path or DEFAULT_DB_PATH
+    path = Path(db_path) if db_path else DEFAULT_DB_PATH
     if not hasattr(_thread_local, 'conn') or _thread_local.conn is None or getattr(_thread_local, 'db_path', None) != str(path):
         path.parent.mkdir(parents=True, exist_ok=True)
         _thread_local.conn = sqlite3.connect(str(path), check_same_thread=False)
@@ -263,6 +265,138 @@ class Mnemosyne:
     def consolidation_log(self, limit: int = 10) -> List[Dict]:
         """Get consolidation history."""
         return self.beam.get_consolidation_log(limit=limit)
+
+    def export_to_file(self, output_path: str) -> Dict:
+        """
+        Export all Mnemosyne data (legacy + BEAM + triples) to a JSON file.
+        Returns export metadata.
+        """
+        from mnemosyne.core.triples import TripleStore
+        import json as _json
+
+        export = {
+            "mnemosyne_export": {
+                "version": "1.0",
+                "export_date": datetime.now().isoformat(),
+                "source_db": str(self.db_path),
+            }
+        }
+
+        # BEAM data
+        beam_data = self.beam.export_to_dict()
+        export["working_memory"] = beam_data.get("working_memory", [])
+        export["episodic_memory"] = beam_data.get("episodic_memory", [])
+        export["episodic_embeddings"] = beam_data.get("episodic_embeddings", [])
+        export["scratchpad"] = beam_data.get("scratchpad", [])
+        export["consolidation_log"] = beam_data.get("consolidation_log", [])
+
+        # Legacy memories
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT id, content, source, timestamp, session_id, importance,
+                   metadata_json, created_at
+            FROM memories
+            ORDER BY session_id, timestamp
+        """)
+        export["legacy_memories"] = [dict(row) for row in cursor.fetchall()]
+
+        # Legacy embeddings
+        cursor.execute("""
+            SELECT memory_id, embedding_json, model, created_at
+            FROM memory_embeddings
+            ORDER BY memory_id
+        """)
+        export["legacy_embeddings"] = [dict(row) for row in cursor.fetchall()]
+
+        # Triples
+        triples = TripleStore(db_path=self.db_path)
+        export["triples"] = triples.export_all()
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            _json.dump(export, f, indent=2, ensure_ascii=False, default=str)
+
+        return {
+            "status": "exported",
+            "path": output_path,
+            "working_memory_count": len(export["working_memory"]),
+            "episodic_memory_count": len(export["episodic_memory"]),
+            "scratchpad_count": len(export["scratchpad"]),
+            "legacy_memories_count": len(export["legacy_memories"]),
+            "triples_count": len(export["triples"]),
+        }
+
+    def import_from_file(self, input_path: str, force: bool = False) -> Dict:
+        """
+        Import Mnemosyne data from a JSON file produced by export_to_file().
+        Idempotent by default: skips existing records.
+        Set force=True to overwrite.
+        Returns import statistics.
+        """
+        from mnemosyne.core.triples import TripleStore
+        import json as _json
+
+        with open(input_path, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+
+        # Validate
+        meta = data.get("mnemosyne_export", {})
+        if meta.get("version") != "1.0":
+            raise ValueError(f"Unsupported export version: {meta.get('version')}")
+
+        stats = {"beam": {}, "legacy": {}, "triples": {}}
+
+        # BEAM import
+        beam_stats = self.beam.import_from_dict(data, force=force)
+        stats["beam"] = beam_stats
+
+        # Legacy memories
+        l_stats = {"inserted": 0, "skipped": 0, "overwritten": 0}
+        cursor = self.conn.cursor()
+        for item in data.get("legacy_memories", []):
+            mid = item.get("id")
+            cursor.execute("SELECT 1 FROM memories WHERE id = ?", (mid,))
+            exists = cursor.fetchone() is not None
+            if exists and not force:
+                l_stats["skipped"] += 1
+                continue
+            if exists and force:
+                cursor.execute("DELETE FROM memories WHERE id = ?", (mid,))
+                l_stats["overwritten"] += 1
+            else:
+                l_stats["inserted"] += 1
+            cursor.execute("""
+                INSERT INTO memories (id, content, source, timestamp, session_id,
+                                      importance, metadata_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                mid, item.get("content"), item.get("source"), item.get("timestamp"),
+                item.get("session_id", "default"), item.get("importance", 0.5),
+                item.get("metadata_json", "{}"), item.get("created_at")
+            ))
+        self.conn.commit()
+
+        # Legacy embeddings
+        for item in data.get("legacy_embeddings", []):
+            mid = item.get("memory_id")
+            cursor.execute("SELECT 1 FROM memory_embeddings WHERE memory_id = ?", (mid,))
+            exists = cursor.fetchone() is not None
+            if exists and not force:
+                continue
+            if exists and force:
+                cursor.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (mid,))
+            cursor.execute("""
+                INSERT INTO memory_embeddings (memory_id, embedding_json, model, created_at)
+                VALUES (?, ?, ?, ?)
+            """, (mid, item.get("embedding_json"), item.get("model", "bge-small-en-v1.5"), item.get("created_at")))
+        self.conn.commit()
+        stats["legacy"] = l_stats
+
+        # Triples
+        triples = TripleStore(db_path=self.db_path)
+        t_stats = triples.import_all(data.get("triples", []), force=force)
+        stats["triples"] = t_stats
+
+        return stats
 
 
 # Global instance for module-level convenience functions

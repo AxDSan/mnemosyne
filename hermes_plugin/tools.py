@@ -67,6 +67,15 @@ REMEMBER_SCHEMA = {
             "source": {
                 "type": "string",
                 "description": "Source of the memory (preference, fact, conversation, etc.)"
+            },
+            "valid_until": {
+                "type": "string",
+                "description": "ISO timestamp when this memory expires (optional)"
+            },
+            "scope": {
+                "type": "string",
+                "description": "'session' (default) or 'global' to make visible across all sessions",
+                "enum": ["session", "global"]
             }
         },
         "required": ["content"]
@@ -148,6 +157,25 @@ SLEEP_SCHEMA = {
     }
 }
 
+INVALIDATE_SCHEMA = {
+    "name": "mnemosyne_invalidate",
+    "description": "Mark a memory as expired or superseded. Use when a fact is no longer true or has been replaced.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {
+                "type": "string",
+                "description": "ID of the memory to invalidate"
+            },
+            "replacement_id": {
+                "type": "string",
+                "description": "Optional ID of the memory that replaces this one"
+            }
+        },
+        "required": ["memory_id"]
+    }
+}
+
 SCRATCHPAD_WRITE_SCHEMA = {
     "name": "mnemosyne_scratchpad_write",
     "description": "Write a temporary note to the Mnemosyne scratchpad.",
@@ -181,6 +209,41 @@ SCRATCHPAD_CLEAR_SCHEMA = {
     }
 }
 
+EXPORT_SCHEMA = {
+    "name": "mnemosyne_export",
+    "description": "Export all Mnemosyne memories to a JSON file for backup or migration to another machine.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "output_path": {
+                "type": "string",
+                "description": "File path to write the export JSON (e.g., /tmp/mnemosyne_backup.json)"
+            }
+        },
+        "required": ["output_path"]
+    }
+}
+
+IMPORT_SCHEMA = {
+    "name": "mnemosyne_import",
+    "description": "Import Mnemosyne memories from a JSON file. Idempotent by default.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "input_path": {
+                "type": "string",
+                "description": "File path to read the export JSON from"
+            },
+            "force": {
+                "type": "boolean",
+                "description": "If true, overwrite existing records instead of skipping",
+                "default": False
+            }
+        },
+        "required": ["input_path"]
+    }
+}
+
 
 # Tool Handlers
 def mnemosyne_remember(args: dict, **kwargs) -> str:
@@ -189,16 +252,23 @@ def mnemosyne_remember(args: dict, **kwargs) -> str:
         content = args.get("content", "").strip()
         importance = args.get("importance", 0.5)
         source = args.get("source", "conversation")
+        valid_until = args.get("valid_until")
+        scope = args.get("scope", "session")
 
         if not content:
             return json.dumps({"error": "Content is required"})
 
         mem = _get_memory()
-        memory_id = mem.remember(content, source=source, importance=importance)
+        memory_id = mem.remember(
+            content, source=source, importance=importance,
+            valid_until=valid_until, scope=scope
+        )
 
         return json.dumps({
             "status": "stored",
             "id": memory_id,
+            "scope": scope,
+            "valid_until": valid_until,
             "content_preview": content[:80] + "..." if len(content) > 80 else content
         })
 
@@ -312,5 +382,56 @@ def mnemosyne_scratchpad_clear(args: dict, **kwargs) -> str:
         mem = _get_memory()
         mem.scratchpad_clear()
         return json.dumps({"status": "cleared"})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+def mnemosyne_invalidate(args: dict, **kwargs) -> str:
+    """Invalidate a memory"""
+    try:
+        memory_id = args.get("memory_id", "").strip()
+        replacement_id = args.get("replacement_id")
+        if not memory_id:
+            return json.dumps({"error": "memory_id is required"})
+
+        mem = _get_memory()
+        ok = mem.invalidate(memory_id, replacement_id=replacement_id)
+        return json.dumps({
+            "status": "invalidated" if ok else "not_found",
+            "memory_id": memory_id,
+            "replacement_id": replacement_id
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+def mnemosyne_export(args: dict, **kwargs) -> str:
+    """Export all memories to a JSON file"""
+    try:
+        output_path = args.get("output_path", "").strip()
+        if not output_path:
+            return json.dumps({"error": "output_path is required"})
+
+        mem = _get_memory()
+        result = mem.export_to_file(output_path)
+        return json.dumps(result)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+def mnemosyne_import(args: dict, **kwargs) -> str:
+    """Import memories from a JSON file"""
+    try:
+        input_path = args.get("input_path", "").strip()
+        force = args.get("force", False)
+        if not input_path:
+            return json.dumps({"error": "input_path is required"})
+
+        mem = _get_memory()
+        stats = mem.import_from_file(input_path, force=force)
+        return json.dumps({
+            "status": "imported",
+            "stats": stats
+        })
     except Exception as e:
         return json.dumps({"error": str(e)})

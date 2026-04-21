@@ -17,6 +17,7 @@ import sqlite3
 import json
 import hashlib
 import threading
+import math
 import numpy as np
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any
@@ -51,6 +52,7 @@ WORKING_MEMORY_TTL_HOURS = int(os.environ.get("MNEMOSYNE_WM_TTL_HOURS", "24"))
 EPISODIC_RECALL_LIMIT = int(os.environ.get("MNEMOSYNE_EP_LIMIT", "50000"))
 SLEEP_BATCH_SIZE = int(os.environ.get("MNEMOSYNE_SLEEP_BATCH", "5000"))
 SCRATCHPAD_MAX_ITEMS = int(os.environ.get("MNEMOSYNE_SP_MAX", "1000"))
+RECENCY_HALFLIFE_HOURS = float(os.environ.get("MNEMOSYNE_RECENCY_HALFLIFE", "168"))  # 1 week default
 
 # Vector compression: float32 | int8 | bit
 VEC_TYPE = os.environ.get("MNEMOSYNE_VEC_TYPE", "int8").lower()
@@ -239,9 +241,47 @@ def init_beam(db_path: Path = None):
 
     conn.commit()
 
+    # --- Migration: recall tracking columns (v2.1) ---
+    _add_column_if_missing(conn, "working_memory", "recall_count", "INTEGER DEFAULT 0")
+    _add_column_if_missing(conn, "working_memory", "last_recalled", "TIMESTAMP DEFAULT NULL")
+    _add_column_if_missing(conn, "episodic_memory", "recall_count", "INTEGER DEFAULT 0")
+    _add_column_if_missing(conn, "episodic_memory", "last_recalled", "TIMESTAMP DEFAULT NULL")
+
+    # --- Migration: temporal validity + scope (v2.2) ---
+    _add_column_if_missing(conn, "working_memory", "valid_until", "TIMESTAMP DEFAULT NULL")
+    _add_column_if_missing(conn, "working_memory", "superseded_by", "TEXT DEFAULT NULL")
+    _add_column_if_missing(conn, "working_memory", "scope", "TEXT DEFAULT 'session'")
+    _add_column_if_missing(conn, "episodic_memory", "valid_until", "TIMESTAMP DEFAULT NULL")
+    _add_column_if_missing(conn, "episodic_memory", "superseded_by", "TEXT DEFAULT NULL")
+    _add_column_if_missing(conn, "episodic_memory", "scope", "TEXT DEFAULT 'session'")
+
 
 def _generate_id(content: str) -> str:
     return hashlib.sha256(f"{content}{datetime.now().isoformat()}".encode()).hexdigest()[:16]
+
+
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, col_type: str):
+    """Safely add a column if it doesn't already exist (SQLite migration helper)."""
+    cursor = conn.cursor()
+    cursor.execute(f"PRAGMA table_info({table})")
+    existing = {row[1] for row in cursor.fetchall()}
+    if column not in existing:
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+        conn.commit()
+
+
+def _recency_decay(timestamp_str: str, halflife_hours: float = RECENCY_HALFLIFE_HOURS) -> float:
+    """Calculate recency decay factor. 1.0 = brand new, ~0.5 = one halflife old."""
+    if not timestamp_str:
+        return 0.5  # Unknown age = neutral
+    try:
+        ts = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=None)
+        hours_old = max(0.0, (datetime.now() - ts).total_seconds() / 3600.0)
+        return math.exp(-hours_old / halflife_hours)
+    except Exception:
+        return 0.5
 
 
 def _vec_available(conn: sqlite3.Connection) -> bool:
@@ -361,16 +401,46 @@ class BeamMemory:
     # ------------------------------------------------------------------
     # Working Memory
     # ------------------------------------------------------------------
+    def _find_duplicate(self, content: str) -> Optional[str]:
+        """Check if exact same content already exists in working_memory for this session.
+        Returns the existing memory_id if found, else None."""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT id FROM working_memory
+            WHERE session_id = ? AND content = ?
+            LIMIT 1
+        """, (self.session_id, content))
+        row = cursor.fetchone()
+        return row["id"] if row else None
+
     def remember(self, content: str, source: str = "conversation",
-                 importance: float = 0.5, metadata: Dict = None) -> str:
-        """Store into working_memory."""
+                 importance: float = 0.5, metadata: Dict = None,
+                 valid_until: str = None, scope: str = "session") -> str:
+        """Store into working_memory. Deduplicates exact content matches."""
+        # --- Deduplication: exact match ---
+        existing_id = self._find_duplicate(content)
+        if existing_id:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                UPDATE working_memory
+                SET importance = MAX(importance, ?), timestamp = ?, source = ?,
+                    valid_until = COALESCE(?, valid_until),
+                    scope = COALESCE(?, scope)
+                WHERE id = ? AND session_id = ?
+            """, (importance, datetime.now().isoformat(), source,
+                  valid_until, scope, existing_id, self.session_id))
+            self.conn.commit()
+            return existing_id
+
         memory_id = _generate_id(content)
         timestamp = datetime.now().isoformat()
         cursor = self.conn.cursor()
         cursor.execute("""
-            INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (memory_id, content, source, timestamp, self.session_id, importance, json.dumps(metadata or {})))
+            INSERT INTO working_memory
+            (id, content, source, timestamp, session_id, importance, metadata_json, valid_until, scope)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (memory_id, content, source, timestamp, self.session_id, importance,
+              json.dumps(metadata or {}), valid_until, scope))
         self.conn.commit()
         self._trim_working_memory()
         return memory_id
@@ -420,16 +490,48 @@ class BeamMemory:
         self.conn.commit()
 
     def get_context(self, limit: int = 10) -> List[Dict]:
-        """Get recent working_memory for prompt injection."""
+        """Get recent working_memory for prompt injection.
+        Global memories are returned first, then session memories."""
         cursor = self.conn.cursor()
+        now = datetime.now().isoformat()
         cursor.execute("""
-            SELECT id, content, source, timestamp, importance
+            SELECT id, content, source, timestamp, importance, scope
             FROM working_memory
-            WHERE session_id = ?
-            ORDER BY timestamp DESC
+            WHERE (session_id = ? OR scope = 'global')
+              AND (valid_until IS NULL OR valid_until > ?)
+              AND superseded_by IS NULL
+            ORDER BY
+                CASE WHEN scope = 'global' THEN 0 ELSE 1 END,
+                timestamp DESC
             LIMIT ?
-        """, (self.session_id, limit))
+        """, (self.session_id, now, limit))
         return [dict(row) for row in cursor.fetchall()]
+
+    def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
+        """
+        Mark a memory as invalid/superseded.
+        If replacement_id is provided, sets superseded_by.
+        Otherwise sets valid_until to now (immediate expiry).
+        """
+        cursor = self.conn.cursor()
+        now = datetime.now().isoformat()
+        # Try working_memory first
+        cursor.execute("""
+            UPDATE working_memory
+            SET valid_until = ?, superseded_by = ?
+            WHERE id = ? AND (session_id = ? OR scope = 'global')
+        """, (now, replacement_id, memory_id, self.session_id))
+        if cursor.rowcount > 0:
+            self.conn.commit()
+            return True
+        # Try episodic_memory
+        cursor.execute("""
+            UPDATE episodic_memory
+            SET valid_until = ?, superseded_by = ?
+            WHERE id = ? AND (session_id = ? OR scope = 'global')
+        """, (now, replacement_id, memory_id, self.session_id))
+        self.conn.commit()
+        return cursor.rowcount > 0
 
     def get_working_stats(self) -> Dict:
         cursor = self.conn.cursor()
@@ -450,7 +552,8 @@ class BeamMemory:
     # ------------------------------------------------------------------
     def consolidate_to_episodic(self, summary: str, source_wm_ids: List[str],
                                 source: str = "consolidation", importance: float = 0.6,
-                                metadata: Dict = None) -> str:
+                                metadata: Dict = None, valid_until: str = None,
+                                scope: str = "session") -> str:
         """
         Store a consolidated summary into episodic_memory with optional embedding.
         """
@@ -458,10 +561,11 @@ class BeamMemory:
         timestamp = datetime.now().isoformat()
         cursor = self.conn.cursor()
         cursor.execute("""
-            INSERT INTO episodic_memory (id, content, source, timestamp, session_id, importance, metadata_json, summary_of)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO episodic_memory
+            (id, content, source, timestamp, session_id, importance, metadata_json, summary_of, valid_until, scope)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (memory_id, summary, source, timestamp, self.session_id, importance,
-              json.dumps(metadata or {}), ",".join(source_wm_ids)))
+              json.dumps(metadata or {}), ",".join(source_wm_ids), valid_until, scope))
         rowid = cursor.lastrowid
 
         if _embeddings.available():
@@ -495,21 +599,26 @@ class BeamMemory:
             placeholders = ",".join("?" * len(wm_ids))
             cursor = self.conn.cursor()
             cursor.execute(f"""
-                SELECT id, content, source, timestamp, importance
+                SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope
                 FROM working_memory
-                WHERE id IN ({placeholders}) AND session_id = ?
-            """, (*tuple(wm_ids), self.session_id))
+                WHERE id IN ({placeholders})
+                  AND (session_id = ? OR scope = 'global')
+                  AND (valid_until IS NULL OR valid_until > ?)
+                  AND superseded_by IS NULL
+            """, (*tuple(wm_ids), self.session_id, datetime.now().isoformat()))
             rows = cursor.fetchall()
         else:
             # Fallback: fetch recent items and score in Python (old path)
             cursor = self.conn.cursor()
             cursor.execute(f"""
-                SELECT id, content, source, timestamp, importance
+                SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope
                 FROM working_memory
-                WHERE session_id = ?
+                WHERE (session_id = ? OR scope = 'global')
+                  AND (valid_until IS NULL OR valid_until > ?)
+                  AND superseded_by IS NULL
                 ORDER BY timestamp DESC
                 LIMIT {min(EPISODIC_RECALL_LIMIT, 2000)}
-            """, (self.session_id,))
+            """, (self.session_id, datetime.now().isoformat()))
             rows = cursor.fetchall()
 
         if wm_ranks:
@@ -527,7 +636,9 @@ class BeamMemory:
                 partial = sum(1 for w in query_words for cw in content_lower.split() if w in cw or cw in w)
                 relevance = (exact * 1.0 + partial * 0.3) / max(len(query_words), 1)
             if relevance > 0.05 or wm_ranks:
-                score = relevance * 0.35 + row["importance"] * 0.2
+                decay = _recency_decay(row["timestamp"])
+                base_score = relevance * 0.35 + row["importance"] * 0.2
+                score = base_score * (0.7 + 0.3 * decay)
                 results.append({
                     "id": row["id"],
                     "content": row["content"][:500],
@@ -538,7 +649,13 @@ class BeamMemory:
                     "keyword_score": round(relevance, 4),
                     "dense_score": 0.0,
                     "fts_score": round(relevance, 4) if wm_ranks else 0.0,
-                    "importance": row["importance"]
+                    "importance": row["importance"],
+                    "recall_count": row["recall_count"] or 0,
+                    "last_recalled": row["last_recalled"],
+                    "recency_decay": round(decay, 4),
+                    "scope": row["scope"] if "scope" in row.keys() else "session",
+                    "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
+                    "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None
                 })
 
         # ---- Episodic memory (vec + FTS5 hybrid) ----
@@ -566,15 +683,20 @@ class BeamMemory:
             placeholders = ",".join("?" * len(episodic_rowids))
             cursor = self.conn.cursor()
             cursor.execute(f"""
-                SELECT rowid, id, content, source, timestamp, importance
+                SELECT rowid, id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope
                 FROM episodic_memory
-                WHERE rowid IN ({placeholders}) AND session_id = ?
-            """, (*tuple(episodic_rowids), self.session_id))
+                WHERE rowid IN ({placeholders})
+                  AND (session_id = ? OR scope = 'global')
+                  AND (valid_until IS NULL OR valid_until > ?)
+                  AND superseded_by IS NULL
+            """, (*tuple(episodic_rowids), self.session_id, datetime.now().isoformat()))
             for row in cursor.fetchall():
                 rid = row["rowid"]
                 sim = vec_results.get(rid, 0.0)
                 fts = fts_results.get(rid, 0.0)
-                score = sim * 0.5 + fts * 0.3 + row["importance"] * 0.2
+                decay = _recency_decay(row["timestamp"])
+                base_score = sim * 0.5 + fts * 0.3 + row["importance"] * 0.2
+                score = base_score * (0.7 + 0.3 * decay)
                 results.append({
                     "id": row["id"],
                     "content": row["content"][:500],
@@ -585,11 +707,40 @@ class BeamMemory:
                     "keyword_score": 0.0,
                     "dense_score": round(sim, 4),
                     "fts_score": round(fts, 4),
-                    "importance": row["importance"]
+                    "importance": row["importance"],
+                    "recall_count": row["recall_count"] or 0,
+                    "last_recalled": row["last_recalled"],
+                    "recency_decay": round(decay, 4),
+                    "scope": row["scope"] if "scope" in row.keys() else "session",
+                    "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
+                    "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None
                 })
 
         results.sort(key=lambda x: x["score"], reverse=True)
-        return results[:top_k]
+        final_results = results[:top_k]
+
+        # --- Recall tracking: increment counts + set last_recalled ---
+        now_iso = datetime.now().isoformat()
+        wm_ids = [r["id"] for r in final_results if r.get("tier") == "working"]
+        em_ids = [r["id"] for r in final_results if r.get("tier") == "episodic"]
+        cursor = self.conn.cursor()
+        if wm_ids:
+            placeholders = ",".join("?" * len(wm_ids))
+            cursor.execute(f"""
+                UPDATE working_memory
+                SET recall_count = recall_count + 1, last_recalled = ?
+                WHERE id IN ({placeholders}) AND session_id = ?
+            """, (now_iso, *tuple(wm_ids), self.session_id))
+        if em_ids:
+            placeholders = ",".join("?" * len(em_ids))
+            cursor.execute(f"""
+                UPDATE episodic_memory
+                SET recall_count = recall_count + 1, last_recalled = ?
+                WHERE id IN ({placeholders}) AND session_id = ?
+            """, (now_iso, *tuple(em_ids), self.session_id))
+        self.conn.commit()
+
+        return final_results
 
     def get_episodic_stats(self) -> Dict:
         cursor = self.conn.cursor()
@@ -642,9 +793,12 @@ class BeamMemory:
     def sleep(self, dry_run: bool = False) -> Dict:
         """
         Consolidate old working_memory into episodic_memory summaries.
+        Uses a local lightweight LLM when available; falls back to aaak
+        compression if the model is missing or inference fails.
         Returns summary of what was done.
         """
         from mnemosyne.core.aaak import encode as aaak_encode
+        from mnemosyne.core import local_llm
 
         cursor = self.conn.cursor()
         cutoff = (datetime.now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)).isoformat()
@@ -665,19 +819,35 @@ class BeamMemory:
 
         consolidated_ids = []
         summaries_created = 0
+        llm_used_count = 0
         for source, items in grouped.items():
             lines = [item["content"] for item in items]
-            combined = " | ".join(lines)
-            compressed = aaak_encode(combined)
-            summary = f"[{source}] {compressed}"
             ids = [item["id"] for item in items]
+
+            # --- Try local LLM summarization first ---
+            summary = None
+            if local_llm.llm_available():
+                summary = local_llm.summarize_memories(lines, source=source)
+                if summary:
+                    llm_used_count += 1
+
+            # --- Fallback to aaak encoding ---
+            if summary is None:
+                combined = " | ".join(lines)
+                compressed = aaak_encode(combined)
+                summary = f"[{source}] {compressed}"
+
             if not dry_run:
                 self.consolidate_to_episodic(
                     summary=summary,
                     source_wm_ids=ids,
                     source="sleep_consolidation",
                     importance=0.6,
-                    metadata={"original_count": len(items), "source": source}
+                    metadata={
+                        "original_count": len(items),
+                        "source": source,
+                        "llm_used": summary != f"[{source}] {aaak_encode(' | '.join(lines))}"
+                    }
                 )
                 placeholders = ",".join("?" * len(ids))
                 cursor.execute(f"DELETE FROM working_memory WHERE id IN ({placeholders})", ids)
@@ -685,17 +855,20 @@ class BeamMemory:
             consolidated_ids.extend(ids)
             summaries_created += 1
 
+        method = "llm" if llm_used_count == summaries_created else ("llm+aaak" if llm_used_count > 0 else "aaak")
         if not dry_run:
             cursor.execute("""
                 INSERT INTO consolidation_log (session_id, items_consolidated, summary_preview)
                 VALUES (?, ?, ?)
-            """, (self.session_id, len(consolidated_ids), f"{summaries_created} summaries from {len(consolidated_ids)} items"))
+            """, (self.session_id, len(consolidated_ids), f"{summaries_created} summaries ({method}) from {len(consolidated_ids)} items"))
             self.conn.commit()
 
         return {
             "status": "dry_run" if dry_run else "consolidated",
             "items_consolidated": len(consolidated_ids),
             "summaries_created": summaries_created,
+            "llm_used": llm_used_count,
+            "method": method,
             "consolidated_ids": consolidated_ids
         }
 
@@ -709,3 +882,207 @@ class BeamMemory:
             LIMIT ?
         """, (self.session_id, limit))
         return [dict(row) for row in cursor.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Export / Import
+    # ------------------------------------------------------------------
+    def export_to_dict(self) -> Dict:
+        """
+        Export all BEAM data to a portable dictionary.
+        Includes working_memory, episodic_memory, embeddings, scratchpad,
+        and consolidation_log across ALL sessions (not just current).
+        """
+        cursor = self.conn.cursor()
+        export = {
+            "mnemosyne_export": {
+                "version": "1.0",
+                "export_date": datetime.now().isoformat(),
+                "source_db": str(self.db_path),
+                "component": "beam"
+            }
+        }
+
+        # Working memory (all sessions)
+        cursor.execute("""
+            SELECT id, content, source, timestamp, session_id, importance,
+                   metadata_json, valid_until, superseded_by, scope,
+                   recall_count, last_recalled, created_at
+            FROM working_memory
+            ORDER BY session_id, timestamp
+        """)
+        export["working_memory"] = [dict(row) for row in cursor.fetchall()]
+
+        # Episodic memory (all sessions)
+        cursor.execute("""
+            SELECT rowid, id, content, source, timestamp, session_id, importance,
+                   metadata_json, summary_of, valid_until, superseded_by, scope,
+                   recall_count, last_recalled, created_at
+            FROM episodic_memory
+            ORDER BY session_id, timestamp
+        """)
+        export["episodic_memory"] = [dict(row) for row in cursor.fetchall()]
+
+        # Episodic embeddings from vec_episodes
+        export["episodic_embeddings"] = []
+        if _vec_available(self.conn):
+            try:
+                cursor.execute("SELECT rowid, embedding FROM vec_episodes")
+                for row in cursor.fetchall():
+                    emb = row["embedding"]
+                    if isinstance(emb, bytes):
+                        emb = list(emb)
+                    elif isinstance(emb, str):
+                        try:
+                            emb = json.loads(emb)
+                        except Exception:
+                            pass
+                    export["episodic_embeddings"].append({
+                        "rowid": row["rowid"],
+                        "embedding": emb
+                    })
+            except Exception:
+                pass
+
+        # Scratchpad (all sessions)
+        cursor.execute("""
+            SELECT id, content, session_id, created_at, updated_at
+            FROM scratchpad
+            ORDER BY session_id, updated_at
+        """)
+        export["scratchpad"] = [dict(row) for row in cursor.fetchall()]
+
+        # Consolidation log (all sessions)
+        cursor.execute("""
+            SELECT id, session_id, items_consolidated, summary_preview, created_at
+            FROM consolidation_log
+            ORDER BY session_id, created_at
+        """)
+        export["consolidation_log"] = [dict(row) for row in cursor.fetchall()]
+
+        return export
+
+    def import_from_dict(self, data: Dict, force: bool = False) -> Dict:
+        """
+        Import BEAM data from a dictionary produced by export_to_dict().
+        Idempotent by default: skips records whose id already exists.
+        Set force=True to overwrite existing records.
+        Returns import statistics.
+        """
+        stats = {
+            "working_memory": {"inserted": 0, "skipped": 0, "overwritten": 0},
+            "episodic_memory": {"inserted": 0, "skipped": 0, "overwritten": 0, "embeddings_inserted": 0},
+            "scratchpad": {"inserted": 0, "updated": 0},
+            "consolidation_log": {"inserted": 0},
+        }
+        cursor = self.conn.cursor()
+
+        # -- Working memory --
+        for item in data.get("working_memory", []):
+            mid = item.get("id")
+            cursor.execute("SELECT 1 FROM working_memory WHERE id = ?", (mid,))
+            exists = cursor.fetchone() is not None
+            if exists and not force:
+                stats["working_memory"]["skipped"] += 1
+                continue
+            if exists and force:
+                cursor.execute("DELETE FROM working_memory WHERE id = ?", (mid,))
+                stats["working_memory"]["overwritten"] += 1
+            else:
+                stats["working_memory"]["inserted"] += 1
+            cursor.execute("""
+                INSERT INTO working_memory
+                (id, content, source, timestamp, session_id, importance, metadata_json,
+                 valid_until, superseded_by, scope, recall_count, last_recalled, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                mid, item.get("content"), item.get("source"), item.get("timestamp"),
+                item.get("session_id", "default"), item.get("importance", 0.5),
+                item.get("metadata_json", "{}"), item.get("valid_until"),
+                item.get("superseded_by"), item.get("scope", "session"),
+                item.get("recall_count", 0), item.get("last_recalled"), item.get("created_at")
+            ))
+        self.conn.commit()
+
+        # -- Episodic memory --
+        old_to_new_rowid = {}
+        for item in data.get("episodic_memory", []):
+            mid = item.get("id")
+            cursor.execute("SELECT rowid FROM episodic_memory WHERE id = ?", (mid,))
+            existing = cursor.fetchone()
+            if existing and not force:
+                stats["episodic_memory"]["skipped"] += 1
+                old_to_new_rowid[item.get("rowid")] = existing["rowid"]
+                continue
+            if existing and force:
+                cursor.execute("DELETE FROM episodic_memory WHERE id = ?", (mid,))
+                stats["episodic_memory"]["overwritten"] += 1
+            else:
+                stats["episodic_memory"]["inserted"] += 1
+            cursor.execute("""
+                INSERT INTO episodic_memory
+                (id, content, source, timestamp, session_id, importance, metadata_json,
+                 summary_of, valid_until, superseded_by, scope, recall_count, last_recalled, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                mid, item.get("content"), item.get("source"), item.get("timestamp"),
+                item.get("session_id", "default"), item.get("importance", 0.5),
+                item.get("metadata_json", "{}"), item.get("summary_of", ""),
+                item.get("valid_until"), item.get("superseded_by"),
+                item.get("scope", "session"), item.get("recall_count", 0),
+                item.get("last_recalled"), item.get("created_at")
+            ))
+            new_rowid = cursor.lastrowid
+            old_to_new_rowid[item.get("rowid")] = new_rowid
+        self.conn.commit()
+
+        # -- Episodic embeddings --
+        vec_ok = _vec_available(self.conn)
+        for emb_item in data.get("episodic_embeddings", []):
+            old_rowid = emb_item.get("rowid")
+            new_rowid = old_to_new_rowid.get(old_rowid)
+            if not new_rowid:
+                continue
+            embedding = emb_item.get("embedding")
+            if not embedding:
+                continue
+            if vec_ok:
+                try:
+                    _vec_insert(self.conn, new_rowid, embedding)
+                    stats["episodic_memory"]["embeddings_inserted"] += 1
+                except Exception:
+                    pass
+        if vec_ok:
+            self.conn.commit()
+
+        # -- Scratchpad --
+        for item in data.get("scratchpad", []):
+            pid = item.get("id")
+            cursor.execute("SELECT 1 FROM scratchpad WHERE id = ?", (pid,))
+            exists = cursor.fetchone() is not None
+            if exists:
+                cursor.execute("""
+                    UPDATE scratchpad SET content=?, session_id=?, created_at=?, updated_at=?
+                    WHERE id=?
+                """, (item.get("content"), item.get("session_id", "default"),
+                      item.get("created_at"), item.get("updated_at"), pid))
+                stats["scratchpad"]["updated"] += 1
+            else:
+                cursor.execute("""
+                    INSERT INTO scratchpad (id, content, session_id, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (pid, item.get("content"), item.get("session_id", "default"),
+                      item.get("created_at"), item.get("updated_at")))
+                stats["scratchpad"]["inserted"] += 1
+        self.conn.commit()
+
+        # -- Consolidation log --
+        for item in data.get("consolidation_log", []):
+            cursor.execute("""
+                INSERT INTO consolidation_log (session_id, items_consolidated, summary_preview, created_at)
+                VALUES (?, ?, ?, ?)
+            """, (item.get("session_id", "default"), item.get("items_consolidated", 0),
+                  item.get("summary_preview", ""), item.get("created_at")))
+            stats["consolidation_log"]["inserted"] += 1
+        self.conn.commit()
+
+        return stats

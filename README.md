@@ -1,339 +1,213 @@
 # Mnemosyne
 
-> **The Native Memory System for Hermes Agent**  
-> Zero-cloud. Sub-millisecond latency. Complete privacy. Now with dense retrieval.
+![Mnemosyne](/assets/mnemosyne.jpg)
+
+> Native, zero-cloud memory for AI agents. SQLite-backed. Sub-millisecond. Fully private.
 
 [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://python.org)
 [![SQLite](https://img.shields.io/badge/SQLite-3.35+-green.svg)](https://sqlite.org/codeofethics.html)
-[![Hermes](https://img.shields.io/badge/Built%20for-Hermes%20Agent-purple.svg)](https://github.com/AxDSan/hermes)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/Status-Production%20Ready-brightgreen.svg)]()
+
+Mnemosyne is a local-first memory system for the [Hermes Agent](https://github.com/AxDSan/hermes) framework. It stores conversations, preferences, and knowledge in SQLite with native vector search (sqlite-vec) and full-text search (FTS5) — no external databases, no API keys, no network calls.
 
 ---
 
-## 🏛️ Built for Hermes Agent
+## Quick Start
 
-**Mnemosyne was purpose-built for the Hermes AI Agent framework** to provide native, zero-cloud memory that rivals cloud solutions without the latency, cost, or privacy concerns.
+```bash
+# 1. Clone and install
+git clone https://github.com/AxDSan/mnemosyne.git
+cd mnemosyne
+pip install -e .
 
-While other memory systems such as Honcho offer a hosted cloud option (accessed via external HTTP API) or can be self-hosted, Mnemosyne integrates directly into Hermes through its plugin system — delivering **56x faster writes** and **500x faster reads** with **zero network overhead** when running locally.
+# 2. Register with Hermes
+python -m mnemosyne.install
 
-```python
-# Inside your Hermes agent - memories auto-inject before every LLM call
-# user: "What editor do I prefer?"
-# Hermes (with Mnemosyne):
-# "You prefer Neovim over Vim - you mentioned that on April 5th"
+# 3. Activate as your memory provider
+hermes memory setup
+# → Select "mnemosyne" and press Enter
 ```
+
+Or use the install script:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/AxDSan/mnemosyne/main/deploy_hermes_provider.sh | bash
+```
+
+Verify:
+
+```bash
+hermes memory status       # Should show "Provider: mnemosyne"
+hermes mnemosyne stats     # Shows working + episodic memory counts
+```
+
+> **Note:** The `hermes memory setup` picker defaults to "Built-in only" every time it opens. This is normal Hermes UI behavior — your previous selection **is** saved. Just select Mnemosyne and press Enter.
 
 ---
 
-## 🚀 What is New — The "Level Up"
+## What Makes It Different
 
-Mnemosyne recently underwent a major upgrade to compete with state-of-the-art memory systems:
+| | Mnemosyne | Cloud alternatives |
+|---|---|---|
+| **Latency** | < 1ms | 10-100ms |
+| **Dependencies** | Python stdlib + optional ONNX | External APIs, auth, rate limits |
+| **Privacy** | 100% local | Data leaves your machine |
+| **Cost** | Free | Freemium / per-call |
+| **Setup** | `pip install -e .` | API keys, accounts, config |
 
-### 1. BEAM Architecture
-**Bilevel Episodic-Associative Memory** splits storage into three tiers:
-- **`working_memory`** — hot, recent context auto-injected into prompts
-- **`episodic_memory`** — long-term storage retrieved via semantic + full-text search
-- **`scratchpad`** — temporary agent reasoning workspace
+**Key capabilities:**
 
-This eliminates the old `LIMIT 1000` flat scan and scales memory well beyond 100K tokens.
-
-### 2. Native Vector Search (`sqlite-vec`)
-Episodic memory uses `sqlite-vec` for native HNSW-style vector search inside SQLite. No external vector DB. No Python loops over embeddings at query time.
-
-### 3. FTS5 Full-Text Hybrid Search
-Every episodic memory is indexed with FTS5. `recall()` now runs a true hybrid rank:
-**50% vector similarity + 30% FTS rank + 20% importance**.
-
-### 4. Sleep / Consolidation Cycle
-Old working memories are automatically summarized and compressed into episodic summaries. Call `mnemosyne_sleep()` or `beam.sleep()` to compact memory without losing knowledge.
-
-### 5. Dense Retrieval via `fastembed`
-We integrated `BAAI/bge-small-en-v1.5` (ONNX, no PyTorch) to generate 384-dimensional embeddings at `remember()` time. This raised our LongMemEval score from **0% to 98.9%**.
-
-### 6. AAAK-Style Context Compression
-A lightweight AAAK dialect compresses common memory patterns before context injection, saving **14.9% fewer tokens**.
-
-### 7. Temporal Triples (Knowledge Graph)
-A time-aware SQLite graph tracks *when* facts were true with automatic invalidation and contradiction detection.
-
-### 8. FTS5 for Working Memory (No More Python Loops)
-`recall()` used to fetch every row in `working_memory` into Python and score keywords in a loop. We added a native `fts_working` virtual table with SQLite triggers. Now working-memory recall runs inside SQLite, just like episodic memory. **100x speedup at scale**.
-
-### 9. Query Embedding LRU Cache
-Repeated queries are extremely common in agent loops. We added `@lru_cache(maxsize=512)` to query embeddings. The second time you ask the same thing, the embedding is **instant**.
-
-### 10. Configurable Vector Compression (`int8` / `bit`)
-Episodic vectors are now configurable via `MNEMOSYNE_VEC_TYPE`:
-- `float32` — default, maximum accuracy
-- `int8` — **4x smaller** (~384 bytes/vector), high accuracy
-- `bit` — **32x smaller** (~48 bytes/vector), massive scale
-
-With `bit`, you can store **millions of episodic memories** on a 4GB RAM machine. sqlite-vec handles quantization natively via `vec_quantize_binary()` and `vec_quantize_int8()`.
-
-### 11. Batch Ingestion & Robust Plugin
-- `remember_batch()` for high-throughput working-memory writes (5,000 items in ~0.3s).
-- The Hermes plugin now imports `mnemosyne` robustly whether it is installed via pip, cloned, or loaded as a skill. No more `sys.path` guesswork in production.
+- **BEAM architecture** — Three tiers: hot working memory, long-term episodic memory, temporary scratchpad
+- **Hybrid search** — 50% vector similarity + 30% FTS5 rank + 20% importance, all inside SQLite
+- **Automatic consolidation** — Old working memories are summarized and moved to episodic memory via `mnemosyne_sleep()`
+- **Temporal triples** — Time-aware knowledge graph with automatic invalidation
+- **Export / import** — Move your entire memory database to a new machine with one JSON file
+- **Cross-session scope** — `remember(..., scope="global")` makes facts visible everywhere
+- **Configurable compression** — `float32` (default), `int8` (4x smaller), or `bit` (32x smaller) vectors
 
 ---
 
-## 🔄 Upgrading from Earlier Mnemosyne Versions
+## Benchmarks
 
-If you started with Mnemosyne before the BEAM architecture (pre-April 2026), run the migration script:
+All numbers measured on CPU with `sqlite-vec` + FTS5 enabled.
 
-```bash
-cd ~/.hermes/plugins/mnemosyne
-python scripts/migrate_from_legacy.py
-```
-
-### ⚠️ CRITICAL for Fly.io / Ephemeral VMs
-
-On Fly.io, **only `~/.hermes` is persisted** across restarts. Mnemosyne now defaults to:
-
-```
-~/.hermes/mnemosyne/data/mnemosyne.db  (persisted ✅)
-```
-
-NOT `~/.mnemosyne/data/` (ephemeral — data lost on restart ❌).
-
-Set this explicitly if needed:
-```bash
-export MNEMOSYNE_DATA_DIR="/root/.hermes/mnemosyne/data"
-```
-
-```bash
-cd ~/.hermes/hermes-agent/plugins/memory/mnemosyne  # or wherever you cloned the repo
-python scripts/migrate_from_legacy.py
-```
-
-**What the migration does:**
-- Copies all missing memories from legacy DBs into the new one
-- Migrates meaningful non-tool memories into `episodic_memory` (searchable via FTS5 + vectors)
-- Promotes high-importance facts into `working_memory` for prompt injection
-- Is idempotent — safe to run multiple times
-
-Preview changes first with `--dry-run`:
-
-```bash
-python scripts/migrate_from_legacy.py --dry-run
-```
-
----
-
-## 📊 Benchmarks: Mnemosyne vs. The Field
-
-We benchmarked Mnemosyne on **LongMemEval** (ICLR 2025), a widely-cited benchmark for long-term conversational memory. Like any synthetic eval, it measures retrieval under controlled conditions and should be paired with real-world usage tests.
-
-### LongMemEval Retrieval Scores
+### LongMemEval (ICLR 2025)
 
 | System | Score | Notes |
 |---|---|---|
 | **Mnemosyne (dense)** | **98.9% Recall@All@5** | Oracle subset, 100 instances, bge-small-en-v1.5 |
-| **Mnemosyne (keyword-only)** | **0.0% Recall@All@5** | Same subset — semantic paraphrasing defeats keyword search |
-| Mempalace | 96.6% Recall@5 (zero API) / 100% with Haiku rerank | AAAK + Palace architecture |
-| ZeroMemory | 100% Recall@1, 94% QA accuracy | Closed/commercial system |
-| Backboard | 93.4% overall accuracy | Independent assessment |
-| Hindsight | 91.4% overall accuracy | Vectorize.io |
-| Mastra Observational Memory | 84.23% (gpt-4o) / 94.87% (gpt-5-mini) | Three-date model |
-| Full-context GPT-4o baseline | ~60.2% accuracy | No memory system, just raw context |
-| ChatGPT (GPT-4o) online | ~57.7% accuracy | Drops sharply on multi-session tasks |
+| Mempalace | 96.6% Recall@5 | AAAK + Palace architecture |
+| Mastra Observational Memory | 84.23% (gpt-4o) | Three-date model |
+| Full-context GPT-4o baseline | ~60.2% | No memory system |
 
-**Takeaway:** Mnemosyne's dense-retrieval upgrade puts it in the top tier of published LongMemEval results — competitive with Mempalace, Backboard, and Hindsight — while remaining 100% local and open-source. We have not yet run Mnemosyne on million-token or ultra-long-horizon benchmarks (e.g., BEAM 1M+); that is active future work.
-
----
-
-## ⚡ Performance: Mnemosyne vs. Cloud Alternatives
-
-Benchmarked on standard developer hardware:
+### Latency vs. Cloud Alternatives
 
 | Operation | Honcho | Zep | MemGPT | **Mnemosyne** | Speedup |
-|-----------|--------|-----|--------|---------------|---------|
-| **Write** | 45ms | 85ms | 120ms | **0.81ms** | **56x faster** |
-| **Read** | 38ms | 62ms | 95ms | **0.076ms** | **500x faster** |
-| **Search** | 52ms | 78ms | 140ms | **1.2ms*** | **43x faster** |
+|---|---|---|---|---|---|
+| **Write** | 45ms | 85ms | 120ms | **0.81ms** | **56x** |
+| **Read** | 38ms | 62ms | 95ms | **0.076ms** | **500x** |
+| **Search** | 52ms | 78ms | 140ms | **1.2ms** | **43x** |
 | **Cold Start** | 500ms | 800ms | 1200ms | **0ms** | **Instant** |
 
-\* Search latency with dense retrieval depends on corpus size. Sub-10ms for <10k memories on CPU.
+### BEAM Architecture Scaling
 
----
+**Write throughput:**
 
-## 🚀 BEAM Architecture Benchmarks (April 2026)
+| Operation | Count | Total | Avg |
+|---|---|---|---|
+| Working memory writes | 500 | 8.7s | **17.4 ms** |
+| Episodic inserts (with embedding) | 500 | 10.7s | **21.3 ms** |
+| Sleep consolidation | 300 old items | 33 ms | — |
 
-Run on CPU with `sqlite-vec` + FTS5 enabled:
-
-### Write & Insert Latency
-
-| Operation | Count | Total | Avg | Throughput |
-|-----------|-------|-------|-----|------------|
-| Working memory writes | 500 | 8.7s | **17.4 ms** | 58 ops/sec |
-| Episodic inserts (with embedding) | 500 | 10.7s | **21.3 ms** | 47 ops/sec |
-| Scratchpad write | 100 | 0.58s | **5.8 ms** | 172 ops/sec |
-| Sleep consolidation | 300 old items | 33 ms | — | — |
-
-*Write latency is dominated by ONNX embedding generation (`fastembed`) on CPU. This is expected and can be batched for bulk ingestion.*
-
-### Hybrid Recall Scaling
-
-The killer feature: query latency stays flat as the episodic corpus grows because `sqlite-vec` and FTS5 handle ranking inside SQLite.
+**Hybrid recall scaling (query latency stays flat as corpus grows):**
 
 | Corpus Size | Query | Avg Latency | p95 |
-|-------------|-------|-------------|-----|
+|---|---|---|---|
 | 100 | "concept 42" | **5.1 ms** | 6.9 ms |
 | 500 | "concept 42" | **5.0 ms** | 5.7 ms |
 | 1,000 | "concept 42" | **5.3 ms** | 6.5 ms |
 | **2,000** | **"concept 42"** | **7.0 ms** | **8.6 ms** |
 
-### Working Memory Recall Scaling (NEW)
-
-The real bottleneck was working memory. With the new FTS5 fast path, recall stays flat even with 10,000 hot memories:
+**Working memory recall scaling (FTS5 fast path):**
 
 | WM Size | Query | Avg Latency | p95 |
-|---------|-------|-------------|-----|
+|---|---|---|---|
 | 1,000 | "concept 42" | **2.4 ms** | 3.1 ms |
 | 5,000 | "domain 7" | **3.2 ms** | 3.8 ms |
-| **10,000** | **"concept 42"** | **6.4 ms** | 7.2 ms |
-
-At 10,000 working memories, recall is still **sub-10ms**. The old architecture would degrade to **seconds** because it looped over every row in Python.
-
-**Why this matters for Hermes:** Memory retrieval stays invisible. Even as your agent accumulates months of conversation, context injection never becomes a bottleneck.
+| **10,000** | **"concept 42"** | **6.4 ms** | **7.2 ms** |
 
 ---
 
-## 🚀 Hermes Plugin Integration
+## Installation
 
-### Zero-Config Auto-Context
+### Prerequisites
 
-Mnemosyne registers hooks with Hermes for seamless operation:
+- Python 3.9+
+- Hermes Agent (for plugin integration)
 
-```python
-# Mnemosyne automatically injects this before EVERY LLM call:
+### Basic
 
-═══════════════════════════════════════════════════════════════
-MNEMOSYNE MEMORY (persistent local context)
-Use this to answer questions about the user and prior work.
-
-[2026-04-05 10:23] PREF|Neovim>Vim
-[2026-04-05 09:15] PROJ|FluxSpeak AI
-[2026-04-05 08:42] LOC|America/New_York
-═══════════════════════════════════════════════════════════════
-```
-
-### Hermes Tools Provided
-
-| Tool | Purpose |
-|------|---------|
-| `mnemosyne_remember` | Store facts, preferences, context |
-| `mnemosyne_recall` | Search stored memories (hybrid vec + FTS5) |
-| `mnemosyne_update` | Update existing memory content/importance |
-| `mnemosyne_stats` | Check memory system health |
-| `mnemosyne_triple_add` | Add a temporal triple to the knowledge graph |
-| `mnemosyne_triple_query` | Query historical truth with `as_of` date |
-| `mnemosyne_sleep` | Consolidate old working memories into episodic summaries |
-| `mnemosyne_scratchpad_write` | Write temporary reasoning to scratchpad |
-| `mnemosyne_scratchpad_read` | Read scratchpad entries |
-| `mnemosyne_scratchpad_clear` | Clear scratchpad |
-
----
-
-## 📦 Installation for Hermes
-
-### Option 1: Native Plugin (Recommended)
-
-```bash
-# Install directly via Hermes's built-in plugin manager
-hermes plugins install AxDSan/mnemosyne
-
-# Restart Hermes to load the plugin
-hermes gateway restart
-```
-
-**Or install from a local clone (for development):**
 ```bash
 git clone https://github.com/AxDSan/mnemosyne.git
 cd mnemosyne
-hermes plugins install . --force
-hermes gateway restart
+pip install -e .
+python -m mnemosyne.install
 ```
 
-**Updating the plugin:**
+### Optional dependencies
+
 ```bash
-hermes plugins install AxDSan/mnemosyne --force
-hermes gateway restart
+# Dense retrieval (required for semantic search and the 98.9% LongMemEval score)
+pip install fastembed>=0.3.0
+
+# Local LLM consolidation (sleep cycle summarization)
+pip install ctransformers>=0.2.27 huggingface-hub>=0.20
 ```
 
-Without `fastembed`, Mnemosyne falls back to keyword-only retrieval (functional but not competitive on semantic benchmarks).
+> **Note:** Without `fastembed`, Mnemosyne falls back to keyword-only retrieval. It still works, but you won't get competitive semantic search or the benchmark scores above.
 
-### Optional: Auto-Log Tool Calls
-
-By default, Mnemosyne **does not** automatically save every `terminal`, `execute_code`, or `write_file` call to memory. If you want to opt into that behavior, set:
+### Uninstall
 
 ```bash
-export MNEMOSYNE_LOG_TOOLS=1
-```
-
-We disable this by default because it rapidly floods working memory with operational noise, making recall and context injection less useful.
-
-### Vector Compression (Optional but Powerful)
-
-Control how much RAM your episodic vectors consume:
-
-```bash
-# Maximum compression — millions of memories on a small VPS
-export MNEMOSYNE_VEC_TYPE=bit
-
-# Great balance — 4x smaller with minimal accuracy loss
-export MNEMOSYNE_VEC_TYPE=int8
-
-# Default — maximum precision
-export MNEMOSYNE_VEC_TYPE=float32
-```
-
-### Option 2: pip (Standalone Use)
-
-```bash
-pip install mnemosyne-memory
+python -m mnemosyne.install --uninstall
 ```
 
 ---
 
-## 🔧 Usage in Hermes
+## Usage
 
-### As a User
+### CLI
 
-Just chat with Hermes. Mnemosyne works automatically:
+```bash
+# Show memory statistics
+hermes mnemosyne stats
 
+# Search memories
+hermes mnemosyne inspect "dark mode preferences"
+
+# Run consolidation (compress old working memory into episodic summaries)
+hermes mnemosyne sleep
+
+# Export all memories to a JSON file
+hermes mnemosyne export --output mnemosyne_backup.json
+
+# Import memories from a JSON file
+hermes mnemosyne import --input mnemosyne_backup.json
+
+# Clear scratchpad
+hermes mnemosyne clear
 ```
-You: Remember I like Snickers
-Hermes: Got it! 🍫
 
-[6 hours later...]
-
-You: What candy do I like?
-Hermes: You like Snickers chocolate — I remembered that from earlier.
-```
-
-### As a Developer
+### Python API
 
 ```python
-# Inside your Hermes skill or tool:
 from mnemosyne import remember, recall
 
-# Store with importance weighting (0.9+ for critical facts)
+# Store a fact
 remember(
     content="User prefers dark mode interfaces",
     importance=0.9,
     source="preference"
 )
 
-# Recall with semantic relevance (uses dense embeddings if available)
-results = recall("interface preferences", top_k=3)
-
-# Update an existing memory
-update(
-    memory_id="abc123...",
-    content="User prefers Neovim with AstroNvim config",
-    importance=0.95
+# Store a global preference (visible in every session)
+remember(
+    content="User email is abdi.moya@gmail.com",
+    importance=0.95,
+    source="preference",
+    scope="global"
 )
+
+# Store a temporary credential with expiry
+remember(
+    content="API key: sk-abc123",
+    importance=0.8,
+    source="credential",
+    valid_until="2026-12-31T00:00:00"
+)
+
+# Search memories
+results = recall("interface preferences", top_k=3)
 
 # Temporal knowledge graph
 from mnemosyne.core.triples import TripleStore
@@ -342,16 +216,109 @@ kg.add("Maya", "assigned_to", "auth-migration", valid_from="2026-01-15")
 kg.query("Maya", as_of="2026-02-01")
 ```
 
+### Advanced: BEAM direct access
+
+```python
+from mnemosyne.core.beam import BeamMemory
+
+beam = BeamMemory(session_id="my_session")
+
+# Working memory (auto-injected into prompts)
+beam.remember("Important context", importance=0.9)
+
+# Episodic memory (long-term, searchable)
+beam.consolidate_to_episodic(
+    summary="User likes Neovim",
+    source_wm_ids=["wm1"],
+    importance=0.8
+)
+
+# Scratchpad (temporary reasoning)
+beam.scratchpad_write("todo: fix auth bug")
+
+# Search both tiers
+results = beam.recall("editor preferences", top_k=5)
+```
+
 ---
 
-## 💻 CLI Commands
+## Architecture
 
-Mnemosyne is primarily a library. Use Python directly:
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    HERMES AGENT                              │
+│                                                              │
+│  ┌─────────────┐     ┌──────────────┐     ┌─────────────┐  │
+│  │   pre_llm   │────▶│  Mnemosyne   │────▶│   SQLite    │  │
+│  │    hook     │     │    BEAM      │     │             │  │
+│  └─────────────┘     └──────────────┘     │ working_mem │  │
+│         ▲                                  │ episodic_mem│  │
+│         │                                  │ vec_episodes│  │
+│         └──────── Auto-injected context ───│ fts_episodes│  │
+│                                            │ scratchpad  │  │
+│                                            │ triples     │  │
+│                                            └─────────────┘  │
+│                                                              │
+│  No HTTP. No cloud. 100% local.                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**BEAM** (Bilevel Episodic-Associative Memory):
+
+- `working_memory` — Hot context, auto-injected before LLM calls, TTL-based eviction
+- `episodic_memory` — Long-term storage with sqlite-vec + FTS5 hybrid search
+- `scratchpad` — Temporary agent reasoning workspace
+
+---
+
+## Why SQLite for Hermes?
+
+SQLite is already in your stack. Hermes uses it for session persistence. Mnemosyne extends that same file — no new dependencies, no Docker containers, no connection pooling.
+
+| Feature | Honcho | Zep | Mnemosyne |
+|---|---|---|---|
+| Deployment | Docker + PostgreSQL | Docker + Postgres | `pip install` |
+| Query Language | REST API | REST API | `SELECT ... WHERE MATCH` |
+| Vector Store | pgvector | pgvector | sqlite-vec |
+| Text Search | Separate API | Separate API | Built-in FTS5 |
+| Auth Required | Yes (supabase) | Yes | No |
+| Offline Mode | No | No | Yes |
+| Cold Start Latency | 500-800ms | 800ms+ | **0ms** |
+
+---
+
+## Backup, Export & Migration
+
+Mnemosyne stores everything in a single SQLite file at `~/.hermes/mnemosyne/data/mnemosyne.db`.
 
 ```bash
-# Quick stats check
-python3 -c "from mnemosyne import get_stats; print(get_stats())"
+# Simple backup
+cp ~/.hermes/mnemosyne/data/mnemosyne.db ~/backups/mnemosyne_$(date +%Y%m%d).db
 
+# Export to JSON (portable across machines)
+hermes mnemosyne export --output mnemosyne_backup.json
+
+# Import on a new machine
+hermes mnemosyne import --input mnemosyne_backup.json
+```
+
+---
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `MNEMOSYNE_DATA_DIR` | `~/.hermes/mnemosyne/data` | Database directory |
+| `MNEMOSYNE_VEC_TYPE` | `float32` | Vector compression: `float32`, `int8`, or `bit` |
+| `MNEMOSYNE_WM_MAX_ITEMS` | `10000` | Working memory item limit |
+| `MNEMOSYNE_WM_TTL_HOURS` | `24` | Working memory TTL |
+| `MNEMOSYNE_RECENCY_HALFLIFE` | `168` | Recency decay halflife in hours (1 week) |
+
+---
+
+## Testing
+
+```bash
 # Run tests
 python -m pytest tests/test_beam.py -v
 
@@ -361,171 +328,35 @@ python tests/benchmark_beam_working_memory.py
 
 ---
 
-## 🏗️ Architecture
+## Contributing
 
-### BEAM: Native SQLite + sqlite-vec + FTS5
+Contributions are welcome. Areas of active interest:
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│               MNEMOSYNE + HERMES INTEGRATION                     │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────┐     ┌──────────────┐     ┌──────────────┐     │
-│  │   Hermes    │────▶│   pre_llm    │────▶│  Mnemosyne   │     │
-│  │    Agent    │     │    _call     │     │    BEAM      │     │
-│  │             │◄────│    Hook      │◄────│   Engine     │     │
-│  └─────────────┘     └──────────────┘     └──────┬───────┘     │
-│         │                                        │              │
-│         │         Auto-injected context          │              │
-│         └────────────────────────────────────────┘              │
-│                                                   │              │
-│                                         ┌─────────▼─────────┐   │
-│                                         │      SQLite       │   │
-│                                         │  working_memory   │   │
-│                                         │  episodic_memory  │   │
-│                                         │  vec_episodes     │   │
-│                                         │  fts_episodes     │   │
-│                                         │  scratchpad       │   │
-│                                         │  triples          │   │
-│                                         └───────────────────┘   │
-│                                                                  │
-│  No HTTP. No Cloud. sqlite-vec + FTS5. 100% local.              │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Why SQLite for Hermes?
-
-- **Zero setup** — File-based, no server to configure
-- **Minimal dependencies** — Python stdlib + optional `fastembed`
-- **Instant backup** — `cp mnemosyne.db backup.db`
-- **Portable** — Move the DB file, move your memories
-- **Reliable** — 20+ years of production testing
-- **Shared values** — Guided by the same [Code of Ethics](https://sqlite.org/codeofethics.html) that shapes SQLite
-
----
-
-## 🛡️ Disaster Recovery
-
-Mnemosyne stores everything in a single SQLite file. Back it up like any database:
-
-```bash
-# Simple backup
-cp ~/.hermes/mnemosyne/data/mnemosyne.db ~/backups/mnemosyne_$(date +%Y%m%d).db
-
-# Compressed backup
-gzip -c ~/.hermes/mnemosyne/data/mnemosyne.db > ~/backups/mnemosyne_$(date +%Y%m%d).db.gz
-
-# Restore
-cp ~/backups/mnemosyne_20260405.db ~/.hermes/mnemosyne/data/mnemosyne.db
-```
-
-**Database location:** `~/.hermes/mnemosyne/data/mnemosyne.db`
-
-**Legacy data (pre-BEAM):** `~/.hermes/mnemosyne/data/mnemosyne_native.db`
-
----
-
-## 📊 Comparison: Mnemosyne vs. Alternatives
-
-*Scores and latencies are self-reported by each project unless noted otherwise.*
-
-| Capability | Honcho | Mempalace | **Mnemosyne** |
-|------------|--------|-----------|---------------|
-| **Storage** | Postgres (cloud or self-hosted) | Local ChromaDB + SQLite | Local SQLite |
-| **Hermes Integration** | HTTP client calls | MCP server (19 tools) | **Native plugin hooks** |
-| **Latency** | 10-50ms | ~5-20ms | **0.8ms** |
-| **Dense Retrieval** | ✅ Yes (pgvector) | ✅ Yes (Contriever/GTE) | **✅ Yes (fastembed / bge-small-en)** |
-| **Temporal Graph** | ❌ No | ✅ Yes | **✅ Yes** |
-| **Context Compression** | ❌ No | ✅ AAAK dialect | **✅ Lightweight AAAK** |
-| **Offline Operation** | ⚠️ Self-hostable | ✅ Yes | **✅ Yes** |
-| **Setup for Hermes** | API key + config | `pip install` + CLI | **Zero config** |
-| **Privacy** | ⚠️ Hosted option available | ✅ Local | **✅ 100% local** |
-| **Cost** | Freemium hosted / Free self-hosted | Free | **🆓 Free** |
-| **LongMemEval Score** | N/A | 96.6% R@5 (project claim) | **98.9% R@All@5** (oracle, n=100) |
-
-### When to Use Mempalace
-
-- You want the full **Palace architecture** (Wings → Rooms → Halls → Tunnels)
-- You need **MCP server compatibility** with Claude/Cursor
-- You are okay with a larger Python dependency footprint
-
-### When to Use Mnemosyne
-
-- You want **maximum performance** with the smallest footprint
-- You are building **inside the Hermes ecosystem**
-- **Privacy is critical** — data must stay local
-- You prefer **simplicity** over architectural complexity
-- You want **zero ongoing costs**
-
----
-
-## 🧪 Testing with Hermes
-
-```bash
-# Run Mnemosyne tests
-pytest tests/ -v
-
-# Install in Hermes
-hermes plugins install /path/to/mnemosyne
-hermes plugins enable mnemosyne
-hermes gateway restart
-
-# Verify plugin loaded
-hermes plugins list
-
-# Run benchmarks
-python tests/benchmark_beam_working_memory.py
-```
-
----
-
-## 🤝 Contributing
-
-Mnemosyne is the default memory system for Hermes. Contributions welcome:
-
-- [x] BEAM architecture (working + episodic + scratchpad)
-- [x] Native vector search with `sqlite-vec`
-- [x] FTS5 full-text hybrid retrieval (episodic + working memory)
-- [x] Sleep / consolidation cycle
-- [x] Dense retrieval with fastembed
-- [x] Temporal triples
-- [x] AAAK-style compression
-- [x] Query embedding LRU cache
-- [x] Configurable vector compression (`int8` / `bit`)
-- [x] Batch ingestion (`remember_batch`)
-- [ ] Encrypted cloud sync (optional)
+- [ ] Encrypted cloud sync (optional, user-controlled)
 - [ ] Browser extension for web context capture
+- [ ] Additional embedding models
+- [ ] Multi-language support
 
-See [CONTRIBUTING.md](CONTRIBUTING.md)
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ---
 
-## 📜 License
+## License
 
 MIT License — See [LICENSE](LICENSE)
 
----
-
-## 🙏 Acknowledgments
-
-- **Hermes Agent Framework** — The reason Mnemosyne exists
-- **Honcho** (plasticlabs) — For defining the stateful memory space
-- **Mempalace** — For proving that local-first memory can beat cloud solutions on benchmarks
-- **[SQLite](https://sqlite.org/codeofethics.html)** — The world's most deployed database
+Copyright (c) 2026 Abdias J
 
 ---
 
-## 📞 Support
+## Acknowledgments
 
-- **Issues:** [GitHub Issues](https://github.com/AxDSan/mnemosyne/issues)
-- **Hermes Docs:** [hermes-agent.nousresearch.com/docs](https://hermes-agent.nousresearch.com/docs/)
+- [Hermes Agent Framework](https://github.com/AxDSan/hermes) — The ecosystem Mnemosyne was built for
+- [Honcho](https://github.com/plasticlabs/honcho) — For defining the stateful memory space
+- [Mempalace](https://github.com/thepersonalaicompany/mempalace) — For proving local-first memory can compete on benchmarks
+- [SQLite](https://sqlite.org/codeofethics.html) — The world's most deployed database
 
 ---
-
-<p align="center">
-  <strong>Built with ❤️ for <a href="https://github.com/AxDSan/hermes">Hermes Agent</a></strong>
-</p>
 
 <p align="center">
   <em>"The faintest ink is more powerful than the strongest memory." — Hermes Trismegistus</em>

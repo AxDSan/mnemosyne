@@ -145,3 +145,48 @@ class TripleStore:
             ORDER BY valid_from DESC
         """, (subject, predicate))
         return [dict(row) for row in cursor.fetchall()]
+
+    def export_all(self) -> List[Dict]:
+        """Export all triples to a list of dictionaries."""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT id, subject, predicate, object, valid_from, valid_until,
+                   source, confidence, created_at
+            FROM triples
+            ORDER BY id
+        """)
+        return [dict(row) for row in cursor.fetchall()]
+
+    def import_all(self, triples: List[Dict], force: bool = False) -> Dict:
+        """
+        Import triples from a list of dictionaries.
+        Idempotent by default: skips records whose id already exists.
+        Set force=True to overwrite.
+        Returns import statistics.
+        """
+        stats = {"inserted": 0, "skipped": 0, "overwritten": 0}
+        cursor = self.conn.cursor()
+        for item in triples:
+            tid = item.get("id")
+            cursor.execute("SELECT 1 FROM triples WHERE id = ?", (tid,))
+            exists = cursor.fetchone() is not None
+            if exists and not force:
+                stats["skipped"] += 1
+                continue
+            if exists and force:
+                cursor.execute("DELETE FROM triples WHERE id = ?", (tid,))
+                stats["overwritten"] += 1
+            else:
+                stats["inserted"] += 1
+            cursor.execute("""
+                INSERT INTO triples (id, subject, predicate, object, valid_from,
+                                     valid_until, source, confidence, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                tid, item.get("subject"), item.get("predicate"), item.get("object"),
+                item.get("valid_from"), item.get("valid_until"),
+                item.get("source", "imported"), item.get("confidence", 1.0),
+                item.get("created_at")
+            ))
+        self.conn.commit()
+        return stats

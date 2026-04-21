@@ -1,0 +1,17 @@
+name: mnemosyne
+version: 2.0.0
+description: "Native local memory for Hermes — SQLite with vector search, FTS5 hybrid ranking, episodic consolidation, and temporal triples. Zero cloud. Zero latency. Deployed via plugin system."
+author: Abdias J
+provides_tools:
+  - mnemosyne_remember
+  - mnemosyne_recall
+  - mnemosyne_sleep
+  - mnemosyne_stats
+  - mnemosyne_invalidate
+  - mnemosyne_triple_add
+  - mnemosyne_triple_query
+provides_hooks:
+  - pre_llm_call
+  - on_session_start
+  - on_session_end
+  - on_memory_write

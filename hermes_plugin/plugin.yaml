@@ -1,7 +1,7 @@
 name: mnemosyne
 version: 1.0.0
 description: Native AI memory system with SQLite - zero dependencies, sub-millisecond latency
-author: FluxSpeak AI
+author: Abdias J
 provides_tools:
   - mnemosyne_remember
   - mnemosyne_recall
