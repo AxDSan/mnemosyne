@@ -250,10 +250,10 @@ def init_beam(db_path: Path = None):
     # --- Migration: temporal validity + scope (v2.2) ---
     _add_column_if_missing(conn, "working_memory", "valid_until", "TIMESTAMP DEFAULT NULL")
     _add_column_if_missing(conn, "working_memory", "superseded_by", "TEXT DEFAULT NULL")
-    _add_column_if_missing(conn, "working_memory", "scope", "TEXT DEFAULT 'session'")
+    _add_column_if_missing(conn, "working_memory", "scope", "TEXT DEFAULT 'global'")
     _add_column_if_missing(conn, "episodic_memory", "valid_until", "TIMESTAMP DEFAULT NULL")
     _add_column_if_missing(conn, "episodic_memory", "superseded_by", "TEXT DEFAULT NULL")
-    _add_column_if_missing(conn, "episodic_memory", "scope", "TEXT DEFAULT 'session'")
+    _add_column_if_missing(conn, "episodic_memory", "scope", "TEXT DEFAULT 'global'")
 
 
 def _generate_id(content: str) -> str:
