@@ -204,8 +204,8 @@ class MnemosyneMemoryProvider(MemoryProvider):
         self._platform = kwargs.get("platform", "cli")
         self._hermes_home = kwargs.get("hermes_home", "")
 
-        if self._agent_context in ("cron", "flush"):
-            logger.debug("Mnemosyne skipped: cron/flush context")
+        if self._agent_context in ("cron", "flush", "subagent"):
+            logger.debug("Mnemosyne skipped: non-primary context=%s", self._agent_context)
             return
 
         self._session_id = f"hermes_{session_id}"
@@ -243,7 +243,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall relevant context via Mnemosyne hybrid search."""
-        if not self._beam or self._agent_context in ("cron", "flush"):
+        if not self._beam or self._agent_context in ("cron", "flush", "subagent"):
             return ""
         try:
             results = self._beam.recall(query, top_k=8)
@@ -267,7 +267,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Persist the turn to Mnemosyne episodic memory."""
-        if not self._beam or self._agent_context in ("cron", "flush"):
+        if not self._beam or self._agent_context in ("cron", "flush", "subagent"):
             return
         try:
             if user_content and len(user_content) > 5:
@@ -427,3 +427,19 @@ def register_memory_provider(ctx):
     """Called by Hermes memory provider discovery system."""
     provider = MnemosyneMemoryProvider()
     ctx.register_memory_provider(provider)
+
+
+# ---------------------------------------------------------------------------
+# Plugin registration (used when loaded via Hermes plugin system)
+# ---------------------------------------------------------------------------
+
+def register(ctx):
+    """Called by Hermes plugin loader to register CLI commands and tools."""
+    from .cli import register_cli, mnemosyne_command
+    ctx.register_cli_command(
+        name="mnemosyne",
+        help="Manage Mnemosyne local memory",
+        description="Inspect, consolidate, and manage Mnemosyne native memory.",
+        setup_fn=register_cli,
+        handler_fn=mnemosyne_command,
+    )

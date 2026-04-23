@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mnemosyne-memory"
+dynamic = ["version"]
+description = "The Zero-Dependency, Sub-Millisecond AI Memory System"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [
+    {name = "Abdias J", email = "abdi.moya@gmail.com"}
+]
+keywords = [
+    "ai",
+    "memory",
+    "sqlite",
+    "agent",
+    "llm",
+    "context",
+    "embeddings",
+    "vector-store",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+llm = ["ctransformers>=0.2.27", "huggingface-hub>=0.20"]
+embeddings = ["fastembed>=0.3.0"]
+all = ["ctransformers>=0.2.27", "huggingface-hub>=0.20", "fastembed>=0.3.0"]
+dev = ["pytest>=7.0", "build", "twine"]
+
+[project.urls]
+Homepage = "https://github.com/AxDSan/mnemosyne"
+Repository = "https://github.com/AxDSan/mnemosyne"
+Issues = "https://github.com/AxDSan/mnemosyne/issues"
+Documentation = "https://github.com/AxDSan/mnemosyne/blob/main/README.md"
+
+[project.scripts]
+mnemosyne-install = "mnemosyne.install:install"
+mnemosyne-uninstall = "mnemosyne.install:uninstall"
+
+[tool.setuptools.packages.find]
+exclude = ["tests*", "benchmark*", "scripts*", "docs*", "assets*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "mnemosyne.__version__"}

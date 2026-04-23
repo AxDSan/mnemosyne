@@ -9,9 +9,17 @@ from pathlib import Path
 readme_path = Path(__file__).parent / "README.md"
 long_description = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
 
+# Single source of truth for version
+version_path = Path(__file__).parent / "mnemosyne" / "__init__.py"
+_version = "0.1"
+for line in version_path.read_text(encoding="utf-8").splitlines():
+    if line.startswith("__version__"):
+        _version = line.split("=")[1].strip().strip('"').strip("'")
+        break
+
 setup(
     name="mnemosyne-memory",
-    version="1.0.0",
+    version=_version,
     author="Abdias J",
     author_email="abdi.moya@gmail.com",
     description="The Zero-Dependency, Sub-Millisecond AI Memory System",

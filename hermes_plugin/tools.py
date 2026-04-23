@@ -5,6 +5,7 @@ Tool implementations that wrap Mnemosyne core functionality.
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -30,14 +31,17 @@ except ImportError:
 
 # Global instances
 _memory_instance = None
+_current_session_id = None
 _triple_store = None
 
 
 def _get_memory():
-    """Get or create global memory instance"""
-    global _memory_instance
-    if _memory_instance is None:
-        _memory_instance = Mnemosyne(session_id="hermes_default")
+    """Get or create memory instance. Recreates if session_id changes."""
+    global _memory_instance, _current_session_id
+    session_id = os.environ.get("HERMES_SESSION_ID", "hermes_default")
+    if _memory_instance is None or _current_session_id != session_id:
+        _current_session_id = session_id
+        _memory_instance = Mnemosyne(session_id=session_id)
     return _memory_instance
 
 

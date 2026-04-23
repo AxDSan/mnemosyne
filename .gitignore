@@ -49,3 +49,7 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Devops plans (private — not for public repo)
+DEVOPS_PLAN_*
+

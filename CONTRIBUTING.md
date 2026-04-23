@@ -7,7 +7,7 @@ Mnemosyne is a personal project that grew into something useful. If you're here,
 ```bash
 git clone https://github.com/AxDSan/mnemosyne.git
 cd mnemosyne
-pip install -e .
+pip install -e ".[all,dev]"
 python -m pytest tests/ -v
 ```
 
@@ -21,6 +21,33 @@ python -m pytest tests/ -v
 - **Submit code** — See below for guidelines.
 
 ## Code Contributions
+
+### Versioning
+
+Mnemosyne uses **Simple Versioning** (`MAJOR.MINOR`, no patch):
+
+- **MINOR** bumps after every iteration: bug fixes, features, docs, refactors.
+- **MAJOR** bumps only for significant new functionality (e.g., 1.0 → 2.0).
+
+`__version__` in `mnemosyne/__init__.py` is the single source of truth. `pyproject.toml` reads from it automatically. If you open a PR that changes user-facing behavior, bump the version and add an entry to `CHANGELOG.md`.
+
+### Releasing (maintainers only)
+
+Releases are fully automated via GitHub Actions:
+
+1. Bump `__version__` in `mnemosyne/__init__.py`
+2. Commit and push to `main`
+3. Tag and push:
+   ```bash
+   git tag -a v1.X.Y -m "Release v1.X.Y"
+   git push origin v1.X.Y
+   ```
+4. The [release workflow](https://github.com/AxDSan/mnemosyne/actions/workflows/release.yml) handles the rest:
+   - Builds wheel + sdist
+   - Creates a [GitHub Release](https://github.com/AxDSan/mnemosyne/releases) with auto-generated notes
+   - Publishes to [PyPI](https://pypi.org/project/mnemosyne-memory/) via trusted publishing (OIDC)
+
+No manual uploads. No API tokens.
 
 ### Principles
 
@@ -37,6 +64,7 @@ Mnemosyne is intentionally minimal. Every addition is weighed against these prin
 2. **Keep it focused.** One PR per logical change.
 3. **Add tests.** If you fix a bug or add a feature, include a test in `tests/`.
 4. **Update the README** if user-facing behavior changes.
+5. **Bump the version** in `mnemosyne/__init__.py` and update `CHANGELOG.md`.
 
 ### Review Process
 

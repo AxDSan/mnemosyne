@@ -5,8 +5,10 @@
 > Native, zero-cloud memory for AI agents. SQLite-backed. Sub-millisecond. Fully private.
 
 [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://python.org)
+[![PyPI](https://img.shields.io/pypi/v/mnemosyne-memory.svg)](https://pypi.org/project/mnemosyne-memory/)
 [![SQLite](https://img.shields.io/badge/SQLite-3.35+-green.svg)](https://sqlite.org/codeofethics.html)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/AxDSan/mnemosyne/actions/workflows/ci.yml/badge.svg)](https://github.com/AxDSan/mnemosyne/actions/workflows/ci.yml)
 
 Mnemosyne is a local-first memory system for the [Hermes Agent](https://github.com/AxDSan/hermes) framework. It stores conversations, preferences, and knowledge in SQLite with native vector search (sqlite-vec) and full-text search (FTS5) — no external databases, no API keys, no network calls.
 
@@ -14,24 +16,55 @@ Mnemosyne is a local-first memory system for the [Hermes Agent](https://github.c
 
 ## Quick Start
 
+### Option A: Install from PyPI (recommended)
+
 ```bash
-# 1. Clone and install
-git clone https://github.com/AxDSan/mnemosyne.git
-cd mnemosyne
-pip install -e .
-
-# 2. Register with Hermes
-python -m mnemosyne.install
-
-# 3. Activate as your memory provider
-hermes memory setup
-# → Select "mnemosyne" and press Enter
+pip install mnemosyne-memory
 ```
 
-Or use the install script:
+> **Note:** The package name on PyPI is `mnemosyne-memory`.
+
+With all optional features (dense retrieval + local LLM consolidation):
+
+```bash
+pip install mnemosyne-memory[all]
+```
+
+> ⚠️ **Ubuntu 24.04 / Debian 12 users:** If you get `error: externally-managed-environment`, your system Python is PEP 668-protected. Use a virtual environment:
+> ```bash
+> python3 -m venv .venv
+> source .venv/bin/activate
+> pip install mnemosyne-memory[all]
+> ```
+> Make sure to activate the venv every time you run Hermes, or install Hermes itself inside the same venv.
+
+### Option B: Install from source (for development)
+
+```bash
+git clone https://github.com/AxDSan/mnemosyne.git
+cd mnemosyne
+pip install -e ".[all,dev]"
+```
+
+### Option C: Hermes MemoryProvider only (no pip needed)
+
+If you only need Mnemosyne as a Hermes memory backend and want to skip pip entirely:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/AxDSan/mnemosyne/main/deploy_hermes_provider.sh | bash
+```
+
+This symlinks the provider into `~/.hermes/plugins/mnemosyne` and adds the repo to `sys.path` at runtime. No virtual environment required — works out of the box on Ubuntu 24.04.
+
+### Register with Hermes
+
+```bash
+# 1. Install the plugin
+python -m mnemosyne.install
+
+# 2. Activate as your memory provider
+hermes memory setup
+# → Select "mnemosyne" and press Enter
 ```
 
 Verify:
@@ -125,14 +158,25 @@ All numbers measured on CPU with `sqlite-vec` + FTS5 enabled.
 - Python 3.9+
 - Hermes Agent (for plugin integration)
 
-### Basic
+### From PyPI (recommended for users)
+
+```bash
+pip install mnemosyne-memory
+
+# With all extras (dense retrieval + local LLM consolidation)
+pip install mnemosyne-memory[all]
+```
+
+### From source (recommended for contributors)
 
 ```bash
 git clone https://github.com/AxDSan/mnemosyne.git
 cd mnemosyne
-pip install -e .
+pip install -e ".[all,dev]"
 python -m mnemosyne.install
 ```
+
+> ⚠️ **Ubuntu 24.04 / Debian 12 users:** If `pip install` fails with `externally-managed-environment`, see the [Quick Start → Option A](#quick-start) note about using a virtual environment.
 
 ### Optional dependencies
 
@@ -151,6 +195,34 @@ pip install ctransformers>=0.2.27 huggingface-hub>=0.20
 ```bash
 python -m mnemosyne.install --uninstall
 ```
+
+### Updating
+
+If you installed from PyPI:
+
+```bash
+pip install --upgrade mnemosyne-memory
+```
+
+If you installed from source:
+
+```bash
+cd mnemosyne
+git pull
+pip install -e ".[all,dev]"
+```
+
+**Always restart Hermes** after updating so plugin changes take effect:
+```bash
+hermes gateway restart
+```
+
+**If the update includes database schema changes**, run the migration helper:
+```bash
+python scripts/migrate_from_legacy.py
+```
+
+See [UPDATING.md](UPDATING.md) for detailed troubleshooting and rollback instructions.
 
 ---
 
@@ -319,12 +391,20 @@ hermes mnemosyne import --input mnemosyne_backup.json
 ## Testing
 
 ```bash
-# Run tests
+# Run tests locally
 python -m pytest tests/test_beam.py -v
 
 # Run benchmarks
 python tests/benchmark_beam_working_memory.py
 ```
+
+All changes are validated through [GitHub Actions CI](https://github.com/AxDSan/mnemosyne/actions/workflows/ci.yml) on Python 3.9–3.12 before merging.
+
+---
+
+## Releases
+
+Mnemosyne publishes [GitHub Releases](https://github.com/AxDSan/mnemosyne/releases) and [PyPI packages](https://pypi.org/project/mnemosyne-memory/) automatically on every `v*` tag. See [CONTRIBUTING.md](CONTRIBUTING.md) for the release process.
 
 ---
 

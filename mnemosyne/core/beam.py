@@ -634,8 +634,18 @@ class BeamMemory:
             else:
                 exact = sum(1 for w in query_words if w in content_lower)
                 partial = sum(1 for w in query_words for cw in content_lower.split() if w in cw or cw in w)
-                relevance = (exact * 1.0 + partial * 0.3) / max(len(query_words), 1)
-            if relevance > 0.05 or wm_ranks:
+                # Cross-substring match: if any query word is a substring of content, or vice versa
+                cross = sum(1 for w in query_words if len(w) >= 2 for cw in content_lower.split() if len(cw) >= 2 and (w in cw or cw in w))
+                # Also check if the full query is a substring of content (handles spaceless languages)
+                full_match = 1.0 if query_lower in content_lower else 0.0
+                if not full_match and content_lower in query_lower:
+                    full_match = 0.5
+                # Character-level overlap for spaceless languages (e.g. Chinese)
+                query_chars = set(query_lower)
+                content_chars = set(content_lower)
+                char_overlap = len(query_chars & content_chars) / max(len(query_chars), 1) if query_chars else 0.0
+                relevance = (exact * 1.0 + partial * 0.3 + cross * 0.5 + full_match + char_overlap * 0.8) / max(len(query_words), 1)
+            if relevance > 0.02 or wm_ranks:
                 decay = _recency_decay(row["timestamp"])
                 base_score = relevance * 0.35 + row["importance"] * 0.2
                 score = base_score * (0.7 + 0.3 * decay)
@@ -660,13 +670,16 @@ class BeamMemory:
 
         # ---- Episodic memory (vec + FTS5 hybrid) ----
         vec_results = {}
+        max_distance = 0.0
         if _embeddings.available() and _vec_available(self.conn):
             emb_result = _embeddings.embed_query(query)
             if emb_result is not None:
                 vec_rows = _vec_search(self.conn, emb_result.tolist(), k=max(top_k * 3, 20))
-                for vr in vec_rows:
-                    sim = max(0.0, 1.0 - vr["distance"])
-                    vec_results[vr["rowid"]] = sim
+                if vec_rows:
+                    max_distance = max(vr["distance"] for vr in vec_rows)
+                    for vr in vec_rows:
+                        sim = max(0.0, 1.0 - (vr["distance"] / max_distance)) if max_distance > 0 else 1.0
+                        vec_results[vr["rowid"]] = sim
 
         fts_results = {}
         fts_rows = _fts_search(self.conn, query, k=max(top_k * 3, 20))
@@ -716,6 +729,54 @@ class BeamMemory:
                     "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None
                 })
 
+        # Fallback: if no episodic matches from vec/FTS, scan recent episodic entries
+        if not episodic_rowids:
+            cursor = self.conn.cursor()
+            cursor.execute(f"""
+                SELECT rowid, id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope
+                FROM episodic_memory
+                WHERE (session_id = ? OR scope = 'global')
+                  AND (valid_until IS NULL OR valid_until > ?)
+                  AND superseded_by IS NULL
+                ORDER BY timestamp DESC
+                LIMIT {min(EPISODIC_RECALL_LIMIT, 500)}
+            """, (self.session_id, datetime.now().isoformat()))
+            for row in cursor.fetchall():
+                content_lower = row["content"].lower()
+                exact = sum(1 for w in query_words if w in content_lower)
+                partial = sum(1 for w in query_words for cw in content_lower.split() if w in cw or cw in w)
+                cross = sum(1 for w in query_words if len(w) >= 2 for cw in content_lower.split() if len(cw) >= 2 and (w in cw or cw in w))
+                full_match = 1.0 if query_lower in content_lower else 0.0
+                if not full_match and content_lower in query_lower:
+                    full_match = 0.5
+                # Character-level overlap for spaceless languages (e.g. Chinese)
+                query_chars = set(query_lower)
+                content_chars = set(content_lower)
+                char_overlap = len(query_chars & content_chars) / max(len(query_chars), 1) if query_chars else 0.0
+                relevance = (exact * 1.0 + partial * 0.3 + cross * 0.5 + full_match + char_overlap * 0.8) / max(len(query_words), 1)
+                if relevance > 0.02:
+                    decay = _recency_decay(row["timestamp"])
+                    base_score = relevance * 0.35 + row["importance"] * 0.2
+                    score = base_score * (0.7 + 0.3 * decay)
+                    results.append({
+                        "id": row["id"],
+                        "content": row["content"][:500],
+                        "source": row["source"],
+                        "timestamp": row["timestamp"],
+                        "tier": "episodic",
+                        "score": round(score, 4),
+                        "keyword_score": round(relevance, 4),
+                        "dense_score": 0.0,
+                        "fts_score": 0.0,
+                        "importance": row["importance"],
+                        "recall_count": row["recall_count"] or 0,
+                        "last_recalled": row["last_recalled"],
+                        "recency_decay": round(decay, 4),
+                        "scope": row["scope"] if "scope" in row.keys() else "session",
+                        "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
+                        "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None
+                    })
+
         results.sort(key=lambda x: x["score"], reverse=True)
         final_results = results[:top_k]
 
@@ -736,7 +797,7 @@ class BeamMemory:
             cursor.execute(f"""
                 UPDATE episodic_memory
                 SET recall_count = recall_count + 1, last_recalled = ?
-                WHERE id IN ({placeholders}) AND session_id = ?
+                WHERE id IN ({placeholders}) AND (session_id = ? OR scope = 'global')
             """, (now_iso, *tuple(em_ids), self.session_id))
         self.conn.commit()
 
@@ -744,9 +805,9 @@ class BeamMemory:
 
     def get_episodic_stats(self) -> Dict:
         cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM episodic_memory WHERE session_id = ?", (self.session_id,))
+        cursor.execute("SELECT COUNT(*) FROM episodic_memory")
         total = cursor.fetchone()[0]
-        cursor.execute("SELECT timestamp FROM episodic_memory WHERE session_id = ? ORDER BY timestamp DESC LIMIT 1", (self.session_id,))
+        cursor.execute("SELECT timestamp FROM episodic_memory ORDER BY timestamp DESC LIMIT 1")
         last = cursor.fetchone()
         vec_count = 0
         vec_type = "none"
@@ -803,7 +864,7 @@ class BeamMemory:
         cursor = self.conn.cursor()
         cutoff = (datetime.now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)).isoformat()
         cursor.execute(f"""
-            SELECT id, content, source, timestamp, importance, metadata_json
+            SELECT id, content, source, timestamp, importance, metadata_json, scope, valid_until
             FROM working_memory
             WHERE session_id = ? AND timestamp < ?
             ORDER BY timestamp ASC
@@ -824,6 +885,16 @@ class BeamMemory:
             lines = [item["content"] for item in items]
             ids = [item["id"] for item in items]
 
+            # Aggregate scope: if ANY item is global, the summary is global
+            aggregated_scope = "session"
+            aggregated_valid_until = None
+            for item in items:
+                if item.get("scope") == "global":
+                    aggregated_scope = "global"
+                if item.get("valid_until"):
+                    if aggregated_valid_until is None or item["valid_until"] < aggregated_valid_until:
+                        aggregated_valid_until = item["valid_until"]
+
             # --- Try local LLM summarization first ---
             summary = None
             if local_llm.llm_available():
@@ -843,6 +914,8 @@ class BeamMemory:
                     source_wm_ids=ids,
                     source="sleep_consolidation",
                     importance=0.6,
+                    scope=aggregated_scope,
+                    valid_until=aggregated_valid_until,
                     metadata={
                         "original_count": len(items),
                         "source": source,
