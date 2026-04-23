@@ -8,6 +8,13 @@ given a version number **MAJOR.MINOR**, increment the:
 
 ---
 
+## 1.10.1
+
+- **Fix `get_working_stats()`** — Now counts ALL working memories globally, not just current session. (PR #11 by @rakaarwaky)
+- **Fix `recall()` tracking UPDATE** — Global memories now correctly increment `recall_count` and `last_recalled` when recalled from other sessions. (PR #11 by @rakaarwaky)
+- **Fix column defaults** — `scope` column defaults changed from `'session'` to `'global'` for backward compatibility with pre-scope behavior. (PR #11 by @rakaarwaky)
+- **Deprecate `get_global_working_stats()`** — Now aliases `get_working_stats()`. The `--global` CLI flag remains for backward compatibility.
+
 ## 1.10.0
 
 - **`hermes mnemosyne stats --global`** — Show working memory stats across all sessions (not just current session). Adds `sessions` count to output.

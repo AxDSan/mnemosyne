@@ -250,10 +250,10 @@ def init_beam(db_path: Path = None):
     # --- Migration: temporal validity + scope (v2.2) ---
     _add_column_if_missing(conn, "working_memory", "valid_until", "TIMESTAMP DEFAULT NULL")
     _add_column_if_missing(conn, "working_memory", "superseded_by", "TEXT DEFAULT NULL")
-    _add_column_if_missing(conn, "working_memory", "scope", "TEXT DEFAULT 'session'")
+    _add_column_if_missing(conn, "working_memory", "scope", "TEXT DEFAULT 'global'")
     _add_column_if_missing(conn, "episodic_memory", "valid_until", "TIMESTAMP DEFAULT NULL")
     _add_column_if_missing(conn, "episodic_memory", "superseded_by", "TEXT DEFAULT NULL")
-    _add_column_if_missing(conn, "episodic_memory", "scope", "TEXT DEFAULT 'session'")
+    _add_column_if_missing(conn, "episodic_memory", "scope", "TEXT DEFAULT 'global'")
 
 
 def _generate_id(content: str) -> str:
@@ -535,21 +535,15 @@ class BeamMemory:
 
     def get_working_stats(self) -> Dict:
         cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM working_memory WHERE session_id = ?", (self.session_id,))
-        total = cursor.fetchone()[0]
-        cursor.execute("SELECT timestamp FROM working_memory WHERE session_id = ? ORDER BY timestamp DESC LIMIT 1", (self.session_id,))
-        last = cursor.fetchone()
-        return {"total": total, "last": last[0] if last else None}
-
-    def get_global_working_stats(self) -> Dict:
-        cursor = self.conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM working_memory")
         total = cursor.fetchone()[0]
         cursor.execute("SELECT timestamp FROM working_memory ORDER BY timestamp DESC LIMIT 1")
         last = cursor.fetchone()
-        cursor.execute("SELECT COUNT(DISTINCT session_id) FROM working_memory")
-        sessions = cursor.fetchone()[0]
-        return {"total": total, "last": last[0] if last else None, "sessions": sessions}
+        return {"total": total, "last": last[0] if last else None}
+
+    def get_global_working_stats(self) -> Dict:
+        """DEPRECATED: Use get_working_stats() instead. Kept for backward compatibility."""
+        return self.get_working_stats()
 
     def forget_working(self, memory_id: str) -> bool:
         cursor = self.conn.cursor()
@@ -800,7 +794,7 @@ class BeamMemory:
             cursor.execute(f"""
                 UPDATE working_memory
                 SET recall_count = recall_count + 1, last_recalled = ?
-                WHERE id IN ({placeholders}) AND session_id = ?
+                WHERE id IN ({placeholders}) AND (session_id = ? OR scope = 'global')
             """, (now_iso, *tuple(wm_ids), self.session_id))
         if em_ids:
             placeholders = ",".join("?" * len(em_ids))
