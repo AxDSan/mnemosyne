@@ -1,6 +1,6 @@
 # Updating Mnemosyne
 
-Mnemosyne is installed from source (not PyPI), so updates are pulled directly from the repository. This guide covers what users need to do when a new commit or PR is merged.
+Mnemosyne can be installed from **PyPI** or from **source**. This guide covers both paths.
 
 ---
 
@@ -8,9 +8,10 @@ Mnemosyne is installed from source (not PyPI), so updates are pulled directly fr
 
 | What changed | User action |
 |---|---|
-| Pure Python fix/feature | `git pull` + restart Hermes |
-| New dependency / entry point | `git pull` + `pip install -e .` + restart Hermes |
-| New CLI command | `git pull` + `pip install -e .` + restart Hermes |
+| PyPI update (new version) | `pip install --upgrade mnemosyne-memory` + restart Hermes |
+| Pure Python fix/feature (source) | `git pull` + restart Hermes |
+| New dependency / entry point (source) | `git pull` + `pip install -e .` + restart Hermes |
+| New CLI command (source) | `git pull` + `pip install -e .` + restart Hermes |
 | Database schema | `git pull` + `migrate_from_legacy.py` + restart Hermes |
 | `plugin.yaml` / tool schema | Restart Hermes only |
 
@@ -18,7 +19,22 @@ Mnemosyne is installed from source (not PyPI), so updates are pulled directly fr
 
 ## By Install Path
 
-### Option A: Full install (`pip install -e .`)
+### Option A: PyPI (recommended for users)
+
+```bash
+pip install --upgrade mnemosyne-memory
+hermes gateway restart
+```
+
+To verify the new version:
+
+```bash
+hermes mnemosyne version
+hermes mnemosyne stats --global
+hermes memory status
+```
+
+### Option B: Full install from source (`pip install -e .`)
 
 For most updates, only `git pull` is required because the editable install symlinks the source:
 
@@ -29,13 +45,13 @@ hermes gateway restart
 ```
 
 **Re-run `pip install -e .` only when:**
-- `setup.py` added new dependencies
+- `setup.py` or `pyproject.toml` added new dependencies
 - New `entry_points` or console scripts were added
 - Package metadata changed
 
 ```bash
 git pull
-pip install -e .
+pip install -e ".[all,dev]"
 hermes gateway restart
 ```
 
@@ -47,7 +63,7 @@ python -m mnemosyne.install
 hermes gateway restart
 ```
 
-### Option B: Hermes MemoryProvider only (deploy script)
+### Option C: Hermes MemoryProvider only (deploy script)
 
 This path symlinks `~/.hermes/plugins/mnemosyne` directly into the repo, so code changes are immediate:
 
@@ -119,6 +135,7 @@ After updating, confirm the new version is active:
 ```bash
 hermes mnemosyne version
 hermes mnemosyne stats
+hermes mnemosyne stats --global
 hermes memory status
 ```
 
