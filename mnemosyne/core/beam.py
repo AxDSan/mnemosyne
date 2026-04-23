@@ -535,9 +535,9 @@ class BeamMemory:
 
     def get_working_stats(self) -> Dict:
         cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM working_memory WHERE session_id = ?", (self.session_id,))
+        cursor.execute("SELECT COUNT(*) FROM working_memory")
         total = cursor.fetchone()[0]
-        cursor.execute("SELECT timestamp FROM working_memory WHERE session_id = ? ORDER BY timestamp DESC LIMIT 1", (self.session_id,))
+        cursor.execute("SELECT timestamp FROM working_memory ORDER BY timestamp DESC LIMIT 1")
         last = cursor.fetchone()
         return {"total": total, "last": last[0] if last else None}
 
@@ -790,7 +790,7 @@ class BeamMemory:
             cursor.execute(f"""
                 UPDATE working_memory
                 SET recall_count = recall_count + 1, last_recalled = ?
-                WHERE id IN ({placeholders}) AND session_id = ?
+                WHERE id IN ({placeholders}) AND (session_id = ? OR scope = 'global')
             """, (now_iso, *tuple(wm_ids), self.session_id))
         if em_ids:
             placeholders = ",".join("?" * len(em_ids))
