@@ -190,3 +190,31 @@ class TripleStore:
             ))
         self.conn.commit()
         return stats
+
+
+# ---------------------------------------------------------------------------
+# Module-level convenience functions
+# ---------------------------------------------------------------------------
+
+def add_triple(subject: str, predicate: str, object: str,
+               valid_from: str = None, source: str = "inferred",
+               confidence: float = 1.0, db_path: Path = None) -> int:
+    """
+    Add a temporal triple without instantiating TripleStore manually.
+    Optional db_path aligns with BEAM memory database when used from Hermes.
+    """
+    store = TripleStore(db_path=db_path)
+    return store.add(subject, predicate, object,
+                     valid_from=valid_from, source=source, confidence=confidence)
+
+
+def query_triples(subject: str = None, predicate: str = None,
+                  object: str = None, as_of: str = None,
+                  db_path: Path = None) -> List[Dict]:
+    """
+    Query temporal triples without instantiating TripleStore manually.
+    Optional db_path aligns with BEAM memory database when used from Hermes.
+    """
+    store = TripleStore(db_path=db_path)
+    return store.query(subject=subject, predicate=predicate,
+                       object=object, as_of=as_of)

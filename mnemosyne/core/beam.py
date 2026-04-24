@@ -345,20 +345,25 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
     """Search sqlite-vec and return rowids with distances."""
     vec_type = _effective_vec_type(conn)
     emb_json = json.dumps(embedding)
+    # NOTE: sqlite-vec requires the KNN limit to be known at query planning time.
+    # Parameter binding (LIMIT ?) fails on some versions because xBestIndex
+    # can't resolve the parameter value. We inline k safely since it's
+    # always an integer computed internally.
+    k = int(k)
     if vec_type == "bit":
         rows = conn.execute(
-            "SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_binary(?) ORDER BY distance LIMIT ?",
-            (emb_json, k)
+            f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_binary(?) ORDER BY distance LIMIT {k}",
+            (emb_json,)
         ).fetchall()
     elif vec_type == "int8":
         rows = conn.execute(
-            "SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_int8(?, 'unit') ORDER BY distance LIMIT ?",
-            (emb_json, k)
+            f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_int8(?, 'unit') ORDER BY distance LIMIT {k}",
+            (emb_json,)
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
-            (emb_json, k)
+            f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH ? ORDER BY distance LIMIT {k}",
+            (emb_json,)
         ).fetchall()
     return [{"rowid": r["rowid"], "distance": r["distance"]} for r in rows]
 

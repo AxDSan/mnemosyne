@@ -46,10 +46,12 @@ def _get_memory():
 
 
 def _get_triples():
-    """Get or create global triple store instance"""
+    """Get or create global triple store instance, aligned with memory DB path."""
     global _triple_store
     if _triple_store is None:
-        _triple_store = TripleStore()
+        # Align triples DB with BEAM memory DB so they live in the same SQLite file
+        mem = _get_memory()
+        _triple_store = TripleStore(db_path=mem.db_path)
     return _triple_store
 
 

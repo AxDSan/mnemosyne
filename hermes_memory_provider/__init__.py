@@ -386,7 +386,8 @@ class MnemosyneMemoryProvider(MemoryProvider):
         if not all([subject, predicate, obj]):
             return json.dumps({"error": "subject, predicate, and object are required"})
         add_triple, _ = _get_triple_module()
-        triple_id = add_triple(subject, predicate, obj, valid_from=valid_from)
+        triple_id = add_triple(subject, predicate, obj, valid_from=valid_from,
+                               db_path=self._beam.db_path)
         return json.dumps({"status": "stored", "triple_id": triple_id})
 
     def _handle_triple_query(self, args: Dict[str, Any]) -> str:
@@ -394,7 +395,8 @@ class MnemosyneMemoryProvider(MemoryProvider):
         predicate = args.get("predicate", "") or None
         obj = args.get("object", "") or None
         _, query_triples = _get_triple_module()
-        results = query_triples(subject=subject, predicate=predicate, object=obj)
+        results = query_triples(subject=subject, predicate=predicate, object=obj,
+                                db_path=self._beam.db_path)
         return json.dumps({"count": len(results), "results": results})
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:

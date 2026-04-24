@@ -53,3 +53,6 @@ Thumbs.db
 # Devops plans (private — not for public repo)
 DEVOPS_PLAN_*
 
+# GSD planning — operational docs stay private
+.planning/
+
