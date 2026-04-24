@@ -95,13 +95,11 @@ SLEEP_SCHEMA = {
 
 STATS_SCHEMA = {
     "name": "mnemosyne_stats",
-    "description": "Return Mnemosyne memory statistics: working count, episodic count, BEAM tiers. Use global=true to see stats across all sessions.",
+    "description": "Return Mnemosyne memory statistics: working count, episodic count, BEAM tiers.",
     "parameters": {
         "type": "object",
-        "properties": {
-            "global": {"type": "boolean", "description": "Show global stats across all sessions instead of current session only.", "default": False}
-        }
-    },
+        "properties": {}
+    }
 }
 
 INVALIDATE_SCHEMA = {
@@ -215,19 +213,6 @@ class MnemosyneMemoryProvider(MemoryProvider):
 
         self._session_id = f"hermes_{session_id}"
 
-        # Read config
-        try:
-            from hermes_cli.config import load_config
-            cfg = load_config()
-            mn_cfg = cfg.get("memory", {}).get("mnemosyne", {})
-            self._auto_sleep_enabled = mn_cfg.get("auto_sleep", True)
-            self._auto_sleep_threshold = mn_cfg.get("sleep_threshold", 50)
-            vec_type = mn_cfg.get("vector_type", "float32")
-            if vec_type:
-                os.environ.setdefault("MNEMOSYNE_VEC_TYPE", vec_type)
-        except Exception:
-            pass
-
         try:
             BeamMemory = _get_beam_class()
             self._beam = BeamMemory(session_id=self._session_id)
@@ -296,7 +281,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
     def _maybe_auto_sleep(self) -> None:
         try:
             stats = self._beam.get_working_stats()
-            working = stats.get("count", 0)
+            working = stats.get("total", 0)
             if working > self._auto_sleep_threshold:
                 logger.info("Mnemosyne auto-sleep: working=%d > threshold=%d", working, self._auto_sleep_threshold)
                 self._beam.sleep()
@@ -363,10 +348,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
         return json.dumps({"status": "consolidated", "working": working, "episodic": episodic})
 
     def _handle_stats(self, args: Dict[str, Any]) -> str:
-        if args.get("global", False):
-            working = self._beam.get_global_working_stats()
-        else:
-            working = self._beam.get_working_stats()
+        working = self._beam.get_working_stats()
         episodic = self._beam.get_episodic_stats()
         return json.dumps({"provider": "mnemosyne", "session_id": self._session_id, "working": working, "episodic": episodic})
 

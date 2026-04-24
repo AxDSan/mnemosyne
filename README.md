@@ -5,7 +5,7 @@
 > Native, zero-cloud memory for AI agents. SQLite-backed. Sub-millisecond. Fully private.
 
 [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://python.org)
-[![PyPI](https://img.shields.io/pypi/v/mnemosyne-memory.svg)](https://pypi.org/project/mnemosyne-memory/)
+[![PyPI](https://img.shields.io/pypi/v/mnemosyne-memory.svg?v=1.10.1)](https://pypi.org/project/mnemosyne-memory/)
 [![SQLite](https://img.shields.io/badge/SQLite-3.35+-green.svg)](https://sqlite.org/codeofethics.html)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/AxDSan/mnemosyne/actions/workflows/ci.yml/badge.svg)](https://github.com/AxDSan/mnemosyne/actions/workflows/ci.yml)
@@ -96,7 +96,7 @@ hermes mnemosyne stats     # Shows working + episodic memory counts
 - **Temporal triples** — Time-aware knowledge graph with automatic invalidation
 - **Export / import** — Move your entire memory database to a new machine with one JSON file
 - **Cross-session scope** — `remember(..., scope="global")` makes facts visible everywhere
-- **Configurable compression** — `float32` (default), `int8` (4x smaller), or `bit` (32x smaller) vectors
+- **Configurable compression** — `int8` (default), `float32`, or `bit` (32x smaller) vectors
 
 ---
 
@@ -253,6 +253,12 @@ hermes mnemosyne import --input mnemosyne_backup.json
 hermes mnemosyne clear
 ```
 
+> **Optional REST API**: For external access or integration with non-Python services, you can run the standalone memory server:
+> ```bash
+> python mnemosyne/cli.py server  # Runs on http://localhost:8090
+> ```
+> This is entirely optional — the core library works without it.
+
 ### Python API
 
 ```python
@@ -334,7 +340,7 @@ results = beam.recall("editor preferences", top_k=5)
 │                                            │ triples     │  │
 │                                            └─────────────┘  │
 │                                                              │
-│  No HTTP. No cloud. 100% local.                              │
+│  Core runs in-process. Optional REST API available.          │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -384,7 +390,7 @@ hermes mnemosyne import --input mnemosyne_backup.json
 | Variable | Default | Description |
 |---|---|---|
 | `MNEMOSYNE_DATA_DIR` | `~/.hermes/mnemosyne/data` | Database directory |
-| `MNEMOSYNE_VEC_TYPE` | `float32` | Vector compression: `float32`, `int8`, or `bit` |
+| `MNEMOSYNE_VEC_TYPE` | `int8` | Vector compression: `float32`, `int8`, or `bit` |
 | `MNEMOSYNE_WM_MAX_ITEMS` | `10000` | Working memory item limit |
 | `MNEMOSYNE_WM_TTL_HOURS` | `24` | Working memory TTL |
 | `MNEMOSYNE_RECENCY_HALFLIFE` | `168` | Recency decay halflife in hours (1 week) |

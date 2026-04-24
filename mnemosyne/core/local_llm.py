@@ -173,20 +173,3 @@ def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
         return cleaned if cleaned else None
     except Exception:
         return None
-
-
-def get_llm_status() -> dict:
-    """Return diagnostics about the local LLM state."""
-    model_file = _model_path()
-    return {
-        "enabled": LLM_ENABLED,
-        "available": llm_available(),
-        "model_repo": DEFAULT_MODEL_REPO,
-        "model_file": DEFAULT_MODEL_FILE,
-        "model_cached": model_file is not None,
-        "model_path": str(model_file) if model_file else None,
-        "cache_dir": str(MODEL_CACHE_DIR),
-        "max_tokens": LLM_MAX_TOKENS,
-        "threads": LLM_N_THREADS,
-        "ctx": LLM_N_CTX,
-    }

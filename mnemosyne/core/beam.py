@@ -294,29 +294,20 @@ def _vec_available(conn: sqlite3.Connection) -> bool:
         return False
 
 
-_vec_type_cache: Dict[int, str] = {}
-
-
 def _effective_vec_type(conn: sqlite3.Connection) -> str:
     """Re-detect the actual vector type used by vec_episodes."""
     if not _vec_available(conn):
         return "float32"
-    cid = id(conn)
-    if cid in _vec_type_cache:
-        return _vec_type_cache[cid]
     try:
         row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='vec_episodes'"
         ).fetchone()
         if row and "int8" in row[0]:
-            _vec_type_cache[cid] = "int8"
             return "int8"
         if row and "bit" in row[0]:
-            _vec_type_cache[cid] = "bit"
             return "bit"
     except Exception:
         pass
-    _vec_type_cache[cid] = "float32"
     return "float32"
 
 
@@ -546,9 +537,32 @@ class BeamMemory:
         last = cursor.fetchone()
         return {"total": total, "last": last[0] if last else None}
 
+    # DEPRECATED — kept for backward compatibility with hermes_memory_provider/cli.py
     def get_global_working_stats(self) -> Dict:
         """DEPRECATED: Use get_working_stats() instead. Kept for backward compatibility."""
         return self.get_working_stats()
+
+    def update_working(self, memory_id: str, content: str = None,
+                       importance: float = None) -> bool:
+        """Update a working_memory entry."""
+        cursor = self.conn.cursor()
+        updates = []
+        params = []
+        if content is not None:
+            updates.append("content = ?")
+            params.append(content)
+        if importance is not None:
+            updates.append("importance = ?")
+            params.append(importance)
+        if not updates:
+            return False
+        params.extend([memory_id, self.session_id])
+        cursor.execute(
+            f"UPDATE working_memory SET {', '.join(updates)} WHERE id = ? AND session_id = ?",
+            params
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
 
     def forget_working(self, memory_id: str) -> bool:
         cursor = self.conn.cursor()

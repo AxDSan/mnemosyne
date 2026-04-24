@@ -97,22 +97,6 @@ def generate_id(content: str) -> str:
     return hashlib.sha256(f"{content}{datetime.now().isoformat()}".encode()).hexdigest()[:16]
 
 
-def calculate_relevance(query_words: List[str], content: str) -> float:
-    """Calculate relevance score between query and content."""
-    content_lower = content.lower()
-    content_words = set(content_lower.split())
-
-    exact_matches = sum(1 for word in query_words if word.lower() in content_words)
-    partial_matches = sum(
-        1 for word in query_words
-        for content_word in content_words
-        if word.lower() in content_word or content_word in word.lower()
-    )
-
-    score = (exact_matches * 1.0 + partial_matches * 0.3) / max(len(query_words), 1)
-    return min(score, 1.0)
-
-
 class Mnemosyne:
     """
     Native memory interface - no HTTP, direct SQLite.
@@ -220,7 +204,7 @@ class Mnemosyne:
 
     def update(self, memory_id: str, content: str = None,
                importance: float = None) -> bool:
-        """Update an existing memory in legacy table."""
+        """Update an existing memory in legacy table and BEAM."""
         cursor = self.conn.cursor()
 
         updates = []
@@ -243,6 +227,10 @@ class Mnemosyne:
             params
         )
         self.conn.commit()
+
+        # Sync BEAM working_memory
+        self.beam.update_working(memory_id, content=content, importance=importance)
+
         return cursor.rowcount > 0
 
     def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
@@ -419,9 +407,11 @@ def _get_default():
 
 # Module-level convenience functions
 def remember(content: str, source: str = "conversation",
-             importance: float = 0.5, metadata: Dict = None) -> str:
+             importance: float = 0.5, metadata: Dict = None,
+             scope: str = "session", valid_until: str = None) -> str:
     """Store a memory using the global instance"""
-    return _get_default().remember(content, source, importance, metadata)
+    return _get_default().remember(content, source, importance, metadata,
+                                   scope=scope, valid_until=valid_until)
 
 
 def recall(query: str, top_k: int = 5) -> List[Dict]:

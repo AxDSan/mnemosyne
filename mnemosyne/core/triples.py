@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
 
-DEFAULT_DB = Path.home() / ".mnemosyne" / "data" / "triples.db"
+DEFAULT_DB = Path.home() / ".hermes" / "mnemosyne" / "data" / "triples.db"
 
 
 def _get_conn(db_path: Path = None) -> sqlite3.Connection:
@@ -116,34 +116,6 @@ class TripleStore:
         where_clause = " AND ".join(conditions)
         cursor.execute(f"SELECT * FROM triples WHERE {where_clause} ORDER BY valid_from DESC", params)
         
-        return [dict(row) for row in cursor.fetchall()]
-    
-    def find_conflicts(self, subject: str, predicate: str,
-                       object: str, valid_from: str = None) -> List[Dict]:
-        """
-        Find contradicting triples for the same subject+predicate.
-        """
-        valid_from = valid_from or datetime.now().isoformat()[:10]
-        cursor = self.conn.cursor()
-        
-        cursor.execute("""
-            SELECT * FROM triples
-            WHERE subject = ? AND predicate = ?
-            AND object != ?
-            AND valid_from <= ?
-            AND (valid_until IS NULL OR valid_until > ?)
-        """, (subject, predicate, object, valid_from, valid_from))
-        
-        return [dict(row) for row in cursor.fetchall()]
-    
-    def get_history(self, subject: str, predicate: str) -> List[Dict]:
-        """Get full timeline of a subject+predicate pair."""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT * FROM triples
-            WHERE subject = ? AND predicate = ?
-            ORDER BY valid_from DESC
-        """, (subject, predicate))
         return [dict(row) for row in cursor.fetchall()]
 
     def export_all(self) -> List[Dict]:

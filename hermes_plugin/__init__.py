@@ -15,6 +15,7 @@ _try_paths = []
 try:
     from mnemosyne.core.memory import Mnemosyne
     from mnemosyne.core.aaak import encode as aaak_encode
+    from mnemosyne.core.triples import TripleStore
 except ImportError:
     # Fallback: search common locations
     _candidates = [
@@ -30,36 +31,35 @@ except ImportError:
             break
     from mnemosyne.core.memory import Mnemosyne
     from mnemosyne.core.aaak import encode as aaak_encode
+    from mnemosyne.core.triples import TripleStore
 
 # Global memory instance
 _memory_instance = None
+_current_session_id = None
+_triple_store = None
 
 
 def _get_memory():
-    """Get or create global memory instance"""
-    global _memory_instance
-    if _memory_instance is None:
-        _memory_instance = Mnemosyne(session_id="hermes_default")
+    """Get or create global memory instance. Recreates if session_id changes."""
+    global _memory_instance, _current_session_id
+    session_id = os.environ.get("HERMES_SESSION_ID", "hermes_default")
+    if _memory_instance is None or _current_session_id != session_id:
+        _current_session_id = session_id
+        _memory_instance = Mnemosyne(session_id=session_id)
     return _memory_instance
+
+
+def _get_triples():
+    """Get or create global triple store instance, aligned with memory DB path."""
+    global _triple_store
+    if _triple_store is None:
+        mem = _get_memory()
+        _triple_store = TripleStore(db_path=mem.db_path)
+    return _triple_store
 
 
 def register(ctx):
     """Register plugin tools and hooks with Hermes"""
-    
-    # Detect if Mnemosyne is already active as a MemoryProvider
-    # If so, skip general plugin registration to avoid double-tools and conflicting hooks
-    try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
-        active_provider = cfg.get("memory", {}).get("provider")
-        if active_provider == "mnemosyne":
-            import logging
-            logging.getLogger(__name__).info(
-                "Mnemosyne general plugin skipped: already active as MemoryProvider"
-            )
-            return {"status": "skipped", "reason": "active_as_memory_provider"}
-    except Exception:
-        pass
     
     from . import tools
     
@@ -117,6 +117,24 @@ def register(ctx):
         toolset="mnemosyne",
         schema=tools.SCRATCHPAD_CLEAR_SCHEMA,
         handler=tools.mnemosyne_scratchpad_clear
+    )
+    ctx.register_tool(
+        name="mnemosyne_invalidate",
+        toolset="mnemosyne",
+        schema=tools.INVALIDATE_SCHEMA,
+        handler=tools.mnemosyne_invalidate
+    )
+    ctx.register_tool(
+        name="mnemosyne_export",
+        toolset="mnemosyne",
+        schema=tools.EXPORT_SCHEMA,
+        handler=tools.mnemosyne_export
+    )
+    ctx.register_tool(
+        name="mnemosyne_import",
+        toolset="mnemosyne",
+        schema=tools.IMPORT_SCHEMA,
+        handler=tools.mnemosyne_import
     )
 
     # Register hooks for automatic context injection
