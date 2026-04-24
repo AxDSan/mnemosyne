@@ -8,6 +8,22 @@ given a version number **MAJOR.MINOR**, increment the:
 
 ---
 
+## 1.10.2
+
+- **Add `mnemosyne_update` and `mnemosyne_forget` tools** — Full CRUD for Hermes plugin. Update content/importance by ID, or hard-delete a memory from both legacy and BEAM tables.
+- **Fix auto-sleep dict key** — `count` → `total` so consolidation triggers correctly. (#12 follow-up)
+- **Fix module-level `remember()` signature** — Added missing `scope` and `valid_until` params.
+- **Fix `update()` BEAM sync** — `Memory.update()` now syncs changes to `working_memory` via new `BeamMemory.update_working()`.
+- **Remove dead `--global` flag** — Cleaned `STATS_SCHEMA` and `_handle_stats` of meaningless `global` parameter.
+- **Fix split-brain session state** — `hermes_plugin/tools.py` now imports `_get_memory()` / `_get_triples()` from `__init__.py` instead of maintaining separate globals.
+- **Remove ghost imports** — Dead `hermes_cli.config` try/except blocks removed from provider and plugin.
+- **Dead code removal** — Removed 6 dead quantization functions, `cosine_similarity`, `calculate_relevance`, `deserialize`, and other unused code. (-307 lines)
+- **Register missing tool schemas** — `mnemosyne_invalidate`, `mnemosyne_export`, `mnemosyne_import` were defined but never registered.
+- **README alignment** — Fixed PyPI badge, VEC_TYPE default (`int8`), Python version (`3.9+`), documented optional REST API.
+- **Align TripleStore default DB** — Changed from `~/.mnemosyne` to `~/.hermes/mnemosyne/data` for consistency.
+- **Fix `_vec_type_cache` stale risk** — Removed unsafe `id(conn)` cache; queries `sqlite_master` each time.
+- **Add DevOps policy** — `DEVOPS.md` covers commit standards, release process, authorship, rollback, security.
+
 ## 1.10.1
 
 - **Fix `get_working_stats()`** — Now counts ALL working memories globally, not just current session. (PR #11 by @rakaarwaky)
