@@ -4,6 +4,20 @@ See [CHANGELOG.md](../CHANGELOG.md) in the repository root for the full version 
 
 ## Recent Releases
 
+### 1.13.0
+
+- **Add:** Temporal query capabilities — `recall(from_date="...", to_date="...", source="...", topic="...")`
+- **Add:** Auto temporal triples on `remember()` — `(memory_id, occurred_on, YYYY-MM-DD)` and `(memory_id, has_source, source)`
+- **Fix:** `UnboundLocalError` in fallback scoring when FTS5 returns empty but temporal filters active
+- **Tests:** 6 new temporal query tests. All 25 passing.
+
+### 1.12.0
+
+- **Fix:** Embeddings generated but discarded when sqlite-vec absent — now falls back to `memory_embeddings` table with numpy cosine similarity
+- **Add:** `_in_memory_vec_search()` — cosine similarity via numpy when sqlite-vec unavailable
+- **Add:** `mnemosyne_diagnose` — PII-safe diagnostic tool for troubleshooting
+- **Docs:** Replaced junk files with proper developer documentation
+
 ### 1.11.0
 
 - **Fix:** Context overflow on consolidation — `sleep()` now chunks memories to fit the LLM context window
