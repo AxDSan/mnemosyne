@@ -265,6 +265,10 @@ class Mnemosyne:
 
         self.conn.commit()
 
+        # BEAM write (reuse the same ID so legacy and working-memory rows stay in sync)
+        self.beam.remember(content, source=source, importance=importance, metadata=metadata,
+                           valid_until=valid_until, scope=scope, memory_id=memory_id)
+
         # Entity extraction (best-effort, never fails the memory write)
         if extract_entities:
             try:

@@ -672,9 +672,15 @@ class BeamMemory:
     def remember(self, content: str, source: str = "conversation",
                  importance: float = 0.5, metadata: Dict = None,
                  valid_until: str = None, scope: str = "session",
+                 memory_id: str = None,
                  extract_entities: bool = False,
                  extract: bool = False) -> str:
         """Store into working_memory. Deduplicates exact content matches.
+
+        When called from the legacy-compatible Mnemosyne.remember() path,
+        memory_id is passed through so the legacy memories row and BEAM
+        working_memory row stay addressable by the same ID. Direct BEAM calls
+        still generate their own deterministic ID.
 
         Args:
             content: The text to remember
@@ -683,6 +689,7 @@ class BeamMemory:
             metadata: Optional dict of additional fields
             valid_until: ISO timestamp when this memory expires
             scope: "session" or "global"
+            memory_id: Optional pre-generated ID from legacy layer
             extract_entities: If True, extract and store entity mentions as triples
             extract: If True, extract structured facts from content using LLM
                 and store as triples. Default False.
@@ -702,7 +709,7 @@ class BeamMemory:
             self.conn.commit()
             return existing_id
 
-        memory_id = _generate_id(content)
+        memory_id = memory_id or _generate_id(content)
         timestamp = datetime.now().isoformat()
         cursor = self.conn.cursor()
         cursor.execute("""

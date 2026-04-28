@@ -149,13 +149,24 @@ class TestMnemosyneIntegration:
         legacy = conn.execute("SELECT * FROM memories WHERE id = ?", (mid,)).fetchone()
         assert legacy is not None
 
-        # BEAM working_memory
-        wm = conn.execute("SELECT * FROM working_memory WHERE session_id = ?", ("s2",)).fetchone()
+        # BEAM working_memory should use the same ID now
+        wm = conn.execute("SELECT * FROM working_memory WHERE id = ? AND session_id = ?", (mid, "s2")).fetchone()
         assert wm is not None
         conn.close()
 
         results = mem.recall("pizza")
         assert len(results) >= 1
+
+    def test_forget_removes_both_layers(self, temp_db):
+        mem = Mnemosyne(session_id="s2", db_path=temp_db)
+        mid = mem.remember("Forget me please", source="preference", importance=0.8)
+        assert mem.forget(mid) is True
+        conn = sqlite3.connect(temp_db)
+        legacy = conn.execute("SELECT * FROM memories WHERE id = ?", (mid,)).fetchone()
+        wm = conn.execute("SELECT * FROM working_memory WHERE id = ? AND session_id = ?", (mid, "s2")).fetchone()
+        conn.close()
+        assert legacy is None
+        assert wm is None
 
     def test_beam_stats(self, temp_db):
         mem = Mnemosyne(session_id="s3", db_path=temp_db)
