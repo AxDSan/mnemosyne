@@ -5,6 +5,7 @@ Falls back to keyword-only if fastembed is unavailable.
 """
 
 import json
+import os
 import numpy as np
 from typing import List, Optional
 from functools import lru_cache
@@ -20,6 +21,9 @@ except Exception:
 _DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 _embedding_model = None
 
+# Persist model cache in ~/.hermes (the only durable volume on ephemeral VPS environments)
+_FASTEMBED_CACHE_DIR = os.path.join(os.path.expanduser("~/.hermes"), "cache", "fastembed")
+
 
 def _get_model() -> Optional[TextEmbedding]:
     """Lazy-load the embedding model."""
@@ -27,7 +31,11 @@ def _get_model() -> Optional[TextEmbedding]:
     if not _FASTEMBED_AVAILABLE:
         return None
     if _embedding_model is None:
-        _embedding_model = TextEmbedding(model_name=_DEFAULT_MODEL)
+        os.makedirs(_FASTEMBED_CACHE_DIR, exist_ok=True)
+        _embedding_model = TextEmbedding(
+            model_name=_DEFAULT_MODEL,
+            cache_dir=_FASTEMBED_CACHE_DIR,
+        )
     return _embedding_model
 
 
