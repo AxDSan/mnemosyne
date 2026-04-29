@@ -465,3 +465,15 @@ def register(ctx):
         setup_fn=register_cli,
         handler_fn=mnemosyne_command,
     )
+
+    # Also register tools and hooks from hermes_plugin (sibling directory).
+    # This way a single symlink to hermes_memory_provider/ gives us the
+    # full Mnemosyne experience: CLI + tools + hooks.
+    try:
+        _repo_root = str(Path(__file__).resolve().parent.parent)
+        if _repo_root not in sys.path:
+            sys.path.insert(0, _repo_root)
+        from hermes_plugin import register as _plugin_register
+        _plugin_register(ctx)
+    except Exception:
+        pass  # Graceful degradation — CLI still works without plugin tools

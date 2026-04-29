@@ -5,13 +5,21 @@ author: Abdias J
 provides_tools:
   - mnemosyne_remember
   - mnemosyne_recall
-  - mnemosyne_sleep
   - mnemosyne_stats
-  - mnemosyne_invalidate
   - mnemosyne_triple_add
   - mnemosyne_triple_query
+  - mnemosyne_sleep
+  - mnemosyne_scratchpad_write
+  - mnemosyne_scratchpad_read
+  - mnemosyne_scratchpad_clear
+  - mnemosyne_invalidate
+  - mnemosyne_export
+  - mnemosyne_import
+  - mnemosyne_update
+  - mnemosyne_forget
+  - mnemosyne_diagnose
 provides_hooks:
   - pre_llm_call
   - on_session_start
-  - on_session_end
-  - on_memory_write
+  - post_tool_call
+dependencies: []
