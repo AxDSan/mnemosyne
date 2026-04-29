@@ -3,9 +3,9 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+and this project adheres to [Simple Versioning](https://github.com/AxDSan/mnemosyne) (MAJOR.MINOR).
 
-## [2.0.0] — 2026-04-29
+## [2.0] — 2026-04-29
 
 ### Added
 
@@ -90,4 +90,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Initial Mnemosyne releases with basic `remember()`/`recall()`/`sleep()` cycle, SQLite + fastembed embeddings, Hermes plugin registration, and AAAK compression.
 
-[2.0.0]: https://github.com/AxDSan/mnemosyne/releases/tag/v2.0.0
+[2.0]: https://github.com/AxDSan/mnemosyne/releases/tag/v2.0

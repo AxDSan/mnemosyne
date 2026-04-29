@@ -1,5 +1,5 @@
 name: mnemosyne
-version: 1.0.0
+version: 2.0
 description: Native AI memory system with SQLite - zero dependencies, sub-millisecond latency
 author: Abdias J
 provides_tools:

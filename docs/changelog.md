@@ -4,6 +4,19 @@ See [CHANGELOG.md](../CHANGELOG.md) in the repository root for the full version 
 
 ## Recent Releases
 
+### 2.0
+
+- **Add:** Entity extraction with Levenshtein fuzzy matching (Phase 1)
+- **Add:** LLM-driven structured fact extraction with fallback chain (Phase 2)
+- **Add:** Temporal recall with exponential decay scoring (Phase 3)
+- **Add:** Configurable hybrid scoring weights (Phase 4)
+- **Add:** Memory banks for per-domain SQLite isolation (Phase 5)
+- **Add:** MCP server with 6 tools, stdio + SSE transports (Phase 6)
+- **Add:** Streaming event bus, pattern detection, plugin system (Phase 8)
+- **Add:** SQLite WAL mode + busy timeout for concurrency
+- **Fix:** Test mocking for extraction fallback (env vars don't affect module-level constants)
+- **Tests:** 292 tests passing. Zero failures.
+
 ### 1.13.0
 
 - **Add:** Temporal query capabilities — `recall(from_date="...", to_date="...", source="...", topic="...")`

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Mnemosyne v2.0.0 Benchmark Suite
+Mnemosyne v2.0 Benchmark Suite
 =================================
 Measures store latency, recall latency, DB size, and embedding overhead.
 Uses a temp directory for the DB (no project pollution).
@@ -312,7 +312,7 @@ def bench_embedding():
 def print_summary(store, recall, db_size, embed):
     """Print a clean markdown summary table."""
     print("\n" + "=" * 70)
-    print("SUMMARY TABLE (Mnemosyne v2.0.0 Benchmark Results)")
+    print("SUMMARY TABLE (Mnemosyne v2.0 Benchmark Results)")
     print("=" * 70)
     print(f"Runs: {N_RUNS} | Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Embedding model: BAAI/bge-small-en-v1.5 (384-dim, int8 vectors)")
@@ -359,7 +359,7 @@ def print_summary(store, recall, db_size, embed):
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("╔══════════════════════════════════════════════════════════════════════╗")
-    print("║           Mnemosyne v2.0.0 Benchmark Suite                        ║")
+    print("║           Mnemosyne v2.0 Benchmark Suite                        ║")
     print("║           Store · Recall · Footprint · Embedding                  ║")
     print("╚══════════════════════════════════════════════════════════════════════╝")
     print(f"  Python:  {sys.version.split()[0]}")
