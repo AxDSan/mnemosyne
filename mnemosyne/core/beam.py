@@ -310,11 +310,12 @@ def _normalize_weights(vec_weight: Optional[float], fts_weight: Optional[float],
 
 
 def _recency_decay(timestamp_str: str, halflife_hours: float = RECENCY_HALFLIFE_HOURS) -> float:
-    """Calculate recency decay factor. 1.0 = brand new, ~0.5 = one halflife old."""
+    """Calculate recency decay factor. 1.0 = brand new, ~0.5 = one halflife old.
+    
+    Exponential decay based on age. Returns 0.5 for unknown/invalid timestamps.
+    """
     if not timestamp_str:
         return 0.5  # Unknown age = neutral
-def _recency_decay(timestamp_str: str, halflife_hours: float = RECENCY_HALFLIFE_HOURS) -> float:
-    """Exponential decay based on age."""
     try:
         ts = datetime.fromisoformat(timestamp_str)
         age_hours = (datetime.now() - ts).total_seconds() / 3600.0

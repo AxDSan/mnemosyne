@@ -43,11 +43,16 @@ except ImportError:
     FASTAPI_AVAILABLE = False
     print("⚠️  FastAPI not installed. Running in library mode only.")
 
-# Configuration
-DATA_DIR = "/root/.hermes/mnemosyne/data"
+# Configuration - use MNEMOSYNE_DATA_DIR env var or sensible default
+from pathlib import Path as _Path
+
+DATA_DIR = os.environ.get(
+    "MNEMOSYNE_DATA_DIR",
+    str(_Path.home() / ".hermes" / "mnemosyne" / "data"),
+)
 os.makedirs(DATA_DIR, exist_ok=True)
 
-DB_PATH = f"{DATA_DIR}/mnemosyne.db"
+DB_PATH = os.path.join(DATA_DIR, "mnemosyne.db")
 VECTOR_DIM = 384  # all-MiniLM-L6-v2 dimension
 
 @dataclass
