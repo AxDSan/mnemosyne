@@ -402,8 +402,12 @@ class Mnemosyne:
     # BEAM-specific public methods
     # ------------------------------------------------------------------
     def sleep(self, dry_run: bool = False) -> Dict:
-        """Run consolidation sleep cycle."""
+        """Run consolidation sleep cycle for the current session."""
         return self.beam.sleep(dry_run=dry_run)
+
+    def sleep_all_sessions(self, dry_run: bool = False) -> Dict:
+        """Run consolidation sleep cycle across all sessions with eligible old working memories."""
+        return self.beam.sleep_all_sessions(dry_run=dry_run)
 
     def scratchpad_write(self, content: str) -> str:
         """Write to scratchpad."""
@@ -634,8 +638,13 @@ def update(memory_id: str, content: str = None, importance: float = None, bank: 
 
 
 def sleep(dry_run: bool = False, bank: str = None) -> Dict:
-    """Run consolidation sleep cycle using the global instance"""
+    """Run consolidation sleep cycle for the global instance's current session"""
     return _get_default(bank).sleep(dry_run=dry_run)
+
+
+def sleep_all_sessions(dry_run: bool = False, bank: str = None) -> Dict:
+    """Run consolidation sleep cycle across all sessions using the global instance"""
+    return _get_default(bank).sleep_all_sessions(dry_run=dry_run)
 
 
 def scratchpad_write(content: str, bank: str = None) -> str:

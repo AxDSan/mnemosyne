@@ -128,13 +128,18 @@ TRIPLE_QUERY_SCHEMA = {
 
 SLEEP_SCHEMA = {
     "name": "mnemosyne_sleep",
-    "description": "Run the Mnemosyne sleep/consolidation cycle. Old working memories are summarized and moved to episodic memory.",
+    "description": "Run the Mnemosyne sleep/consolidation cycle. Old working memories are summarized and moved to episodic memory. Set all_sessions=true to include inactive sessions.",
     "parameters": {
         "type": "object",
         "properties": {
             "dry_run": {
                 "type": "boolean",
                 "description": "If true, preview what would be consolidated without making changes",
+                "default": False
+            },
+            "all_sessions": {
+                "type": "boolean",
+                "description": "If true, consolidate eligible old working memories across all sessions instead of only the current session",
                 "default": False
             }
         }
@@ -394,8 +399,12 @@ def mnemosyne_sleep(args: dict, **kwargs) -> str:
     """Run consolidation sleep cycle"""
     try:
         dry_run = args.get("dry_run", False)
+        all_sessions = args.get("all_sessions", False)
         mem = _get_memory()
-        result = mem.sleep(dry_run=dry_run)
+        if all_sessions and hasattr(mem, "sleep_all_sessions"):
+            result = mem.sleep_all_sessions(dry_run=dry_run)
+        else:
+            result = mem.sleep(dry_run=dry_run)
         return json.dumps(result)
     except Exception as e:
         return json.dumps({"error": str(e)})

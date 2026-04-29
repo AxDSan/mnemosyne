@@ -293,14 +293,19 @@ def _handle_recall(arguments: Dict[str, Any]) -> Dict[str, Any]:
 def _handle_sleep(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_sleep tool call."""
     dry_run = arguments.get("dry_run", False)
+    all_sessions = arguments.get("all_sessions", False)
     bank = arguments.get("bank", "default")
 
     mem = _get_instance(bank)
-    result = mem.sleep(dry_run=dry_run)
+    if all_sessions and hasattr(mem, "sleep_all_sessions"):
+        result = mem.sleep_all_sessions(dry_run=dry_run)
+    else:
+        result = mem.sleep(dry_run=dry_run)
 
     return {
         "status": "ok",
         "dry_run": dry_run,
+        "all_sessions": all_sessions,
         "result": result,
         "bank": bank
     }

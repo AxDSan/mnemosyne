@@ -138,6 +138,91 @@ class TestSleepCycle:
         stats = beam.get_working_stats()
         assert stats["total"] == 1
 
+    def test_sleep_remains_session_scoped(self, temp_db):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        conn = sqlite3.connect(temp_db)
+        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        conn.executemany(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
+            [
+                ("s1-old", "session one task", "conversation", old_ts, "s1"),
+                ("s2-old", "session two task", "conversation", old_ts, "s2"),
+            ]
+        )
+        conn.commit()
+        conn.close()
+
+        result = beam.sleep(dry_run=False)
+        assert result["status"] == "consolidated"
+        assert result["items_consolidated"] == 1
+
+        conn = sqlite3.connect(temp_db)
+        remaining = conn.execute("SELECT session_id FROM working_memory ORDER BY session_id").fetchall()
+        conn.close()
+        assert remaining == [("s2",)]
+
+    def test_sleep_all_sessions_consolidates_inactive_sessions(self, temp_db):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        conn = sqlite3.connect(temp_db)
+        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        fresh_ts = datetime.now().isoformat()
+        conn.executemany(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
+            [
+                ("s1-old", "session one old task", "conversation", old_ts, "s1"),
+                ("s2-old", "session two old task", "conversation", old_ts, "s2"),
+                ("s2-fresh", "session two fresh task", "conversation", fresh_ts, "s2"),
+            ]
+        )
+        conn.commit()
+        conn.close()
+
+        result = beam.sleep_all_sessions(dry_run=False)
+        assert result["status"] == "consolidated"
+        assert result["sessions_scanned"] == 2
+        assert result["sessions_consolidated"] == 2
+        assert result["items_consolidated"] == 2
+        assert result["summaries_created"] == 2
+        assert result["errors"] == 0
+
+        conn = sqlite3.connect(temp_db)
+        remaining = conn.execute("SELECT id, session_id FROM working_memory").fetchall()
+        logs = conn.execute("SELECT session_id, items_consolidated FROM consolidation_log ORDER BY session_id").fetchall()
+        episodic_count = conn.execute("SELECT COUNT(*) FROM episodic_memory").fetchone()[0]
+        conn.close()
+
+        assert remaining == [("s2-fresh", "s2")]
+        assert logs == [("s1", 1), ("s2", 1)]
+        assert episodic_count == 2
+
+    def test_sleep_all_sessions_dry_run_preserves_working_memory(self, temp_db):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        conn = sqlite3.connect(temp_db)
+        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        conn.executemany(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
+            [
+                ("s1-old", "session one task", "conversation", old_ts, "s1"),
+                ("s2-old", "session two task", "conversation", old_ts, "s2"),
+            ]
+        )
+        conn.commit()
+        conn.close()
+
+        result = beam.sleep_all_sessions(dry_run=True)
+        assert result["status"] == "dry_run"
+        assert result["sessions_scanned"] == 2
+        assert result["items_consolidated"] == 2
+
+        conn = sqlite3.connect(temp_db)
+        working_count = conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0]
+        episodic_count = conn.execute("SELECT COUNT(*) FROM episodic_memory").fetchone()[0]
+        log_count = conn.execute("SELECT COUNT(*) FROM consolidation_log").fetchone()[0]
+        conn.close()
+        assert working_count == 2
+        assert episodic_count == 0
+        assert log_count == 0
+
 
 class TestMnemosyneIntegration:
     def test_legacy_and_beam_dual_write(self, temp_db):

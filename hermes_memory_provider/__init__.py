@@ -106,9 +106,24 @@ SLEEP_SCHEMA = {
     "name": "mnemosyne_sleep",
     "description": (
         "Run the Mnemosyne consolidation cycle. Compresses old working memories "
-        "into episodic summaries. Call after long sessions or when memory feels stale."
+        "into episodic summaries. Call after long sessions or when memory feels stale. "
+        "Set all_sessions=true to consolidate eligible old working memories across inactive sessions."
     ),
-    "parameters": {"type": "object", "properties": {}},
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "all_sessions": {
+                "type": "boolean",
+                "description": "If true, consolidate eligible old working memories across all sessions instead of only the current session.",
+                "default": False,
+            },
+            "dry_run": {
+                "type": "boolean",
+                "description": "If true, report what would be consolidated without writing changes.",
+                "default": False,
+            },
+        },
+    },
 }
 
 STATS_SCHEMA = {
@@ -304,7 +319,10 @@ class MnemosyneMemoryProvider(MemoryProvider):
             working = stats.get("total", 0)
             if working > self._auto_sleep_threshold:
                 logger.info("Mnemosyne auto-sleep: working=%d > threshold=%d", working, self._auto_sleep_threshold)
-                self._beam.sleep()
+                if hasattr(self._beam, "sleep_all_sessions"):
+                    self._beam.sleep_all_sessions()
+                else:
+                    self._beam.sleep()
         except Exception:
             pass
 
@@ -372,10 +390,15 @@ class MnemosyneMemoryProvider(MemoryProvider):
         return json.dumps({"query": query, "count": len(results), "temporal_weight": temporal_weight, "results": results})
 
     def _handle_sleep(self, args: Dict[str, Any]) -> str:
-        self._beam.sleep()
+        dry_run = bool(args.get("dry_run", False))
+        all_sessions = bool(args.get("all_sessions", False))
+        if all_sessions and hasattr(self._beam, "sleep_all_sessions"):
+            result = self._beam.sleep_all_sessions(dry_run=dry_run)
+        else:
+            result = self._beam.sleep(dry_run=dry_run)
         working = self._beam.get_working_stats()
         episodic = self._beam.get_episodic_stats()
-        return json.dumps({"status": "consolidated", "working": working, "episodic": episodic})
+        return json.dumps({"status": result.get("status", "consolidated"), "result": result, "working": working, "episodic": episodic})
 
     def _handle_stats(self, args: Dict[str, Any]) -> str:
         working = self._beam.get_working_stats()

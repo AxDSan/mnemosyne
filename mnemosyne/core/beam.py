@@ -1496,10 +1496,14 @@ class BeamMemory:
     # ------------------------------------------------------------------
     def sleep(self, dry_run: bool = False) -> Dict:
         """
-        Consolidate old working_memory into episodic_memory summaries.
+        Consolidate old working_memory for this session into episodic summaries.
         Uses a local lightweight LLM when available; falls back to aaak
         compression if the model is missing or inference fails.
         Returns summary of what was done.
+
+        Note: this method intentionally remains session-scoped. Use
+        sleep_all_sessions() for maintenance that consolidates eligible old
+        working memories across inactive sessions.
         """
         from mnemosyne.core.aaak import encode as aaak_encode
         from mnemosyne.core import local_llm
@@ -1609,6 +1613,79 @@ class BeamMemory:
             "llm_used": llm_used_count,
             "method": method,
             "consolidated_ids": consolidated_ids
+        }
+
+    def sleep_all_sessions(self, dry_run: bool = False) -> Dict:
+        """
+        Consolidate eligible old working memories across all sessions.
+
+        This is the maintenance-oriented counterpart to sleep(), which remains
+        scoped to self.session_id. It prevents inactive sessions from leaving
+        old working_memory rows stranded after they pass the sleep cutoff.
+        """
+        cursor = self.conn.cursor()
+        cutoff = (datetime.now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)).isoformat()
+        cursor.execute("""
+            SELECT session_id, COUNT(*) AS eligible
+            FROM working_memory
+            WHERE timestamp < ?
+            GROUP BY session_id
+            ORDER BY MIN(timestamp) ASC
+        """, (cutoff,))
+        session_rows = cursor.fetchall()
+        if not session_rows:
+            return {
+                "status": "no_op",
+                "message": "No old working memories to consolidate",
+                "sessions_scanned": 0,
+                "sessions_consolidated": 0,
+                "items_consolidated": 0,
+                "summaries_created": 0,
+                "llm_used": 0,
+                "errors": 0,
+                "session_results": [],
+            }
+
+        session_results = []
+        sessions_consolidated = 0
+        items_consolidated = 0
+        summaries_created = 0
+        llm_used = 0
+        errors = []
+
+        for row in session_rows:
+            session_id = row["session_id"] if hasattr(row, "keys") else row[0]
+            if session_id is None:
+                session_id = "default"
+            try:
+                beam = self if session_id == self.session_id else BeamMemory(
+                    session_id=session_id,
+                    db_path=self.db_path,
+                )
+                result = beam.sleep(dry_run=dry_run)
+                result = dict(result)
+                result["session_id"] = session_id
+                result["eligible"] = row["eligible"] if hasattr(row, "keys") else row[1]
+                session_results.append(result)
+
+                if result.get("status") in ("consolidated", "dry_run"):
+                    sessions_consolidated += 1
+                    items_consolidated += int(result.get("items_consolidated", 0) or 0)
+                    summaries_created += int(result.get("summaries_created", 0) or 0)
+                    llm_used += int(result.get("llm_used", 0) or 0)
+            except Exception as exc:
+                errors.append({"session_id": session_id, "error": repr(exc)})
+
+        return {
+            "status": "dry_run" if dry_run else ("consolidated" if items_consolidated else "no_op"),
+            "sessions_scanned": len(session_rows),
+            "sessions_consolidated": sessions_consolidated,
+            "items_consolidated": items_consolidated,
+            "summaries_created": summaries_created,
+            "llm_used": llm_used,
+            "errors": len(errors),
+            "error_details": errors,
+            "session_results": session_results,
         }
 
     def get_consolidation_log(self, limit: int = 10) -> List[Dict]:

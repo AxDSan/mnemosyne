@@ -65,7 +65,7 @@ User plugins take precedence over bundled plugins on name collision.
 |------|---------|
 | `mnemosyne_remember` | Store durable memory with importance, scope, expiry |
 | `mnemosyne_recall` | Hybrid search (50% vector + 30% FTS + 20% importance) |
-| `mnemosyne_sleep` | Consolidate working → episodic memory |
+| `mnemosyne_sleep` | Consolidate working → episodic memory; pass `all_sessions=true` for inactive-session maintenance |
 | `mnemosyne_stats` | Show working + episodic counts |
 | `mnemosyne_invalidate` | Mark memory as expired/superseded |
 | `mnemosyne_triple_add` | Add temporal fact to knowledge graph |

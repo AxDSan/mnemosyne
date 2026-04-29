@@ -128,7 +128,7 @@ hermes mnemosyne stats     # Shows working + episodic memory counts
 
 - **BEAM architecture** — Three tiers: hot working memory, long-term episodic memory, temporary scratchpad
 - **Hybrid search** — 50% vector similarity + 30% FTS5 rank + 20% importance, all inside SQLite
-- **Automatic consolidation** — Old working memories are summarized and moved to episodic memory via `mnemosyne_sleep()`
+- **Automatic consolidation** — Old working memories are summarized and moved to episodic memory via `mnemosyne_sleep()`; use `hermes mnemosyne sleep --all-sessions` for scheduled maintenance across inactive sessions
 - **Temporal triples** — Time-aware knowledge graph with automatic invalidation
 - **Export / import** — Move your entire memory database to a new machine with one JSON file
 - **Cross-session scope** — `remember(..., scope="global")` makes facts visible everywhere
@@ -276,8 +276,11 @@ hermes mnemosyne stats --global
 # Search memories
 hermes mnemosyne inspect "dark mode preferences"
 
-# Run consolidation (compress old working memory into episodic summaries)
+# Run consolidation for the current session (compress old working memory into episodic summaries)
 hermes mnemosyne sleep
+
+# Run maintenance consolidation across all sessions with eligible old working memory
+hermes mnemosyne sleep --all-sessions
 
 # Export all memories to a JSON file
 hermes mnemosyne export --output mnemosyne_backup.json
