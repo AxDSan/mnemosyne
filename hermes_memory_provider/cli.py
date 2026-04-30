@@ -21,7 +21,9 @@ def register_cli(subparser):
     stats_cmd = mn_cmds.add_parser("stats", help="Show memory statistics")
     stats_cmd.add_argument("--global", "-g", action="store_true", help="Show global stats across all sessions")
 
-    mn_cmds.add_parser("sleep", help="Run consolidation cycle")
+    sleep_cmd = mn_cmds.add_parser("sleep", help="Run consolidation cycle")
+    sleep_cmd.add_argument("--all-sessions", action="store_true", help="Consolidate eligible old working memories across all sessions")
+    sleep_cmd.add_argument("--dry-run", action="store_true", help="Report what would be consolidated without writing changes")
     mn_cmds.add_parser("version", help="Show Mnemosyne version")
 
     inspect_cmd = mn_cmds.add_parser("inspect", help="Search memories")
@@ -67,10 +69,12 @@ def mnemosyne_command(args):
         print(f"Mnemosyne {__version__} by {__author__}")
 
     elif cmd == "sleep":
-        beam.sleep()
-        working = beam.get_working_stats()
-        episodic = beam.get_episodic_stats()
-        print(f"Consolidation complete. Working: {working.get('count', 0)}, Episodic: {episodic.get('count', 0)}")
+        dry_run = bool(getattr(args, "dry_run", False))
+        if getattr(args, "all_sessions", False):
+            result = beam.sleep_all_sessions(dry_run=dry_run)
+        else:
+            result = beam.sleep(dry_run=dry_run)
+        print(json.dumps(result, indent=2))
 
     elif cmd == "inspect":
         query = getattr(args, "query", "") or ""
