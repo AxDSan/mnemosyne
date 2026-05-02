@@ -1,6 +1,6 @@
 # Mnemosyne vs Hindsight Self-Hosted
 
-**Last updated:** 2026-04-29 · Mnemosyne v2.0
+**Last updated:** 2026-05-02 · Mnemosyne v2.1
 
 This is an honest, technical comparison between Mnemosyne and Hindsight self-hosted (local Docker, not the managed Cloud product). Every claim below is grounded in source code — no fabricated benchmarks or aspirational APIs.
 
@@ -271,4 +271,4 @@ Both systems are fully offline after initial setup. The difference is weight: Mn
 
 ---
 
-*This page was rewritten for v2.0 after community feedback about inaccurate comparisons. Every feature listed for Mnemosyne has been verified against the source code. Hindsight features are based on public documentation and the author's direct codebase analysis. If anything here is wrong, please open an issue — we'll fix it.*
+*This page was rewritten for v2.1 after community feedback about inaccurate comparisons. Every feature listed for Mnemosyne has been verified against the source code. Hindsight features are based on public documentation and the author's direct codebase analysis. If anything here is wrong, please open an issue — we'll fix it.*

@@ -40,13 +40,22 @@ _triple_store = None
 
 
 def _get_memory(session_id: str = None):
-    """Get or create global memory instance. Recreates if session_id changes."""
+    """Get or create global memory instance. Recreates if session_id changes.
+    
+    Identity is resolved from environment variables set by the Hermes plugin
+    provider (e.g., MNEMOSYNE_AUTHOR_ID from user context).
+    """
     global _memory_instance, _current_session_id
     if session_id is None:
         session_id = os.environ.get("HERMES_SESSION_ID", "hermes_default")
     if _memory_instance is None or _current_session_id != session_id:
         _current_session_id = session_id
-        _memory_instance = Mnemosyne(session_id=session_id)
+        _memory_instance = Mnemosyne(
+            session_id=session_id,
+            author_id=os.environ.get("MNEMOSYNE_AUTHOR_ID"),
+            author_type=os.environ.get("MNEMOSYNE_AUTHOR_TYPE"),
+            channel_id=os.environ.get("MNEMOSYNE_CHANNEL_ID")
+        )
     return _memory_instance
 
 

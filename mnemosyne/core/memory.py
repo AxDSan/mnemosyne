@@ -108,9 +108,14 @@ class Mnemosyne:
     Each bank is a separate SQLite database for complete isolation.
     """
 
-    def __init__(self, session_id: str = "default", db_path: Path = None, bank: str = None):
+    def __init__(self, session_id: str = "default", db_path: Path = None, bank: str = None,
+                 author_id: str = None, author_type: str = None,
+                 channel_id: str = None):
         self.session_id = session_id
         self.bank = bank or "default"
+        self.author_id = author_id
+        self.author_type = author_type
+        self.channel_id = channel_id or session_id  # default channel = session
 
         # Resolve database path based on bank
         if db_path:
@@ -123,7 +128,9 @@ class Mnemosyne:
 
         self.conn = _get_connection(self.db_path)
         init_db(self.db_path)
-        self.beam = BeamMemory(session_id=session_id, db_path=self.db_path)
+        self.beam = BeamMemory(session_id=session_id, db_path=self.db_path,
+                               author_id=author_id, author_type=author_type,
+                               channel_id=channel_id)
 
         # Phase 8: Streaming + Patterns + Plugins (lazy init)
         self._stream = None
@@ -305,6 +312,9 @@ class Mnemosyne:
     def recall(self, query: str, top_k: int = 5, *,
                from_date: Optional[str] = None, to_date: Optional[str] = None,
                source: Optional[str] = None, topic: Optional[str] = None,
+               author_id: Optional[str] = None,
+               author_type: Optional[str] = None,
+               channel_id: Optional[str] = None,
                temporal_weight: float = 0.0,
                query_time: Optional[Any] = None,
                temporal_halflife: Optional[float] = None) -> List[Dict]:
@@ -312,11 +322,14 @@ class Mnemosyne:
         Search memories with hybrid relevance scoring.
         Uses BEAM episodic + working memory retrieval (sqlite-vec + FTS5).
         Supports temporal filtering: from_date, to_date, source, topic.
+        Supports multi-agent identity filtering: author_id, author_type, channel_id.
         Supports temporal scoring: temporal_weight, query_time, temporal_halflife.
         """
         return self.beam.recall(query, top_k=top_k,
                                 from_date=from_date, to_date=to_date,
                                 source=source, topic=topic,
+                                author_id=author_id, author_type=author_type,
+                                channel_id=channel_id,
                                 temporal_weight=temporal_weight,
                                 query_time=query_time,
                                 temporal_halflife=temporal_halflife)
@@ -328,8 +341,9 @@ class Mnemosyne:
         """
         return self.beam.get_context(limit=limit)
 
-    def get_stats(self) -> Dict:
-        """Get memory system statistics (legacy + BEAM)."""
+    def get_stats(self, author_id: str = None, author_type: str = None,
+                  channel_id: str = None) -> Dict:
+        """Get memory system statistics (legacy + BEAM). Supports multi-agent identity filters."""
         cursor = self.conn.cursor()
 
         cursor.execute("SELECT COUNT(*) FROM memories")
@@ -344,8 +358,10 @@ class Mnemosyne:
         cursor.execute("SELECT timestamp FROM memories ORDER BY timestamp DESC LIMIT 1")
         last = cursor.fetchone()
 
-        beam_wm = self.beam.get_working_stats()
-        beam_ep = self.beam.get_episodic_stats()
+        beam_wm = self.beam.get_working_stats(author_id=author_id, author_type=author_type,
+                                               channel_id=channel_id)
+        beam_ep = self.beam.get_episodic_stats(author_id=author_id, author_type=author_type,
+                                                channel_id=channel_id)
 
         return {
             "total_memories": total_legacy,

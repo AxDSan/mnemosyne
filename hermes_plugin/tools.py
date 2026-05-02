@@ -45,6 +45,18 @@ REMEMBER_SCHEMA = {
                 "type": "boolean",
                 "description": "If true, extract structured facts from content using LLM and store as triples for fact-aware recall",
                 "default": False
+            },
+            "author_id": {
+                "type": "string",
+                "description": "Who stored this memory (e.g., 'abdias'). Auto-set from session if not provided."
+            },
+            "author_type": {
+                "type": "string",
+                "description": "Type: 'human', 'agent', or 'system'."
+            },
+            "channel_id": {
+                "type": "string",
+                "description": "Channel/group this belongs to (e.g., 'fluxspeak-team')."
             }
         },
         "required": ["content"]
@@ -81,6 +93,18 @@ RECALL_SCHEMA = {
                 "description": "Hours until temporal boost decays by half. Default 24. Lower = faster decay.",
                 "default": 24,
             },
+            "author_id": {
+                "type": "string",
+                "description": "Filter by author (e.g., 'abdias'). Only recalls memories by this author."
+            },
+            "author_type": {
+                "type": "string",
+                "description": "Filter by author type: 'human', 'agent', or 'system'."
+            },
+            "channel_id": {
+                "type": "string",
+                "description": "Filter by channel/group (e.g., 'fluxspeak-team')."
+            }
         },
         "required": ["query"],
     },

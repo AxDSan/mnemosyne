@@ -64,6 +64,18 @@ _REMEMBER_SCHEMA = {
             "description": "Extract structured facts from content (Phase 2 feature).",
             "default": False
         },
+        "author_id": {
+            "type": "string",
+            "description": "Who stored this memory (e.g., 'abdias', 'codex-agent'). Auto-set from env MNEMOSYNE_AUTHOR_ID if not provided."
+        },
+        "author_type": {
+            "type": "string",
+            "description": "Type of author: 'human', 'agent', or 'system'. Auto-set from env MNEMOSYNE_AUTHOR_TYPE."
+        },
+        "channel_id": {
+            "type": "string",
+            "description": "Channel or group this memory belongs to (e.g., 'fluxspeak-team')."
+        },
         "bank": {
             "type": "string",
             "description": "Memory bank to store in (Phase 5 feature).",
@@ -114,6 +126,18 @@ _RECALL_SCHEMA = {
             "type": "number",
             "description": "Importance score weight (Phase 4 feature).",
             "default": 0.2
+        },
+        "author_id": {
+            "type": "string",
+            "description": "Filter by author (e.g., 'abdias', 'codex-agent'). Only recalls memories by this author."
+        },
+        "author_type": {
+            "type": "string",
+            "description": "Filter by author type: 'human', 'agent', or 'system'."
+        },
+        "channel_id": {
+            "type": "string",
+            "description": "Filter by channel/group (e.g., 'fluxspeak-team')."
         }
     },
     "required": ["query"]
@@ -211,17 +235,30 @@ TOOLS: List[Dict[str, Any]] = [
 ]
 
 # ---------------------------------------------------------------------------
-# Mnemosyne Instance Cache (per-bank)
+# Mnemosyne Instance Per Connection (no module-level cache)
 # ---------------------------------------------------------------------------
-
-_bank_instances: Dict[str, Mnemosyne] = {}
-
-
-def _get_instance(bank: str = "default") -> Mnemosyne:
-    """Get or create a Mnemosyne instance for the given bank."""
-    if bank not in _bank_instances:
-        _bank_instances[bank] = Mnemosyne(session_id=f"mcp_{bank}")
-    return _bank_instances[bank]
+def _create_instance(session_id: str = None, author_id: str = None,
+                     author_type: str = None, channel_id: str = None,
+                     bank: str = "default") -> Mnemosyne:
+    """Create a fresh Mnemosyne instance for each MCP connection.
+    
+    Identity is resolved from:
+    1. Explicit args (from tool call or constructor)
+    2. Environment variables (MNEMOSYNE_AUTHOR_ID, etc.)
+    3. None (backward compatible, no identity tracking)
+    """
+    auth = author_id or os.environ.get("MNEMOSYNE_AUTHOR_ID")
+    auth_type = author_type or os.environ.get("MNEMOSYNE_AUTHOR_TYPE")
+    chan = channel_id or os.environ.get("MNEMOSYNE_CHANNEL_ID") or session_id or "default"
+    sess = session_id or f"mcp_{bank}"
+    
+    return Mnemosyne(
+        session_id=sess,
+        author_id=auth,
+        author_type=auth_type,
+        channel_id=chan,
+        bank=bank
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +275,7 @@ def _handle_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
     extract = arguments.get("extract", False)
     bank = arguments.get("bank", "default")
 
-    mem = _get_instance(bank)
+    mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
     memory_id = mem.remember(
         content=content,
         source=source,
@@ -263,7 +300,7 @@ def _handle_recall(arguments: Dict[str, Any]) -> Dict[str, Any]:
     temporal_weight = arguments.get("temporal_weight", 0.0)
     query_time = arguments.get("query_time")
 
-    mem = _get_instance(bank)
+    mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
     results = mem.recall(
         query=query,
         top_k=top_k,
@@ -296,7 +333,7 @@ def _handle_sleep(arguments: Dict[str, Any]) -> Dict[str, Any]:
     all_sessions = arguments.get("all_sessions", False)
     bank = arguments.get("bank", "default")
 
-    mem = _get_instance(bank)
+    mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
     if all_sessions and hasattr(mem, "sleep_all_sessions"):
         result = mem.sleep_all_sessions(dry_run=dry_run)
     else:
@@ -315,7 +352,7 @@ def _handle_scratchpad_read(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_scratchpad_read tool call."""
     bank = arguments.get("bank", "default")
 
-    mem = _get_instance(bank)
+    mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
     entries = mem.scratchpad_read()
 
     return {
@@ -331,7 +368,7 @@ def _handle_scratchpad_write(arguments: Dict[str, Any]) -> Dict[str, Any]:
     content = arguments["content"]
     bank = arguments.get("bank", "default")
 
-    mem = _get_instance(bank)
+    mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
     entry_id = mem.scratchpad_write(content)
 
     return {
@@ -345,7 +382,7 @@ def _handle_get_stats(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_get_stats tool call."""
     bank = arguments.get("bank", "default")
 
-    mem = _get_instance(bank)
+    mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
     stats = mem.get_stats()
 
     # Serialize for JSON

@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Simple Versioning](https://github.com/AxDSan/mnemosyne) (MAJOR.MINOR).
 
+## [2.1] — 2026-05-02
+
+### Added
+
+**Multi-Agent Identity Layer**
+- New columns `author_id`, `author_type`, `channel_id` on `working_memory` and `episodic_memory` with indexes
+- `Mnemosyne(author_id=..., author_type=..., channel_id=...)` constructor params
+- `remember()` auto-populates identity columns from session context
+- `recall(author_id=..., author_type=..., channel_id=...)` filter params
+- `get_stats(author_id=..., author_type=..., channel_id=...)` filter params
+- Cross-session channel recall: when `channel_id` is provided, scope expands to include all memories in that channel regardless of session
+- MCP server: per-connection instances replace module-level cache; identity via tool args or env vars (`MNEMOSYNE_AUTHOR_ID`, `MNEMOSYNE_AUTHOR_TYPE`, `MNEMOSYNE_CHANNEL_ID`)
+- Hermes plugin `_get_memory()` reads identity from environment variables
+
+### Changed
+- MCP `_get_instance()` renamed to `_create_instance()` — creates fresh instances per connection
+- Episodic memory SELECTs and recall-tracking UPDATEs use dynamic session/channel scope
+
 ## [2.0] — 2026-04-29
 
 ### Added
