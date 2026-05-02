@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Simple Versioning](https://github.com/AxDSan/mnemosyne) (MAJOR.MINOR).
 
+## [2.2] — 2026-05-02
+
+### Added
+
+**Cross-Provider Importers — migrate from any memory platform**
+- New `mnemosyne/core/importers/` module with 6 provider importers
+- **Mem0:** SDK pagination → REST → structured export fallback chain; preserves user/agent/app scoping
+- **Letta (MemGPT):** AgentFile `.af` format parsing (JSON/YAML/TOML); memory blocks → working_memory, messages → episodic
+- **Zep:** users → sessions → `memory.get()` per-session iteration; messages + summaries + facts extraction
+- **Cognee:** `get_graph_data()` nodes/edges extraction; nodes → episodic memories, edges → triples
+- **Honcho:** peers → sessions → `context()` + messages; peer identity preserved as author_id
+- **SuperMemory:** `documents.list()` + `search.execute()`; container tags mapped to channel_id
+- **Agentic importer:** generates ready-to-run Python migration scripts and AI agent instructions for all 6 providers
+
+**CLI: `hermes mnemosyne import` extended**
+- `--from <provider>` — import directly from Mem0, Letta, Zep, etc.
+- `--list-providers` — show all supported providers with docs links
+- `--generate-script` — generate a migration script for any provider
+- `--agentic` — output instructions to give your AI agent for extraction
+- `--dry-run` — validate and transform without writing
+
+**Plugin tool updated**
+- `mnemosyne_import` schema extended with `provider`, `api_key`, `user_id`, `agent_id`, `dry_run`, `channel_id` params
+
+### Changed
+
+- README: added "Migrate from other memory providers" section with examples
+
 ## [2.1] — 2026-05-02
 
 ### Added

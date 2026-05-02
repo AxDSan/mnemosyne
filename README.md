@@ -5,7 +5,7 @@
 > Native, zero-cloud memory for AI agents. SQLite-backed. Sub-millisecond. Fully private.
 
 [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://python.org)
-[![PyPI](https://img.shields.io/pypi/v/mnemosyne-memory.svg?v=2.1)](https://pypi.org/project/mnemosyne-memory/)
+[![PyPI](https://img.shields.io/pypi/v/mnemosyne-memory.svg?v=2.2)](https://pypi.org/project/mnemosyne-memory/)
 [![SQLite](https://img.shields.io/badge/SQLite-3.35+-green.svg)](https://sqlite.org/codeofethics.html)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/AxDSan/mnemosyne/actions/workflows/ci.yml/badge.svg)](https://github.com/AxDSan/mnemosyne/actions/workflows/ci.yml)
@@ -507,6 +507,34 @@ hermes mnemosyne export --output mnemosyne_backup.json
 # Import on a new machine
 hermes mnemosyne import --input mnemosyne_backup.json
 ```
+
+### Migrate from other memory providers
+
+Import directly from 6 supported providers into Mnemosyne:
+
+```bash
+# List all supported providers
+hermes mnemosyne import --list-providers
+
+# Mem0 → Mnemosyne
+hermes mnemosyne import --from mem0 --api-key sk-xxx
+
+# Letta → Mnemosyne (offline .af file)
+hermes mnemosyne import --from letta --agent-file-path ./agent.af
+
+# Zep → Mnemosyne
+hermes mnemosyne import --from zep --api-key sk-xxx --max-sessions 100
+
+# Generate a migration script for any provider
+hermes mnemosyne import --from mem0 --generate-script --output-script migrate.py
+
+# Use AI agent extraction (no SDK needed)
+hermes mnemosyne import --from zep --agentic
+```
+
+**Supported providers:** Mem0, Letta (MemGPT), Zep, Cognee, Honcho, SuperMemory
+
+All importers preserve metadata, timestamps, user/agent identity, and relationships (graph edges → triples). Use `--dry-run` to validate without writing.
 
 ---
 
