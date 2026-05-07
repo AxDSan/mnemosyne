@@ -203,6 +203,11 @@ except ImportError:
 class MnemosyneMemoryProvider(MemoryProvider):
     """Mnemosyne native memory — local SQLite with vector + FTS5 hybrid search."""
 
+    # How long on_session_end will wait for sleep/consolidation to finish before
+    # giving up and letting the daemon thread continue in the background. Tests
+    # may shorten this to keep the suite fast.
+    SESSION_END_SLEEP_TIMEOUT_SECONDS = 15
+
     def __init__(self):
         self._beam: Optional[Any] = None
         self._session_id = "hermes_default"
@@ -254,6 +259,18 @@ class MnemosyneMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.warning("Mnemosyne init failed: %s", e)
             self._beam = None
+
+        # Register the Hermes auxiliary LLM backend so Mnemosyne can route
+        # consolidation and fact extraction through Hermes' authenticated
+        # provider (e.g., openai-codex via OAuth) when the user opts in via
+        # MNEMOSYNE_HOST_LLM_ENABLED=true. Registration alone does not
+        # change Mnemosyne behavior; failure here must not break the provider.
+        try:
+            from hermes_memory_provider.hermes_llm_adapter import register_hermes_host_llm
+            if register_hermes_host_llm():
+                logger.info("Mnemosyne registered Hermes auxiliary LLM backend for memory operations")
+        except Exception as exc:
+            logger.debug("Mnemosyne could not register Hermes auxiliary LLM backend: %s", exc)
 
     def system_prompt_block(self) -> str:
         if not self._beam:
@@ -455,11 +472,24 @@ class MnemosyneMemoryProvider(MemoryProvider):
         self._turn_count = turn_number
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        # Bound the consolidation call so a slow LLM (e.g., a Hermes-routed
+        # network call) cannot block Hermes shutdown indefinitely. Mirrors
+        # the daemon-thread pattern already used by _maybe_auto_sleep above:
+        # the thread keeps running in the background if it overruns, but the
+        # main shutdown path is freed after the join timeout.
         if not self._beam:
             return
         try:
             logger.info("Mnemosyne session end — running consolidation")
-            self._beam.sleep()
+            timeout = self.SESSION_END_SLEEP_TIMEOUT_SECONDS
+            sleep_thread = threading.Thread(target=self._beam.sleep, daemon=True)
+            sleep_thread.start()
+            sleep_thread.join(timeout=timeout)
+            if sleep_thread.is_alive():
+                logger.warning(
+                    "Mnemosyne session-end sleep timed out after %ss — consolidation deferred",
+                    timeout,
+                )
         except Exception as e:
             logger.debug("Mnemosyne session-end sleep failed: %s", e)
 
@@ -478,6 +508,14 @@ class MnemosyneMemoryProvider(MemoryProvider):
             logger.debug("Mnemosyne mirror write failed: %s", e)
 
     def shutdown(self) -> None:
+        # Symmetric with initialize(): clear the Hermes host LLM backend so a
+        # process that later uses Mnemosyne outside Hermes does not retain a
+        # stale reference into agent.auxiliary_client.
+        try:
+            from hermes_memory_provider.hermes_llm_adapter import unregister_hermes_host_llm
+            unregister_hermes_host_llm()
+        except Exception as exc:
+            logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
         self._beam = None
 
 
