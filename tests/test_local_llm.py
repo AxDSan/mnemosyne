@@ -3,6 +3,10 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from mnemosyne.core import local_llm
+from mnemosyne.core.llm_backends import (
+    CallableLLMBackend,
+    set_host_llm_backend,
+)
 
 
 class TestRemoteLLM:
@@ -115,3 +119,165 @@ class TestRemoteLLM:
                 assert result is None
                 mock_remote.assert_called_once()
                 mock_load.assert_called_once()
+
+
+class TestHostLLMBackend:
+    """Tests for the host LLM adapter integration in summarize_memories()."""
+
+    def _enable_host(self, monkeypatch):
+        monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
+        monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", True)
+        monkeypatch.setattr(local_llm, "HOST_LLM_PROVIDER", None)
+        monkeypatch.setattr(local_llm, "HOST_LLM_MODEL", None)
+
+    def test_summarize_memories_uses_host_when_enabled(self, monkeypatch):
+        """Host backend is consulted before remote when enabled."""
+        self._enable_host(monkeypatch)
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://remote/v1")
+        monkeypatch.setattr(local_llm, "LLM_MAX_TOKENS", 128)
+        monkeypatch.setattr(local_llm, "HOST_LLM_PROVIDER", "openai-codex")
+        monkeypatch.setattr(local_llm, "HOST_LLM_MODEL", "gpt-5.1-mini")
+
+        captured = []
+
+        def fake(prompt, *, max_tokens, temperature, timeout, provider=None, model=None):
+            captured.append({
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "timeout": timeout,
+                "provider": provider,
+                "model": model,
+            })
+            return "Host summary."
+
+        set_host_llm_backend(CallableLLMBackend("test", fake))
+        with patch.object(local_llm, "_call_remote_llm") as mock_remote, \
+             patch.object(local_llm, "_call_local_llm") as mock_local:
+            assert local_llm.summarize_memories(["Memory one"]) == "Host summary."
+            mock_remote.assert_not_called()
+            mock_local.assert_not_called()
+        assert captured
+        assert captured[0]["max_tokens"] == 128
+        assert captured[0]["temperature"] == 0.3
+        assert captured[0]["timeout"] == local_llm.HOST_LLM_TIMEOUT
+        assert captured[0]["provider"] == "openai-codex"
+        assert captured[0]["model"] == "gpt-5.1-mini"
+        # Host prompt MUST NOT contain TinyLlama chat-template tokens.
+        assert "<|user|>" not in captured[0]["prompt"]
+        assert "</s>" not in captured[0]["prompt"]
+        assert "<|assistant|>" not in captured[0]["prompt"]
+
+    def test_summarize_memories_skips_remote_on_host_miss(self, monkeypatch):
+        """A3 contract: host enabled + host returns None → fall to local, NOT to remote."""
+        self._enable_host(monkeypatch)
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://remote/v1")
+        set_host_llm_backend(CallableLLMBackend("test", lambda *a, **k: None))
+        with patch.object(local_llm, "_call_remote_llm", return_value="Remote summary.") as mock_remote, \
+             patch.object(local_llm, "_call_local_llm", return_value="Local summary.") as mock_local:
+            assert local_llm.summarize_memories(["Memory one"]) == "Local summary."
+            mock_remote.assert_not_called()
+            mock_local.assert_called_once()
+
+    def test_summarize_memories_returns_none_when_host_and_local_both_fail(self, monkeypatch):
+        """Host attempted + nothing + local fails → None (NOT remote)."""
+        self._enable_host(monkeypatch)
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://remote/v1")
+        set_host_llm_backend(CallableLLMBackend("test", lambda *a, **k: None))
+        with patch.object(local_llm, "_call_remote_llm", return_value="Remote summary.") as mock_remote, \
+             patch.object(local_llm, "_call_local_llm", return_value=None) as mock_local:
+            assert local_llm.summarize_memories(["Memory one"]) is None
+            mock_remote.assert_not_called()
+            mock_local.assert_called_once()
+
+    def test_summarize_memories_unchanged_when_HOST_LLM_ENABLED_false(self, monkeypatch):
+        """REGRESSION: existing remote/local behavior is preserved when host is off."""
+        monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
+        monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", False)  # explicitly off
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://remote/v1")
+        # Even with a backend registered, host is gated off.
+        set_host_llm_backend(CallableLLMBackend("test", lambda *a, **k: "Host summary."))
+        with patch.object(local_llm, "_call_remote_llm", return_value="Remote summary.") as mock_remote:
+            assert local_llm.summarize_memories(["Memory one"]) == "Remote summary."
+            mock_remote.assert_called_once()
+
+    def test_summarize_memories_unchanged_when_LLM_ENABLED_false(self, monkeypatch):
+        """A2 contract: MNEMOSYNE_LLM_ENABLED=false disables host and remote alike."""
+        monkeypatch.setattr(local_llm, "LLM_ENABLED", False)
+        monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", True)
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://remote/v1")
+        set_host_llm_backend(CallableLLMBackend("test", lambda *a, **k: "Host summary."))
+        with patch.object(local_llm, "_call_remote_llm", return_value="Remote summary.") as mock_remote, \
+             patch.object(local_llm, "_call_local_llm", return_value=None) as mock_local:
+            # Host gated by LLM_ENABLED → not attempted; remote also gated → not called;
+            # local: _call_local_llm internally checks via _load_llm() which itself
+            # gates on LLM_ENABLED (preserving prior behavior). End result: None.
+            assert local_llm.summarize_memories(["Memory one"]) is None
+            mock_remote.assert_not_called()
+
+    def test_summarize_memories_swallows_host_exception(self, monkeypatch):
+        """Backend that raises is treated as host-attempted-with-no-output (A3 still applies)."""
+        self._enable_host(monkeypatch)
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://remote/v1")
+
+        def boom(*a, **k):
+            raise RuntimeError("provider exploded")
+
+        set_host_llm_backend(CallableLLMBackend("test", boom))
+        with patch.object(local_llm, "_call_remote_llm", return_value="Remote summary.") as mock_remote, \
+             patch.object(local_llm, "_call_local_llm", return_value="Local summary.") as mock_local:
+            assert local_llm.summarize_memories(["Memory one"]) == "Local summary."
+            mock_remote.assert_not_called()
+            mock_local.assert_called_once()
+
+
+class TestLLMAvailable:
+    """Tests for the host-aware llm_available() gate."""
+
+    def test_llm_available_true_when_only_host_backend_registered(self, monkeypatch):
+        """A5 contract: Hermes-only users (no remote URL, no GGUF) still report available."""
+        monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
+        monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", True)
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "")
+        monkeypatch.setattr(local_llm, "_llm_available", False)
+        set_host_llm_backend(CallableLLMBackend("test", lambda *a, **k: "x"))
+        assert local_llm.llm_available() is True
+
+    def test_llm_available_false_when_host_enabled_but_no_backend(self, monkeypatch):
+        """HOST_LLM_ENABLED=true with no backend registered must not fake availability."""
+        monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
+        monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", True)
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "")
+        monkeypatch.setattr(local_llm, "_llm_available", False)
+        # No backend registered.
+        assert local_llm.llm_available() is False
+
+    def test_llm_available_false_when_LLM_ENABLED_false(self, monkeypatch):
+        """A2 contract: MNEMOSYNE_LLM_ENABLED=false makes everything unavailable."""
+        monkeypatch.setattr(local_llm, "LLM_ENABLED", False)
+        monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", True)
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://remote/v1")
+        monkeypatch.setattr(local_llm, "_llm_available", False)
+        set_host_llm_backend(CallableLLMBackend("test", lambda *a, **k: "x"))
+        assert local_llm.llm_available() is False
+
+
+class TestHostAwareChunking:
+    """Tests for HOST_LLM_N_CTX-aware budgeting (decision C6)."""
+
+    def test_prompt_token_budget_uses_host_n_ctx_when_host_will_handle(self, monkeypatch):
+        monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
+        monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", True)
+        monkeypatch.setattr(local_llm, "LLM_N_CTX", 2048)
+        monkeypatch.setattr(local_llm, "HOST_LLM_N_CTX", 32000)
+        monkeypatch.setattr(local_llm, "LLM_MAX_TOKENS", 256)
+        set_host_llm_backend(CallableLLMBackend("test", lambda *a, **k: "x"))
+
+        host_budget = local_llm._prompt_token_budget()
+        # Should be much larger than the TinyLlama-calibrated default budget.
+        assert host_budget > 10_000
+
+        # Same module without a host backend → falls back to LLM_N_CTX budget.
+        set_host_llm_backend(None)
+        local_budget = local_llm._prompt_token_budget()
+        assert local_budget < host_budget

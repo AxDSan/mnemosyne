@@ -215,3 +215,92 @@ def run_all_tests():
 if __name__ == "__main__":
     success = run_all_tests()
     sys.exit(0 if success else 1)
+
+
+# ---------------------------------------------------------------------------
+# Host LLM backend integration (decisions A1, A3, C2)
+# ---------------------------------------------------------------------------
+
+from unittest.mock import patch  # noqa: E402
+
+from mnemosyne.core import extraction as _extraction_mod, local_llm  # noqa: E402
+from mnemosyne.core.llm_backends import (  # noqa: E402
+    CallableLLMBackend,
+    set_host_llm_backend,
+)
+
+
+def _enable_host(monkeypatch):
+    monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
+    monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", True)
+    monkeypatch.setattr(local_llm, "HOST_LLM_PROVIDER", None)
+    monkeypatch.setattr(local_llm, "HOST_LLM_MODEL", None)
+
+
+def test_host_extract_facts_uses_temperature_zero(monkeypatch):
+    """C2 contract: extract_facts forces temperature=0.0 for determinism."""
+    _enable_host(monkeypatch)
+    monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://remote/v1")
+    monkeypatch.setattr(local_llm, "LLM_MAX_TOKENS", 128)
+
+    captured = []
+
+    def fake(prompt, *, max_tokens, temperature, timeout, provider=None, model=None):
+        captured.append({"temperature": temperature, "max_tokens": max_tokens})
+        return "Chris uses Neovim.\nChris dislikes VSCode."
+
+    set_host_llm_backend(CallableLLMBackend("test", fake))
+    with patch.object(local_llm, "_call_remote_llm") as mock_remote:
+        facts = extract_facts("Chris said he prefers Neovim and dislikes VSCode.")
+        mock_remote.assert_not_called()
+
+    assert any("Neovim" in f for f in facts)
+    assert captured
+    assert captured[0]["temperature"] == 0.0
+    assert captured[0]["max_tokens"] == 128
+
+
+def test_host_extract_facts_skips_remote_on_host_miss(monkeypatch):
+    """A3 contract: host enabled, host returns None → fall to local, NOT remote."""
+    _enable_host(monkeypatch)
+    monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://remote/v1")
+    set_host_llm_backend(CallableLLMBackend("test", lambda *a, **k: None))
+
+    fake_local = lambda prompt, max_new_tokens, stop: "Local fact one.\nLocal fact two."  # noqa: E731
+
+    with patch.object(local_llm, "_call_remote_llm", return_value="Remote facts.") as mock_remote, \
+         patch.object(local_llm, "_load_llm", return_value=fake_local) as mock_load:
+        facts = extract_facts("some content with facts to extract")
+        mock_remote.assert_not_called()
+        mock_load.assert_called()
+
+    assert any("Local fact" in f for f in facts)
+
+
+def test_host_extract_facts_unchanged_when_HOST_LLM_ENABLED_false(monkeypatch):
+    """REGRESSION: existing behavior preserved when host is off."""
+    monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
+    monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", False)
+    monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://remote/v1")
+    set_host_llm_backend(CallableLLMBackend("test", lambda *a, **k: "Host fact.\nAnother host fact."))
+    with patch.object(local_llm, "_call_remote_llm", return_value="Remote fact one.\nRemote fact two."):
+        facts = extract_facts("some content")
+    assert any("Remote fact" in f for f in facts)
+    assert not any("Host fact" in f for f in facts)
+
+
+def test_host_extract_facts_swallows_exception_then_local(monkeypatch):
+    """Backend that raises is treated as host-attempted-with-no-output."""
+    _enable_host(monkeypatch)
+    monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://remote/v1")
+
+    def boom(*a, **k):
+        raise RuntimeError("hermes is angry")
+
+    set_host_llm_backend(CallableLLMBackend("test", boom))
+    fake_local = lambda prompt, max_new_tokens, stop: "Recovered fact one.\nRecovered fact two."  # noqa: E731
+    with patch.object(local_llm, "_call_remote_llm") as mock_remote, \
+         patch.object(local_llm, "_load_llm", return_value=fake_local):
+        facts = extract_facts("some content")
+        mock_remote.assert_not_called()
+    assert any("Recovered fact" in f for f in facts)

@@ -37,6 +37,19 @@ LLM_BASE_URL = os.environ.get("MNEMOSYNE_LLM_BASE_URL", "").rstrip("/")
 LLM_API_KEY = os.environ.get("MNEMOSYNE_LLM_API_KEY", "")
 LLM_REMOTE_MODEL = os.environ.get("MNEMOSYNE_LLM_MODEL", "")
 
+# Host LLM adapter (Hermes or another agent). Disabled by default to preserve
+# existing standalone behavior. When MNEMOSYNE_HOST_LLM_ENABLED=true and a
+# backend is registered via mnemosyne.core.llm_backends.set_host_llm_backend(),
+# the host backend is consulted before the existing remote/local chain.
+# See docs/hermes-llm-integration.md for the full behavior model.
+HOST_LLM_ENABLED = os.environ.get("MNEMOSYNE_HOST_LLM_ENABLED", "false").lower() in ("1", "true", "yes")
+HOST_LLM_PROVIDER = os.environ.get("MNEMOSYNE_HOST_LLM_PROVIDER", "").strip() or None
+HOST_LLM_MODEL = os.environ.get("MNEMOSYNE_HOST_LLM_MODEL", "").strip() or None
+HOST_LLM_TIMEOUT = 15.0  # Per-attempt safety cap; not user-facing.
+# Host context window: TinyLlama-calibrated LLM_N_CTX (2048) is too small for
+# Codex/GPT-class aux models; use this larger budget when the host is the path.
+HOST_LLM_N_CTX = int(os.environ.get("MNEMOSYNE_HOST_LLM_N_CTX", "32000"))
+
 # --- Lazy singleton ----------------------------------------------------------
 _llm_instance = None
 _llm_backend = None  # "llamacpp", "ctransformers", or None
@@ -191,7 +204,13 @@ def _call_local_llm(prompt: str) -> Optional[str]:
 
 
 def _build_prompt(memories: List[str], source: str = "") -> str:
-    """Build a consolidation prompt from a list of memory strings."""
+    """Build a consolidation prompt from a list of memory strings.
+
+    Uses TinyLlama chat-template tokens (<|user|>, </s>, <|assistant|>)
+    suitable for the local GGUF model. For host LLM calls, use
+    :func:`_build_host_prompt` instead — Codex/GPT-class providers treat
+    these tokens as garbage text.
+    """
     header = (
         "Summarize the following memories into 1-3 concise sentences. "
         "Preserve facts, names, preferences, and decisions. Discard fluff."
@@ -202,6 +221,79 @@ def _build_prompt(memories: List[str], source: str = "") -> str:
     lines = "\n".join(f"- {m}" for m in memories if m)
     prompt = f"<|user|>\n{header}\n\n{lines}\n</s>\n<|assistant|>\n"
     return prompt
+
+
+def _build_host_prompt(memories: List[str], source: str = "") -> str:
+    """Plain-text consolidation prompt for host LLMs (no TinyLlama tokens).
+
+    The host adapter wraps this string as the user-message content of a
+    Chat Completions call; embedding TinyLlama chat-template tokens here
+    would degrade output quality on every modern aux provider.
+    """
+    header = (
+        "Summarize the following memories into 1-3 concise sentences. "
+        "Preserve facts, names, preferences, and decisions. Discard fluff."
+    )
+    if source:
+        header += f" Source: {source}."
+
+    lines = "\n".join(f"- {m}" for m in memories if m)
+    return f"{header}\n\n{lines}"
+
+
+def _host_backend_will_handle_call() -> bool:
+    """True iff the host backend will be the chosen path for an LLM call.
+
+    Used to pick the right context budget at chunk time (HOST_LLM_N_CTX vs
+    LLM_N_CTX) and to short-circuit llm_available() for Hermes-only users.
+    """
+    if not LLM_ENABLED or not HOST_LLM_ENABLED:
+        return False
+    try:
+        from mnemosyne.core.llm_backends import get_host_llm_backend
+        return get_host_llm_backend() is not None
+    except Exception:
+        return False
+
+
+def _try_host_llm(
+    prompt: str,
+    *,
+    max_tokens: int,
+    temperature: float,
+):
+    """Attempt the host LLM backend if enabled and registered.
+
+    Returns ``(attempted, text)``:
+
+    - ``(False, None)`` when host is disabled, MNEMOSYNE_LLM_ENABLED is false,
+      or no backend is registered. Caller should proceed with the existing
+      remote/local fallback chain.
+    - ``(True, text-or-None)`` when the backend was called. The ``attempted``
+      flag is the sentinel callers use to honor the precedence rule: when
+      host is enabled and was attempted, the existing MNEMOSYNE_LLM_BASE_URL
+      path MUST be skipped on failure; fall straight to local GGUF, then None.
+
+    See ``docs/hermes-llm-integration.md`` for the full behavior model.
+    """
+    if not LLM_ENABLED or not HOST_LLM_ENABLED:
+        return (False, None)
+    try:
+        from mnemosyne.core.llm_backends import call_host_llm, get_host_llm_backend
+    except Exception:
+        return (False, None)
+    if get_host_llm_backend() is None:
+        return (False, None)
+    raw = call_host_llm(
+        prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        timeout=HOST_LLM_TIMEOUT,
+        provider=HOST_LLM_PROVIDER,
+        model=HOST_LLM_MODEL,
+    )
+    cleaned = _clean_output(raw) if raw else None
+    return (True, cleaned if cleaned else None)
 
 
 def _clean_output(text: str) -> str:
@@ -221,11 +313,17 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _prompt_token_budget() -> int:
-    """Return usable token budget for memory content (reserves overhead + output)."""
+    """Return usable token budget for memory content (reserves overhead + output).
+
+    Picks the larger HOST_LLM_N_CTX when the host backend will handle the
+    call; otherwise the TinyLlama-calibrated LLM_N_CTX. This avoids the
+    multi-chunk-summary degradation on 128K-context aux providers.
+    """
     overhead = 80
     output_reserve = LLM_MAX_TOKENS
-    safety_margin = int(LLM_N_CTX * 0.2)
-    return max(64, LLM_N_CTX - overhead - output_reserve - safety_margin)
+    n_ctx = HOST_LLM_N_CTX if _host_backend_will_handle_call() else LLM_N_CTX
+    safety_margin = int(n_ctx * 0.2)
+    return max(64, n_ctx - overhead - output_reserve - safety_margin)
 
 
 def chunk_memories_by_budget(memories: List[str], source: str = "") -> List[List[str]]:
@@ -267,9 +365,18 @@ def chunk_memories_by_budget(memories: List[str], source: str = "") -> List[List
 
 
 def llm_available() -> bool:
-    """Check whether any LLM backend (local or remote) is available."""
+    """Check whether any LLM backend (host, remote, or local) is available.
+
+    Returns True for Hermes-only users (no MNEMOSYNE_LLM_BASE_URL, no local
+    GGUF) as long as a host backend is registered and enabled — otherwise
+    sleep would skip ``summarize_memories()`` before the host path could run.
+    """
     global _llm_available
-    if LLM_BASE_URL:
+    # 0. Host backend (if a host is registered and the user opted in).
+    if _host_backend_will_handle_call():
+        return True
+    # 1. Remote API: only consider it when LLM is globally enabled.
+    if LLM_ENABLED and LLM_BASE_URL:
         return True
     if _llm_available is not None:
         return _llm_available
@@ -332,26 +439,47 @@ def _call_remote_llm(prompt: str) -> Optional[str]:
 
 def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
     """Summarize a batch of working-memory items into a single episodic string.
-    
+
     Fallback chain:
-    1. Remote OpenAI-compatible API (if MNEMOSYNE_LLM_BASE_URL is set)
-    2. llama-cpp-python (ARM64 + x86_64 native)
-    3. ctransformers (x86_64 only, legacy)
-    4. Return None → caller falls back to AAAK encoding
+
+    0. Host-provided LLM backend, only if MNEMOSYNE_HOST_LLM_ENABLED=true,
+       MNEMOSYNE_LLM_ENABLED=true, AND a backend is registered. When this
+       path is attempted but produces no usable text, the existing remote
+       URL is **skipped** — falls through to local GGUF, then None. This
+       prevents accidentally routing memory content to a stale
+       MNEMOSYNE_LLM_BASE_URL the user forgot to clear.
+    1. Remote OpenAI-compatible API (if MNEMOSYNE_LLM_BASE_URL is set
+       AND MNEMOSYNE_LLM_ENABLED is not false).
+    2. llama-cpp-python (ARM64 + x86_64 native).
+    3. ctransformers (x86_64 only, legacy).
+    4. Return None → caller falls back to AAAK encoding.
     """
     if not memories:
         return None
 
     prompt = _build_prompt(memories, source=source)
 
-    # 1. Remote API
-    if LLM_BASE_URL:
+    # 0. Host backend.
+    host_prompt = _build_host_prompt(memories, source=source)
+    attempted, text = _try_host_llm(host_prompt, max_tokens=LLM_MAX_TOKENS, temperature=0.3)
+    if attempted:
+        if text:
+            return text
+        # Host attempted but produced nothing. Skip remote per A3; try local.
+        raw = _call_local_llm(prompt)
+        if raw:
+            cleaned = _clean_output(raw)
+            return cleaned if cleaned else None
+        return None
+
+    # 1. Remote API.
+    if LLM_ENABLED and LLM_BASE_URL:
         raw = _call_remote_llm(prompt)
         if raw:
             cleaned = _clean_output(raw)
             return cleaned if cleaned else None
 
-    # 2. Local LLM (llama-cpp-python or ctransformers fallback)
+    # 2. Local LLM (llama-cpp-python or ctransformers fallback).
     raw = _call_local_llm(prompt)
     if raw:
         cleaned = _clean_output(raw)
