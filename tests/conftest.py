@@ -48,6 +48,15 @@ def _close_cached_connections():
     except Exception:
         pass
 
+    # Reset host LLM backend registry to prevent cross-test contamination.
+    # The registry is a process-global; a test that forgets to unregister
+    # would otherwise bleed into the next.
+    try:
+        from mnemosyne.core import llm_backends as _llm_backends_mod
+        _llm_backends_mod._backend = None
+    except Exception:
+        pass
+
 
 @pytest.fixture(autouse=True)
 def _reset_thread_local_connections():
