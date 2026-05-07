@@ -98,6 +98,18 @@ All data is stored in:
 
 This path is chosen because Hermes already persists `~/.hermes/` across sessions (including on ephemeral VMs like Fly.io).
 
+## Auxiliary LLM routing (Codex / OAuth providers)
+
+By default Mnemosyne uses its own LLM config (`MNEMOSYNE_LLM_BASE_URL` /
+`MNEMOSYNE_LLM_API_KEY`) or a local GGUF for sleep/consolidation and fact
+extraction. Hermes users with OAuth-backed providers like `openai-codex` can
+opt into routing those calls through Hermes' authenticated auxiliary client
+instead — no extra credentials required.
+
+Set `MNEMOSYNE_HOST_LLM_ENABLED=true` to enable. See
+[hermes-llm-integration.md](hermes-llm-integration.md) for the full behavior
+model, configuration reference, and session-shutdown semantics.
+
 ## Optional REST API
 
 For integration with non-Python services:
