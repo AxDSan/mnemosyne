@@ -158,6 +158,22 @@ def cmd_import(args):
     print(f"Imported {result.get('count', 0)} memories from {args[0]}")
 
 
+def cmd_import_hindsight(args):
+    """Import memories from a Hindsight JSON export or API."""
+    if not args:
+        print("Usage: mnemosyne import-hindsight <file.json|base_url> [bank]")
+        return
+    target = args[0]
+    bank = args[1] if len(args) > 1 else "hermes"
+    mem = _get_memory()
+    from mnemosyne.core.importers.hindsight import import_from_hindsight
+    if target.startswith("http://") or target.startswith("https://"):
+        result = import_from_hindsight(mem, base_url=target, bank=bank)
+    else:
+        result = import_from_hindsight(mem, file_path=target, bank=bank)
+    print(result.to_json())
+
+
 def cmd_mcp(args):
     """Start MCP server."""
     try:
@@ -214,6 +230,7 @@ COMMANDS = {
     "diagnose": cmd_diagnose,
     "export": cmd_export,
     "import": cmd_import,
+    "import-hindsight": cmd_import_hindsight,
     "mcp": cmd_mcp,
     "bank": cmd_bank,
 }
@@ -234,6 +251,7 @@ def run_cli():
         print("  diagnose                               Run diagnostics")
         print("  export [file.json]                     Export memories")
         print("  import <file.json>                     Import memories")
+        print("  import-hindsight <file|url> [bank]      Import Hindsight memories")
         print("  bank list|create|delete [name]         Manage memory banks")
         print("  mcp [--transport sse] [--port 8080]    Start MCP server")
         return

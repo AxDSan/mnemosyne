@@ -10,6 +10,7 @@ Supported providers:
     cognee      — Cognee graph memory
     honcho      — Honcho entity memory
     supermemory — SuperMemory cloud API
+    hindsight   — Hindsight/Hermes memory provider
 
 CLI usage:
     hermes mnemosyne import --from mem0 --api-key sk-xxx
@@ -28,6 +29,7 @@ from .zep import ZepImporter
 from .cognee import CogneeImporter
 from .honcho import HonchoImporter
 from .supermemory import SuperMemoryImporter
+from .hindsight import HindsightImporter, import_from_hindsight
 from .agentic import (
     AgenticImporter,
     generate_migration_script,
@@ -91,6 +93,15 @@ PROVIDERS = {
         "env_key": "SUPERMEMORY_API_KEY",
         "pypi_package": "supermemory",
         "description": "Cloud memory API with container tags and document management.",
+    },
+    "hindsight": {
+        "name": "Hindsight",
+        "class": HindsightImporter,
+        "module": "hindsight",
+        "docs": "https://github.com/vectorize-io/hindsight",
+        "env_key": None,
+        "pypi_package": None,
+        "description": "Hermes memory provider. Imports consolidated memories into episodic storage while preserving timestamps and metadata.",
     },
 }
 
