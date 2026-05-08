@@ -62,8 +62,8 @@ setup(
     extras_require={
         "llm": ["ctransformers>=0.2.27", "huggingface-hub>=0.20"],
         "embeddings": ["fastembed>=0.3.0"],
-        "mcp": ["mcp>=1.0.0", "anyio>=4.0"],
-        "all": ["ctransformers>=0.2.27", "huggingface-hub>=0.20", "fastembed>=0.3.0", "mcp>=1.0.0", "anyio>=4.0"],
+        "mcp": ["mcp>=1.0.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'"],
+        "all": ["ctransformers>=0.2.27", "huggingface-hub>=0.20", "fastembed>=0.3.0", "mcp>=1.0.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'"],
     },
     entry_points={
         "console_scripts": [
