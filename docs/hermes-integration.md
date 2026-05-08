@@ -80,6 +80,12 @@ hermes mnemosyne inspect "query"    # Search memories
 hermes mnemosyne sleep              # Run consolidation
 hermes mnemosyne export --output backup.json
 hermes mnemosyne import --input backup.json
+
+# Import historical Hindsight memories via PR #28's timestamp-preserving importer
+hermes mnemosyne import --from hindsight --file hindsight-export.json --bank hermes
+hermes mnemosyne import --from hindsight --input hindsight-export.json --bank hermes
+hermes mnemosyne import --from hindsight --base-url http://localhost:8888 --bank hermes
+
 hermes mnemosyne clear              # Clear scratchpad
 hermes mnemosyne version            # Show version
 ```

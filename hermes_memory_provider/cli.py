@@ -37,12 +37,14 @@ def register_cli(subparser):
 
     import_cmd = mn_cmds.add_parser("import", help="Import memories from a JSON file or another provider")
     import_cmd.add_argument("--input", "-i", type=str, help="Input JSON file path (for file imports)")
+    import_cmd.add_argument("--file", type=str, help="Provider file input, e.g. Hindsight JSON export")
     import_cmd.add_argument("--force", action="store_true", help="Overwrite existing records (file import)")
     import_cmd.add_argument("--from", dest="from_provider", type=str, help="Provider to import from (e.g., 'mem0')")
     import_cmd.add_argument("--api-key", type=str, help="Provider API key (or set env var)")
     import_cmd.add_argument("--user-id", type=str, help="Filter by user ID (provider-specific)")
     import_cmd.add_argument("--agent-id", type=str, help="Filter by agent ID (provider-specific)")
     import_cmd.add_argument("--base-url", type=str, help="Provider base URL (for self-hosted)")
+    import_cmd.add_argument("--bank", type=str, help="Provider memory bank, e.g. Hindsight bank")
     import_cmd.add_argument("--dry-run", action="store_true", help="Validate but don't import")
     import_cmd.add_argument("--session-id", type=str, help="Override session for imported memories")
     import_cmd.add_argument("--channel-id", type=str, help="Channel for imported memories")
@@ -187,6 +189,53 @@ def mnemosyne_command(args):
             agent_id = getattr(args, "agent_id", None)
             base_url = getattr(args, "base_url", None)
 
+            def _print_import_result(result):
+                print(f"\nImport complete:")
+                print(f"  Total found: {result.total}")
+                print(f"  Imported:    {result.imported}")
+                print(f"  Skipped:     {result.skipped}")
+                print(f"  Failed:      {result.failed}")
+                if result.errors:
+                    print(f"  Errors:")
+                    for err in result.errors[:10]:
+                        print(f"    - {err}")
+                    if len(result.errors) > 10:
+                        print(f"    ... and {len(result.errors) - 10} more")
+
+            if cross_provider == "hindsight":
+                file_path = getattr(args, "file", None) or input_path
+                bank = getattr(args, "bank", None) or "hermes"
+                if not file_path and not base_url:
+                    print("Error: Hindsight import requires --file/--input or --base-url.")
+                    return 1
+
+                print("Importing from hindsight...")
+                if dry_run:
+                    print("  (dry-run mode: no memories will be written)")
+
+                try:
+                    from mnemosyne.core.importers import import_from_provider
+                    import_kwargs = {
+                        "file_path": file_path,
+                        "base_url": base_url,
+                        "bank": bank,
+                        "dry_run": dry_run,
+                        "session_id": session_id,
+                        "channel_id": channel_id,
+                    }
+                    result = import_from_provider(
+                        "hindsight", mem,
+                        **import_kwargs,
+                    )
+                    _print_import_result(result)
+                    return 0 if result.failed == 0 else 1
+                except ValueError as e:
+                    print(f"Error: {e}")
+                    return 1
+                except Exception as e:
+                    print(f"Import failed: {e}")
+                    return 1
+
             # Try env var fallback
             import os
             if not api_key:
@@ -215,17 +264,7 @@ def mnemosyne_command(args):
                     session_id=session_id,
                     channel_id=channel_id,
                 )
-                print(f"\nImport complete:")
-                print(f"  Total found: {result.total}")
-                print(f"  Imported:    {result.imported}")
-                print(f"  Skipped:     {result.skipped}")
-                print(f"  Failed:      {result.failed}")
-                if result.errors:
-                    print(f"  Errors:")
-                    for err in result.errors[:10]:
-                        print(f"    - {err}")
-                    if len(result.errors) > 10:
-                        print(f"    ... and {len(result.errors) - 10} more")
+                _print_import_result(result)
                 return 0 if result.failed == 0 else 1
             except ValueError as e:
                 print(f"Error: {e}")

@@ -654,6 +654,11 @@ mnemosyne export backup.json
 mnemosyne import backup.json
 mnemosyne import-hindsight export.json [bank]      # Import Hindsight JSON
 mnemosyne import-hindsight http://localhost:8888    # Import from live API
+
+# Hermes CLI routes through the same HindsightImporter, preserving timestamps
+hermes mnemosyne import --from hindsight --file export.json --bank hermes
+hermes mnemosyne import --from hindsight --input export.json --bank hermes
+hermes mnemosyne import --from hindsight --base-url http://localhost:8888 --bank hermes
 mnemosyne bank list
 mnemosyne bank create work
 mnemosyne bank delete work
