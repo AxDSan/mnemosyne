@@ -13,15 +13,21 @@ FTS5 for full-text retrieval.
 Hybrid ranking: 50% vector + 30% FTS rank + 20% importance.
 """
 
+from __future__ import annotations
+
 import sqlite3
 import json
 import hashlib
 import threading
 import math
-import numpy as np
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any, Set, Union
 from pathlib import Path
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 from mnemosyne.core import embeddings as _embeddings
 
@@ -665,6 +671,8 @@ def _find_memories_by_fact(beam: "BeamMemory", query: str) -> List[str]:
 
 def _in_memory_vec_search(conn: sqlite3.Connection, query_embedding: np.ndarray, k: int = 20) -> List[Dict]:
     """Fallback vector search using memory_embeddings table + numpy cosine similarity."""
+    if np is None:
+        return []
     cursor = conn.cursor()
     # Join with episodic_memory (not memories) since that's where BEAM stores consolidated data
     cursor.execute("""

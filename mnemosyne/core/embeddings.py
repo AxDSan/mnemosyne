@@ -4,19 +4,25 @@ Local embedding-based memory retrieval using fastembed (ONNX, no PyTorch).
 Falls back to keyword-only if fastembed is unavailable.
 """
 
+from __future__ import annotations
+
 import json
 import os
-import numpy as np
 from typing import List, Optional
 from functools import lru_cache
 
-# Optional dependency
+# Optional dependencies
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
 try:
     from fastembed import TextEmbedding
-    _FASTEMBED_AVAILABLE = True
 except Exception:
-    _FASTEMBED_AVAILABLE = False
     TextEmbedding = None
+
+_FASTEMBED_AVAILABLE = np is not None and TextEmbedding is not None
 
 _DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 _embedding_model = None
