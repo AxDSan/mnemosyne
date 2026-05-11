@@ -244,20 +244,19 @@ class TripleStore:
         [DEPRECATED post-E6] Use AnnotationStore.add_many(memory_id, "fact", facts).
 
         Multi-fact storage is an annotation use case — multiple values per
-        `(memory_id, "fact")` key should coexist. This legacy implementation
-        calls `TripleStore.add()` per fact, which silently invalidates each
+        `(memory_id, "fact")` key should coexist. The pre-E6 implementation
+        called `TripleStore.add()` per fact, which silently invalidated each
         prior fact on the next write because the invalidation key is
-        `(subject, predicate)` regardless of object. Existing reads via
-        `query_by_predicate("fact")` happen to still surface all rows
-        because that method does not filter by `valid_until`, so the bug
-        is latent rather than active for current production read paths —
-        but the data semantics are wrong.
+        `(subject, predicate)` regardless of object.
 
-        Behavior is preserved for backward compatibility. The PR migrates
-        production callers (`Mnemosyne.remember`, `BeamMemory` ingest
-        helpers) to `AnnotationStore` directly so the deprecation warning
-        is silent in the official code paths. External callers see the
-        DeprecationWarning and should migrate.
+        Post-E6, this shim routes writes to `AnnotationStore` so external
+        callers' facts land in the table the new recall path reads from
+        (`_find_memories_by_fact`). Without this redirect, deprecation-period
+        callers would get a successful return code but their facts would be
+        invisible to `Mnemosyne.recall()` until the next BeamMemory init
+        auto-migrated them out of the triples table — a real silent
+        behavior change. Routing through AnnotationStore makes the shim
+        compatibility-correct.
 
         Args:
             memory_id: The subject memory ID
@@ -267,32 +266,27 @@ class TripleStore:
 
         Returns:
             Number of facts stored (matches legacy filtering: drops empty
-            and shorter-than-10-char entries)
+            and shorter-than-10-char entries). With INSERT OR IGNORE on the
+            UNIQUE(memory_id, kind, value) index, duplicate facts are
+            silently de-duped — the count reflects facts kept after both
+            length filtering and uniqueness.
         """
         import warnings
         warnings.warn(
             "TripleStore.add_facts is deprecated post-E6. Use "
             "AnnotationStore.add_many(memory_id, 'fact', facts) directly. "
-            "This shim preserves legacy write behavior (writes to the "
-            "triples table with auto-invalidation) for backward compat; "
-            "it will be removed in a future release.",
+            "This shim routes writes to AnnotationStore so the data lands "
+            "where the post-E6 recall path looks for it; it will be "
+            "removed in a future release.",
             DeprecationWarning,
             stacklevel=2,
         )
-        # Use the shared filter so the threshold can't drift from the
-        # production extraction call sites.
-        from mnemosyne.core.annotations import filter_facts
+        from mnemosyne.core.annotations import AnnotationStore, filter_facts
         kept = filter_facts(facts)
-
-        for fact in kept:
-            self.add(
-                subject=memory_id,
-                predicate="fact",
-                object=fact,
-                source=source,
-                confidence=confidence
-            )
-
+        if not kept:
+            return 0
+        store = AnnotationStore(db_path=self.db_path)
+        store.add_many(memory_id, "fact", kept, source=source, confidence=confidence)
         return len(kept)
 
     def export_all(self) -> List[Dict]:

@@ -694,14 +694,16 @@ def _extract_and_store_entities(beam: "BeamMemory", memory_id: str, content: str
     """
     try:
         from mnemosyne.core.entities import extract_entities_regex
-        from mnemosyne.core.annotations import AnnotationStore
 
         entities = extract_entities_regex(content)
         if not entities:
             return
 
-        annotations = AnnotationStore(db_path=beam.db_path)
-        annotations.add_many(
+        # Reuse BeamMemory's shared AnnotationStore (cached on the beam
+        # instance, shares the thread-local connection). UNIQUE constraint
+        # on (memory_id, kind, value) plus INSERT OR IGNORE makes this
+        # idempotent — re-extraction on duplicate-content writes is a no-op.
+        beam.annotations.add_many(
             memory_id=memory_id,
             kind="mentions",
             values=entities,
@@ -729,7 +731,7 @@ def _extract_and_store_facts(beam: "BeamMemory", memory_id: str, content: str, s
     """
     try:
         from mnemosyne.core.extraction import extract_facts_safe
-        from mnemosyne.core.annotations import AnnotationStore, filter_facts
+        from mnemosyne.core.annotations import filter_facts
 
         facts = extract_facts_safe(content)
         if not facts:
@@ -738,8 +740,7 @@ def _extract_and_store_facts(beam: "BeamMemory", memory_id: str, content: str, s
         # Filter to match the legacy filtering applied by TripleStore.add_facts.
         kept = filter_facts(facts)
         if kept:
-            annotations = AnnotationStore(db_path=beam.db_path)
-            annotations.add_many(
+            beam.annotations.add_many(
                 memory_id=memory_id,
                 kind="fact",
                 values=kept,
@@ -804,12 +805,9 @@ def _find_memories_by_entity(beam: "BeamMemory", entity_name: str, threshold: fl
     """
     try:
         from mnemosyne.core.entities import find_similar_entities
-        from mnemosyne.core.annotations import AnnotationStore
 
-        annotations = AnnotationStore(db_path=beam.db_path)
-
-        # Get all known entities
-        known_entities = annotations.get_distinct_values("mentions")
+        # Get all known entities (uses BeamMemory's cached AnnotationStore)
+        known_entities = beam.annotations.get_distinct_values("mentions")
         if not known_entities:
             return []
 
@@ -819,7 +817,7 @@ def _find_memories_by_entity(beam: "BeamMemory", entity_name: str, threshold: fl
         # Collect memory IDs for all matched entities
         memory_ids: Set[str] = set()
         for matched_entity, _ in matches:
-            results = annotations.query_by_kind("mentions", value=matched_entity)
+            results = beam.annotations.query_by_kind("mentions", value=matched_entity)
             for row in results:
                 memory_ids.add(row["memory_id"])
 
@@ -838,12 +836,8 @@ def _find_memories_by_fact(beam: "BeamMemory", query: str) -> List[str]:
     facts now all surface (silent-destruction bug fixed).
     """
     try:
-        from mnemosyne.core.annotations import AnnotationStore
-
-        annotations = AnnotationStore(db_path=beam.db_path)
-
-        # Get all fact annotations
-        all_facts = annotations.query_by_kind("fact")
+        # Get all fact annotations (uses BeamMemory's cached AnnotationStore)
+        all_facts = beam.annotations.query_by_kind("fact")
         if not all_facts:
             return []
 
@@ -1116,9 +1110,17 @@ class BeamMemory:
         # E6: ensure schema split + auto-migrate legacy TripleStore rows
         # to AnnotationStore. Honors MNEMOSYNE_AUTO_MIGRATE=0 for operators
         # who want explicit control. See:
-        # - scripts/migrate_triplestore_split.py
+        # - mnemosyne/migrations/e6_triplestore_split.py
         # - .hermes/ledger/memory-contract.md (E6)
         self._ensure_e6_schema_with_migration()
+
+        # E6: shared AnnotationStore handle reusing this BeamMemory's
+        # thread-local connection. Production call sites use `self.annotations`
+        # instead of constructing fresh AnnotationStore(...) per call —
+        # eliminates the per-call file-descriptor cost the post-E6 review
+        # surfaced (every extraction/recall opened 2 connections + ran DDL).
+        from mnemosyne.core.annotations import AnnotationStore
+        self.annotations = AnnotationStore(db_path=self.db_path, conn=self.conn)
 
         # Phase 3: Episodic graph (shared connection)
         self.episodic_graph = None
@@ -1587,17 +1589,16 @@ class BeamMemory:
         "user prefers X". Method name kept for backward compat.
         """
         try:
-            from mnemosyne.core.annotations import AnnotationStore
             date_str = timestamp[:10]  # YYYY-MM-DD
-            annotations = AnnotationStore(db_path=self.db_path)
-            annotations.add(
+            # Reuse the cached AnnotationStore handle on self.
+            self.annotations.add(
                 memory_id=memory_id,
                 kind="occurred_on",
                 value=date_str,
             )
             # Also tag source type
             if source and source not in ("conversation", "user", "assistant"):
-                annotations.add(
+                self.annotations.add(
                     memory_id=memory_id,
                     kind="has_source",
                     value=source,

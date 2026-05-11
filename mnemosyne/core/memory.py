@@ -353,11 +353,13 @@ class Mnemosyne:
         if extract_entities:
             try:
                 from mnemosyne.core.entities import extract_entities_regex
-                from mnemosyne.core.annotations import AnnotationStore
                 entities = extract_entities_regex(content)
                 if entities:
-                    annotations = AnnotationStore(db_path=self.db_path)
-                    annotations.add_many(
+                    # Reuse BeamMemory's cached AnnotationStore — no per-call
+                    # connection opening. UNIQUE constraint on
+                    # (memory_id, kind, value) makes this idempotent under
+                    # repeated remember() with the same content.
+                    self.beam.annotations.add_many(
                         memory_id=memory_id,
                         kind="mentions",
                         values=entities,
@@ -371,14 +373,13 @@ class Mnemosyne:
         if extract:
             try:
                 from mnemosyne.core.extraction import extract_facts_safe
-                from mnemosyne.core.annotations import AnnotationStore, filter_facts
+                from mnemosyne.core.annotations import filter_facts
                 facts = extract_facts_safe(content)
                 if facts:
                     # E6: Use proper filter_facts from annotations (replaces inline len check)
                     kept = filter_facts(facts)
                     if kept:
-                        annotations = AnnotationStore(db_path=self.db_path)
-                        annotations.add_many(
+                        self.beam.annotations.add_many(
                             memory_id=memory_id,
                             kind="fact",
                             values=kept,

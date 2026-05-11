@@ -117,13 +117,14 @@ def test_extract_facts_safe_exception_handling():
 def test_triplestore_add_facts():
     """Test TripleStore.add_facts() batch storage.
 
-    Post-E6: add_facts is deprecated (emits DeprecationWarning) but still
-    writes to the triples table for backward compatibility. Verifies the
-    legacy filtering behavior and write path are preserved during the
-    deprecation period. Production callers are migrated to AnnotationStore
-    directly elsewhere in this PR.
+    Post-E6: add_facts is a deprecation shim that routes writes to the
+    AnnotationStore (not the triples table). This was changed during the
+    /review adversarial pass — pre-redirect, deprecated callers' facts
+    went into the triples table but the new recall path read from
+    annotations, making the facts silently invisible.
     """
     import warnings
+    from mnemosyne.core.annotations import AnnotationStore
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test.db"
@@ -141,13 +142,12 @@ def test_triplestore_add_facts():
 
         assert count == 2  # "x" filtered out
 
-        # Legacy behavior: facts still readable via query_by_predicate
-        # (which does not filter by valid_until, so silent-invalidation
-        # is latent rather than data-destroying for this read path).
-        all_facts = triples.query_by_predicate("fact")
+        # Post-E6: facts land in annotations where the recall path looks.
+        ann_store = AnnotationStore(db_path=db_path)
+        all_facts = ann_store.query_by_memory(memory_id="mem_123", kind="fact")
         assert len(all_facts) == 2
-        assert all(f["subject"] == "mem_123" for f in all_facts)
-        assert all(f["predicate"] == "fact" for f in all_facts)
+        assert all(f["memory_id"] == "mem_123" for f in all_facts)
+        assert all(f["kind"] == "fact" for f in all_facts)
         assert all(f["confidence"] == 0.7 for f in all_facts)
 
         print("PASS: test_triplestore_add_facts")

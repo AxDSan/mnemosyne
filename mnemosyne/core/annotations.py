@@ -74,8 +74,20 @@ def init_annotations(db_path: Optional[Path] = None) -> None:
     """Create the annotations table and supporting indexes if absent.
 
     Idempotent. Safe to call on databases that already have the table.
+    Opens and closes its own connection; does not leak file descriptors.
     """
     conn = _get_conn(db_path)
+    try:
+        _init_annotations_with_conn(conn)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _init_annotations_with_conn(conn: sqlite3.Connection) -> None:
+    """Run schema DDL on an existing connection. Caller owns conn lifetime."""
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -102,6 +114,16 @@ def init_annotations(db_path: Optional[Path] = None) -> None:
         "CREATE INDEX IF NOT EXISTS idx_annot_kind_value "
         "ON annotations(kind, value)"
     )
+    # UNIQUE on (memory_id, kind, value) makes concurrent ingest and migration
+    # safe against duplicate inserts. Use a unique INDEX rather than a column
+    # constraint so existing tables (created by earlier dev/test runs) acquire
+    # the guarantee on next init via the IF NOT EXISTS clause — no migration
+    # required. Writers pair this with INSERT OR IGNORE so concurrent inserts
+    # of the same logical annotation are idempotent.
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_annot_unique "
+        "ON annotations(memory_id, kind, value)"
+    )
 
     conn.commit()
 
@@ -119,10 +141,30 @@ class AnnotationStore:
          {'memory_id': 'mem-42', 'kind': 'mentions', 'value': 'Bob', ...}]
     """
 
-    def __init__(self, db_path: Optional[Path] = None):
+    def __init__(
+        self,
+        db_path: Optional[Path] = None,
+        conn: Optional[sqlite3.Connection] = None,
+    ):
+        """Create an AnnotationStore handle.
+
+        When ``conn`` is provided the store reuses that connection — this is
+        how BeamMemory shares its thread-local connection with the store,
+        avoiding the per-call file-descriptor cost of opening fresh
+        connections for every entity/fact extraction or recall pass. The
+        caller owns the connection's lifetime.
+
+        When ``conn`` is None, AnnotationStore opens its own connection (the
+        standalone / convenience path).
+        """
         self.db_path = db_path or DEFAULT_DB
-        init_annotations(self.db_path)
-        self.conn = _get_conn(self.db_path)
+        if conn is not None:
+            self.conn = conn
+            # Ensure schema exists on the shared connection — idempotent.
+            _init_annotations_with_conn(conn)
+        else:
+            init_annotations(self.db_path)
+            self.conn = _get_conn(self.db_path)
 
     # ------------------------------------------------------------------
     # Writes
@@ -144,7 +186,7 @@ class AnnotationStore:
         cursor = self.conn.cursor()
         cursor.execute(
             """
-            INSERT INTO annotations (memory_id, kind, value, source, confidence)
+            INSERT OR IGNORE INTO annotations (memory_id, kind, value, source, confidence)
             VALUES (?, ?, ?, ?, ?)
             """,
             (memory_id, kind, value, source, confidence),
@@ -178,7 +220,7 @@ class AnnotationStore:
         cursor = self.conn.cursor()
         cursor.executemany(
             """
-            INSERT INTO annotations (memory_id, kind, value, source, confidence)
+            INSERT OR IGNORE INTO annotations (memory_id, kind, value, source, confidence)
             VALUES (?, ?, ?, ?, ?)
             """,
             rows,

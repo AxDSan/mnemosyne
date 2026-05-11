@@ -51,9 +51,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from mnemosyne.migrations.e6_triplestore_split import migrate
 
 
-# Canonical DB path matches mnemosyne.core.triples.DEFAULT_DB and
-# mnemosyne.core.annotations.DEFAULT_DB. Keep in sync if those move.
-CANONICAL_DB = Path.home() / ".hermes" / "mnemosyne" / "data" / "triples.db"
+# Canonical DB path matches mnemosyne.core.beam.DEFAULT_DB_PATH and
+# mnemosyne.core.memory.DEFAULT_DB_PATH — i.e., where Mnemosyne actually
+# stores production data. NOT mnemosyne.core.triples.DEFAULT_DB, which is a
+# standalone fallback used only when TripleStore is instantiated without a
+# db_path. The migration must target the active Mnemosyne DB.
+CANONICAL_DB = Path.home() / ".hermes" / "mnemosyne" / "data" / "mnemosyne.db"
 
 
 def main(argv: Optional[List[str]] = None) -> int:
