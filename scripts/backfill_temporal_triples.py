@@ -10,6 +10,18 @@ Usage:
     python scripts/backfill_temporal_triples.py [--dry-run]
 
 This is a one-time migration script for Mnemosyne v1.13.0.
+
+Post-E6 note
+------------
+This script writes occurred_on / has_source rows into the legacy `triples`
+table. Post-E6, those rows belong in the `annotations` table — but they
+will be relocated automatically on the next `BeamMemory()` init via the
+auto-migrate hook (or by `python scripts/migrate_triplestore_split.py`
+when MNEMOSYNE_AUTO_MIGRATE=0). So this script remains correct in its
+data semantics; it just adds an extra migration hop. Prefer running on
+a fresh / pre-E6 database; on a post-E6 database the new annotations
+are written directly by BeamMemory.remember() and the backfill is
+typically unnecessary.
 """
 
 import os

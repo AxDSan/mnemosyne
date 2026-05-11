@@ -78,11 +78,20 @@ def collect():
             ep["recent"].append({"id": r[0], "preview": (r[1] or "")[:70], "imp": r[2], "date": r[3]})
     s["episodic"] = ep
 
-    # Triples
+    # Triples (current-truth temporal facts; post-E6 scope)
     tg = {"total": cnt(db, "triples"), "predicates": {}}
     for r in q(db, "SELECT predicate, COUNT(*) FROM triples GROUP BY predicate ORDER BY COUNT(*) DESC LIMIT 10"):
         tg["predicates"][r[0]] = r[1]
     s["triples"] = tg
+
+    # Annotations (post-E6: multi-valued memory annotations — mentions, facts,
+    # occurred_on, has_source). Counted separately so operators can see the
+    # split clearly. Pre-E6 databases that haven't been migrated yet will
+    # show 0 here; the BeamMemory auto-migrate hook moves rows on next init.
+    ann = {"total": cnt(db, "annotations"), "kinds": {}}
+    for r in q(db, "SELECT kind, COUNT(*) FROM annotations GROUP BY kind ORDER BY COUNT(*) DESC LIMIT 10"):
+        ann["kinds"][r[0]] = r[1]
+    s["annotations"] = ann
 
     # Consolidation
     con = {"events": cnt(db, "consolidation_log"), "items": 0, "recent": []}
