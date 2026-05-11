@@ -32,6 +32,7 @@ def temp_db():
 
 def _content_to_vec(text: str, dim: int = 384) -> np.ndarray:
     """Deterministic content-encoding 'embedding'. Different content
+<<<<<<< HEAD
     produces different vectors. Spreads signal across many dimensions
     so binarization (sign-based) and other compression schemes can
     detect content changes.
@@ -48,6 +49,30 @@ def _content_to_vec(text: str, dim: int = 384) -> np.ndarray:
         h = hash(text) & 0xFFFF
         v[2] = float(h % 256) * 0.01
         v[3] = float((h >> 8) % 256) * 0.01
+=======
+    produces different vectors AND different sign patterns, so the
+    sign-bit binarizer in binary_vectors.py also produces different
+    bytes. Without sign-pattern variation, two distinct strings would
+    binarize to identical bytes and the binary_vector regeneration
+    assertion couldn't tell whether refresh ran."""
+    v = np.zeros(dim, dtype=np.float32)
+    if not text:
+        return v
+    # Spread 32 bits of the content hash across the leading dims as
+    # signed ±1.0 — one sign per hash bit. Two distinct strings produce
+    # two distinct hashes → ~16 differing sign bits → distinct binary
+    # vectors after sign-bit binarization. (Python's hash() is salted
+    # per process by PYTHONHASHSEED but stable within a process, which
+    # is all we need here.)
+    h = hash(text) & 0xFFFFFFFF
+    for i in range(32):
+        v[i] = 1.0 if (h >> i) & 1 else -1.0
+    # Length and first-char in dims past the sign-bit block so the
+    # float-embedding-differs assertions still see length/content
+    # signal layered on top of the hash-driven sign pattern.
+    v[32] = float(len(text))
+    v[33] = float(ord(text[0]))
+>>>>>>> bb590e4 (test(c18.b): fix sign-pattern collision in degrade_vector fixture)
     return v
 
 
