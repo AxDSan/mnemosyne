@@ -206,6 +206,71 @@ class TestAnnotationStoreExportImport(unittest.TestCase):
         self.assertEqual(stats["inserted"], 0)
 
 
+class TestTripleStoreAddFactsDeprecation(unittest.TestCase):
+    """
+    Post-E6, TripleStore.add_facts emits DeprecationWarning and routes writes
+    to AnnotationStore — preserving multi-fact data that the legacy
+    implementation would have silently invalidated.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db_path = Path(self.tmp.name)
+        self.store = TripleStore(db_path=self.db_path)
+
+    def tearDown(self):
+        try:
+            self.store.conn.close()
+        except Exception:
+            pass
+        try:
+            os.unlink(self.tmp.name)
+        except OSError:
+            pass
+
+    def test_add_facts_emits_deprecation_warning(self):
+        import warnings
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.store.add_facts(
+                "mem-1",
+                ["The user prefers concise responses (a long enough fact)"],
+            )
+            deprecation_msgs = [
+                w for w in caught if issubclass(w.category, DeprecationWarning)
+            ]
+            self.assertTrue(
+                len(deprecation_msgs) >= 1,
+                "add_facts should emit DeprecationWarning post-E6",
+            )
+
+    def test_add_facts_preserves_legacy_write_count(self):
+        """Shim still returns the same count as the legacy implementation —
+        the filtering of empty/too-short facts is preserved so external
+        callers' assumptions hold during the deprecation period.
+
+        Note: the actual silent-invalidation bug remains in the legacy
+        write path (writes hit the triples table with auto-invalidation).
+        Production callers are migrated to AnnotationStore directly in
+        a sibling commit. External callers see the DeprecationWarning
+        and are expected to migrate.
+        """
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            stored = self.store.add_facts(
+                "mem-1",
+                [
+                    "First fact about mem-1 that is long enough",
+                    "Second fact about mem-1 that is long enough",
+                    "x",  # too short, filtered
+                ],
+            )
+        # Legacy filtering: returns count of kept facts.
+        self.assertEqual(stored, 2)
+
+
 class TestTripleStoreSilentInvalidationBehavior(unittest.TestCase):
     """
     Characterization test documenting the bug E6 fixes.

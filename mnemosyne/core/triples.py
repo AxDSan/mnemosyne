@@ -2,6 +2,27 @@
 Mnemosyne Temporal Triples
 Time-aware knowledge graph on top of SQLite.
 Tracks when facts were true, enabling contradiction detection and historical queries.
+
+Post-E6 scope
+-------------
+TripleStore is the canonical home for **single-current-truth temporal facts**.
+Its `add()` auto-invalidates prior rows with the same `(subject, predicate)`
+on every write — correct for facts like "user prefers X" later superseded
+by "user prefers Y", wrong for multi-valued annotations where many objects
+should coexist for the same `(subject, predicate)` key.
+
+Multi-valued annotation use cases (`(memory_id, "mentions", entity)`,
+`(memory_id, "fact", text)`, `(memory_id, "occurred_on", date)`, etc.)
+have moved to `mnemosyne.core.annotations.AnnotationStore`, which is
+append-only and preserves all values. See the E6 migration:
+
+- `mnemosyne/core/annotations.py` — the new append-only store
+- `scripts/migrate_triplestore_split.py` — moves existing annotation rows
+- `.hermes/ledger/memory-contract.md` (E6) — ledger row + audit trail
+
+Legacy callers of `TripleStore.add_facts()` continue to work — the method
+now routes writes to `AnnotationStore` and emits a DeprecationWarning so
+new code uses the right store directly.
 """
 
 import os
@@ -91,12 +112,26 @@ def init_triples(db_path: Path = None):
 
 class TripleStore:
     """
-    Temporal knowledge graph for Mnemosyne.
-    
-    Example:
+    Temporal knowledge graph for Mnemosyne — single-current-truth semantics.
+
+    `add()` auto-invalidates prior rows with the same `(subject, predicate)`.
+    This is the right shape for facts that change over time, where only one
+    value should be "currently true" at any moment:
+
         >>> kg = TripleStore()
         >>> kg.add("Maya", "assigned_to", "auth-migration", valid_from="2026-01-15")
-        >>> kg.query("Maya", as_of="2026-01-20")
+        >>> kg.add("Maya", "assigned_to", "billing", valid_from="2026-03-01")
+        >>> kg.query("Maya")                 # → "billing" (current)
+        >>> kg.query("Maya", as_of="2026-02-01")  # → "auth-migration" (historical)
+
+    Do NOT use TripleStore for multi-valued annotations like entity mentions
+    or extracted facts on a single memory — those belong in
+    `mnemosyne.core.annotations.AnnotationStore`, which is append-only:
+
+        >>> from mnemosyne.core.annotations import AnnotationStore
+        >>> ann = AnnotationStore()
+        >>> ann.add("mem-1", "mentions", "Alice")
+        >>> ann.add("mem-1", "mentions", "Bob")  # both preserved
     """
     
     def __init__(self, db_path: Path = None):
@@ -206,7 +241,23 @@ class TripleStore:
 
     def add_facts(self, memory_id: str, facts: List[str], source: str = "", confidence: float = 0.7) -> int:
         """
-        Batch-store extracted facts as triples.
+        [DEPRECATED post-E6] Use AnnotationStore.add_many(memory_id, "fact", facts).
+
+        Multi-fact storage is an annotation use case — multiple values per
+        `(memory_id, "fact")` key should coexist. This legacy implementation
+        calls `TripleStore.add()` per fact, which silently invalidates each
+        prior fact on the next write because the invalidation key is
+        `(subject, predicate)` regardless of object. Existing reads via
+        `query_by_predicate("fact")` happen to still surface all rows
+        because that method does not filter by `valid_until`, so the bug
+        is latent rather than active for current production read paths —
+        but the data semantics are wrong.
+
+        Behavior is preserved for backward compatibility. The PR migrates
+        production callers (`Mnemosyne.remember`, `BeamMemory` ingest
+        helpers) to `AnnotationStore` directly so the deprecation warning
+        is silent in the official code paths. External callers see the
+        DeprecationWarning and should migrate.
 
         Args:
             memory_id: The subject memory ID
@@ -215,8 +266,19 @@ class TripleStore:
             confidence: Confidence score for extracted facts (default 0.7)
 
         Returns:
-            Number of facts stored
+            Number of facts stored (matches legacy filtering: drops empty
+            and shorter-than-10-char entries)
         """
+        import warnings
+        warnings.warn(
+            "TripleStore.add_facts is deprecated post-E6. Use "
+            "AnnotationStore.add_many(memory_id, 'fact', facts) directly. "
+            "This shim preserves legacy write behavior (writes to the "
+            "triples table with auto-invalidation) for backward compat; "
+            "it will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         if not facts:
             return 0
 

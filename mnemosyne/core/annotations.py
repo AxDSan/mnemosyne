@@ -33,6 +33,20 @@ from typing import List, Dict, Optional
 DEFAULT_DB = Path.home() / ".hermes" / "mnemosyne" / "data" / "triples.db"
 
 
+# Known annotation kinds in production use. The migration script (E6) uses
+# this set to classify rows in the legacy `triples` table: predicates in
+# this set move to `annotations`; anything else stays in `temporal_triples`
+# (current-truth semantics) or — if it cannot be unambiguously classified —
+# defaults to `annotations` (the safer choice given that the silent-
+# invalidation bug only affects the auto-invalidating temporal store).
+ANNOTATION_KINDS = frozenset({
+    "mentions",
+    "fact",
+    "occurred_on",
+    "has_source",
+})
+
+
 def _get_conn(db_path: Optional[Path] = None) -> sqlite3.Connection:
     path = Path(db_path) if db_path else DEFAULT_DB
     path.parent.mkdir(parents=True, exist_ok=True)

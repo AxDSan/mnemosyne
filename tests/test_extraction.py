@@ -115,28 +115,41 @@ def test_extract_facts_safe_exception_handling():
 
 
 def test_triplestore_add_facts():
-    """Test TripleStore.add_facts() batch storage."""
+    """Test TripleStore.add_facts() batch storage.
+
+    Post-E6: add_facts is deprecated (emits DeprecationWarning) but still
+    writes to the triples table for backward compatibility. Verifies the
+    legacy filtering behavior and write path are preserved during the
+    deprecation period. Production callers are migrated to AnnotationStore
+    directly elsewhere in this PR.
+    """
+    import warnings
+
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test.db"
         init_triples(db_path)
-        
+
         triples = TripleStore(db_path=db_path)
-        count = triples.add_facts(
-            "mem_123",
-            ["The user loves coffee", "The user hates mornings", "x"],  # "x" too short
-            source="test",
-            confidence=0.7
-        )
-        
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            count = triples.add_facts(
+                "mem_123",
+                ["The user loves coffee", "The user hates mornings", "x"],  # "x" too short
+                source="test",
+                confidence=0.7
+            )
+
         assert count == 2  # "x" filtered out
-        
-        # Verify stored
+
+        # Legacy behavior: facts still readable via query_by_predicate
+        # (which does not filter by valid_until, so silent-invalidation
+        # is latent rather than data-destroying for this read path).
         all_facts = triples.query_by_predicate("fact")
         assert len(all_facts) == 2
         assert all(f["subject"] == "mem_123" for f in all_facts)
         assert all(f["predicate"] == "fact" for f in all_facts)
         assert all(f["confidence"] == 0.7 for f in all_facts)
-        
+
         print("PASS: test_triplestore_add_facts")
 
 
