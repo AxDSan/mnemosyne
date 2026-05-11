@@ -1525,6 +1525,11 @@ class BeamMemory:
         else:
             th_halflife = float(os.environ.get("MNEMOSYNE_TEMPORAL_HALFLIFE_HOURS", "24"))
 
+        # [C4] Recall path diagnostics — lazy import to avoid module-
+        # load coupling.
+        from mnemosyne.core.recall_diagnostics import get_diagnostics as _get_recall_diag
+        _recall_diag = _get_recall_diag()
+
         # ---- Working memory (FTS5 fast path) ----
         try:
             wm_fts = _fts_search_working(self.conn, query, k=max(top_k * 3, 50))
@@ -1533,6 +1538,10 @@ class BeamMemory:
 
         wm_ids = {r["id"] for r in wm_fts}
         wm_ranks = {r["id"]: r["rank"] for r in wm_fts}
+        # Record FTS hit count (0 if FTS errored or returned no matches —
+        # the diagnostics counter doesn't distinguish, but `wm_fallback`
+        # below catches the both-failed case).
+        _recall_diag.record_tier_hits("wm_fts", len(wm_fts))
 
         # ---- Working memory (vector search) ----
         wm_vec_sims = {}
@@ -1540,13 +1549,23 @@ class BeamMemory:
             try:
                 emb_result = _embeddings.embed_query(query)
                 if emb_result is not None:
-                    wm_vec = _wm_vec_search(self.conn, emb_result, 
+                    wm_vec = _wm_vec_search(self.conn, emb_result,
                                               k=max(top_k, 20) if _BEAM_MODE else max(top_k * 3, 50))
                     for vr in wm_vec:
                         wm_vec_sims[vr["id"]] = vr["sim"]
                         wm_ids.add(vr["id"])  # Merge vector results with FTS5 results
             except Exception:
                 pass
+        # Count vec-only contributions (rows in vec but not FTS).
+        # Rows in both wm_ranks and wm_vec_sims belong to wm_fts;
+        # vec-only rows are the unique vector contribution.
+        _wm_vec_only = set(wm_vec_sims) - set(wm_ranks)
+        _recall_diag.record_tier_hits("wm_vec", len(_wm_vec_only))
+        # If both FTS and vec produced nothing, the fallback at the
+        # else-branch below fires. Pre-fix this was silent.
+        _wm_fallback_used = not wm_ids
+        if _wm_fallback_used:
+            _recall_diag.record_fallback_used(wm=True)
 
         # Build temporal filter clause for working memory
         wm_where_clauses = [
@@ -1618,6 +1637,11 @@ class BeamMemory:
                 LIMIT {min(EPISODIC_RECALL_LIMIT, 2000)}
             """, wm_params)
             rows = cursor.fetchall()
+            # [C4] Record fallback hit count so operators see how
+            # many results came from this weak-signal path. Note: this
+            # path is reached only when both FTS and vec produced no
+            # ids — so `_wm_fallback_used` is already True above.
+            _recall_diag.record_tier_hits("wm_fallback", len(rows))
 
         # Precompute min_rank/rng for wm_ranks normalization
         if wm_ranks:
@@ -1958,6 +1982,14 @@ class BeamMemory:
                 fts_results[fr["rowid"]] = normalized
 
         episodic_rowids = set(vec_results.keys()) | set(fts_results.keys())
+        # [C4] Record episodic FTS / vec hit counts so operators see
+        # the primary-vs-fallback distribution. fts and vec sets are
+        # disjoint after dedup: a rowid in both counts once under
+        # _em_overlap (or could count under fts; deduplicate by
+        # crediting vec-only hits to vec, FTS hits to fts).
+        _em_vec_only = set(vec_results) - set(fts_results)
+        _recall_diag.record_tier_hits("em_fts", len(fts_results))
+        _recall_diag.record_tier_hits("em_vec", len(_em_vec_only))
         
         # Build temporal filter for episodic memory
         em_where_clauses = [
@@ -2109,6 +2141,12 @@ class BeamMemory:
 
         # Fallback: if no episodic matches from vec/FTS, scan recent episodic entries
         if not episodic_rowids:
+            # [C4] Record EM fallback firing so operators see how
+            # often recall comes from the weak-signal substring path
+            # rather than vec/FTS. High em_fallback_rate during a
+            # benchmark means recall scores aren't measuring what
+            # the experiment thinks they're measuring.
+            _recall_diag.record_fallback_used(em=True)
             cursor = self.conn.cursor()
             cursor.execute(f"""
                 SELECT rowid, id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope, author_id, author_type, channel_id, memory_type, binary_vector
@@ -2117,7 +2155,13 @@ class BeamMemory:
                 ORDER BY timestamp DESC
                 LIMIT {min(EPISODIC_RECALL_LIMIT, 500)}
             """, em_params)
-            for row in cursor.fetchall():
+            _em_fallback_rows = cursor.fetchall()
+            # Record total scanned rows on the em_fallback tier so
+            # operators see how often this weak-signal path engaged.
+            _recall_diag.record_tier_hits(
+                "em_fallback", len(_em_fallback_rows)
+            )
+            for row in _em_fallback_rows:
                 content_lower = row["content"].lower()
                 content_words_set = set(content_lower.split())
                 # exact: query words appearing as complete tokens in content
@@ -2262,6 +2306,11 @@ class BeamMemory:
                 WHERE id IN ({placeholders}) AND {rec_scope}
             """, (*rec_params,))
         self.conn.commit()
+
+        # [C4] Record the outer call. truly_empty=True means no
+        # results from any tier including fallback — distinct from
+        # "fallback fired and returned some weak-signal results."
+        _recall_diag.record_call(truly_empty=(len(final_results) == 0))
 
         return final_results
 
