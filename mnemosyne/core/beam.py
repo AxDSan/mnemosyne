@@ -1741,8 +1741,17 @@ class BeamMemory:
     def forget_working(self, memory_id: str) -> bool:
         cursor = self.conn.cursor()
         cursor.execute("DELETE FROM working_memory WHERE id = ? AND session_id = ?", (memory_id, self.session_id))
+        wm_rows = cursor.rowcount
+        # E6.a: cascade-delete annotations for this memory_id. Pre-fix,
+        # forget() left mentions / fact / occurred_on / has_source rows in
+        # the annotations table — the data leaked through export_to_file
+        # and re-surfaced via _find_memories_by_entity / _find_memories_by_fact
+        # for queries matching the forgotten content. The cascade is scoped
+        # to memory_id (no session_id filter — annotations don't have a
+        # session column and a memory_id can only belong to one memory).
+        cursor.execute("DELETE FROM annotations WHERE memory_id = ?", (memory_id,))
         self.conn.commit()
-        return cursor.rowcount > 0
+        return wm_rows > 0
 
     # ------------------------------------------------------------------
     # Episodic Memory

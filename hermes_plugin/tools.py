@@ -439,18 +439,51 @@ def mnemosyne_stats(args: dict, **kwargs) -> str:
 
 
 def mnemosyne_triple_add(args: dict, **kwargs) -> str:
-    """Add a temporal triple"""
+    """Add a temporal triple, or an annotation if the predicate is annotation-flavored.
+
+    Post-E6 routing: predicates in `ANNOTATION_KINDS` (mentions, fact,
+    occurred_on, has_source) write to `AnnotationStore` instead of
+    `TripleStore`. Without this routing, an agent calling this tool with
+    e.g. predicate="mentions" would silently invalidate prior annotation
+    rows sharing the (subject, predicate) key — the same silent-destruction
+    bug E6 fixed for the production extraction path. Current-truth
+    predicates (anything else) still route to `TripleStore.add()`.
+    """
     try:
+        predicate = args["predicate"]
+        from mnemosyne.core.annotations import ANNOTATION_KINDS
+        if predicate in ANNOTATION_KINDS:
+            from mnemosyne.core.annotations import AnnotationStore
+            mem = _get_memory()
+            store = AnnotationStore(db_path=mem.db_path)
+            row_id = store.add(
+                memory_id=args["subject"],
+                kind=predicate,
+                value=args["object"],
+                source=args.get("source", "conversation"),
+                confidence=args.get("confidence", 1.0),
+            )
+            return json.dumps({
+                "status": "added",
+                "annotation_id": row_id,
+                "store": "annotations",
+            })
+
+        # Current-truth temporal fact — TripleStore is the right home.
         kg = _get_triples()
         triple_id = kg.add(
             subject=args["subject"],
-            predicate=args["predicate"],
+            predicate=predicate,
             object=args["object"],
             valid_from=args.get("valid_from"),
             source=args.get("source", "conversation"),
             confidence=args.get("confidence", 1.0)
         )
-        return json.dumps({"status": "added", "triple_id": triple_id})
+        return json.dumps({
+            "status": "added",
+            "triple_id": triple_id,
+            "store": "triples",
+        })
     except Exception as e:
         return json.dumps({"error": str(e)})
 
