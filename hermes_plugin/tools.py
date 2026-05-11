@@ -438,6 +438,21 @@ def mnemosyne_stats(args: dict, **kwargs) -> str:
         return json.dumps({"error": str(e)})
 
 
+from mnemosyne.core.annotations import ANNOTATION_KINDS as _ANNOTATION_KINDS
+
+
+def _is_annotation_predicate(predicate) -> bool:
+    """Membership check that safely handles non-string predicates.
+
+    Returns False for None, lists, dicts, or any non-hashable value the
+    caller might supply through the MCP boundary. Whitespace and case
+    differences are NOT normalized — agents that mean `mentions` must
+    spell it `mentions`. A future enhancement could accept case variants
+    and emit a warning.
+    """
+    return isinstance(predicate, str) and predicate in _ANNOTATION_KINDS
+
+
 def mnemosyne_triple_add(args: dict, **kwargs) -> str:
     """Add a temporal triple, or an annotation if the predicate is annotation-flavored.
 
@@ -448,14 +463,24 @@ def mnemosyne_triple_add(args: dict, **kwargs) -> str:
     rows sharing the (subject, predicate) key — the same silent-destruction
     bug E6 fixed for the production extraction path. Current-truth
     predicates (anything else) still route to `TripleStore.add()`.
+
+    Note for callers: `valid_from` is ignored when the predicate routes
+    to annotations. The annotations table has no valid_from / valid_until
+    columns — multi-valued annotations don't supersede each other. For
+    `occurred_on` specifically, the date should be passed in `object`.
     """
     try:
         predicate = args["predicate"]
-        from mnemosyne.core.annotations import ANNOTATION_KINDS
-        if predicate in ANNOTATION_KINDS:
-            from mnemosyne.core.annotations import AnnotationStore
+        if _is_annotation_predicate(predicate):
             mem = _get_memory()
-            store = AnnotationStore(db_path=mem.db_path)
+            # Reuse BeamMemory's cached AnnotationStore handle (shared
+            # connection, no per-call file-descriptor cost).
+            store = getattr(mem.beam, "annotations", None)
+            if store is None:
+                # Defensive fallback for older BeamMemory builds that
+                # don't expose the cached handle yet.
+                from mnemosyne.core.annotations import AnnotationStore
+                store = AnnotationStore(db_path=mem.db_path, conn=mem.beam.conn)
             row_id = store.add(
                 memory_id=args["subject"],
                 kind=predicate,
@@ -489,16 +514,50 @@ def mnemosyne_triple_add(args: dict, **kwargs) -> str:
 
 
 def mnemosyne_triple_query(args: dict, **kwargs) -> str:
-    """Query temporal triples"""
+    """Query temporal triples or annotations.
+
+    Post-E6.a routing mirrors `mnemosyne_triple_add`: predicates in
+    `ANNOTATION_KINDS` query `AnnotationStore`, others query `TripleStore`.
+    Without this, agents would write via the tool, the data would land in
+    annotations, but read-back through this same tool would return [] —
+    a silent split-brain between write and read paths.
+
+    The `as_of` arg only applies to TripleStore queries (current-truth
+    semantics with validity windows). Annotation queries ignore it
+    because the annotations table has no time-bounded validity.
+    """
     try:
+        predicate = args.get("predicate")
+        if _is_annotation_predicate(predicate):
+            mem = _get_memory()
+            store = getattr(mem.beam, "annotations", None)
+            if store is None:
+                from mnemosyne.core.annotations import AnnotationStore
+                store = AnnotationStore(db_path=mem.db_path, conn=mem.beam.conn)
+            results = store.query_by_kind(
+                kind=predicate,
+                value=args.get("object"),
+                memory_id=args.get("subject"),
+            )
+            return json.dumps({
+                "results_count": len(results),
+                "results": results,
+                "store": "annotations",
+            })
+
+        # Current-truth: TripleStore with optional as_of filter.
         kg = _get_triples()
         results = kg.query(
             subject=args.get("subject"),
-            predicate=args.get("predicate"),
+            predicate=predicate,
             object=args.get("object"),
             as_of=args.get("as_of")
         )
-        return json.dumps({"results_count": len(results), "results": results})
+        return json.dumps({
+            "results_count": len(results),
+            "results": results,
+            "store": "triples",
+        })
     except Exception as e:
         return json.dumps({"error": str(e)})
 

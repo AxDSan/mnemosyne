@@ -1739,18 +1739,36 @@ class BeamMemory:
         return cursor.rowcount > 0
 
     def forget_working(self, memory_id: str) -> bool:
+        # E6.a: the cascade-delete of annotations must be authorized by the
+        # session-scoped working_memory DELETE. The annotations table has no
+        # session_id column, so an unconditional `DELETE FROM annotations
+        # WHERE memory_id = ?` lets a hostile caller in session B pass a
+        # memory_id from session A and silently wipe session A's annotations
+        # — adversarial /review found this. The session-scoped working_memory
+        # DELETE is the trust boundary: if it matches a row, the caller is
+        # authorized to delete the row's annotations. If it matches zero
+        # rows (wrong session, or already-forgotten), we skip the cascade.
+        #
+        # Wrapped in an explicit transaction with rollback so a mid-cascade
+        # failure (corrupted table, lock contention, future FK trigger)
+        # rolls back the working_memory DELETE rather than leaving it
+        # uncommitted on the connection for a later unrelated commit to
+        # silently include.
         cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM working_memory WHERE id = ? AND session_id = ?", (memory_id, self.session_id))
-        wm_rows = cursor.rowcount
-        # E6.a: cascade-delete annotations for this memory_id. Pre-fix,
-        # forget() left mentions / fact / occurred_on / has_source rows in
-        # the annotations table — the data leaked through export_to_file
-        # and re-surfaced via _find_memories_by_entity / _find_memories_by_fact
-        # for queries matching the forgotten content. The cascade is scoped
-        # to memory_id (no session_id filter — annotations don't have a
-        # session column and a memory_id can only belong to one memory).
-        cursor.execute("DELETE FROM annotations WHERE memory_id = ?", (memory_id,))
-        self.conn.commit()
+        try:
+            cursor.execute(
+                "DELETE FROM working_memory WHERE id = ? AND session_id = ?",
+                (memory_id, self.session_id),
+            )
+            wm_rows = cursor.rowcount
+            if wm_rows > 0:
+                cursor.execute(
+                    "DELETE FROM annotations WHERE memory_id = ?", (memory_id,)
+                )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
         return wm_rows > 0
 
     # ------------------------------------------------------------------

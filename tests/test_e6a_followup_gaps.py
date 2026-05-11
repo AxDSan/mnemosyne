@@ -275,5 +275,241 @@ class TestMcpTripleAddAnnotationRouting(unittest.TestCase):
             )
 
 
+class TestForgetCrossSessionDoesNotLeakAnnotations(unittest.TestCase):
+    """E6.a /review finding F1: an attacker / hostile agent in session B
+    must not be able to wipe session A's annotations by calling forget()
+    with a memory_id from session A.
+
+    Pre-fix, the cascade `DELETE FROM annotations WHERE memory_id = ?`
+    ran unconditionally — the session_id check on the working_memory
+    DELETE was the only authorization, and a wrong-session call matched
+    zero working_memory rows but silently nuked all annotations for that
+    memory_id. forget() returned False so the operator saw 'not found'
+    while the damage was already done.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db_path = Path(self.tmp.name)
+
+    def tearDown(self):
+        import os
+        for suffix in ("", ".pre_e6_backup"):
+            try:
+                os.unlink(str(self.tmp.name) + suffix)
+            except OSError:
+                pass
+
+    def test_wrong_session_forget_does_not_touch_annotations(self):
+        # Session A stores a memory and extracts annotations.
+        mem_a = Mnemosyne(session_id="session-a", db_path=self.db_path)
+        memory_id = mem_a.remember(
+            "Alice met Bob in Paris.",
+            source="test",
+            extract_entities=True,
+        )
+
+        ann_store = AnnotationStore(db_path=self.db_path)
+        pre_count = len(ann_store.query_by_memory(memory_id=memory_id))
+        self.assertGreater(pre_count, 0, "test setup: expected annotations")
+
+        # Session B tries to forget session A's memory_id. This used to
+        # silently destroy session A's annotations.
+        mem_b = Mnemosyne(session_id="session-b", db_path=self.db_path)
+        result = mem_b.forget(memory_id)
+
+        self.assertFalse(result, "forget() should return False — cross-session attempt")
+
+        # The critical assertion: session A's annotations must still exist.
+        post_rows = ann_store.query_by_memory(memory_id=memory_id)
+        self.assertEqual(
+            len(post_rows), pre_count,
+            f"cross-session forget silently destroyed annotations: {pre_count} → {len(post_rows)}",
+        )
+
+    def test_correct_session_forget_still_works(self):
+        """Same-session forget must still cascade correctly — the fix
+        is gating the cascade on authorization, not disabling it."""
+        mem = Mnemosyne(session_id="session-a", db_path=self.db_path)
+        memory_id = mem.remember(
+            "Test memory with entities Alice and Bob.",
+            source="test",
+            extract_entities=True,
+        )
+        ann_store = AnnotationStore(db_path=self.db_path)
+        self.assertGreater(len(ann_store.query_by_memory(memory_id=memory_id)), 0)
+
+        result = mem.forget(memory_id)
+        self.assertTrue(result, "same-session forget should match the row")
+        self.assertEqual(
+            ann_store.query_by_memory(memory_id=memory_id), [],
+            "same-session forget should still cascade-delete annotations",
+        )
+
+
+class TestForgetCascadeIsAtomic(unittest.TestCase):
+    """E6.a /review finding F3: the working_memory DELETE and annotations
+    DELETE must be atomic — if the cascade raises, the working_memory
+    delete should roll back, not sit uncommitted on the connection
+    waiting to be silently committed by an unrelated later call.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db_path = Path(self.tmp.name)
+
+    def tearDown(self):
+        import os
+        for suffix in ("", ".pre_e6_backup"):
+            try:
+                os.unlink(str(self.tmp.name) + suffix)
+            except OSError:
+                pass
+
+    def test_failed_cascade_rolls_back_working_memory_delete(self):
+        """Simulate cascade failure by dropping the annotations table after
+        BeamMemory.__init__ has finished its schema setup but before
+        forget_working() runs. The wm DELETE succeeds, the annotations
+        DELETE raises `sqlite3.OperationalError: no such table`, and the
+        try/except/rollback in forget_working() must put the wm row back.
+        """
+        import sqlite3
+
+        beam = BeamMemory(session_id="s1", db_path=self.db_path)
+        memory_id = beam.remember(
+            "Atomic cascade test.", source="test", importance=0.5,
+            extract_entities=True,
+        )
+
+        # Sanity: row is present.
+        row = beam.conn.execute(
+            "SELECT id FROM working_memory WHERE id = ?", (memory_id,)
+        ).fetchone()
+        self.assertIsNotNone(row)
+
+        # Force the annotations DELETE to fail by dropping the table out
+        # from under forget_working() between its schema-setup and the
+        # DELETE itself. We do this on a separate raw connection so
+        # beam.conn's own state isn't disturbed.
+        raw = sqlite3.connect(str(self.db_path))
+        raw.execute("DROP TABLE annotations")
+        raw.commit()
+        raw.close()
+
+        # forget_working should raise (sqlite OperationalError) and roll back.
+        with self.assertRaises(sqlite3.OperationalError):
+            beam.forget_working(memory_id)
+
+        # The critical assertion: the wm row must still be present
+        # because the cascade rolled back atomically.
+        row = beam.conn.execute(
+            "SELECT id FROM working_memory WHERE id = ?", (memory_id,)
+        ).fetchone()
+        self.assertIsNotNone(
+            row,
+            "working_memory row was not rolled back after cascade failure",
+        )
+
+
+class TestMcpTripleQueryAnnotationRouting(unittest.TestCase):
+    """E6.a /review finding F5: mnemosyne_triple_query must mirror the
+    write-side routing. Pre-fix, agents would write a `mentions` via
+    triple_add (routed to annotations) and then query via triple_query
+    (still hit triples only) and get empty results — silent split-brain.
+    """
+
+    def setUp(self):
+        import hermes_plugin
+        hermes_plugin._memory_instance = None
+        hermes_plugin._current_session_id = None
+        hermes_plugin._triple_store = None
+
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db_path = Path(self.tmp.name)
+
+        import os
+        self._saved_env = os.environ.get("MNEMOSYNE_DATA_DIR")
+        os.environ["MNEMOSYNE_DATA_DIR"] = str(self.db_path.parent)
+        self.canon_db = self.db_path.parent / "mnemosyne.db"
+
+    def tearDown(self):
+        import os
+        if self._saved_env is None:
+            os.environ.pop("MNEMOSYNE_DATA_DIR", None)
+        else:
+            os.environ["MNEMOSYNE_DATA_DIR"] = self._saved_env
+
+        for path in (self.tmp.name, str(self.canon_db), str(self.canon_db) + ".pre_e6_backup"):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+        import hermes_plugin
+        hermes_plugin._memory_instance = None
+        hermes_plugin._current_session_id = None
+        hermes_plugin._triple_store = None
+
+    def test_query_for_annotation_predicate_routes_to_annotation_store(self):
+        from hermes_plugin.tools import mnemosyne_triple_add, mnemosyne_triple_query
+
+        # Write via triple_add — lands in annotations.
+        add_result = json.loads(mnemosyne_triple_add({
+            "subject": "mem-rq-1",
+            "predicate": "mentions",
+            "object": "Alice",
+        }))
+        self.assertEqual(add_result.get("store"), "annotations")
+
+        # Query via triple_query — must mirror the routing and read from annotations.
+        query_result = json.loads(mnemosyne_triple_query({
+            "subject": "mem-rq-1",
+            "predicate": "mentions",
+        }))
+        self.assertEqual(query_result.get("store"), "annotations")
+        self.assertEqual(query_result.get("results_count"), 1)
+        results = query_result.get("results", [])
+        self.assertEqual(results[0]["value"], "Alice")
+        self.assertEqual(results[0]["kind"], "mentions")
+
+    def test_query_for_current_truth_predicate_still_uses_triplestore(self):
+        from hermes_plugin.tools import mnemosyne_triple_add, mnemosyne_triple_query
+
+        json.loads(mnemosyne_triple_add({
+            "subject": "Maya",
+            "predicate": "assigned_to",
+            "object": "auth-migration",
+            "valid_from": "2026-01-15",
+        }))
+
+        query_result = json.loads(mnemosyne_triple_query({
+            "subject": "Maya",
+            "predicate": "assigned_to",
+        }))
+        self.assertEqual(query_result.get("store"), "triples")
+        self.assertEqual(query_result.get("results_count"), 1)
+
+    def test_non_string_predicate_does_not_raise(self):
+        """E6.a /review F9: hostile / malformed predicate types must not
+        crash the handler. None / lists / dicts get a False membership
+        check (via the isinstance guard) and fall through to TripleStore
+        which handles the error path itself."""
+        from hermes_plugin.tools import mnemosyne_triple_query
+
+        for bad_predicate in (None, [], {}, 123):
+            result = json.loads(mnemosyne_triple_query({
+                "predicate": bad_predicate,
+            }))
+            # Either a successful empty-result response or an error
+            # response — but not a TypeError exception escaping.
+            self.assertTrue(
+                "results" in result or "error" in result,
+                f"unexpected response for predicate={bad_predicate!r}: {result}",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
