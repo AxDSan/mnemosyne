@@ -224,9 +224,18 @@ class TestBeamRecallInstrumentation:
         # Fallback's scanned-row count includes the seeded row.
         assert snap["by_tier"]["wm_fallback"]["total_hits"] >= 1
 
-    def test_em_fallback_fires_on_empty_episodic_match(self, temp_db):
+    def test_em_fallback_fires_on_empty_episodic_match(
+        self, temp_db, monkeypatch
+    ):
         """The episodic fallback fires when vec+fts produce no
-        episodic rowids."""
+        episodic rowids. Embeddings monkeypatched off so the vec
+        path doesn't return weak cosine-sim hits — environments
+        with fastembed installed (CI) would otherwise see vec
+        produce nonzero similarity for any query and skip the
+        fallback."""
+        monkeypatch.setattr(
+            "mnemosyne.core.embeddings.available", lambda: False
+        )
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         # Seed an episodic row directly so the fallback has something
         # to scan over but the query won't match via FTS/vec.
@@ -240,8 +249,9 @@ class TestBeamRecallInstrumentation:
         snap = get_recall_diagnostics()
         # EM fallback fired.
         assert snap["totals"]["calls_using_em_fallback"] == 1
-        # And its scanned count reflects the episodic row.
-        assert snap["by_tier"]["em_fallback"]["total_hits"] >= 1
+        # The fallback scanned the seeded row; whether it kept it
+        # depends on the relevance threshold. At minimum the
+        # fallback's `calls_using_em_fallback` boolean fired.
 
     def test_truly_empty_call_counted(self, temp_db):
         """A recall call that returns ZERO results from all paths
@@ -331,7 +341,9 @@ class TestReviewHardening:
             f"got {snap['by_tier']['wm_fts']}"
         )
 
-    def test_em_fallback_counter_records_kept_not_scanned(self, temp_db):
+    def test_em_fallback_counter_records_kept_not_scanned(
+        self, temp_db, monkeypatch
+    ):
         """[Codex adv #1 + Claude adv #9] Pre-fix EM fallback
         recorded `len(scanned_rows)` regardless of how many passed
         the relevance > 0.02 threshold. Fix: counter increments
@@ -339,7 +351,14 @@ class TestReviewHardening:
 
         Construct content with disjoint char sets vs. the query so
         the substring scorer's char_overlap term returns 0 and
-        rows score below the threshold."""
+        rows score below the threshold.
+
+        Embeddings monkeypatched off so the vec path doesn't
+        surface the rows via cosine similarity (which would
+        bypass the fallback entirely — CI has fastembed)."""
+        monkeypatch.setattr(
+            "mnemosyne.core.embeddings.available", lambda: False
+        )
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         # Content + query chosen to share ZERO chars (including no
         # whitespace match — `char_overlap` is computed over all
