@@ -33,44 +33,56 @@ class MockLLMExtractor:
 def test_end_to_end_extract_recall():
     """
     Test: remember with extract=True -> facts stored -> recall finds them
+
+    Post-E6: facts are seeded via AnnotationStore (the read path for
+    `_find_memories_by_fact` queries the annotations table). The legacy
+    `TripleStore.add_facts` shim is preserved for external callers but
+    writes to the deprecated triples table, which the post-E6 recall
+    no longer reads from.
     """
+    from mnemosyne.core.annotations import AnnotationStore
+
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test.db"
-        
-        # Initialize
-        init_triples(db_path)
-        
-        # Create Mnemosyne instance
+
+        # Create Mnemosyne instance (auto-initializes both schemas)
         mem = Mnemosyne(session_id="test_session", db_path=db_path)
-        
+
         # Store a memory WITH fact extraction (mocked)
         content = "I absolutely love coffee, especially dark roast. I hate mornings though."
-        
+
         # Manually inject facts (simulating LLM extraction)
         memory_id = mem.remember(content, source="test", extract=False)
-        
-        # Manually add facts to triples
-        triples = TripleStore(db_path=db_path)
-        triples.add_facts(memory_id, [
-            "The user loves coffee",
-            "The user hates mornings",
-            "The user prefers dark roast"
-        ], source="test", confidence=0.7)
-        
+
+        # Seed extracted facts into the annotations store — the new home
+        # for multi-valued fact annotations (post-E6).
+        annotations = AnnotationStore(db_path=db_path)
+        annotations.add_many(
+            memory_id=memory_id,
+            kind="fact",
+            values=[
+                "The user loves coffee",
+                "The user hates mornings",
+                "The user prefers dark roast",
+            ],
+            source="test",
+            confidence=0.7,
+        )
+
         # Now recall with a query that matches the facts
         results = mem.recall("what does the user like", top_k=5)
-        
+
         # Should find the memory via fact matching
         assert len(results) > 0, "Recall should find results"
-        
+
         # Check if fact_match is present in any result
         fact_matches = [r for r in results if r.get("fact_match")]
         assert len(fact_matches) > 0, "At least one result should have fact_match=True"
-        
+
         # The memory should be in results
         memory_ids = [r["id"] for r in results]
         assert memory_id in memory_ids, f"Memory {memory_id} should be in recall results"
-        
+
         print("PASS: test_end_to_end_extract_recall")
 
 
@@ -200,20 +212,23 @@ def test_graceful_fallback_no_llm():
 def test_fact_aware_recall_boosts_scores():
     """
     Test: Fact matches get score boost (1.2x)
+
+    Post-E6: facts are seeded via AnnotationStore.
     """
+    from mnemosyne.core.annotations import AnnotationStore
+
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test.db"
-        init_triples(db_path)
-        
+
         mem = Mnemosyne(session_id="test_session_6", db_path=db_path)
-        
+
         # Store two similar memories (different content to avoid dedup)
         id1 = mem.remember("I love coffee and tea in the morning", source="test", importance=0.5)
         id2 = mem.remember("I love coffee and tea in the evening", source="test", importance=0.5)
-        
-        # Add fact only to id1
-        triples = TripleStore(db_path=db_path)
-        triples.add_facts(id1, ["The user loves coffee"], source="test")
+
+        # Add fact only to id1 via the annotations store (post-E6 read path).
+        annotations = AnnotationStore(db_path=db_path)
+        annotations.add(id1, "fact", "The user loves coffee", source="test")
         
         # Recall for "coffee" - id1 should have fact_match
         results = mem.recall("coffee", top_k=5)

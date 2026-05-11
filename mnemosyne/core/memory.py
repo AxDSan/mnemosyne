@@ -338,12 +338,52 @@ class Mnemosyne:
 
         self.conn.commit()
 
-        # The first BEAM write already inserted the working_memory row with
-        # the correct memory_id (we used it for the legacy dual-write above).
-        # A second beam.remember call would only re-run the dedup branch and
-        # _ingest_graph_and_veracity — duplicating gist/fact graph edges and
-        # bumping mention_count for what is a single user-level remember. So
-        # this function returns directly after the legacy write.
+        # The first beam.remember() call (line 313) already inserted the
+        # working_memory row, ran entity extraction, and ingested graph
+        # edges + veracity. A second beam.remember() would duplicate those
+        # side effects. We return directly after the legacy dual-write.
+
+        # E6: Entity extraction via AnnotationStore (additive, best-effort).
+        # This replaces the pre-E6 TripleStore extraction path. Annotations
+        # are stored independently of the beam write and don't duplicate
+        # anything since BeamMemory.remember()'s extract path populates
+        # the facts table, not the annotations table.
+        if extract_entities:
+            try:
+                from mnemosyne.core.entities import extract_entities_regex
+                from mnemosyne.core.annotations import AnnotationStore
+                entities = extract_entities_regex(content)
+                if entities:
+                    annotations = AnnotationStore(db_path=self.db_path)
+                    annotations.add_many(
+                        memory_id=memory_id,
+                        kind="mentions",
+                        values=entities,
+                        source=source,
+                        confidence=0.8,
+                    )
+            except Exception:
+                pass  # Entity extraction is best-effort
+
+        # E6: Structured fact extraction via AnnotationStore (additive, best-effort)
+        if extract:
+            try:
+                from mnemosyne.core.extraction import extract_facts_safe
+                from mnemosyne.core.annotations import AnnotationStore
+                facts = extract_facts_safe(content)
+                if facts:
+                    kept = [f for f in facts if f and len(f) > 10]
+                    if kept:
+                        annotations = AnnotationStore(db_path=self.db_path)
+                        annotations.add_many(
+                            memory_id=memory_id,
+                            kind="fact",
+                            values=kept,
+                            source=source,
+                            confidence=0.7,
+                        )
+            except Exception:
+                pass  # Fact extraction is best-effort
         return memory_id
 
     def recall(self, query: str, top_k: int = 5, *,

@@ -684,26 +684,30 @@ def _vec_available(conn: sqlite3.Connection) -> bool:
 
 def _extract_and_store_entities(beam: "BeamMemory", memory_id: str, content: str):
     """
-    Extract entities from content and store as triples.
+    Extract entities from content and store as annotations (post-E6).
     Called internally by remember() when extract_entities=True.
+
+    Pre-E6 wrote to TripleStore with predicate="mentions", which silently
+    invalidated prior mentions on the same memory via auto-invalidation
+    on (subject, predicate). Post-E6, writes go to AnnotationStore where
+    multiple mentions per memory coexist.
     """
     try:
         from mnemosyne.core.entities import extract_entities_regex
-        from mnemosyne.core.triples import TripleStore
-        
+        from mnemosyne.core.annotations import AnnotationStore
+
         entities = extract_entities_regex(content)
         if not entities:
             return
-        
-        triples = TripleStore(db_path=beam.db_path)
-        for entity in entities:
-            triples.add(
-                subject=memory_id,
-                predicate="mentions",
-                object=entity,
-                source="regex",
-                confidence=0.8
-            )
+
+        annotations = AnnotationStore(db_path=beam.db_path)
+        annotations.add_many(
+            memory_id=memory_id,
+            kind="mentions",
+            values=entities,
+            source="regex",
+            confidence=0.8,
+        )
     except Exception:
         # Entity extraction is best-effort; never fail remember() because of it
         pass
@@ -711,26 +715,40 @@ def _extract_and_store_entities(beam: "BeamMemory", memory_id: str, content: str
 
 def _extract_and_store_facts(beam: "BeamMemory", memory_id: str, content: str, source: str = ""):
     """
-    Extract structured facts from content using LLM and store as triples + facts table.
-    Called internally by remember() when extract=True.
+    Extract structured facts from content using LLM and store as annotations
+    + facts table. Called internally by remember() when extract=True.
 
     Stores in TWO places:
-    1. TripleStore (entity-level triples, backward compat)
+    1. AnnotationStore with kind="fact" (post-E6; was TripleStore pre-E6)
     2. facts table (structured SPO facts for fact_recall())
+
+    Post-E6 note: writes formerly used TripleStore.add_facts() which
+    silently invalidated each prior fact via (subject, predicate) auto-
+    invalidation. AnnotationStore.add_many is append-only so all facts
+    coexist.
     """
     try:
         from mnemosyne.core.extraction import extract_facts_safe
-        from mnemosyne.core.triples import TripleStore
-        
+        from mnemosyne.core.annotations import AnnotationStore
+
         facts = extract_facts_safe(content)
         if not facts:
             return
-        
-        # Store in triples (existing behavior)
-        triples = TripleStore(db_path=beam.db_path)
-        triples.add_facts(memory_id, facts, source=source, confidence=0.7)
 
-        # ALSO store in facts table (new cloud extraction path)
+        # Filter to match the legacy filtering applied by TripleStore.add_facts.
+        kept = [f for f in facts if f and len(f) > 10]
+        if kept:
+            annotations = AnnotationStore(db_path=beam.db_path)
+            annotations.add_many(
+                memory_id=memory_id,
+                kind="fact",
+                values=kept,
+                source=source,
+                confidence=0.7,
+            )
+
+        # ALSO store in facts table (new cloud extraction path) — uses the
+        # full facts list (matching pre-E6 behavior).
         _store_facts_in_table(beam, memory_id, content, source, facts)
 
     except Exception:
@@ -778,28 +796,33 @@ def _find_memories_by_entity(beam: "BeamMemory", entity_name: str, threshold: fl
     """
     Find memory IDs that mention an entity (or similar entity via fuzzy match).
     Returns list of memory_id strings.
+
+    Post-E6: reads from AnnotationStore. Memories with multiple mentions
+    now all surface (silent-destruction bug fixed) — the pre-E6 path
+    against TripleStore returned only the last-written mention per memory
+    because of auto-invalidation on (subject, predicate).
     """
     try:
         from mnemosyne.core.entities import find_similar_entities
-        from mnemosyne.core.triples import TripleStore
-        
-        triples = TripleStore(db_path=beam.db_path)
-        
+        from mnemosyne.core.annotations import AnnotationStore
+
+        annotations = AnnotationStore(db_path=beam.db_path)
+
         # Get all known entities
-        known_entities = triples.get_distinct_objects("mentions")
+        known_entities = annotations.get_distinct_values("mentions")
         if not known_entities:
             return []
-        
+
         # Find similar entities
         matches = find_similar_entities(entity_name, known_entities, threshold=threshold)
-        
+
         # Collect memory IDs for all matched entities
         memory_ids: Set[str] = set()
         for matched_entity, _ in matches:
-            results = triples.query_by_predicate("mentions", object=matched_entity)
+            results = annotations.query_by_kind("mentions", value=matched_entity)
             for row in results:
-                memory_ids.add(row["subject"])
-        
+                memory_ids.add(row["memory_id"])
+
         return list(memory_ids)
     except Exception:
         return []
@@ -808,33 +831,36 @@ def _find_memories_by_entity(beam: "BeamMemory", entity_name: str, threshold: fl
 def _find_memories_by_fact(beam: "BeamMemory", query: str) -> List[str]:
     """
     Find memory IDs that have extracted facts matching the query.
-    Does simple keyword matching against stored fact triples.
+    Does simple keyword matching against stored fact annotations.
     Returns list of memory_id strings.
+
+    Post-E6: reads from AnnotationStore. Memories with multiple extracted
+    facts now all surface (silent-destruction bug fixed).
     """
     try:
-        from mnemosyne.core.triples import TripleStore
-        
-        triples = TripleStore(db_path=beam.db_path)
-        
-        # Get all fact triples
-        all_facts = triples.query_by_predicate("fact")
+        from mnemosyne.core.annotations import AnnotationStore
+
+        annotations = AnnotationStore(db_path=beam.db_path)
+
+        # Get all fact annotations
+        all_facts = annotations.query_by_kind("fact")
         if not all_facts:
             return []
-        
+
         query_lower = query.lower()
         query_words = set(query_lower.split())
-        
+
         # Simple keyword matching against fact text
         memory_ids: Set[str] = set()
         for fact_row in all_facts:
-            fact_text = fact_row.get("object", "").lower()
+            fact_text = fact_row.get("value", "").lower()
             # Check if any query word appears in the fact
             if any(word in fact_text for word in query_words):
-                memory_ids.add(fact_row["subject"])
+                memory_ids.add(fact_row["memory_id"])
             # Also check if the full query is a substring of the fact
             elif query_lower in fact_text:
-                memory_ids.add(fact_row["subject"])
-        
+                memory_ids.add(fact_row["memory_id"])
+
         return list(memory_ids)
     except Exception:
         return []
@@ -1558,30 +1584,32 @@ class BeamMemory:
                 pass  # Veracity failures are non-blocking
 
     def _add_temporal_triple(self, memory_id: str, timestamp: str, source: str, content: str):
-        """Auto-generate temporal triple for a memory. Bridges BEAM and TripleStore."""
+        """Auto-generate temporal annotations for a memory.
+
+        Post-E6: writes occurred_on / has_source as annotations rather
+        than triples. These are inherently single-valued per memory
+        today, but `annotations` is the correct home — they describe a
+        memory rather than expressing a current-truth fact like
+        "user prefers X". Method name kept for backward compat.
+        """
         try:
-            # Import triples module lazily to avoid circular dependency
-            from mnemosyne.core.triples import TripleStore, init_triples
+            from mnemosyne.core.annotations import AnnotationStore
             date_str = timestamp[:10]  # YYYY-MM-DD
-            # Ensure triples table exists
-            init_triples(db_path=self.db_path)
-            triple_store = TripleStore(db_path=self.db_path)
-            triple_store.add(
-                subject=memory_id,
-                predicate="occurred_on",
-                object=date_str,
-                valid_from=date_str
+            annotations = AnnotationStore(db_path=self.db_path)
+            annotations.add(
+                memory_id=memory_id,
+                kind="occurred_on",
+                value=date_str,
             )
             # Also tag source type
             if source and source not in ("conversation", "user", "assistant"):
-                triple_store.add(
-                    subject=memory_id,
-                    predicate="has_source",
-                    object=source,
-                    valid_from=date_str
+                annotations.add(
+                    memory_id=memory_id,
+                    kind="has_source",
+                    value=source,
                 )
         except Exception:
-            # TripleStore is optional; don't fail memory write if triples fail
+            # Annotation writes are optional; don't fail memory write if they fail
             pass
 
     def _trim_working_memory(self):

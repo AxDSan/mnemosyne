@@ -696,16 +696,22 @@ class TestTemporalQueries:
         assert all("Q4" not in r["content"] for r in results_filtered)
 
     def test_temporal_triple_auto_generated(self, temp_db):
-        """Temporal triples should be auto-generated on remember()."""
-        from mnemosyne.core.triples import TripleStore
+        """Temporal annotations should be auto-generated on remember().
+
+        Post-E6: occurred_on and has_source are written to AnnotationStore
+        rather than TripleStore (they are memory metadata, not current-
+        truth temporal facts). Test method name kept for git-history
+        continuity.
+        """
+        from mnemosyne.core.annotations import AnnotationStore
 
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         mid = beam.remember("Deploy script updated", source="dev", importance=0.8)
 
-        triple_store = TripleStore(db_path=temp_db)
-        triples = triple_store.query(subject=mid)
-        assert len(triples) >= 1
-        assert any(t["predicate"] == "occurred_on" for t in triples)
+        annotations = AnnotationStore(db_path=temp_db)
+        rows = annotations.query_by_memory(memory_id=mid)
+        assert len(rows) >= 1
+        assert any(r["kind"] == "occurred_on" for r in rows)
 
 
 class TestTokenAwareConsolidation:

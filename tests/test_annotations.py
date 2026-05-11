@@ -206,6 +206,85 @@ class TestAnnotationStoreExportImport(unittest.TestCase):
         self.assertEqual(stats["inserted"], 0)
 
 
+class TestE6EndToEndProductionPath(unittest.TestCase):
+    """
+    End-to-end regression guard for the silent-destruction fix.
+
+    Pre-E6: calling `BeamMemory.remember()` with multiple entities in the
+    content would silently invalidate prior entity-mention rows on the
+    same memory via TripleStore's auto-invalidation. Reading them back
+    through `_find_memories_by_entity` would still surface the memory
+    (the query did not filter by valid_until), but the entity graph
+    was effectively scoped to "last entity per memory" for any consumer
+    that did filter by validity.
+
+    Post-E6: writes go to AnnotationStore (append-only), reads go to
+    AnnotationStore. Multiple entities per memory survive end-to-end.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db_path = Path(self.tmp.name)
+
+    def tearDown(self):
+        for suffix in ("", ".pre_e6_backup"):
+            try:
+                os.unlink(str(self.tmp.name) + suffix)
+            except OSError:
+                pass
+
+    def test_multiple_entities_per_memory_survive_remember(self):
+        """remember(extract_entities=True) with multi-entity content
+        stores all entities post-E6.
+
+        Pre-E6 this stored each entity then silently invalidated all
+        prior mentions for the same memory via (subject, predicate)
+        auto-invalidation on the triples table. Post-E6 writes land in
+        AnnotationStore which is append-only.
+        """
+        from mnemosyne.core.beam import BeamMemory
+
+        beam = BeamMemory(session_id="e2e", db_path=self.db_path)
+        memory_id = beam.remember(
+            "Alice met Bob and Charlie at the conference in San Francisco.",
+            source="test",
+            importance=0.5,
+            extract_entities=True,
+        )
+
+        ann_store = AnnotationStore(db_path=self.db_path)
+        mentions = ann_store.query_by_memory(memory_id=memory_id, kind="mentions")
+        values = {r["value"] for r in mentions}
+
+        # Multiple capitalised entities extracted and all preserved.
+        # We don't assert the exact set (entity extraction may merge or
+        # split capitalisations), just that more than one entity survives —
+        # that's the silent-destruction fix in action.
+        self.assertGreaterEqual(
+            len(values), 2,
+            f"Expected multiple distinct mentions, got: {values}",
+        )
+
+    def test_both_occurred_on_and_has_source_annotations_present(self):
+        """Temporal annotations land in the annotations table post-E6."""
+        from mnemosyne.core.beam import BeamMemory
+
+        beam = BeamMemory(session_id="e2e", db_path=self.db_path)
+        memory_id = beam.remember(
+            "Deploy notes from the migration tool run.",
+            source="custom-tool",  # non-standard source triggers has_source
+            importance=0.5,
+        )
+
+        ann_store = AnnotationStore(db_path=self.db_path)
+        rows = ann_store.query_by_memory(memory_id=memory_id)
+        kinds = {r["kind"] for r in rows}
+
+        self.assertIn("occurred_on", kinds)
+        self.assertIn("has_source", kinds)
+
+
 class TestTripleStoreAddFactsDeprecation(unittest.TestCase):
     """
     Post-E6, TripleStore.add_facts emits DeprecationWarning and routes writes
