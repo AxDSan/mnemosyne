@@ -19,6 +19,7 @@ import logging
 import sqlite3
 import json
 import hashlib
+import logging
 import threading
 import math
 
@@ -1086,6 +1087,13 @@ class BeamMemory:
         self.conn = _get_connection(self.db_path)
         init_beam(self.db_path)
 
+        # E6: ensure schema split + auto-migrate legacy TripleStore rows
+        # to AnnotationStore. Honors MNEMOSYNE_AUTO_MIGRATE=0 for operators
+        # who want explicit control. See:
+        # - scripts/migrate_triplestore_split.py
+        # - .hermes/ledger/memory-contract.md (E6)
+        self._ensure_e6_schema_with_migration()
+
         # Phase 3: Episodic graph (shared connection)
         self.episodic_graph = None
         if EpisodicGraph is not None:
@@ -1101,6 +1109,125 @@ class BeamMemory:
                 self.veracity_consolidator = VeracityConsolidator(conn=self.conn, db_path=self.db_path)
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------
+    # E6 schema split + auto-migration
+    # ------------------------------------------------------------------
+    def _ensure_e6_schema_with_migration(self) -> None:
+        """Ensure the AnnotationStore schema exists; auto-migrate legacy
+        TripleStore rows on first run with a pre-E6 database.
+
+        Idempotent. Safe to call on fresh installs (no triples table to
+        migrate) and on databases that have already been migrated.
+
+        Respects ``MNEMOSYNE_AUTO_MIGRATE=0`` for operators who want
+        explicit control over schema migrations. When auto-migration is
+        disabled and a migration would have been required, log a clear
+        warning pointing at the manual migration script — the AnnotationStore
+        schema is still created so downstream code can run, but legacy rows
+        remain in the triples table until the operator runs the script.
+
+        Failures are caught and logged; init does not raise. The provider
+        layer's silent-fail pattern (C27) would mask any exception we
+        raised here, so logging is the visible channel for now. The user-
+        facing pattern is "migration ran (or didn't), continue with
+        whatever schema state we have."
+        """
+        import os
+        from mnemosyne.core.annotations import init_annotations
+
+        logger = logging.getLogger(__name__)
+
+        # Always ensure the annotations table exists (cheap, idempotent).
+        try:
+            init_annotations(self.db_path)
+        except Exception as e:
+            logger.error("E6: failed to initialize annotations schema: %s", e)
+            return
+
+        # Honor opt-out for operators who want explicit migrations only.
+        if os.environ.get("MNEMOSYNE_AUTO_MIGRATE", "1") == "0":
+            # If a migration would be needed, leave a warning so operators
+            # see something concrete in their logs.
+            try:
+                cursor = self.conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='triples'"
+                )
+                if cursor.fetchone() is not None:
+                    cursor = self.conn.execute(
+                        "SELECT COUNT(*) FROM triples WHERE predicate IN "
+                        "('mentions','fact','occurred_on','has_source')"
+                    )
+                    pending = cursor.fetchone()[0]
+                    if pending > 0:
+                        logger.warning(
+                            "E6: MNEMOSYNE_AUTO_MIGRATE=0 and %d annotation "
+                            "rows remain in the legacy triples table. Run "
+                            "`python scripts/migrate_triplestore_split.py "
+                            "--db %s` to migrate manually.",
+                            pending,
+                            self.db_path,
+                        )
+            except Exception as e:
+                logger.debug("E6: opt-out probe failed: %s", e)
+            return
+
+        # Auto-migrate path. Import lazily so the migration script is not a
+        # required dependency at module-import time (it's a script, not a
+        # package member).
+        try:
+            import importlib.util
+            from pathlib import Path as _Path
+
+            # Resolve the script path relative to the package root.
+            pkg_root = _Path(__file__).resolve().parent.parent.parent
+            script_path = pkg_root / "scripts" / "migrate_triplestore_split.py"
+            if not script_path.exists():
+                logger.debug(
+                    "E6: migration script not found at %s; skipping auto-migrate. "
+                    "Annotations schema is ready; legacy rows will remain in "
+                    "triples until the script is available.",
+                    script_path,
+                )
+                return
+
+            spec = importlib.util.spec_from_file_location(
+                "_e6_migrate", script_path
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            # Flush any pending writes on our connection (init_beam commits
+            # internally, but be defensive). The migration opens its own
+            # connection; under WAL mode multiple connections to the same
+            # SQLite file coexist without us closing ours.
+            try:
+                self.conn.commit()
+            except Exception:
+                pass
+
+            written = module.migrate(
+                db_path=self.db_path,
+                dry_run=False,
+                backup=True,
+                log_fn=lambda line: logger.info("E6 migrate: %s", line),
+            )
+            if written > 0:
+                logger.warning(
+                    "E6: auto-migrated %d annotation rows from triples → "
+                    "annotations. Backup written to %s.pre_e6_backup. "
+                    "Set MNEMOSYNE_AUTO_MIGRATE=0 to disable auto-migration.",
+                    written,
+                    self.db_path,
+                )
+        except Exception as e:
+            logger.error(
+                "E6: auto-migration failed (continuing init with current schema "
+                "state). Run `python scripts/migrate_triplestore_split.py "
+                "--db %s` manually. Error: %s",
+                self.db_path,
+                e,
+            )
 
     # ------------------------------------------------------------------
     # Working Memory
