@@ -9,7 +9,6 @@ Covers:
 - Migration failure: BeamMemory init still succeeds (graceful degradation)
 """
 
-import importlib
 import logging
 import os
 import sqlite3

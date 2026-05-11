@@ -279,22 +279,21 @@ class TripleStore:
             DeprecationWarning,
             stacklevel=2,
         )
-        if not facts:
-            return 0
+        # Use the shared filter so the threshold can't drift from the
+        # production extraction call sites.
+        from mnemosyne.core.annotations import filter_facts
+        kept = filter_facts(facts)
 
-        stored = 0
-        for fact in facts:
-            if fact and len(fact) > 10:
-                self.add(
-                    subject=memory_id,
-                    predicate="fact",
-                    object=fact,
-                    source=source,
-                    confidence=confidence
-                )
-                stored += 1
+        for fact in kept:
+            self.add(
+                subject=memory_id,
+                predicate="fact",
+                object=fact,
+                source=source,
+                confidence=confidence
+            )
 
-        return stored
+        return len(kept)
 
     def export_all(self) -> List[Dict]:
         """Export all triples to a list of dictionaries."""

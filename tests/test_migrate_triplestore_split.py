@@ -21,18 +21,21 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# Load the migration script as a module so we can call migrate() directly.
-_MIGRATE_SCRIPT_PATH = (
-    Path(__file__).parent.parent / "scripts" / "migrate_triplestore_split.py"
-)
-spec = importlib.util.spec_from_file_location(
-    "migrate_triplestore_split", _MIGRATE_SCRIPT_PATH
-)
-migrate_module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(migrate_module)
-
+# Migration logic now lives in the package (post-E6 review fix). The
+# CLI wrapper at scripts/migrate_triplestore_split.py is also loaded
+# below so the CLI entry-point tests still exercise its argparse layer.
+from mnemosyne.migrations import e6_triplestore_split as migrate_module
 from mnemosyne.core.triples import TripleStore
 from mnemosyne.core.annotations import AnnotationStore
+
+_CLI_SCRIPT_PATH = (
+    Path(__file__).parent.parent / "scripts" / "migrate_triplestore_split.py"
+)
+_cli_spec = importlib.util.spec_from_file_location(
+    "migrate_triplestore_split_cli", _CLI_SCRIPT_PATH
+)
+cli_module = importlib.util.module_from_spec(_cli_spec)
+_cli_spec.loader.exec_module(cli_module)
 
 
 class TestMigrateTripleStoreSplit(unittest.TestCase):
@@ -340,6 +343,82 @@ class TestMigrateTripleStoreSplit(unittest.TestCase):
         self.assertFalse(backup_path.exists())
 
 
+class TestHasPendingMigration(unittest.TestCase):
+    """`has_pending_migration` is the cheap pre-flight check used by
+    BeamMemory's auto-migrate hook to short-circuit on every init."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db_path = Path(self.tmp.name)
+
+    def tearDown(self):
+        try:
+            os.unlink(self.tmp.name)
+        except OSError:
+            pass
+
+    def test_empty_db_has_no_pending(self):
+        sqlite3.connect(str(self.db_path)).close()
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            self.assertFalse(migrate_module.has_pending_migration(conn))
+        finally:
+            conn.close()
+
+    def test_triples_without_annotations_kinds_has_no_pending(self):
+        """Current-truth rows (non-annotation predicates) don't trigger."""
+        from mnemosyne.core.triples import init_triples
+        init_triples(self.db_path)
+        conn = sqlite3.connect(str(self.db_path))
+        conn.execute(
+            "INSERT INTO triples (subject, predicate, object, valid_from) "
+            "VALUES ('user', 'prefers', 'concise', '2026-01-01')"
+        )
+        conn.commit()
+        try:
+            self.assertFalse(migrate_module.has_pending_migration(conn))
+        finally:
+            conn.close()
+
+    def test_unmigrated_annotation_row_has_pending(self):
+        from mnemosyne.core.triples import init_triples
+        init_triples(self.db_path)
+        conn = sqlite3.connect(str(self.db_path))
+        conn.execute(
+            "INSERT INTO triples (subject, predicate, object, valid_from) "
+            "VALUES ('mem-1', 'mentions', 'Alice', '2026-01-01')"
+        )
+        conn.commit()
+        try:
+            self.assertTrue(migrate_module.has_pending_migration(conn))
+        finally:
+            conn.close()
+
+    def test_after_migration_no_pending(self):
+        """Post-migration the fast-path should return False, allowing
+        BeamMemory init to skip the heavyweight classify scan."""
+        from mnemosyne.core.triples import init_triples
+        init_triples(self.db_path)
+        conn = sqlite3.connect(str(self.db_path))
+        conn.execute(
+            "INSERT INTO triples (subject, predicate, object, valid_from) "
+            "VALUES ('mem-1', 'mentions', 'Alice', '2026-01-01')"
+        )
+        conn.commit()
+        conn.close()
+
+        migrate_module.migrate(
+            db_path=self.db_path, dry_run=False, backup=False, log_fn=lambda _: None
+        )
+
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            self.assertFalse(migrate_module.has_pending_migration(conn))
+        finally:
+            conn.close()
+
+
 class TestMigrationViaCLI(unittest.TestCase):
     """Exercise the argparse / main() entry point."""
 
@@ -368,19 +447,19 @@ class TestMigrationViaCLI(unittest.TestCase):
                 pass
 
     def test_main_returns_0_on_success(self):
-        rc = migrate_module.main(
+        rc = cli_module.main(
             ["--db", str(self.db_path), "--no-backup"]
         )
         self.assertEqual(rc, 0)
 
     def test_main_returns_2_on_dry_run_with_pending_work(self):
-        rc = migrate_module.main(
+        rc = cli_module.main(
             ["--db", str(self.db_path), "--dry-run", "--no-backup"]
         )
         self.assertEqual(rc, 2)
 
     def test_main_returns_1_on_missing_db(self):
-        rc = migrate_module.main(["--db", "/nonexistent/path.db"])
+        rc = cli_module.main(["--db", "/nonexistent/path.db"])
         self.assertEqual(rc, 1)
 
 

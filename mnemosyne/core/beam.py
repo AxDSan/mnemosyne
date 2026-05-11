@@ -729,14 +729,14 @@ def _extract_and_store_facts(beam: "BeamMemory", memory_id: str, content: str, s
     """
     try:
         from mnemosyne.core.extraction import extract_facts_safe
-        from mnemosyne.core.annotations import AnnotationStore
+        from mnemosyne.core.annotations import AnnotationStore, filter_facts
 
         facts = extract_facts_safe(content)
         if not facts:
             return
 
         # Filter to match the legacy filtering applied by TripleStore.add_facts.
-        kept = [f for f in facts if f and len(f) > 10]
+        kept = filter_facts(facts)
         if kept:
             annotations = AnnotationStore(db_path=beam.db_path)
             annotations.add_many(
@@ -1160,7 +1160,7 @@ class BeamMemory:
         whatever schema state we have."
         """
         import os
-        from mnemosyne.core.annotations import init_annotations
+        from mnemosyne.core.annotations import ANNOTATION_KINDS, init_annotations
 
         logger = logging.getLogger(__name__)
 
@@ -1180,9 +1180,10 @@ class BeamMemory:
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='triples'"
                 )
                 if cursor.fetchone() is not None:
+                    placeholders = ",".join("?" * len(ANNOTATION_KINDS))
                     cursor = self.conn.execute(
-                        "SELECT COUNT(*) FROM triples WHERE predicate IN "
-                        "('mentions','fact','occurred_on','has_source')"
+                        f"SELECT COUNT(*) FROM triples WHERE predicate IN ({placeholders})",
+                        tuple(ANNOTATION_KINDS),
                     )
                     pending = cursor.fetchone()[0]
                     if pending > 0:
@@ -1198,30 +1199,21 @@ class BeamMemory:
                 logger.debug("E6: opt-out probe failed: %s", e)
             return
 
-        # Auto-migrate path. Import lazily so the migration script is not a
-        # required dependency at module-import time (it's a script, not a
-        # package member).
+        # Auto-migrate path. The migration logic lives inside the package
+        # (mnemosyne.migrations.e6_triplestore_split) so pip-installed
+        # deployments get the same auto-migrate behavior as source checkouts.
+        # No filesystem-relative path resolution; just import.
         try:
-            import importlib.util
-            from pathlib import Path as _Path
-
-            # Resolve the script path relative to the package root.
-            pkg_root = _Path(__file__).resolve().parent.parent.parent
-            script_path = pkg_root / "scripts" / "migrate_triplestore_split.py"
-            if not script_path.exists():
-                logger.debug(
-                    "E6: migration script not found at %s; skipping auto-migrate. "
-                    "Annotations schema is ready; legacy rows will remain in "
-                    "triples until the script is available.",
-                    script_path,
-                )
-                return
-
-            spec = importlib.util.spec_from_file_location(
-                "_e6_migrate", script_path
+            from mnemosyne.migrations.e6_triplestore_split import (
+                migrate as _e6_migrate,
+                has_pending_migration as _e6_has_pending,
             )
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+
+            # Fast-path: cheap index-driven existence check before any
+            # heavyweight classify scan / Python-side set diff. Most BeamMemory
+            # inits on a post-migration DB end here in microseconds.
+            if not _e6_has_pending(self.conn):
+                return
 
             # Flush any pending writes on our connection (init_beam commits
             # internally, but be defensive). The migration opens its own
@@ -1232,7 +1224,7 @@ class BeamMemory:
             except Exception:
                 pass
 
-            written = module.migrate(
+            written = _e6_migrate(
                 db_path=self.db_path,
                 dry_run=False,
                 backup=True,
@@ -1241,7 +1233,9 @@ class BeamMemory:
             if written > 0:
                 logger.warning(
                     "E6: auto-migrated %d annotation rows from triples → "
-                    "annotations. Backup written to %s.pre_e6_backup. "
+                    "annotations. Backup is at %s.pre_e6_backup "
+                    "(from this run if newly created, or an earlier run if "
+                    "the file already existed). "
                     "Set MNEMOSYNE_AUTO_MIGRATE=0 to disable auto-migration.",
                     written,
                     self.db_path,

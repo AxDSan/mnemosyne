@@ -47,6 +47,21 @@ ANNOTATION_KINDS = frozenset({
 })
 
 
+# Minimum character length for a candidate fact string to be persisted.
+# Matches the legacy filter in TripleStore.add_facts; centralized here so
+# call sites in beam.py, memory.py, and the deprecated add_facts shim cannot
+# drift independently.
+MIN_FACT_LENGTH = 10
+
+
+def filter_facts(facts: List[str]) -> List[str]:
+    """Drop empty / too-short candidate facts. Used by extraction call
+    sites so the threshold lives in one place."""
+    if not facts:
+        return []
+    return [f for f in facts if f and len(f) > MIN_FACT_LENGTH]
+
+
 def _get_conn(db_path: Optional[Path] = None) -> sqlite3.Connection:
     path = Path(db_path) if db_path else DEFAULT_DB
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -202,10 +217,14 @@ class AnnotationStore:
     ) -> List[Dict]:
         """All annotations with a given kind, optionally filtered by value or memory_id.
 
-        Mirrors the shape of TripleStore.query_by_predicate so existing
-        call sites can swap with minimal changes:
+        Argument shape mirrors TripleStore.query_by_predicate (kind=predicate,
+        value=object), but returned dicts use ``memory_id`` / ``kind`` /
+        ``value`` keys — not ``subject`` / ``predicate`` / ``object``. Callers
+        migrating from TripleStore must remap row access:
             triples.query_by_predicate("mentions", object=entity)
+                # → row["subject"], row["object"]
             annotations.query_by_kind("mentions", value=entity)
+                # → row["memory_id"], row["value"]
         """
         conditions = ["kind = ?"]
         params: List = [kind]

@@ -458,6 +458,82 @@ class TestExportImport:
             assert stats["legacy"]["inserted"] >= 1
             assert stats["beam"]["working_memory"]["inserted"] >= 1
 
+    def test_mnemosyne_export_includes_annotations(self, temp_db):
+        """Post-E6 regression guard: export_to_file must include annotations
+        (kind='mentions', 'fact', 'occurred_on', 'has_source'). Pre-fix the
+        export schema only carried `triples` and silently dropped the new
+        AnnotationStore data, so backups would lose entity/fact graphs.
+        """
+        from mnemosyne.core.annotations import AnnotationStore
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Seed source with multiple annotations on one memory.
+            src = Mnemosyne(session_id="s1", db_path=temp_db)
+            memory_id = src.remember(
+                "Alice met Bob in San Francisco.",
+                source="preference", importance=0.5,
+            )
+            ann = AnnotationStore(db_path=temp_db)
+            ann.add(memory_id, "mentions", "Alice")
+            ann.add(memory_id, "mentions", "Bob")
+            ann.add(memory_id, "fact", "The user met Alice and Bob")
+
+            # Export.
+            export_path = Path(tmpdir) / "export.json"
+            export_stats = src.export_to_file(str(export_path))
+            assert export_stats["annotations_count"] >= 3
+            with open(export_path) as f:
+                payload = _json.load(f)
+            assert payload["mnemosyne_export"]["version"] == "1.1"
+            assert "annotations" in payload
+            assert len(payload["annotations"]) >= 3
+
+            # Round-trip into a fresh DB.
+            target_db = Path(tmpdir) / "target.db"
+            target = Mnemosyne(session_id="s1", db_path=target_db)
+            stats = target.import_from_file(str(export_path))
+            assert stats["annotations"]["inserted"] >= 3
+
+            # Verify the data survived end-to-end.
+            target_ann = AnnotationStore(db_path=target_db)
+            mentions = target_ann.query_by_memory(memory_id, kind="mentions")
+            assert {r["value"] for r in mentions} == {"Alice", "Bob"}
+
+    def test_mnemosyne_import_accepts_legacy_1_0_export(self, temp_db):
+        """Backward compat: pre-E6 backups (version 1.0, no annotations key)
+        import cleanly; the annotations import stats simply report zero
+        inserted rows."""
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Hand-craft a minimal 1.0 export payload.
+            legacy_export = {
+                "mnemosyne_export": {
+                    "version": "1.0",
+                    "export_date": "2026-01-01T00:00:00",
+                    "source_db": "/fake/path.db",
+                },
+                "working_memory": [],
+                "episodic_memory": [],
+                "episodic_embeddings": [],
+                "scratchpad": [],
+                "consolidation_log": [],
+                "legacy_memories": [],
+                "legacy_embeddings": [],
+                "triples": [],
+                # NOTE: no "annotations" key — that's the 1.0 contract.
+            }
+            export_path = Path(tmpdir) / "legacy_export.json"
+            with open(export_path, "w") as f:
+                _json.dump(legacy_export, f)
+
+            target_db = Path(tmpdir) / "target.db"
+            target = Mnemosyne(session_id="s1", db_path=target_db)
+            stats = target.import_from_file(str(export_path))
+            # 1.0 import should produce zero annotation rows but not error.
+            assert stats["annotations"]["inserted"] == 0
+            assert stats["annotations"]["skipped"] == 0
+
 
 class TestProviderContextSafety:
     def test_subagent_context_does_not_initialize_or_write(self, temp_db, monkeypatch):
