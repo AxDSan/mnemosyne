@@ -52,12 +52,25 @@ class _TierStats:
     """Per-tier counters.
 
     `calls_with_hits`: how many recall() invocations got at least
-        one result from this path. NOT a per-result counter — recall
-        is one logical operation per invocation, regardless of how
-        many results come back.
-    `total_hits`: total result rows attributed to this path across
-        all calls. Combined with `calls_with_hits` an operator can
-        compute average hits-per-call for the tier.
+        one kept-and-attributed result from this path.
+    `total_hits`: total kept result rows attributed to this path
+        across all calls. Post-filter and post-relevance-threshold;
+        a row counts here only if it ended up in `results` AND was
+        sourced from this tier.
+
+    Tier attribution semantics:
+      - `wm_fts` / `em_fts`: rows that came from the FTS5 index hit
+        set (overlap with vec credited here).
+      - `wm_vec` / `em_vec`: rows uniquely contributed by vector
+        search (i.e., in the vec result set but NOT in the FTS
+        result set).
+      - `wm_fallback` / `em_fallback`: rows from the substring-
+        scoring fallback path (fires when FTS+vec both produced
+        zero candidates).
+
+    Sum over tiers per call = total kept rows that recall() emitted
+    (excluding the entity-aware expansion path which is a separate
+    signal source).
     """
     calls_with_hits: int = 0
     total_hits: int = 0
@@ -147,9 +160,13 @@ class RecallDiagnostics:
         with self._lock:
             if self._total_calls == 0:
                 return {"wm": 0.0, "em": 0.0}
+            # Clamp at 1.0 to defend against a reset-mid-call race
+            # where pre-reset record_fallback_used calls accumulate
+            # against a post-reset _total_calls counter. The clamp
+            # ensures dashboards never see impossible >1.0 rates.
             return {
-                "wm": self._calls_using_wm_fallback / self._total_calls,
-                "em": self._calls_using_em_fallback / self._total_calls,
+                "wm": min(1.0, self._calls_using_wm_fallback / self._total_calls),
+                "em": min(1.0, self._calls_using_em_fallback / self._total_calls),
             }
 
     def snapshot(self) -> Dict:
@@ -195,8 +212,9 @@ class RecallDiagnostics:
                 wm_rate = 0.0
                 em_rate = 0.0
             else:
-                wm_rate = self._calls_using_wm_fallback / self._total_calls
-                em_rate = self._calls_using_em_fallback / self._total_calls
+                # Clamp matches fallback_rate() — see comment there.
+                wm_rate = min(1.0, self._calls_using_wm_fallback / self._total_calls)
+                em_rate = min(1.0, self._calls_using_em_fallback / self._total_calls)
             return {
                 "created_at": self._created_at,
                 "snapshot_at": datetime.now().isoformat(),

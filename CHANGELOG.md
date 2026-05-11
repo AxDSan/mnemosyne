@@ -49,6 +49,13 @@ and this project adheres to [Simple Versioning](https://github.com/AxDSan/mnemos
 - **For the BEAM experiment**: after running an arm, snapshot the diagnostics. If `wm_fallback_rate` or `em_fallback_rate` is high (>0.2 ish), recall scores in that arm are dominated by the weak-signal substring path. Arm-vs-arm comparisons need similar rates across arms to be interpretable.
 >>>>>>> 17bb600 (feat(c4): recall path provenance diagnostics)
 
+### Counter semantics (post-/review hardening)
+
+- **Per-row tier attribution.** Each kept row credits exactly one tier (FTS+vec overlap credited to FTS; vec-only rows to vec; fallback rows to wm_fallback/em_fallback). Sum across tiers per call = total kept rows for that call (excluding entity-aware expansion which is a separate signal source). Pre-fix counters recorded pre-filter candidate sets — rows that FTS/vec returned but got dropped by `wm_where`/`em_where` (session/scope/date/source/etc.) inflated the counters, making the provenance and fallback-rate signals look healthier than reality.
+- **Kept rows, not scanned rows.** Both `wm_fallback` and `em_fallback` counters increment for rows that pass the substring relevance threshold (0.02) and end up in the result list — not for rows merely scanned by the fallback's `LIMIT 500` SELECT. Pre-fix the EM fallback always recorded `len(scanned_rows)` regardless of whether any survived the threshold.
+- **`truly_empty` is post-filter strict.** True only when `len(final_results) == 0` AND zero kept rows across all tiers. Distinguishes "no signal anywhere" from "candidates existed but got filtered" (top_k=0 callers, post-filter dropouts, etc.).
+- **`fallback_rate` clamped at 1.0.** Defends against a reset-mid-call race where pre-reset `record_fallback_used` calls could accumulate against a post-reset `_total_calls` counter, producing >1.0 ratios in dashboards.
+
 ## [2.5] — 2026-05-10
 
 ### Added

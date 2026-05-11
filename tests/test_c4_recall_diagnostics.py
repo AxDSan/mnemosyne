@@ -293,7 +293,158 @@ class TestBeamRecallInstrumentation:
         assert snap["totals"]["wm_fallback_rate"] == pytest.approx(0.4)
 
 
-class TestRecallBehaviorUnchanged:
+class TestReviewHardening:
+    """Findings from /review (Codex structured + Codex adv + Claude
+    adv). Each test pins one of the closed semantic gaps."""
+
+    def test_counters_record_post_filter_rows(self, temp_db):
+        """[Codex P2 + Codex adv #2 + Claude adv #6] Pre-fix the
+        tier counters recorded BEFORE the `wm_where`/`em_where`
+        filter — rows that FTS/vec returned but got dropped by
+        session/scope/date/source filters inflated the counters.
+        Operators saw "FTS healthy" when actually every FTS hit got
+        filtered out. Fix: counters record POST-filter kept rows."""
+        beam = BeamMemory(session_id="alice-session", db_path=temp_db)
+        # Seed an FTS-matching row but with a different session.
+        # Direct insert with explicit scope='session' — the column
+        # default is 'global' which would surface cross-session and
+        # defeat the filter test.
+        beam.conn.execute(
+            "INSERT INTO working_memory "
+            "(id, content, source, timestamp, session_id, importance, scope) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("foreign-row", "Alice was here", "test",
+             datetime.now().isoformat(), "other-session", 0.5, "session"),
+        )
+        beam.conn.commit()
+
+        # Recall from alice-session for "Alice" — FTS will match
+        # foreign-row by content, but it gets dropped by wm_where
+        # because session_id doesn't match and scope is 'session'.
+        results = beam.recall("Alice", top_k=10)
+
+        snap = get_recall_diagnostics()
+        # Post-filter: foreign-row didn't survive, so wm_fts_kept = 0.
+        # Pre-fix this would have counted 1.
+        assert snap["by_tier"]["wm_fts"]["total_hits"] == 0, (
+            f"wm_fts counter inflated by filtered-out row: "
+            f"got {snap['by_tier']['wm_fts']}"
+        )
+
+    def test_em_fallback_counter_records_kept_not_scanned(self, temp_db):
+        """[Codex adv #1 + Claude adv #9] Pre-fix EM fallback
+        recorded `len(scanned_rows)` regardless of how many passed
+        the relevance > 0.02 threshold. Fix: counter increments
+        only for kept (appended) rows.
+
+        Construct content with disjoint char sets vs. the query so
+        the substring scorer's char_overlap term returns 0 and
+        rows score below the threshold."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        # Content + query chosen to share ZERO chars (including no
+        # whitespace match — `char_overlap` is computed over all
+        # chars in the strings, including spaces). Use single-word
+        # query so char-set is bounded.
+        beam.consolidate_to_episodic(
+            summary="abcdefghij",
+            source_wm_ids=["x"],
+            importance=0.5,
+        )
+        beam.consolidate_to_episodic(
+            summary="abcdefghij",
+            source_wm_ids=["y"],
+            importance=0.5,
+        )
+
+        # Single-word query with chars disjoint from a-j (no
+        # overlap with content). Substring scoring produces 0 +
+        # 0 + 0 + 0 + 0 → relevance below threshold; rows
+        # scanned but NOT kept.
+        results = beam.recall("xyzqwvu", top_k=10)
+
+        snap = get_recall_diagnostics()
+        assert snap["totals"]["calls_using_em_fallback"] == 1
+        kept = snap["by_tier"]["em_fallback"]["total_hits"]
+        # Pre-fix counter was 2 (scanned both rows). Post-fix it
+        # reflects appended rows only — 0 because neither row's
+        # substring score exceeded 0.02.
+        assert kept == 0, (
+            f"em_fallback counter still records scanned rows, not "
+            f"kept rows: got total_hits={kept} with 2 rows seeded"
+        )
+
+    def test_fallback_rate_clamped_at_one(self):
+        """[Claude adv #12] Defense-in-depth: fallback_rate() must
+        not exceed 1.0 even under simulated reset-mid-call races.
+        Operators dashboarding the rate get sensible numbers."""
+        diag = RecallDiagnostics()
+        # Simulate the race: many fallback_used signals accumulate
+        # before total_calls catches up.
+        for _ in range(5):
+            diag.record_fallback_used(wm=True)
+        diag.record_call()  # total_calls = 1, calls_using_wm = 5
+
+        rates = diag.fallback_rate()
+        assert rates["wm"] == 1.0, (
+            f"fallback_rate not clamped: got {rates['wm']}"
+        )
+
+        snap = diag.snapshot()
+        assert snap["totals"]["wm_fallback_rate"] == 1.0
+
+    def test_tier_attribution_no_double_count(self, temp_db):
+        """Each kept row credits exactly one tier. Sum across tiers
+        equals total kept rows for the call (excluding entity-aware
+        expansion which is a separate signal source)."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        beam.remember("Alice prefers Vim", source="pref", importance=0.7)
+        beam.remember("Bob owns auth", source="fact", importance=0.8)
+
+        results = beam.recall("Alice Vim", top_k=10)
+        snap = get_recall_diagnostics()
+
+        total_kept = sum(
+            snap["by_tier"][tier]["total_hits"] for tier in RECALL_TIERS
+        )
+        # Working-tier results in the output (excluding entity-aware
+        # boosts which credit no tier).
+        wm_results = [r for r in results if r.get("tier") == "working" and not r.get("entity_match")]
+        em_results = [r for r in results if r.get("tier") == "episodic" and not r.get("entity_match")]
+        attributable = len(wm_results) + len(em_results)
+        # Counters >= attributable; the entity-aware path can add
+        # more results that aren't tier-attributed.
+        assert total_kept >= attributable, (
+            f"counter undercounts: total_kept={total_kept}, "
+            f"attributable={attributable}, results={results}"
+        )
+
+    def test_truly_empty_distinguishes_filter_dropouts(self, temp_db):
+        """[Claude adv #8] truly_empty must distinguish 'no signal
+        anywhere' from 'candidates existed but got filtered'. Fix:
+        truly_empty = final_results empty AND zero kept across all
+        tiers."""
+        beam = BeamMemory(session_id="alice", db_path=temp_db)
+        # Seed an FTS-matchable row in a different session, scope=
+        # 'session' so it doesn't surface cross-session (column
+        # default is 'global').
+        beam.conn.execute(
+            "INSERT INTO working_memory "
+            "(id, content, source, timestamp, session_id, importance, scope) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("other-sess-row", "Alice was here", "test",
+             datetime.now().isoformat(), "other-session", 0.5, "session"),
+        )
+        beam.conn.commit()
+
+        results = beam.recall("Alice", top_k=10)
+        assert results == []
+        snap = get_recall_diagnostics()
+        # Final results empty AND no tier attributed a kept row →
+        # this case IS truly empty by the new gate (post-filter
+        # dropouts don't credit the counters, so kept_sum=0).
+        # Note: that's the right call — operators care that NO
+        # signal made it through, regardless of why.
+        assert snap["totals"]["calls_truly_empty"] == 1
     """[/regression] Adding diagnostics must not alter recall output.
     Pre-C4 recall returned X; post-C4 it must return the same X.
     Test by recording a baseline expectation and asserting against

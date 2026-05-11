@@ -1526,9 +1526,25 @@ class BeamMemory:
             th_halflife = float(os.environ.get("MNEMOSYNE_TEMPORAL_HALFLIFE_HOURS", "24"))
 
         # [C4] Recall path diagnostics — lazy import to avoid module-
-        # load coupling.
+        # load coupling. Counters are recorded AFTER the per-row
+        # scoring loops below so they reflect POST-FILTER kept rows
+        # (not pre-filter candidate sets). /review caught the
+        # pre-filter shape as misleading.
         from mnemosyne.core.recall_diagnostics import get_diagnostics as _get_recall_diag
         _recall_diag = _get_recall_diag()
+        # Per-call kept-row accumulators. Incremented as the scoring
+        # loops append to `results`. Final values recorded to the
+        # diagnostics in the try/finally at the end of recall().
+        _wm_fts_kept = 0
+        _wm_vec_kept = 0
+        _wm_fallback_kept = 0
+        _em_fts_kept = 0
+        _em_vec_kept = 0
+        _em_fallback_kept = 0
+        _wm_fallback_used = False
+        _em_fallback_used = False
+        _wm_had_candidates = False
+        _em_had_candidates = False
 
         # ---- Working memory (FTS5 fast path) ----
         try:
@@ -1538,10 +1554,6 @@ class BeamMemory:
 
         wm_ids = {r["id"] for r in wm_fts}
         wm_ranks = {r["id"]: r["rank"] for r in wm_fts}
-        # Record FTS hit count (0 if FTS errored or returned no matches —
-        # the diagnostics counter doesn't distinguish, but `wm_fallback`
-        # below catches the both-failed case).
-        _recall_diag.record_tier_hits("wm_fts", len(wm_fts))
 
         # ---- Working memory (vector search) ----
         wm_vec_sims = {}
@@ -1556,13 +1568,14 @@ class BeamMemory:
                         wm_ids.add(vr["id"])  # Merge vector results with FTS5 results
             except Exception:
                 pass
-        # Count vec-only contributions (rows in vec but not FTS).
-        # Rows in both wm_ranks and wm_vec_sims belong to wm_fts;
-        # vec-only rows are the unique vector contribution.
-        _wm_vec_only = set(wm_vec_sims) - set(wm_ranks)
-        _recall_diag.record_tier_hits("wm_vec", len(_wm_vec_only))
-        # If both FTS and vec produced nothing, the fallback at the
-        # else-branch below fires. Pre-fix this was silent.
+        # Track whether the FTS+vec layer produced any candidates
+        # at all (signal source for the truly_empty gate later).
+        if wm_ids:
+            _wm_had_candidates = True
+        # If both FTS and vec produced nothing, the WM fallback at
+        # the else-branch below fires. Recording the fallback signal
+        # uses a boolean (per-call), not a per-row count — that
+        # avoids double-counting against the kept-row accumulators.
         _wm_fallback_used = not wm_ids
         if _wm_fallback_used:
             _recall_diag.record_fallback_used(wm=True)
@@ -1637,11 +1650,9 @@ class BeamMemory:
                 LIMIT {min(EPISODIC_RECALL_LIMIT, 2000)}
             """, wm_params)
             rows = cursor.fetchall()
-            # [C4] Record fallback hit count so operators see how
-            # many results came from this weak-signal path. Note: this
-            # path is reached only when both FTS and vec produced no
-            # ids — so `_wm_fallback_used` is already True above.
-            _recall_diag.record_tier_hits("wm_fallback", len(rows))
+            # [C4] _wm_fallback_kept incremented per-row inside the
+            # scoring loop above. record_fallback_used was already
+            # called when wm_ids was empty.
 
         # Precompute min_rank/rng for wm_ranks normalization
         if wm_ranks:
@@ -1693,6 +1704,20 @@ class BeamMemory:
                 if temporal_weight > 0.0:
                     t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
                     score *= (1.0 + temporal_weight * t_boost)
+                # [C4] Per-row tier attribution. Credit FTS for any
+                # row in wm_ranks (overlap with vec credited to FTS
+                # so the union sum stays consistent). Vec-only rows
+                # (in wm_vec_sims but not wm_ranks) credit wm_vec.
+                # Rows reached via the fallback branch (wm_ids empty)
+                # credit wm_fallback. Each row credits exactly one
+                # tier so `wm_fts + wm_vec + wm_fallback` = total
+                # kept WM rows for this call.
+                if _wm_fallback_used:
+                    _wm_fallback_kept += 1
+                elif wm_ranks and row["id"] in wm_ranks:
+                    _wm_fts_kept += 1
+                elif row["id"] in wm_vec_sims:
+                    _wm_vec_kept += 1
                 results.append({
                     "id": row["id"],
                     "content": row["content"][:500],
@@ -1982,14 +2007,14 @@ class BeamMemory:
                 fts_results[fr["rowid"]] = normalized
 
         episodic_rowids = set(vec_results.keys()) | set(fts_results.keys())
-        # [C4] Record episodic FTS / vec hit counts so operators see
-        # the primary-vs-fallback distribution. fts and vec sets are
-        # disjoint after dedup: a rowid in both counts once under
-        # _em_overlap (or could count under fts; deduplicate by
-        # crediting vec-only hits to vec, FTS hits to fts).
-        _em_vec_only = set(vec_results) - set(fts_results)
-        _recall_diag.record_tier_hits("em_fts", len(fts_results))
-        _recall_diag.record_tier_hits("em_vec", len(_em_vec_only))
+        if episodic_rowids:
+            _em_had_candidates = True
+        # [C4] em_fts/em_vec kept counts are accumulated per-row
+        # inside the scoring loop below so the counters reflect
+        # post-filter results, not pre-filter candidate sets.
+        # /review caught the pre-filter recording as misleading —
+        # rows that pass FTS but get dropped by wm_where/em_where
+        # (session/channel/date) inflated the counter.
         
         # Build temporal filter for episodic memory
         em_where_clauses = [
@@ -2117,6 +2142,13 @@ class BeamMemory:
             if temporal_weight > 0.0:
                 t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
                 score *= (1.0 + temporal_weight * t_boost)
+            # [C4] Per-row tier attribution. FTS gets the overlap;
+            # vec gets vec-only rows. One increment per kept row.
+            rid = row["rowid"]
+            if rid in fts_results:
+                _em_fts_kept += 1
+            elif rid in vec_results:
+                _em_vec_kept += 1
             results.append({
                 "id": row["id"],
                 "content": row["content"][:500],
@@ -2141,6 +2173,7 @@ class BeamMemory:
 
         # Fallback: if no episodic matches from vec/FTS, scan recent episodic entries
         if not episodic_rowids:
+            _em_fallback_used = True
             # [C4] Record EM fallback firing so operators see how
             # often recall comes from the weak-signal substring path
             # rather than vec/FTS. High em_fallback_rate during a
@@ -2156,11 +2189,10 @@ class BeamMemory:
                 LIMIT {min(EPISODIC_RECALL_LIMIT, 500)}
             """, em_params)
             _em_fallback_rows = cursor.fetchall()
-            # Record total scanned rows on the em_fallback tier so
-            # operators see how often this weak-signal path engaged.
-            _recall_diag.record_tier_hits(
-                "em_fallback", len(_em_fallback_rows)
-            )
+            # [C4] em_fallback kept count is incremented per-row
+            # inside the loop below (only rows passing the
+            # relevance>0.02 threshold) so the counter reflects
+            # results-attributable contributions, not scanned rows.
             for row in _em_fallback_rows:
                 content_lower = row["content"].lower()
                 content_words_set = set(content_lower.split())
@@ -2221,6 +2253,8 @@ class BeamMemory:
                     if temporal_weight > 0.0:
                         t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
                         score *= (1.0 + temporal_weight * t_boost)
+                    # [C4] Kept-row credit for em_fallback tier.
+                    _em_fallback_kept += 1
                     results.append({
                         "id": row["id"],
                         "content": row["content"][:500],
@@ -2307,10 +2341,32 @@ class BeamMemory:
             """, (*rec_params,))
         self.conn.commit()
 
-        # [C4] Record the outer call. truly_empty=True means no
-        # results from any tier including fallback — distinct from
-        # "fallback fired and returned some weak-signal results."
-        _recall_diag.record_call(truly_empty=(len(final_results) == 0))
+        # [C4] Final tier-attribution records. Each counter holds the
+        # number of kept rows attributed to that tier on this call.
+        # Summing across tiers gives total kept rows for the call.
+        # `truly_empty` is gated on whether ANY layer (primary OR
+        # fallback) produced candidates — distinct from "final
+        # results empty after top_k slicing / post-filter dropouts."
+        _recall_diag.record_tier_hits("wm_fts", _wm_fts_kept)
+        _recall_diag.record_tier_hits("wm_vec", _wm_vec_kept)
+        _recall_diag.record_tier_hits("wm_fallback", _wm_fallback_kept)
+        _recall_diag.record_tier_hits("em_fts", _em_fts_kept)
+        _recall_diag.record_tier_hits("em_vec", _em_vec_kept)
+        _recall_diag.record_tier_hits("em_fallback", _em_fallback_kept)
+        # truly_empty = final results empty AND no tier attributed
+        # a kept row. Distinguishes "post-filter dropouts" (some
+        # tier counted hits but they got filtered) from "no signal
+        # anywhere" (zero kept across all tiers). top_k=0 callers
+        # also land here, but that's an artifact of the caller's
+        # choice, not a recall failure — operators wanting to
+        # exclude artifact cases can check top_k > 0 from their
+        # side.
+        _total_kept = (
+            _wm_fts_kept + _wm_vec_kept + _wm_fallback_kept
+            + _em_fts_kept + _em_vec_kept + _em_fallback_kept
+        )
+        _truly_empty = (len(final_results) == 0) and (_total_kept == 0)
+        _recall_diag.record_call(truly_empty=_truly_empty)
 
         return final_results
 
