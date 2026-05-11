@@ -12,8 +12,55 @@ Mnemosyne can be installed from **PyPI** or from **source**. This guide covers b
 | Pure Python fix/feature (source) | `git pull` + restart Hermes |
 | New dependency / entry point (source) | `git pull` + `pip install -e .` + restart Hermes |
 | New CLI command (source) | `git pull` + `pip install -e .` + restart Hermes |
-| Database schema | `git pull` + `migrate_from_legacy.py` + restart Hermes |
+| Database schema (legacy ephemeral → persisted) | `git pull` + `migrate_from_legacy.py` + restart Hermes |
+| Database schema (TripleStore split, E6) | `git pull` + restart Hermes (auto-migrates on first BeamMemory init; backup at `{db}.pre_e6_backup`) — or `MNEMOSYNE_AUTO_MIGRATE=0` + `python scripts/migrate_triplestore_split.py` for explicit control |
 | `plugin.yaml` / tool schema | Restart Hermes only |
+
+### Upgrading to the E6 TripleStore split
+
+The first BeamMemory init on a pre-E6 database moves annotation-flavored rows (`mentions`, `fact`, `occurred_on`, `has_source`) from the legacy `triples` table to the new `annotations` table. Before any writes, a file-level backup is created at `{db}.pre_e6_backup` (existing backups are not overwritten).
+
+**Default behavior (recommended for most users):**
+
+```bash
+pip install --upgrade mnemosyne-memory   # or git pull
+hermes gateway restart
+# First memory operation auto-migrates; check logs for:
+#   "E6: auto-migrated N annotation rows from triples → annotations.
+#    Backup written to /path/to/mnemosyne.db.pre_e6_backup."
+```
+
+**Manual control (for operators who prefer explicit migrations):**
+
+```bash
+# Disable auto-migration
+export MNEMOSYNE_AUTO_MIGRATE=0
+
+# Restart Hermes — BeamMemory will log a WARNING listing pending row count
+hermes gateway restart
+
+# Run the migration when ready
+python scripts/migrate_triplestore_split.py --dry-run    # preview
+python scripts/migrate_triplestore_split.py              # commit
+```
+
+**What's preserved, what's not:**
+
+| Data | After E6 |
+|---|---|
+| Existing entity mentions (`mentions`) | Moved to `annotations`. Multiple mentions per memory now coexist (silent-destruction fix). |
+| Existing extracted facts (`fact`) | Moved to `annotations`. Multiple facts per memory now coexist. |
+| Existing `occurred_on` / `has_source` rows | Moved to `annotations`. |
+| Other predicates in `triples` (custom / current-truth) | Stay in `triples`. The table retains auto-invalidation semantics for genuine current-truth facts. |
+| Backup file at `{db}.pre_e6_backup` | Always written before mutation; restore by `cp` if anything goes wrong. |
+
+**Rollback:**
+
+```bash
+cp ~/.hermes/mnemosyne/data/mnemosyne.db.pre_e6_backup ~/.hermes/mnemosyne/data/mnemosyne.db
+# Then pin to a pre-E6 version
+pip install 'mnemosyne-memory<X.Y'   # X.Y is the first release including E6
+```
 
 ---
 
