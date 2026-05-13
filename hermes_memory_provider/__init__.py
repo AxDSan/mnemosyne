@@ -1068,7 +1068,9 @@ class MnemosyneMemoryProvider(MemoryProvider):
         output_path = args.get("output_path", "").strip()
         if not output_path:
             return json.dumps({"error": "output_path is required"})
-        result = self._beam.export_to_file(output_path)
+        from mnemosyne.core.memory import Mnemosyne
+        mem = Mnemosyne(session_id=self._session_id, db_path=self._beam.db_path)
+        result = mem.export_to_file(output_path)
         return json.dumps(result)
 
     def _handle_update(self, args: Dict[str, Any]) -> str:
@@ -1099,6 +1101,9 @@ class MnemosyneMemoryProvider(MemoryProvider):
         dry_run = bool(args.get("dry_run", False))
         force = bool(args.get("force", False))
 
+        from mnemosyne.core.memory import Mnemosyne
+        mem = Mnemosyne(session_id=self._session_id, db_path=self._beam.db_path)
+
         if provider:
             api_key = args.get("api_key", "").strip()
             user_id = args.get("user_id", "").strip() or None
@@ -1118,7 +1123,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
 
             from mnemosyne.core.importers import import_from_provider
             result = import_from_provider(
-                provider, self._beam,
+                provider, mem,
                 api_key=api_key,
                 user_id=user_id,
                 agent_id=agent_id,
@@ -1133,13 +1138,13 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 "error": "Either input_path (for file import) or provider "
                          "(for cross-provider import) is required",
             })
-        stats = self._beam.import_from_file(input_path, force=force)
+        stats = mem.import_from_file(input_path, force=force)
         return json.dumps({"status": "imported", "stats": stats})
 
     def _handle_diagnose(self, args: Dict[str, Any]) -> str:
         from mnemosyne.diagnose import run_diagnostics
         result = run_diagnostics()
-        return json.dumps(result, indent=2)
+        return json.dumps(result, indent=2, default=str)
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         self._turn_count = turn_number
