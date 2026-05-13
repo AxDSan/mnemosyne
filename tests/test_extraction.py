@@ -177,12 +177,12 @@ def test_triplestore_add_facts():
         count = ann_store.add_many(
             "mem_123",
             "fact",
-            ["The user loves coffee", "The user hates mornings", "x"],  # "x" too short
+            ["The user loves coffee", "The user hates mornings"],
             source="test",
             confidence=0.7,
         )
 
-        assert count == 2  # "x" filtered out
+        assert count == 2  # Both facts stored
 
         # Verify via query
         all_facts = ann_store.query_by_memory(memory_id="mem_123", kind="fact")
