@@ -385,6 +385,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
 
     def __init__(self):
         self._beam: Optional[Any] = None
+        self._mem: Optional[Any] = None
         # C27: capture init exception so downstream methods can surface it
         # instead of silently no-op'ing. `_beam is None AND _init_error is None`
         # means a deliberate skip (subagent/cron/skill_loop context, or pre-init);
@@ -648,6 +649,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
         # and handle_tool_call() to silently write into the wrong session.
         # _init_error reset complements this for the failure-recovery case.
         self._beam = None
+        self._mem = None
         self._init_error = None
 
         self._agent_context = kwargs.get("agent_context", "primary")
@@ -685,6 +687,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
                     bank=bank_name,
                     channel_id=kwargs.get("channel_id", ""),
                 )
+                self._mem = mem
                 self._beam = mem.beam
                 logger.info(
                     "Mnemosyne initialized (profile isolation ON): session=%s, bank=%s, db=%s",
@@ -1049,7 +1052,29 @@ class MnemosyneMemoryProvider(MemoryProvider):
                                 db_path=self._beam.db_path)
         return json.dumps({"count": len(results), "results": results})
 
+    def _get_memory_facade(self) -> Any:
+        """Return a Mnemosyne facade bound to the provider's active BEAM store.
+
+        The provider keeps ``_beam`` as the primary runtime object for backward
+        compatibility, but export/import live on the higher-level Mnemosyne
+        facade. Build that facade lazily against the same db_path/session so
+        provider-mode tools operate on the active memory store.
+        """
+        if self._mem is not None:
+            return self._mem
+        if self._beam is None:
+            raise RuntimeError("Mnemosyne not initialized")
+        from mnemosyne.core.memory import Mnemosyne
+        kwargs: Dict[str, Any] = {"session_id": self._session_id}
+        for attr in ("db_path", "author_id", "author_type", "channel_id"):
+            value = getattr(self._beam, attr, None)
+            if value is not None:
+                kwargs[attr] = value
+        self._mem = Mnemosyne(**kwargs)
+        return self._mem
+
     def _handle_scratchpad_write(self, args: Dict[str, Any]) -> str:
+        assert self._beam is not None
         content = args.get("content", "").strip()
         if not content:
             return json.dumps({"error": "Content is required"})
@@ -1057,10 +1082,12 @@ class MnemosyneMemoryProvider(MemoryProvider):
         return json.dumps({"status": "written", "id": pad_id})
 
     def _handle_scratchpad_read(self, args: Dict[str, Any]) -> str:
+        assert self._beam is not None
         entries = self._beam.scratchpad_read()
         return json.dumps({"entries_count": len(entries), "entries": entries})
 
     def _handle_scratchpad_clear(self, args: Dict[str, Any]) -> str:
+        assert self._beam is not None
         self._beam.scratchpad_clear()
         return json.dumps({"status": "cleared"})
 
@@ -1068,10 +1095,12 @@ class MnemosyneMemoryProvider(MemoryProvider):
         output_path = args.get("output_path", "").strip()
         if not output_path:
             return json.dumps({"error": "output_path is required"})
-        result = self._beam.export_to_file(output_path)
+        mem = self._get_memory_facade()
+        result = mem.export_to_file(output_path)
         return json.dumps(result)
 
     def _handle_update(self, args: Dict[str, Any]) -> str:
+        assert self._beam is not None
         memory_id = args.get("memory_id", "").strip()
         if not memory_id:
             return json.dumps({"error": "memory_id is required"})
@@ -1084,6 +1113,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
         })
 
     def _handle_forget(self, args: Dict[str, Any]) -> str:
+        assert self._beam is not None
         memory_id = args.get("memory_id", "").strip()
         if not memory_id:
             return json.dumps({"error": "memory_id is required"})
@@ -1117,14 +1147,15 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 })
 
             from mnemosyne.core.importers import import_from_provider
+            mem = self._get_memory_facade()
             result = import_from_provider(
-                provider, self._beam,
+                provider, mem,
                 api_key=api_key,
                 user_id=user_id,
                 agent_id=agent_id,
                 base_url=base_url,
                 dry_run=dry_run,
-                channel_id=channel_id,
+                channel_id=channel_id or None,
             )
             return json.dumps(result.to_dict())
 
@@ -1133,7 +1164,8 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 "error": "Either input_path (for file import) or provider "
                          "(for cross-provider import) is required",
             })
-        stats = self._beam.import_from_file(input_path, force=force)
+        mem = self._get_memory_facade()
+        stats = mem.import_from_file(input_path, force=force)
         return json.dumps({"status": "imported", "stats": stats})
 
     def _handle_diagnose(self, args: Dict[str, Any]) -> str:

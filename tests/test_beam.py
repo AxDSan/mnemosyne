@@ -5,6 +5,7 @@ Tests for Mnemosyne BEAM architecture
 import pytest
 import tempfile
 import sqlite3
+import json
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -610,6 +611,44 @@ class TestProviderContextSafety:
         count = conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] if exists else 0
         conn.close()
         assert count == 0
+
+    def test_provider_export_uses_mnemosyne_facade_not_raw_beam(self, temp_db, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(temp_db.parent))
+
+        from hermes_memory_provider import MnemosyneMemoryProvider
+
+        provider = MnemosyneMemoryProvider()
+        provider.initialize("provider-export")
+        provider.handle_tool_call("mnemosyne_remember", {"content": "export smoke", "source": "test"})
+
+        output_path = temp_db.parent / "export.json"
+        result = json.loads(provider.handle_tool_call(
+            "mnemosyne_export",
+            {"output_path": str(output_path)},
+        ))
+
+        assert result["status"] == "exported"
+        assert output_path.exists()
+
+    def test_provider_file_import_uses_mnemosyne_facade_not_raw_beam(self, temp_db, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(temp_db.parent))
+
+        source = Mnemosyne(session_id="source-import-smoke", db_path=temp_db)
+        source.remember("import smoke", source="test")
+        export_path = temp_db.parent / "import-source.json"
+        source.export_to_file(str(export_path))
+
+        from hermes_memory_provider import MnemosyneMemoryProvider
+
+        provider = MnemosyneMemoryProvider()
+        provider.initialize("provider-import")
+        result = json.loads(provider.handle_tool_call(
+            "mnemosyne_import",
+            {"input_path": str(export_path), "force": True},
+        ))
+
+        assert result["status"] == "imported"
+        assert "beam" in result["stats"]
 
 
 class TestCrossSessionRecall:
