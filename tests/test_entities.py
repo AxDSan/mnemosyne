@@ -129,10 +129,13 @@ class TestRegexEntityExtraction(unittest.TestCase):
 
     def test_stop_words_filtered(self):
         result = extract_entities_regex("The Quick Brown Fox")
-        # "The" should be filtered as a stop word, but the full phrase
-        # "The Quick Brown Fox" is kept (capitalized sequence)
+        # "The" is filtered as a stop word, and with the any-word-stopword filter,
+        # "The Quick Brown Fox" is also dropped because "The" contaminates it.
         self.assertNotIn("The", result)
-        self.assertIn("The Quick Brown Fox", result)
+        self.assertNotIn("The Quick Brown Fox", result)
+        self.assertIn("Quick", result)
+        self.assertIn("Brown", result)
+        self.assertIn("Fox", result)
 
     def test_mixed_content(self):
         result = extract_entities_regex(
@@ -140,8 +143,8 @@ class TestRegexEntityExtraction(unittest.TestCase):
             "Contact @support or visit New York.'"
         )
         self.assertIn("Abdias", result)
-        # "The Mnemosyne" is extracted as a capitalized sequence
-        self.assertIn("The Mnemosyne", result)
+        # "The Mnemosyne" is dropped because "The" is a stopword contaminating the phrase
+        self.assertNotIn("The Mnemosyne", result)
         self.assertIn("Awesome", result)  # from #Awesome
         self.assertIn("support", result)  # from @support
         self.assertIn("New York", result)

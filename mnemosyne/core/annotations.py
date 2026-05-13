@@ -291,6 +291,7 @@ class AnnotationStore:
         kind: str,
         value: Optional[str] = None,
         memory_id: Optional[str] = None,
+        filter_noise: bool = True,
     ) -> List[Dict]:
         """All annotations with a given kind, optionally filtered by value or memory_id.
 
@@ -302,6 +303,11 @@ class AnnotationStore:
                 # → row["subject"], row["object"]
             annotations.query_by_kind("mentions", value=entity)
                 # → row["memory_id"], row["value"]
+
+        When *filter_noise* is True (default) and *kind* is ``"mentions"``,
+        rows matching known meta-system noise words are excluded from the
+        result.  This is a non-destructive alternative to mass-deleting
+        pre-existing dirty annotations.
         """
         conditions = ["kind = ?"]
         params: List = [kind]
@@ -319,7 +325,10 @@ class AnnotationStore:
             "ORDER BY created_at ASC, id ASC",
             params,
         )
-        return [dict(row) for row in cursor.fetchall()]
+        rows = [dict(row) for row in cursor.fetchall()]
+        if filter_noise and kind == "mentions":
+            rows = filter_clean_mentions(rows)
+        return rows
 
     def get_distinct_values(self, kind: str) -> List[str]:
         """All distinct values seen for a given kind.
