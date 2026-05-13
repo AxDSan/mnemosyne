@@ -17,6 +17,7 @@ from typing import List, Optional, Set, Tuple
 # =============================================================================
 
 ENTITY_EXTRACTION_STOP_WORDS: Set[str] = {
+    # Standard stop words
     "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
     "of", "with", "by", "from", "as", "is", "was", "are", "were", "be",
     "been", "being", "have", "has", "had", "do", "does", "did", "will",
@@ -25,6 +26,16 @@ ENTITY_EXTRACTION_STOP_WORDS: Set[str] = {
     "us", "them", "my", "your", "his", "its", "our", "their",
     "this", "that", "these", "those", "here", "there", "where",
     "when", "what", "which", "who", "whom", "whose", "how", "why",
+    # Meta/system words that are NOT meaningful entities — extracted noise
+    # from LLM-generated summaries and extraction prompts
+    "assistant", "user", "skill", "review", "target", "class",
+    "level", "signals", "phase", "api", "pi", "summary", "added",
+    "active", "be", "not", "whether", "all", "no", "replying",
+    "ai", "memory", "mnemosyne", "conversation", "fact",
+    "false", "true", "none", "null", "signal",
+    "hermes", "assistant", "agent", "model", "system", "memory",
+    "note", "task", "project", "result", "output", "input", "data",
+    "step", "process", "point", "way", "thing", "time", "work",
 }
 
 # Backward compatibility alias
@@ -137,9 +148,13 @@ def extract_entities_regex(text: str) -> List[str]:
             # Filter: must be at least 2 chars
             if len(entity) < 2:
                 continue
-            # Filter out stop words (single word only)
+            # Filter out stop words (single word only); case-insensitive
             words = entity.split()
             if len(words) == 1 and entity.lower() in _STOP_WORDS:
+                continue
+            # Filter entities where ANY word is a stopword (e.g. "The USER",
+            # "Active Signal" -- the stopword contaminates the whole phrase)
+            if any(w.lower() in _STOP_WORDS for w in words):
                 continue
             # Filter out pure numbers
             if entity.replace('.', '').replace(',', '').isdigit():
