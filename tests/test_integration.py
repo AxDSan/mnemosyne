@@ -123,7 +123,8 @@ class TestEpisodicGraph(unittest.TestCase):
         
         self.graph.add_edge(GraphEdge("mem_001", "mem_002", "rel", 0.8, datetime.now().isoformat()))
         related = self.graph.find_related_memories("mem_001", depth=1)
-        self.assertIn("mem_002", related)
+        mids = [r["memory_id"] for r in related]
+        self.assertIn("mem_002", mids)
 
 
 class TestVeracityConsolidation(unittest.TestCase):

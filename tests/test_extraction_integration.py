@@ -101,9 +101,10 @@ def test_fact_recall_keyword_matching():
         id2 = mem.remember("I enjoy swimming at the beach", source="test", extract=False)
         
         # Add facts manually
-        triples = TripleStore(db_path=db_path)
-        triples.add_facts(id1, ["The user loves hiking", "The user enjoys mountains"], source="test")
-        triples.add_facts(id2, ["The user enjoys swimming", "The user likes the beach"], source="test")
+        from mnemosyne.core.annotations import AnnotationStore
+        ann = AnnotationStore(db_path=db_path)
+        ann.add_many(id1, "fact", ["The user loves hiking", "The user enjoys mountains"], source="test")
+        ann.add_many(id2, "fact", ["The user enjoys swimming", "The user likes the beach"], source="test")
         
         # Recall for "hiking" should find id1 via facts
         results = mem.recall("hiking", top_k=5)
@@ -134,8 +135,9 @@ def test_fact_and_entity_extraction_together():
         memory_id = mem.remember(content, source="test", extract_entities=True, extract=False)
         
         # Manually add facts
-        triples = TripleStore(db_path=db_path)
-        triples.add_facts(memory_id, ["The user met Abdias", "Abdias loves coffee"], source="test")
+        from mnemosyne.core.annotations import AnnotationStore
+        ann = AnnotationStore(db_path=db_path)
+        ann.add_many(memory_id, "fact", ["The user met Abdias", "Abdias loves coffee"], source="test")
         
         # Recall for "Abdias" should find via entity
         results = mem.recall("Abdias", top_k=5)
