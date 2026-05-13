@@ -356,11 +356,70 @@ DIAGNOSE_SCHEMA = {
     "parameters": {"type": "object", "properties": {}},
 }
 
+GRAPH_QUERY_SCHEMA = {
+    "name": "mnemosyne_graph_query",
+    "description": "Traverse the memory graph to find memories related to a seed memory. Uses multi-hop BFS through graph_edges with optional edge_type and min_weight filtering.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "seed_memory_id": {
+                "type": "string",
+                "description": "Memory ID to start traversal from",
+            },
+            "max_hops": {
+                "type": "integer",
+                "description": "Maximum traversal depth (default: 2)",
+                "default": 2,
+            },
+            "edge_type": {
+                "type": "string",
+                "description": "Filter by edge type (empty = all types, e.g. 'ctx', 'rel', 'syn', 'references', 'caused', 'supersedes')",
+                "default": "",
+            },
+            "min_weight": {
+                "type": "number",
+                "description": "Minimum edge weight threshold (0.0 to 1.0, default: 0.0 = no filter)",
+                "default": 0.0,
+            },
+        },
+        "required": ["seed_memory_id"],
+    },
+}
+
+GRAPH_LINK_SCHEMA = {
+    "name": "mnemosyne_graph_link",
+    "description": "Declare a semantic edge between two memories in the graph. Use this to explicitly link related memories so graph traversal finds them.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "source_id": {
+                "type": "string",
+                "description": "Source memory ID",
+            },
+            "target_id": {
+                "type": "string",
+                "description": "Target memory ID",
+            },
+            "relationship": {
+                "type": "string",
+                "description": "Relationship label (e.g. 'references', 'caused', 'supersedes', 'related_to')",
+            },
+            "weight": {
+                "type": "number",
+                "description": "Edge weight from 0.0 to 1.0 (default: 0.5)",
+                "default": 0.5,
+            },
+        },
+        "required": ["source_id", "target_id", "relationship"],
+    },
+}
+
 ALL_TOOL_SCHEMAS = [
     REMEMBER_SCHEMA, RECALL_SCHEMA, SLEEP_SCHEMA, STATS_SCHEMA,
     INVALIDATE_SCHEMA, TRIPLE_ADD_SCHEMA, TRIPLE_QUERY_SCHEMA,
     SCRATCHPAD_WRITE_SCHEMA, SCRATCHPAD_READ_SCHEMA, SCRATCHPAD_CLEAR_SCHEMA,
     EXPORT_SCHEMA, UPDATE_SCHEMA, FORGET_SCHEMA, IMPORT_SCHEMA, DIAGNOSE_SCHEMA,
+    GRAPH_QUERY_SCHEMA, GRAPH_LINK_SCHEMA,
 ]
 
 
@@ -928,6 +987,10 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 return self._handle_import(args)
             elif tool_name == "mnemosyne_diagnose":
                 return self._handle_diagnose(args)
+            elif tool_name == "mnemosyne_graph_query":
+                return self._handle_graph_query(args)
+            elif tool_name == "mnemosyne_graph_link":
+                return self._handle_graph_link(args)
             else:
                 return json.dumps({"error": f"Unknown Mnemosyne tool: {tool_name}"})
         except Exception as e:
@@ -1145,6 +1208,56 @@ class MnemosyneMemoryProvider(MemoryProvider):
         from mnemosyne.diagnose import run_diagnostics
         result = run_diagnostics()
         return json.dumps(result, indent=2, default=str)
+
+    def _handle_graph_query(self, args: Dict[str, Any]) -> str:
+        seed_id = args.get("seed_memory_id", "").strip()
+        if not seed_id:
+            return json.dumps({"error": "seed_memory_id is required"})
+        depth = int(args.get("max_hops", 2))
+        edge_type = args.get("edge_type", "") or ""
+        min_weight = float(args.get("min_weight", 0.0))
+        if self._beam.episodic_graph is None:
+            return json.dumps({"error": "Episodic graph not available"})
+        related = self._beam.episodic_graph.find_related_memories(
+            seed_id, depth=depth, edge_type=edge_type, min_weight=min_weight
+        )
+        return json.dumps({
+            "seed_memory_id": seed_id,
+            "max_hops": depth,
+            "edge_type": edge_type or "all",
+            "min_weight": min_weight,
+            "count": len(related),
+            "results": related,
+        })
+
+    def _handle_graph_link(self, args: Dict[str, Any]) -> str:
+        source_id = args.get("source_id", "").strip()
+        target_id = args.get("target_id", "").strip()
+        relationship = args.get("relationship", "").strip()
+        weight = float(args.get("weight", 0.5))
+        if not all([source_id, target_id, relationship]):
+            return json.dumps({
+                "error": "source_id, target_id, and relationship are required",
+            })
+        if self._beam.episodic_graph is None:
+            return json.dumps({"error": "Episodic graph not available"})
+        from mnemosyne.core.episodic_graph import GraphEdge
+        from datetime import datetime
+        edge = GraphEdge(
+            source=source_id,
+            target=target_id,
+            edge_type=relationship,
+            weight=weight,
+            timestamp=datetime.now().isoformat(),
+        )
+        self._beam.episodic_graph.add_edge(edge)
+        return json.dumps({
+            "status": "linked",
+            "source": source_id,
+            "target": target_id,
+            "relationship": relationship,
+            "weight": weight,
+        })
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         self._turn_count = turn_number

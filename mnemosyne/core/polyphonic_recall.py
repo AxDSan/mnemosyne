@@ -492,35 +492,69 @@ class PolyphonicRecallEngine:
         Extracts entities from query, finds related memories
         through graph edges.
 
+        Two retrieval strategies:
+        1. Entity-based: search gists/facts by extracted entity names
+        2. Graph traversal: walk graph edges from found memory IDs
+           using find_related_memories (multi-hop BFS)
+
         A/B toggle: `MNEMOSYNE_VOICE_GRAPH=0` disables this voice.
         """
         if _env_disabled("MNEMOSYNE_VOICE_GRAPH"):
             return []
         # Extract entities (simple noun extraction)
         entities = self._extract_entities(query)
-        
+
         results = []
+        seed_ids = set()
         for entity in entities:
             # Find gists mentioning this entity
             gists = self.graph.find_gists_by_participant(entity)
             for gist in gists:
+                gist_mid = gist.id.replace("gist_", "")
+                seed_ids.add(gist_mid)
                 results.append(RecallResult(
-                    memory_id=gist.id.replace("gist_", ""),
+                    memory_id=gist_mid,
                     score=0.6,  # Base graph score
                     voice="graph",
                     metadata={"entity": entity, "gist": gist.text}
                 ))
-            
+
             # Find facts about this entity
             facts = self.graph.find_facts_by_subject(entity)
             for fact in facts:
+                fact_mid = fact.id.split("_")[-1] if "_" in fact.id else fact.id
+                seed_ids.add(fact_mid)
                 results.append(RecallResult(
-                    memory_id=fact.id.split("_")[-1] if "_" in fact.id else fact.id,
+                    memory_id=fact_mid,
                     score=fact.confidence * 0.5,
                     voice="graph",
                     metadata={"entity": entity, "fact": f"{fact.subject} {fact.predicate} {fact.object}"}
                 ))
-        
+
+        # Graph traversal: from seed memory IDs, walk edges to
+        # discover indirectly related memories (ctx edges only,
+        # moderate weight threshold to avoid noise).
+        traversed_ids = set()
+        for seed_id in seed_ids:
+            related = self.graph.find_related_memories(
+                seed_id, depth=2, edge_type="ctx", min_weight=0.3
+            )
+            for rel in related:
+                mid = rel["memory_id"]
+                if mid not in traversed_ids and mid not in seed_ids:
+                    traversed_ids.add(mid)
+                    results.append(RecallResult(
+                        memory_id=mid,
+                        score=0.4 / rel["depth"],  # Score decays with hop distance
+                        voice="graph_traversal",
+                        metadata={
+                            "seed": seed_id,
+                            "edge_type": rel["edge_type"],
+                            "depth": rel["depth"],
+                            "weight": rel["weight"],
+                        }
+                    ))
+
         return results
     
     def _fact_voice(self, query: str) -> List[RecallResult]:
