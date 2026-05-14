@@ -20,7 +20,7 @@ from mnemosyne.core.extraction import (
     _parse_facts,
     EXTRACTION_PROMPT,
 )
-from mnemosyne.core.triples import TripleStore, init_triples
+from mnemosyne.core.triples import init_triples
 
 
 class MockLLM:
@@ -161,56 +161,52 @@ def test_extract_facts_safe_exception_handling():
     print("PASS: test_extract_facts_safe_exception_handling")
 
 
-def test_triplestore_add_facts():
-    """Test TripleStore.add_facts() batch storage.
+def test_annotation_store_add_many():
+    """Test AnnotationStore.add_many() batch storage.
 
-    Post-E6: add_facts is a deprecation shim that routes writes to the
-    AnnotationStore (not the triples table). This was changed during the
-    /review adversarial pass — pre-redirect, deprecated callers' facts
-    went into the triples table but the new recall path read from
-    annotations, making the facts silently invisible.
+    Post-E6: callers now use AnnotationStore.add_many directly instead of the
+    deprecated TripleStore.add_facts shim.
     """
-    import warnings
     from mnemosyne.core.annotations import AnnotationStore
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test.db"
         init_triples(db_path)
 
-        triples = TripleStore(db_path=db_path)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            count = triples.add_facts(
-                "mem_123",
-                ["The user loves coffee", "The user hates mornings", "x"],  # "x" too short
-                source="test",
-                confidence=0.7
-            )
-
-        assert count == 2  # "x" filtered out
-
-        # Post-E6: facts land in annotations where the recall path looks.
         ann_store = AnnotationStore(db_path=db_path)
+        count = ann_store.add_many(
+            "mem_123",
+            "fact",
+            ["The user loves coffee", "The user hates mornings"],
+            source="test",
+            confidence=0.7,
+        )
+
+        assert count == 2  # Both facts stored
+
+        # Verify via query
         all_facts = ann_store.query_by_memory(memory_id="mem_123", kind="fact")
         assert len(all_facts) == 2
         assert all(f["memory_id"] == "mem_123" for f in all_facts)
         assert all(f["kind"] == "fact" for f in all_facts)
         assert all(f["confidence"] == 0.7 for f in all_facts)
 
-        print("PASS: test_triplestore_add_facts")
+        print("PASS: test_annotation_store_add_many")
 
 
-def test_triplestore_add_facts_empty():
-    """Test TripleStore.add_facts() with empty list."""
+def test_annotation_store_add_many_empty():
+    """Test AnnotationStore.add_many() with empty list."""
+    from mnemosyne.core.annotations import AnnotationStore
+
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test.db"
         init_triples(db_path)
-        
-        triples = TripleStore(db_path=db_path)
-        count = triples.add_facts("mem_456", [], source="test")
+
+        ann_store = AnnotationStore(db_path=db_path)
+        count = ann_store.add_many("mem_456", "fact", [], source="test")
         assert count == 0
         
-        print("PASS: test_triplestore_add_facts_empty")
+        print("PASS: test_annotation_store_add_many_empty")
 
 
 def test_extraction_prompt_configurable():
@@ -253,8 +249,8 @@ def run_all_tests():
         test_parse_facts_empty,
         test_extract_facts_safe_no_llm,
         test_extract_facts_safe_exception_handling,
-        test_triplestore_add_facts,
-        test_triplestore_add_facts_empty,
+        test_annotation_store_add_many,
+        test_annotation_store_add_many_empty,
         test_extraction_prompt_configurable,
     ]
     

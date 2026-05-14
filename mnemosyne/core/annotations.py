@@ -33,6 +33,41 @@ from typing import List, Dict, Optional
 DEFAULT_DB = Path.home() / ".hermes" / "mnemosyne" / "data" / "triples.db"
 
 
+# ---------------------------------------------------------------------------
+# Retrieval-time noisy-mention filter
+# ---------------------------------------------------------------------------
+# Filters mention annotations whose values are meta-system noise words that
+# leaked in before the write-time stopword fix (entities.py).  This is
+# non-destructive defense-in-depth — avoids DELETE from the DB.
+
+_ENTITY_STOP_WORDS: frozenset[str] = frozenset({
+    "assistant", "user", "skill", "review", "target", "class",
+    "level", "signals", "phase", "api", "pi", "summary", "added",
+    "active", "be", "not", "whether", "all", "no", "replying",
+    "ai", "memory", "mnemosyne", "conversation", "fact",
+    "false", "true", "none", "null", "signal",
+    "hermes", "agent", "model", "system", "note", "task", "project",
+    "result", "output", "input", "data", "step", "process", "point",
+    "way", "thing", "time", "work",
+})
+
+
+def _is_noisy_mention(value: str) -> bool:
+    """Return True if a mention value is a known meta-system noise word."""
+    words = value.split()
+    if len(words) == 1:
+        return words[0].lower() in _ENTITY_STOP_WORDS
+    return any(w.lower() in _ENTITY_STOP_WORDS for w in words)
+
+
+def filter_clean_mentions(rows: List[Dict]) -> List[Dict]:
+    """Filter out noisy mention rows from a list of annotation dicts.
+    
+    Returns the subset of rows that have meaningful entity values.
+    """
+    return [r for r in rows if not _is_noisy_mention(r.get("value", ""))]
+
+
 # Known annotation kinds in production use. The migration script (E6) uses
 # this set to classify rows in the legacy `triples` table: predicates in
 # this set move to `annotations`; anything else stays in `temporal_triples`
@@ -256,6 +291,7 @@ class AnnotationStore:
         kind: str,
         value: Optional[str] = None,
         memory_id: Optional[str] = None,
+        filter_noise: bool = True,
     ) -> List[Dict]:
         """All annotations with a given kind, optionally filtered by value or memory_id.
 
@@ -267,6 +303,11 @@ class AnnotationStore:
                 # → row["subject"], row["object"]
             annotations.query_by_kind("mentions", value=entity)
                 # → row["memory_id"], row["value"]
+
+        When *filter_noise* is True (default) and *kind* is ``"mentions"``,
+        rows matching known meta-system noise words are excluded from the
+        result.  This is a non-destructive alternative to mass-deleting
+        pre-existing dirty annotations.
         """
         conditions = ["kind = ?"]
         params: List = [kind]
@@ -284,7 +325,10 @@ class AnnotationStore:
             "ORDER BY created_at ASC, id ASC",
             params,
         )
-        return [dict(row) for row in cursor.fetchall()]
+        rows = [dict(row) for row in cursor.fetchall()]
+        if filter_noise and kind == "mentions":
+            rows = filter_clean_mentions(rows)
+        return rows
 
     def get_distinct_values(self, kind: str) -> List[str]:
         """All distinct values seen for a given kind.

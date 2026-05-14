@@ -50,6 +50,10 @@ HOST_LLM_TIMEOUT = 15.0  # Per-attempt safety cap; not user-facing.
 # Codex/GPT-class aux models; use this larger budget when the host is the path.
 HOST_LLM_N_CTX = int(os.environ.get("MNEMOSYNE_HOST_LLM_N_CTX", "32000"))
 
+# Optional consolidation prompt override. Supports {source}, {memories}, and
+# {memory_count}; unset keeps the historical built-in prompt.
+SLEEP_PROMPT = os.environ.get("MNEMOSYNE_SLEEP_PROMPT", "").strip()
+
 # --- Lazy singleton ----------------------------------------------------------
 _llm_instance = None
 _llm_backend = None  # "llamacpp", "ctransformers", or None
@@ -203,6 +207,29 @@ def _call_local_llm(prompt: str) -> Optional[str]:
         return None
 
 
+def _memory_lines(memories: List[str]) -> str:
+    """Format memories for insertion into consolidation prompts."""
+    return "\n".join(f"- {m}" for m in memories if m)
+
+
+def _format_sleep_prompt(memories: List[str], source: str = "") -> Optional[str]:
+    """Render MNEMOSYNE_SLEEP_PROMPT when configured.
+
+    Supported placeholders:
+    - {source}: source label passed by sleep() / summarize_memories()
+    - {memories}: newline-separated bullet list of source memories
+    - {memory_count}: number of non-empty memories in this chunk
+    """
+    if not SLEEP_PROMPT:
+        return None
+    non_empty = [m for m in memories if m]
+    return SLEEP_PROMPT.format(
+        source=source,
+        memories=_memory_lines(memories),
+        memory_count=len(non_empty),
+    )
+
+
 def _build_prompt(memories: List[str], source: str = "") -> str:
     """Build a consolidation prompt from a list of memory strings.
 
@@ -210,6 +237,10 @@ def _build_prompt(memories: List[str], source: str = "") -> str:
     suitable for both local GGUF models and any LLM. For host LLM
     calls, use :func:`_build_host_prompt` instead.
     """
+    custom = _format_sleep_prompt(memories, source=source)
+    if custom is not None:
+        return custom
+
     header = (
         "Summarize the following memories into 1-3 concise sentences. "
         "Preserve facts, names, preferences, and decisions. Discard fluff."
@@ -217,8 +248,7 @@ def _build_prompt(memories: List[str], source: str = "") -> str:
     if source:
         header += f" Source: {source}."
 
-    lines = "\n".join(f"- {m}" for m in memories if m)
-    prompt = f"{header}\n\n{lines}\n\nSummary:"
+    prompt = f"{header}\n\n{_memory_lines(memories)}\n\nSummary:"
     return prompt
 
 
@@ -229,6 +259,10 @@ def _build_host_prompt(memories: List[str], source: str = "") -> str:
     Chat Completions call; embedding TinyLlama chat-template tokens here
     would degrade output quality on every modern aux provider.
     """
+    custom = _format_sleep_prompt(memories, source=source)
+    if custom is not None:
+        return custom
+
     header = (
         "Summarize the following memories into 1-3 concise sentences. "
         "Preserve facts, names, preferences, and decisions. Discard fluff."
@@ -236,8 +270,7 @@ def _build_host_prompt(memories: List[str], source: str = "") -> str:
     if source:
         header += f" Source: {source}."
 
-    lines = "\n".join(f"- {m}" for m in memories if m)
-    return f"{header}\n\n{lines}"
+    return f"{header}\n\n{_memory_lines(memories)}"
 
 
 def _host_backend_will_handle_call() -> bool:

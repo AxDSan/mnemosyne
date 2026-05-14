@@ -130,9 +130,14 @@ def test_on_session_end_logs_warning_on_timeout(caplog):
     assert any("timed out" in m for m in msgs), msgs
 
 
-def test_session_end_timeout_default_matches_design():
-    """The production default should remain 15s (decision A6)."""
-    assert MnemosyneMemoryProvider.SESSION_END_SLEEP_TIMEOUT_SECONDS == 15
+def test_session_end_timeout_default_matches_design(monkeypatch):
+    """The production default should remain 15s when no env var is set."""
+    monkeypatch.delenv("MNEMOSYNE_SESSION_END_TIMEOUT", raising=False)
+    # Re-import so class attrs re-evaluate
+    import importlib
+    import hermes_memory_provider as hmp
+    importlib.reload(hmp)
+    assert hmp.MnemosyneMemoryProvider.SESSION_END_SLEEP_TIMEOUT_SECONDS == 15
 
 
 def test_on_session_end_completes_when_sleep_is_fast():
@@ -248,18 +253,97 @@ def test_shutdown_drain_default_matches_design():
 
 
 # ---------------------------------------------------------------------------
+# Env var override and validation
+# ---------------------------------------------------------------------------
+
+def test_session_end_timeout_default_is_15(monkeypatch):
+    """When MNEMOSYNE_SESSION_END_TIMEOUT is absent, default is 15s."""
+    monkeypatch.delenv("MNEMOSYNE_SESSION_END_TIMEOUT", raising=False)
+    import importlib
+    import hermes_memory_provider as hmp
+    importlib.reload(hmp)
+    assert hmp.MnemosyneMemoryProvider.SESSION_END_SLEEP_TIMEOUT_SECONDS == 15
+
+
+def test_session_end_timeout_env_override(monkeypatch):
+    """When MNEMOSYNE_SESSION_END_TIMEOUT is set, value is used."""
+    monkeypatch.setenv("MNEMOSYNE_SESSION_END_TIMEOUT", "30.5")
+    import importlib
+    import hermes_memory_provider as hmp
+    importlib.reload(hmp)
+    assert hmp.MnemosyneMemoryProvider.SESSION_END_SLEEP_TIMEOUT_SECONDS == 30.5
+
+
+def test_session_end_timeout_invalid_env_falls_back(monkeypatch):
+    """Invalid MNEMOSYNE_SESSION_END_TIMEOUT falls back to default."""
+    monkeypatch.setenv("MNEMOSYNE_SESSION_END_TIMEOUT", "not-a-number")
+    import importlib
+    import hermes_memory_provider as hmp
+    importlib.reload(hmp)
+    assert hmp.MnemosyneMemoryProvider.SESSION_END_SLEEP_TIMEOUT_SECONDS == 15
+
+
+def test_auto_sleep_timeout_default_is_5(monkeypatch):
+    """When MNEMOSYNE_AUTO_SLEEP_TIMEOUT is absent, default is 5s."""
+    monkeypatch.delenv("MNEMOSYNE_AUTO_SLEEP_TIMEOUT", raising=False)
+    import importlib
+    import hermes_memory_provider as hmp
+    importlib.reload(hmp)
+    assert hmp.MnemosyneMemoryProvider._AUTO_SLEEP_TIMEOUT_SECONDS == 5
+
+
+def test_auto_sleep_timeout_env_override(monkeypatch):
+    """When MNEMOSYNE_AUTO_SLEEP_TIMEOUT is set, value is used."""
+    monkeypatch.setenv("MNEMOSYNE_AUTO_SLEEP_TIMEOUT", "10.0")
+    import importlib
+    import hermes_memory_provider as hmp
+    importlib.reload(hmp)
+    assert hmp.MnemosyneMemoryProvider._AUTO_SLEEP_TIMEOUT_SECONDS == 10.0
+
+
+def test_auto_sleep_timeout_invalid_env_falls_back(monkeypatch):
+    """Invalid MNEMOSYNE_AUTO_SLEEP_TIMEOUT falls back to default."""
+    monkeypatch.setenv("MNEMOSYNE_AUTO_SLEEP_TIMEOUT", "garbage")
+    import importlib
+    import hermes_memory_provider as hmp
+    importlib.reload(hmp)
+    assert hmp.MnemosyneMemoryProvider._AUTO_SLEEP_TIMEOUT_SECONDS == 5
+
+
+def test_shutdown_drain_timeout_default_is_2(monkeypatch):
+    """When MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT is absent, default is 2s."""
+    monkeypatch.delenv("MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT", raising=False)
+    import importlib
+    import hermes_memory_provider as hmp
+    importlib.reload(hmp)
+    assert hmp.MnemosyneMemoryProvider.SHUTDOWN_DRAIN_TIMEOUT_SECONDS == 2
+
+
+def test_shutdown_drain_timeout_env_override(monkeypatch):
+    """When MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT is set, value is used."""
+    monkeypatch.setenv("MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT", "12.0")
+    import importlib
+    import hermes_memory_provider as hmp
+    importlib.reload(hmp)
+    assert hmp.MnemosyneMemoryProvider.SHUTDOWN_DRAIN_TIMEOUT_SECONDS == 12.0
+
+
+def test_shutdown_drain_timeout_invalid_env_falls_back(monkeypatch):
+    """Invalid MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT falls back to default."""
+    monkeypatch.setenv("MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT", "bad")
+    import importlib
+    import hermes_memory_provider as hmp
+    importlib.reload(hmp)
+    assert hmp.MnemosyneMemoryProvider.SHUTDOWN_DRAIN_TIMEOUT_SECONDS == 2
+
+
+# ---------------------------------------------------------------------------
 # C12.b — REMEMBER_SCHEMA + _handle_remember per-call kwargs parity
 # ---------------------------------------------------------------------------
 #
 # BeamMemory.remember() accepts extract, metadata, veracity per call. The
 # plugin's REMEMBER_SCHEMA used to only expose content/importance/source/
 # scope/valid_until/extract_entities, so callers passing any of the missing
-# fields had them silently stripped:
-#   - extract=True (LLM fact-triple extraction): facts never extracted
-#   - metadata={...} (source/tag tracking): provenance lost
-#   - veracity="stated"/"tool"/...: every plugin memory defaulted to "unknown",
-#     defeating the veracity boost in recall
-# These tests lock the schema → handler → beam wiring.
 
 def test_remember_schema_advertises_extract_and_metadata_and_veracity():
     """[C12.b] REMEMBER_SCHEMA must advertise the per-call kwargs that

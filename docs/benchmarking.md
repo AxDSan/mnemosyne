@@ -146,6 +146,7 @@ If you don't enable this for benchmarks ≥100K, expect FTS-driven recall to mis
 |---|---|---|
 | `MNEMOSYNE_WM_TTL_HOURS` | `24` | Working memory rows older than this get pulled into `sleep()`. The benchmark harness backdates timestamps to ensure rows are eligible. |
 | `MNEMOSYNE_SLEEP_BATCH` | `5000` | Max rows pulled per `sleep()` invocation. Larger batches reduce sleep overhead; smaller batches reduce peak memory during summarization. |
+| `MNEMOSYNE_SLEEP_PROMPT` | *(built-in)* | Optional consolidation prompt override. Pin this across multilingual benchmark arms because it changes episodic summary language/content. |
 | `MNEMOSYNE_LLM_ENABLED` | `true` | When `false`, `sleep()` skips local LLM summarization and falls back to AAAK encoding. Useful for benchmark runs that want deterministic summaries without per-row LLM latency. |
 
 ---

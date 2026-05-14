@@ -404,38 +404,57 @@ class EpisodicGraph:
     
     # --- Graph Traversal ---
     
-    def find_related_memories(self, memory_id: str, depth: int = 2) -> List[str]:
+    def find_related_memories(self, memory_id: str, depth: int = 2,
+                                edge_type: str = "", min_weight: float = 0.0) -> List[Dict]:
         """
         Find memories related to a given memory via graph traversal.
-        
+
         Args:
             memory_id: Starting memory
             depth: Traversal depth (default 2)
-            
+            edge_type: Filter by edge type (empty = all types). Built-in types:
+                       "rel" (relation), "ctx" (context), "syn" (synonymy).
+                       Agent-declared types like "references", "caused",
+                       "supersedes" also work since the column is freeform TEXT.
+            min_weight: Minimum edge weight threshold (default 0.0 = no filter)
+
         Returns:
-            List of related memory IDs
+            List of dicts with keys: memory_id, edge_type, weight, depth
         """
-        related = set()
+        results = []
         current_level = {memory_id}
-        
-        for _ in range(depth):
+        seen = {memory_id}
+
+        for hop in range(1, depth + 1):
             next_level = set()
             for mem in current_level:
                 cursor = self.conn.cursor()
-                cursor.execute("""
-                    SELECT source, target FROM graph_edges
-                    WHERE source = ? OR target = ?
-                """, (mem, mem))
-                
+                if edge_type:
+                    cursor.execute("""
+                        SELECT source, target, edge_type, weight FROM graph_edges
+                        WHERE (source = ? OR target = ?) AND edge_type = ? AND weight >= ?
+                    """, (mem, mem, edge_type, min_weight))
+                else:
+                    cursor.execute("""
+                        SELECT source, target, edge_type, weight FROM graph_edges
+                        WHERE (source = ? OR target = ?) AND weight >= ?
+                    """, (mem, mem, min_weight))
+
                 for row in cursor.fetchall():
-                    next_level.add(row["source"])
-                    next_level.add(row["target"])
-            
-            related.update(next_level)
+                    neighbor = row["target"] if row["source"] == mem else row["source"]
+                    if neighbor not in seen:
+                        next_level.add(neighbor)
+                        seen.add(neighbor)
+                        results.append({
+                            "memory_id": neighbor,
+                            "edge_type": row["edge_type"],
+                            "weight": row["weight"],
+                            "depth": hop,
+                        })
+
             current_level = next_level
-        
-        related.discard(memory_id)
-        return list(related)
+
+        return results
     
     def find_facts_by_subject(self, subject: str) -> List[Fact]:
         """Find all facts about a subject."""
@@ -554,7 +573,9 @@ if __name__ == "__main__":
     
     # Find related
     related = graph.find_related_memories("mem_001", depth=1)
-    print(f"\nRelated memories: {related}")
+    print(f"\nRelated memories:")
+    for r in related:
+        print(f"  {r['memory_id']} --{r['edge_type']}--> weight={r['weight']} (depth={r['depth']})")
     
     # Find facts by subject
     alice_facts = graph.find_facts_by_subject("Alice")

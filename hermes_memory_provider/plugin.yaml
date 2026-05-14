@@ -18,6 +18,8 @@ provides_tools:
   - mnemosyne_update
   - mnemosyne_forget
   - mnemosyne_diagnose
+  - mnemosyne_graph_query
+  - mnemosyne_graph_link
 provides_hooks:
   - pre_llm_call
   - on_session_start

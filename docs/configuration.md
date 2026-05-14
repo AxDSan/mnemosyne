@@ -70,6 +70,7 @@ All values use 384-dimensional vectors (bge-small-en-v1.5 embedding model).
 | `MNEMOSYNE_LLM_N_THREADS` | `4` | CPU threads for local inference |
 | `MNEMOSYNE_LLM_REPO` | `TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF` | HuggingFace repo for GGUF model |
 | `MNEMOSYNE_LLM_FILE` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | GGUF filename |
+| `MNEMOSYNE_SLEEP_PROMPT` | *(built-in)* | Optional sleep/consolidation prompt override. Supports `{source}`, `{memories}`, and `{memory_count}` placeholders for language-specific summaries. |
 
 ### Remote LLM (OpenAI-compatible)
 

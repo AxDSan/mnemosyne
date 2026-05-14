@@ -121,6 +121,43 @@ class TestRemoteLLM:
                 mock_load.assert_called_once()
 
 
+class TestSleepPromptOverride:
+    def test_build_prompt_uses_sleep_prompt_override(self, monkeypatch):
+        """MNEMOSYNE_SLEEP_PROMPT can steer local consolidation language."""
+        monkeypatch.setattr(
+            local_llm,
+            "SLEEP_PROMPT",
+            "Fasse diese Erinnerungen auf Deutsch zusammen.\nQuelle: {source}\n{memories}\nAntwort:",
+            raising=False,
+        )
+
+        prompt = local_llm._build_prompt(
+            ["Ich mag Kaffee", "Berlin bleibt wichtig"],
+            source="conversation",
+        )
+
+        assert "Fasse diese Erinnerungen auf Deutsch zusammen." in prompt
+        assert "Quelle: conversation" in prompt
+        assert "- Ich mag Kaffee" in prompt
+        assert "- Berlin bleibt wichtig" in prompt
+        assert "Summarize the following memories" not in prompt
+
+    def test_build_host_prompt_uses_same_sleep_prompt_override(self, monkeypatch):
+        """Host LLM consolidation gets the same language-controlled prompt."""
+        monkeypatch.setattr(
+            local_llm,
+            "SLEEP_PROMPT",
+            "Write in German. Source={source}. Memories:\n{memories}",
+            raising=False,
+        )
+
+        prompt = local_llm._build_host_prompt(["User prefers tea"], source="profile")
+
+        assert prompt == "Write in German. Source=profile. Memories:\n- User prefers tea"
+        assert "<|user|>" not in prompt
+        assert "</s>" not in prompt
+
+
 class TestHostLLMBackend:
     """Tests for the host LLM adapter integration in summarize_memories()."""
 

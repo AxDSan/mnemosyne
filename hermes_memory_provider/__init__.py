@@ -21,6 +21,8 @@ import sys
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from datetime import datetime
+from mnemosyne.core.episodic_graph import GraphEdge
 
 # Ensure mnemosyne core is importable from this directory
 _mnemosyne_root = Path(__file__).resolve().parent.parent
@@ -75,6 +77,42 @@ def _get_beam_class():
 def _get_triple_module():
     from mnemosyne.core.triples import add_triple, query_triples
     return add_triple, query_triples
+
+
+def _prefetch_content_char_limit() -> int:
+    """Return the per-memory prefetch content limit.
+
+    ``0`` means no truncation. This is the default because the old hardcoded
+    200-character cap often removed the actual fact from LLM-authored memories.
+    Operators that need tighter prompt budgets can set
+    ``MNEMOSYNE_PREFETCH_CONTENT_CHARS`` to a positive integer.
+    """
+    raw = os.environ.get("MNEMOSYNE_PREFETCH_CONTENT_CHARS", "0").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid MNEMOSYNE_PREFETCH_CONTENT_CHARS=%r; disabling prefetch truncation",
+            raw,
+        )
+        return 0
+
+
+def _format_prefetch_content(content: str, limit: int) -> str:
+    """Format recalled memory content for prompt injection.
+
+    When a positive limit is configured, truncate on a word boundary instead of
+    splitting mid-token. Without a positive limit, return the complete content.
+    """
+    if limit <= 0 or len(content) <= limit:
+        return content
+
+    cut = content[:limit].rstrip()
+    # Prefer a word boundary when one exists reasonably close to the limit.
+    boundary = cut.rfind(" ")
+    if boundary >= max(1, limit // 2):
+        cut = cut[:boundary].rstrip()
+    return f"{cut}..."
 
 
 # ---------------------------------------------------------------------------
@@ -356,11 +394,70 @@ DIAGNOSE_SCHEMA = {
     "parameters": {"type": "object", "properties": {}},
 }
 
+GRAPH_QUERY_SCHEMA = {
+    "name": "mnemosyne_graph_query",
+    "description": "Traverse the memory graph to find memories related to a seed memory. Uses multi-hop BFS through graph_edges with optional edge_type and min_weight filtering.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "seed_memory_id": {
+                "type": "string",
+                "description": "Memory ID to start traversal from",
+            },
+            "max_hops": {
+                "type": "integer",
+                "description": "Maximum traversal depth (default: 2)",
+                "default": 2,
+            },
+            "edge_type": {
+                "type": "string",
+                "description": "Filter by edge type (empty = all types, e.g. 'ctx', 'rel', 'syn', 'references', 'caused', 'supersedes')",
+                "default": "",
+            },
+            "min_weight": {
+                "type": "number",
+                "description": "Minimum edge weight threshold (0.0 to 1.0, default: 0.0 = no filter)",
+                "default": 0.0,
+            },
+        },
+        "required": ["seed_memory_id"],
+    },
+}
+
+GRAPH_LINK_SCHEMA = {
+    "name": "mnemosyne_graph_link",
+    "description": "Declare a semantic edge between two memories in the graph. Use this to explicitly link related memories so graph traversal finds them.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "source_id": {
+                "type": "string",
+                "description": "Source memory ID",
+            },
+            "target_id": {
+                "type": "string",
+                "description": "Target memory ID",
+            },
+            "relationship": {
+                "type": "string",
+                "description": "Relationship label (e.g. 'references', 'caused', 'supersedes', 'related_to')",
+            },
+            "weight": {
+                "type": "number",
+                "description": "Edge weight from 0.0 to 1.0 (default: 0.5)",
+                "default": 0.5,
+            },
+        },
+        "required": ["source_id", "target_id", "relationship"],
+    },
+}
+
 ALL_TOOL_SCHEMAS = [
     REMEMBER_SCHEMA, RECALL_SCHEMA, SLEEP_SCHEMA, STATS_SCHEMA,
     INVALIDATE_SCHEMA, TRIPLE_ADD_SCHEMA, TRIPLE_QUERY_SCHEMA,
     SCRATCHPAD_WRITE_SCHEMA, SCRATCHPAD_READ_SCHEMA, SCRATCHPAD_CLEAR_SCHEMA,
     EXPORT_SCHEMA, UPDATE_SCHEMA, FORGET_SCHEMA, IMPORT_SCHEMA, DIAGNOSE_SCHEMA,
+    GRAPH_QUERY_SCHEMA, GRAPH_LINK_SCHEMA,
 ]
 
 
@@ -380,8 +477,23 @@ class MnemosyneMemoryProvider(MemoryProvider):
 
     # How long on_session_end will wait for sleep/consolidation to finish before
     # giving up and letting the daemon thread continue in the background. Tests
-    # may shorten this to keep the suite fast.
-    SESSION_END_SLEEP_TIMEOUT_SECONDS = 15
+    # may shorten this to keep the suite fast. Override via MNEMOSYNE_SESSION_END_TIMEOUT.
+    @staticmethod
+    def _parse_env_float(key: str, default: float) -> float:
+        """Read a float env var, falling back to default on missing or invalid value."""
+        val = os.environ.get(key)
+        if val is None:
+            return default
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return default
+
+    SESSION_END_SLEEP_TIMEOUT_SECONDS = _parse_env_float("MNEMOSYNE_SESSION_END_TIMEOUT", 15)
+
+    # Auto-sleep thread join timeout. Re-read from env once at class level so
+    # it's not re-parsed on every _maybe_auto_sleep call.
+    _AUTO_SLEEP_TIMEOUT_SECONDS = _parse_env_float("MNEMOSYNE_AUTO_SLEEP_TIMEOUT", 5)
 
     def __init__(self):
         self._beam: Optional[Any] = None
@@ -787,10 +899,12 @@ class MnemosyneMemoryProvider(MemoryProvider):
             if not filtered:
                 return ""
             lines = ["## Mnemosyne Context"]
+            content_limit = _prefetch_content_char_limit()
             for r in filtered:
-                content = r.get("content", "")[:200]
-                if len(r.get("content", "")) > 200:
-                    content += "..."
+                content = _format_prefetch_content(
+                    r.get("content", ""),
+                    content_limit,
+                )
                 ts = r.get("timestamp", "")[:16] if r.get("timestamp") else ""
                 imp = r.get("importance", 0.0)
                 trust = r.get("trust_tier", "STATED")
@@ -871,9 +985,9 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 sleep_fn = self._beam.sleep_all_sessions if hasattr(self._beam, "sleep_all_sessions") else self._beam.sleep
                 sleep_thread = threading.Thread(target=sleep_fn, daemon=True)
                 sleep_thread.start()
-                sleep_thread.join(timeout=5)
+                sleep_thread.join(timeout=self._AUTO_SLEEP_TIMEOUT_SECONDS)
                 if sleep_thread.is_alive():
-                    logger.warning("Mnemosyne auto-sleep timed out after 5s — consolidation deferred")
+                    logger.warning("Mnemosyne auto-sleep timed out after %.0fs — consolidation deferred", self._AUTO_SLEEP_TIMEOUT_SECONDS)
         except Exception:
             pass
 
@@ -928,6 +1042,10 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 return self._handle_import(args)
             elif tool_name == "mnemosyne_diagnose":
                 return self._handle_diagnose(args)
+            elif tool_name == "mnemosyne_graph_query":
+                return self._handle_graph_query(args)
+            elif tool_name == "mnemosyne_graph_link":
+                return self._handle_graph_link(args)
             else:
                 return json.dumps({"error": f"Unknown Mnemosyne tool: {tool_name}"})
         except Exception as e:
@@ -1146,6 +1264,60 @@ class MnemosyneMemoryProvider(MemoryProvider):
         result = run_diagnostics()
         return json.dumps(result, indent=2, default=str)
 
+    def _handle_graph_query(self, args: Dict[str, Any]) -> str:
+        seed_id = args.get("seed_memory_id", "").strip()
+        if not seed_id:
+            return json.dumps({"error": "seed_memory_id is required"})
+        depth = int(args.get("max_hops", 2))
+        if depth < 1:
+            return json.dumps({"error": "max_hops must be greater than 0"})
+        edge_type = args.get("edge_type", "") or ""
+        min_weight = float(args.get("min_weight", 0.0))
+        if not (0.0 <= min_weight <= 1.0):
+            return json.dumps({"error": "min_weight must be between 0.0 and 1.0"})
+        if self._beam.episodic_graph is None:
+            return json.dumps({"error": "Episodic graph not available"})
+        related = self._beam.episodic_graph.find_related_memories(
+            seed_id, depth=depth, edge_type=edge_type, min_weight=min_weight
+        )
+        return json.dumps({
+            "seed_memory_id": seed_id,
+            "max_hops": depth,
+            "edge_type": edge_type or "all",
+            "min_weight": min_weight,
+            "count": len(related),
+            "results": related,
+        })
+
+    def _handle_graph_link(self, args: Dict[str, Any]) -> str:
+        source_id = args.get("source_id", "").strip()
+        target_id = args.get("target_id", "").strip()
+        relationship = args.get("relationship", "").strip()
+        weight = float(args.get("weight", 0.5))
+        if not (0.0 <= weight <= 1.0):
+            return json.dumps({"error": "weight must be between 0.0 and 1.0"})
+        if not all([source_id, target_id, relationship]):
+            return json.dumps({
+                "error": "source_id, target_id, and relationship are required",
+            })
+        if self._beam.episodic_graph is None:
+            return json.dumps({"error": "Episodic graph not available"})
+        edge = GraphEdge(
+            source=source_id,
+            target=target_id,
+            edge_type=relationship,
+            weight=weight,
+            timestamp=datetime.now().isoformat(),
+        )
+        self._beam.episodic_graph.add_edge(edge)
+        return json.dumps({
+            "status": "linked",
+            "source": source_id,
+            "target": target_id,
+            "relationship": relationship,
+            "weight": weight,
+        })
+
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         self._turn_count = turn_number
 
@@ -1202,8 +1374,9 @@ class MnemosyneMemoryProvider(MemoryProvider):
     # held up indefinitely; just long enough to close the race window where
     # the daemon thread's post-join host call could see a None backend and
     # fall through to MNEMOSYNE_LLM_BASE_URL (violating the host-skips-remote
-    # contract). Tests may shorten this to keep the suite fast.
-    SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 2
+    # contract). Tests may shorten this to keep the suite fast. Override via
+    # MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT.
+    SHUTDOWN_DRAIN_TIMEOUT_SECONDS = _parse_env_float("MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT", 2)
 
     def shutdown(self) -> None:
         # If session_end's daemon thread is still consolidating when shutdown
