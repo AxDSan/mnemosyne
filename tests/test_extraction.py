@@ -20,7 +20,7 @@ from mnemosyne.core.extraction import (
     _parse_facts,
     EXTRACTION_PROMPT,
 )
-from mnemosyne.core.triples import TripleStore, init_triples
+from mnemosyne.core.triples import init_triples
 
 
 class MockLLM:
@@ -161,11 +161,11 @@ def test_extract_facts_safe_exception_handling():
     print("PASS: test_extract_facts_safe_exception_handling")
 
 
-def test_triplestore_add_facts():
-    """Test TripleStore.add_facts() batch storage — migrated to AnnotationStore.
+def test_annotation_store_add_many():
+    """Test AnnotationStore.add_many() batch storage.
 
-    Post-E6: add_facts is a deprecation shim. Test calls AnnotationStore.add_many
-    directly instead.
+    Post-E6: callers now use AnnotationStore.add_many directly instead of the
+    deprecated TripleStore.add_facts shim.
     """
     from mnemosyne.core.annotations import AnnotationStore
 
@@ -191,11 +191,11 @@ def test_triplestore_add_facts():
         assert all(f["kind"] == "fact" for f in all_facts)
         assert all(f["confidence"] == 0.7 for f in all_facts)
 
-        print("PASS: test_triplestore_add_facts")
+        print("PASS: test_annotation_store_add_many")
 
 
-def test_triplestore_add_facts_empty():
-    """Test add_facts() with empty list via AnnotationStore."""
+def test_annotation_store_add_many_empty():
+    """Test AnnotationStore.add_many() with empty list."""
     from mnemosyne.core.annotations import AnnotationStore
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -206,7 +206,7 @@ def test_triplestore_add_facts_empty():
         count = ann_store.add_many("mem_456", "fact", [], source="test")
         assert count == 0
         
-        print("PASS: test_triplestore_add_facts_empty")
+        print("PASS: test_annotation_store_add_many_empty")
 
 
 def test_extraction_prompt_configurable():
@@ -249,8 +249,8 @@ def run_all_tests():
         test_parse_facts_empty,
         test_extract_facts_safe_no_llm,
         test_extract_facts_safe_exception_handling,
-        test_triplestore_add_facts,
-        test_triplestore_add_facts_empty,
+        test_annotation_store_add_many,
+        test_annotation_store_add_many_empty,
         test_extraction_prompt_configurable,
     ]
     
