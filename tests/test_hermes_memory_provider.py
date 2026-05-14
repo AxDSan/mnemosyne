@@ -131,8 +131,10 @@ def test_on_session_end_logs_warning_on_timeout(caplog):
 
 
 def test_session_end_timeout_default_matches_design():
-    """The production default should remain 15s (decision A6)."""
-    assert MnemosyneMemoryProvider.SESSION_END_SLEEP_TIMEOUT_SECONDS == 15
+    """The production default should remain 60s (env-var override available)."""
+    # Default is 60s (was 15s hardcoded). Operators can override via
+    # MNEMOSYNE_SESSION_END_TIMEOUT for slow local LLM consolidation.
+    assert MnemosyneMemoryProvider.SESSION_END_SLEEP_TIMEOUT_SECONDS == 60
 
 
 def test_on_session_end_completes_when_sleep_is_fast():
@@ -243,8 +245,10 @@ def test_shutdown_proceeds_when_drain_times_out(caplog):
 
 
 def test_shutdown_drain_default_matches_design():
-    """Production drain default should remain 2s."""
-    assert MnemosyneMemoryProvider.SHUTDOWN_DRAIN_TIMEOUT_SECONDS == 2
+    """Production drain default should remain 8s (env-var override available)."""
+    # Default is 8s (was 2s hardcoded). Operators can override via
+    # MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT for slow hosts.
+    assert MnemosyneMemoryProvider.SHUTDOWN_DRAIN_TIMEOUT_SECONDS == 8
 
 
 # ---------------------------------------------------------------------------

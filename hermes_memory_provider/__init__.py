@@ -477,8 +477,11 @@ class MnemosyneMemoryProvider(MemoryProvider):
 
     # How long on_session_end will wait for sleep/consolidation to finish before
     # giving up and letting the daemon thread continue in the background. Tests
-    # may shorten this to keep the suite fast.
-    SESSION_END_SLEEP_TIMEOUT_SECONDS = 15
+    # may shorten this to keep the suite fast. Allow user override via env var
+    # for hosts with slow local LLM consolidation.
+    SESSION_END_SLEEP_TIMEOUT_SECONDS = float(
+        os.environ.get("MNEMOSYNE_SESSION_END_TIMEOUT", "60")
+    )
 
     def __init__(self):
         self._beam: Optional[Any] = None
@@ -970,9 +973,10 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 sleep_fn = self._beam.sleep_all_sessions if hasattr(self._beam, "sleep_all_sessions") else self._beam.sleep
                 sleep_thread = threading.Thread(target=sleep_fn, daemon=True)
                 sleep_thread.start()
-                sleep_thread.join(timeout=5)
+                auto_timeout = float(os.environ.get("MNEMOSYNE_AUTO_SLEEP_TIMEOUT", "15"))
+                sleep_thread.join(timeout=auto_timeout)
                 if sleep_thread.is_alive():
-                    logger.warning("Mnemosyne auto-sleep timed out after 5s — consolidation deferred")
+                    logger.warning("Mnemosyne auto-sleep timed out after %.0fs — consolidation deferred", auto_timeout)
         except Exception:
             pass
 
@@ -1359,8 +1363,11 @@ class MnemosyneMemoryProvider(MemoryProvider):
     # held up indefinitely; just long enough to close the race window where
     # the daemon thread's post-join host call could see a None backend and
     # fall through to MNEMOSYNE_LLM_BASE_URL (violating the host-skips-remote
-    # contract). Tests may shorten this to keep the suite fast.
-    SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 2
+    # contract). Tests may shorten this to keep the suite fast. Allow user
+    # override via env var.
+    SHUTDOWN_DRAIN_TIMEOUT_SECONDS = float(
+        os.environ.get("MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT", "8")
+    )
 
     def shutdown(self) -> None:
         # If session_end's daemon thread is still consolidating when shutdown
