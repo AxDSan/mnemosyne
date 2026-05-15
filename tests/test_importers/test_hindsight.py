@@ -1,6 +1,7 @@
 import json
 import sqlite3
 
+import mnemosyne.core.importers.hindsight as hindsight_module
 from mnemosyne.core.importers import HindsightImporter, import_from_provider
 from mnemosyne.core.memory import Mnemosyne
 
@@ -100,3 +101,64 @@ def test_hindsight_provider_registry_import(tmp_path):
 
     assert result.provider == "hindsight"
     assert result.imported == 1
+
+
+
+def test_hindsight_importer_adds_quality_metadata_and_can_skip_low_value(tmp_path):
+    export = tmp_path / "hindsight-export.json"
+    export.write_text(json.dumps({"items": [
+        _sample_items()[0],
+        {
+            "id": "hs-meta-prompt",
+            "text": "Review the conversation above and consider saving to memory if appropriate. Focus on user preferences.",
+            "fact_type": "experience",
+            "mentioned_at": "2026-05-15T23:00:00+00:00",
+        },
+    ]}), encoding="utf-8")
+
+    db_path = tmp_path / "mnemosyne.db"
+    mem = Mnemosyne(session_id="default", db_path=db_path)
+    result = HindsightImporter(file_path=str(export), bank="hermes", skip_low_value=True).run(mem)
+
+    assert result.failed == 0
+    assert result.imported == 1
+    assert result.skipped == 1
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT metadata_json FROM episodic_memory").fetchone()
+    metadata = json.loads(row["metadata_json"])
+    assert metadata["migration_source"] == "hindsight"
+    assert metadata["import_quality_score"] == 1.0
+    assert "import_quality_flags" not in metadata
+
+
+def test_hindsight_importer_generates_binary_vectors_when_embedding_backend_available(tmp_path, monkeypatch):
+    class FakeEmbeddingBackend:
+        @staticmethod
+        def available():
+            return True
+
+        @staticmethod
+        def embed(texts):
+            assert texts == ["Phin prefers full subject names instead of subject codes."]
+            return [object()]
+
+    monkeypatch.setattr(hindsight_module, "_embeddings", FakeEmbeddingBackend)
+    monkeypatch.setattr(hindsight_module, "_vec_available", lambda conn: False)
+    monkeypatch.setattr(hindsight_module, "_vec_insert", None)
+    monkeypatch.setattr(hindsight_module, "_mib", lambda vec: b"binary-vector")
+
+    export = tmp_path / "hindsight-export.json"
+    export.write_text(json.dumps({"items": _sample_items()[:1]}), encoding="utf-8")
+
+    db_path = tmp_path / "mnemosyne.db"
+    mem = Mnemosyne(session_id="default", db_path=db_path)
+    result = HindsightImporter(file_path=str(export), bank="hermes").run(mem)
+
+    assert result.failed == 0
+    assert result.imported == 1
+
+    conn = sqlite3.connect(db_path)
+    binary_vector = conn.execute("SELECT binary_vector FROM episodic_memory").fetchone()[0]
+    assert binary_vector == b"binary-vector"

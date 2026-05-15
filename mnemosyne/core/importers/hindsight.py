@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -25,6 +26,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from mnemosyne.core.importers.base import BaseImporter, ImporterResult
+
+try:  # Optional semantic-search backfill for direct episodic imports.
+    from mnemosyne.core import embeddings as _embeddings
+    from mnemosyne.core.beam import _vec_available, _vec_insert
+    from mnemosyne.core.binary_vectors import maximally_informative_binarization as _mib
+except Exception:  # pragma: no cover - importer must still work without embeddings extras
+    _embeddings = None
+    _vec_available = None
+    _vec_insert = None
+    _mib = None
 
 
 class HindsightImporter(BaseImporter):
@@ -43,6 +54,8 @@ class HindsightImporter(BaseImporter):
     def __init__(self, file_path: str = None, base_url: str = None,
                  bank: str = "hermes", page_size: int = 500,
                  max_items: int = None, namespace: str = None,
+                 skip_low_value: bool = False,
+                 generate_embeddings: bool = True,
                  **kwargs):
         super().__init__(**kwargs)
         self.file_path = file_path
@@ -51,6 +64,8 @@ class HindsightImporter(BaseImporter):
         self.page_size = min(max(int(page_size), 1), 1000)
         self.max_items = max_items
         self.namespace = namespace or bank
+        self.skip_low_value = skip_low_value
+        self.generate_embeddings = generate_embeddings
 
     # ------------------------------------------------------------------
     # Extract
@@ -116,6 +131,13 @@ class HindsightImporter(BaseImporter):
                 continue
             fact_type = item.get("fact_type") or item.get("type") or "memory"
             timestamp = self._timestamp_for(item)
+            metadata = self._metadata_for(item)
+            quality_flags = self._quality_flags(content)
+            if quality_flags:
+                metadata["import_quality_flags"] = quality_flags
+            metadata["import_quality_score"] = self._quality_score(content, quality_flags)
+            if self.skip_low_value and self._is_low_value(content, quality_flags):
+                continue
             memories.append({
                 "id": self._stable_id(item),
                 "content": content,
@@ -123,7 +145,7 @@ class HindsightImporter(BaseImporter):
                 "timestamp": timestamp,
                 "session_id": self._session_id_for(item),
                 "importance": self._importance_for(item),
-                "metadata": self._metadata_for(item),
+                "metadata": metadata,
                 "valid_until": item.get("valid_until"),
                 "scope": "global",
                 "channel_id": "hindsight",
@@ -213,6 +235,42 @@ class HindsightImporter(BaseImporter):
         }
         return {**metadata, **preserved}
 
+    @staticmethod
+    def _quality_flags(content: str) -> List[str]:
+        """Detect common low-value/polluted memories without hiding provenance."""
+        flags: List[str] = []
+        text = content.strip()
+        lower = text.lower()
+        if len(text) < 40:
+            flags.append("very_short")
+        if re.search(r"\bConversation between\b|\bvia Telegram DM\b|\bon Telegram DM platform\b", text, re.I):
+            flags.append("generic_conversation_metadata")
+        if re.search(r"Review the conversation above|consider saving.*memory|Has the user revealed|Focus on:", text, re.I | re.S):
+            flags.append("meta_memory_prompt")
+        if re.search(r"\b[A-Za-z0-9+/]{90,}={0,2}\b", text) or "aaak" in lower:
+            flags.append("dense_or_encoded_blob")
+        if lower in {"no new narrow skills.", "- no new narrow skills.", "soucrce: convo", "source: convo"}:
+            flags.append("explicit_low_value")
+        return flags
+
+    @staticmethod
+    def _quality_score(content: str, flags: List[str]) -> float:
+        score = 1.0
+        penalties = {
+            "very_short": 0.2,
+            "generic_conversation_metadata": 0.35,
+            "meta_memory_prompt": 0.5,
+            "dense_or_encoded_blob": 0.5,
+            "explicit_low_value": 0.8,
+        }
+        for flag in flags:
+            score -= penalties.get(flag, 0.1)
+        return max(0.0, round(score, 3))
+
+    @classmethod
+    def _is_low_value(cls, content: str, flags: List[str]) -> bool:
+        return cls._quality_score(content, flags) <= 0.5
+
     # ------------------------------------------------------------------
     # Import
     # ------------------------------------------------------------------
@@ -250,7 +308,11 @@ class HindsightImporter(BaseImporter):
                         mem["session_id"] = session_id
                     if channel_id:
                         mem["channel_id"] = channel_id
-                    inserted = self._insert_episodic(conn, mem)
+                    inserted = self._insert_episodic(
+                        conn,
+                        mem,
+                        generate_embeddings=self.generate_embeddings,
+                    )
                     if inserted:
                         result.imported += 1
                         result.memory_ids.append(mem["id"])
@@ -268,7 +330,7 @@ class HindsightImporter(BaseImporter):
         return result
 
     @staticmethod
-    def _insert_episodic(conn, mem: Dict) -> bool:
+    def _insert_episodic(conn, mem: Dict, generate_embeddings: bool = True) -> bool:
         metadata_json = json.dumps(mem.get("metadata", {}), ensure_ascii=False, sort_keys=True, default=str)
         cur = conn.execute("""
             INSERT OR IGNORE INTO episodic_memory
@@ -295,19 +357,43 @@ class HindsightImporter(BaseImporter):
             None,
             mem.get("author_type"),
         ))
-        return cur.rowcount > 0
+        inserted = cur.rowcount > 0
+        if inserted and generate_embeddings:
+            HindsightImporter._backfill_import_embedding(conn, cur.lastrowid, mem["content"])
+        return inserted
+
+    @staticmethod
+    def _backfill_import_embedding(conn, rowid: int, content: str) -> None:
+        """Best-effort vector generation for direct episodic imports."""
+        if not (_embeddings and _embeddings.available()):
+            return
+        vecs = _embeddings.embed([content])
+        if vecs is None:
+            return
+        vec = vecs[0]
+        if _vec_available and _vec_insert and _vec_available(conn):
+            _vec_insert(conn, rowid, vec.tolist())
+        if _mib is not None:
+            conn.execute(
+                "UPDATE episodic_memory SET binary_vector = ? WHERE rowid = ?",
+                (_mib(vec), rowid),
+            )
 
 
 def import_from_hindsight(mnemosyne, file_path: str = None, base_url: str = None,
                           bank: str = "hermes", dry_run: bool = False,
                           session_id: str = None, channel_id: str = None,
-                          max_items: int = None) -> ImporterResult:
+                          max_items: int = None,
+                          skip_low_value: bool = False,
+                          generate_embeddings: bool = True) -> ImporterResult:
     """Convenience wrapper for importing Hindsight memories."""
     importer = HindsightImporter(
         file_path=file_path,
         base_url=base_url,
         bank=bank,
         max_items=max_items,
+        skip_low_value=skip_low_value,
+        generate_embeddings=generate_embeddings,
     )
     return importer.run(
         mnemosyne,
