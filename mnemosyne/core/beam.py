@@ -182,6 +182,7 @@ DEFAULT_DATA_DIR = Path.home() / ".hermes" / "mnemosyne" / "data"
 DEFAULT_DB_PATH = DEFAULT_DATA_DIR / "mnemosyne.db"
 
 import os
+import re
 
 def _env_truthy(name: str) -> bool:
     """Parse an env var as truthy. Accepts `1`/`true`/`yes`/`on`
@@ -1116,6 +1117,66 @@ def _find_memories_by_entity(beam: "BeamMemory", entity_name: str, threshold: fl
         return []
 
 
+_FACT_MATCH_STOPWORDS: Set[str] = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "can", "could",
+    "did", "do", "does", "for", "from", "had", "has", "have", "how", "i",
+    "in", "is", "it", "its", "me", "my", "of", "on", "or", "our", "should",
+    "that", "the", "their", "there", "this", "to", "use", "uses", "was", "we",
+    "what", "when", "where", "which", "who", "why", "with", "you", "your",
+}
+
+
+def _fact_match_tokens(text: str) -> Set[str]:
+    """Return meaningful tokens for strict fact matching."""
+    tokens = set(re.findall(r"[a-z0-9][a-z0-9_.:/-]*", text.lower()))
+    return {
+        token
+        for token in tokens
+        if len(token) >= 3 and token not in _FACT_MATCH_STOPWORDS
+    }
+
+
+def _strict_fact_matches(query: str, fact_text: str) -> bool:
+    """Conservative fact matching for natural-language recall queries.
+
+    The legacy fact matcher accepts any query token as a substring of the
+    fact. That makes stopwords like "where"/"the"/"use" retrieve unrelated
+    facts. The strict matcher keeps exact phrase/path/domain matches, then
+    requires multiple meaningful token overlaps (or one very distinctive
+    path/domain-like token) before admitting a fact candidate.
+    """
+    query_lower = query.lower().strip()
+    fact_lower = fact_text.lower().strip()
+    if not query_lower or not fact_lower:
+        return False
+
+    if query_lower in fact_lower:
+        return True
+
+    query_tokens = _fact_match_tokens(query_lower)
+    fact_tokens = _fact_match_tokens(fact_lower)
+    if not query_tokens or not fact_tokens:
+        return False
+
+    overlap = query_tokens & fact_tokens
+    if len(overlap) >= 2:
+        return True
+
+    # Allow a single highly distinctive exact token, but not arbitrary words.
+    if len(overlap) == 1:
+        token = next(iter(overlap))
+        return (
+            len(token) >= 8
+            or "." in token
+            or "/" in token
+            or ":" in token
+            or "-" in token
+            or "_" in token
+        )
+
+    return False
+
+
 def _find_memories_by_fact(beam: "BeamMemory", query: str) -> List[str]:
     """
     Find memory IDs that have extracted facts matching the query.
@@ -1133,13 +1194,17 @@ def _find_memories_by_fact(beam: "BeamMemory", query: str) -> List[str]:
 
         query_lower = query.lower()
         query_words = set(query_lower.split())
+        strict_fact_match = _env_truthy("MNEMOSYNE_STRICT_FACT_MATCH")
 
         # Simple keyword matching against fact text
         memory_ids: Set[str] = set()
         for fact_row in all_facts:
             fact_text = fact_row.get("value", "").lower()
+            if strict_fact_match:
+                if _strict_fact_matches(query_lower, fact_text):
+                    memory_ids.add(fact_row["memory_id"])
             # Check if any query word appears in the fact
-            if any(word in fact_text for word in query_words):
+            elif any(word in fact_text for word in query_words):
                 memory_ids.add(fact_row["memory_id"])
             # Also check if the full query is a substring of the fact
             elif query_lower in fact_text:

@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 from datetime import datetime, timedelta
 
-from mnemosyne.core.beam import BeamMemory, init_beam
+from mnemosyne.core.beam import BeamMemory, init_beam, _find_memories_by_fact
 from mnemosyne.core.memory import Mnemosyne
 
 
@@ -18,6 +18,59 @@ def temp_db():
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test.db"
         yield db_path
+
+
+class _FakeAnnotations:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def query_by_kind(self, kind):
+        assert kind == "fact"
+        return self._rows
+
+
+class _FakeBeam:
+    def __init__(self, rows):
+        self.annotations = _FakeAnnotations(rows)
+
+
+class TestFactAnnotationMatching:
+    def test_strict_fact_match_ignores_stopword_only_matches(self, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_STRICT_FACT_MATCH", "1")
+        beam = _FakeBeam([
+            {"memory_id": "noise", "value": "The user likes coffee and the weather is sunny."},
+            {
+                "memory_id": "target",
+                "value": "Project Atlas lives at /opt/apps/project-atlas and URL http://127.0.0.1:8765/.",
+            },
+        ])
+
+        result = set(_find_memories_by_fact(
+            beam,
+            "Where does the Project Atlas app live and what URL port does it use?",
+        ))
+
+        assert result == {"target"}
+
+    def test_strict_fact_match_allows_exact_entity_phrase(self, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_STRICT_FACT_MATCH", "1")
+        beam = _FakeBeam([
+            {"memory_id": "target", "value": "Docker Browser must use host.docker.internal for host machine apps."},
+        ])
+
+        result = set(_find_memories_by_fact(beam, "Docker Browser"))
+
+        assert result == {"target"}
+
+    def test_legacy_fact_match_preserved_when_flag_off(self, monkeypatch):
+        monkeypatch.delenv("MNEMOSYNE_STRICT_FACT_MATCH", raising=False)
+        beam = _FakeBeam([
+            {"memory_id": "legacy", "value": "The user likes coffee."},
+        ])
+
+        result = set(_find_memories_by_fact(beam, "where is the dashboard"))
+
+        assert result == {"legacy"}
 
 
 class TestBeamSchema:
