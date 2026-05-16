@@ -80,6 +80,29 @@ def test_complete_calls_call_llm_with_compression_task(fake_agent_module):
     assert "model" not in captured
 
 
+def test_complete_uses_configurable_hermes_task(fake_agent_module, monkeypatch):
+    captured = {}
+
+    def fake_call_llm(**kwargs):
+        captured.update(kwargs)
+        return {"choices": [{"message": {"content": "Summary."}}]}
+
+    fake_agent_module.call_llm = fake_call_llm
+    monkeypatch.setenv("MNEMOSYNE_HOST_LLM_TASK", "memory")
+
+    adapter = _import_adapter()
+    backend = adapter.HermesAuxLLMBackend()
+    out = backend.complete(
+        "the prompt",
+        max_tokens=128,
+        temperature=0.2,
+        timeout=12.0,
+    )
+
+    assert out == "Summary."
+    assert captured["task"] == "memory"
+
+
 def test_complete_passes_provider_and_model_overrides(fake_agent_module):
     captured = {}
     fake_agent_module.call_llm = lambda **kw: (captured.update(kw) or {"choices": [{"message": {"content": "ok"}}]})
@@ -99,9 +122,17 @@ def test_complete_passes_provider_and_model_overrides(fake_agent_module):
 
 
 def test_complete_returns_none_when_agent_import_unavailable(monkeypatch):
-    """No fake agent in sys.modules → adapter returns None, never raises."""
+    """Missing Hermes auxiliary client → adapter returns None, never raises."""
+    real_import = __import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "agent.auxiliary_client" or (name == "agent" and "auxiliary_client" in fromlist):
+            raise ImportError("no hermes auxiliary client in this test")
+        return real_import(name, globals, locals, fromlist, level)
+
     monkeypatch.delitem(sys.modules, "agent", raising=False)
     monkeypatch.delitem(sys.modules, "agent.auxiliary_client", raising=False)
+    monkeypatch.setattr("builtins.__import__", guarded_import)
 
     adapter = _import_adapter()
     backend = adapter.HermesAuxLLMBackend()

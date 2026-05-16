@@ -17,8 +17,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
+import re
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from datetime import datetime
@@ -510,6 +513,8 @@ class MnemosyneMemoryProvider(MemoryProvider):
         self._turn_count = 0
         self._auto_sleep_threshold = 50
         self._auto_sleep_enabled = os.environ.get("MNEMOSYNE_AUTO_SLEEP_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+        self._user_autosave_mode = os.environ.get("MNEMOSYNE_AUTOSAVE_USER_MODE", "raw").strip().lower() or "raw"
+        self._user_autosave_extract_async = os.environ.get("MNEMOSYNE_AUTOSAVE_EXTRACT_ASYNC", "true").strip().lower() in ("1", "true", "yes", "on")
         self._ignore_patterns: List[str] = []  # Regex patterns to filter from memory
         self._skip_contexts = {"cron", "flush", "subagent", "background", "skill_loop"}  # Agent contexts to skip
         # Profile memory isolation: when enabled, each Hermes profile gets its own
@@ -520,6 +525,9 @@ class MnemosyneMemoryProvider(MemoryProvider):
         # daemon thread from racing with unregister and falling through to
         # MNEMOSYNE_LLM_BASE_URL.
         self._session_end_thread: Optional[threading.Thread] = None
+        self._autosave_extract_queue: queue.Queue[str] = queue.Queue()
+        self._autosave_extract_worker: Optional[threading.Thread] = None
+        self._autosave_extract_lock = threading.Lock()
         # C13: per-instance tracking of whether THIS provider contributed
         # to the module-level _active_provider_count. Lets each instance
         # increment exactly once on activate and decrement exactly once on
@@ -616,6 +624,32 @@ class MnemosyneMemoryProvider(MemoryProvider):
         if vector_type and vector_type not in ("float32", "int8", "bit"):
             logger.warning("Mnemosyne: unknown vector_type=%r, ignoring", vector_type)
 
+        # user_autosave_mode: raw preserves legacy behavior; filtered/extract/off reduce chat dust.
+        user_autosave_mode = (
+            kwargs.get("user_autosave_mode")
+            or self._read_config_key("user_autosave_mode")
+            or os.environ.get("MNEMOSYNE_AUTOSAVE_USER_MODE")
+        )
+        if user_autosave_mode:
+            mode = str(user_autosave_mode).strip().lower()
+            if mode in ("raw", "filtered", "filter", "extract", "off", "false", "0", "none"):
+                self._user_autosave_mode = mode
+            else:
+                logger.warning("Mnemosyne: unknown user_autosave_mode=%r, keeping %s", user_autosave_mode, self._user_autosave_mode)
+
+        user_autosave_extract_async = (
+            kwargs.get("user_autosave_extract_async")
+            if "user_autosave_extract_async" in kwargs
+            else self._read_config_key("user_autosave_extract_async")
+        )
+        if user_autosave_extract_async is None:
+            user_autosave_extract_async = os.environ.get("MNEMOSYNE_AUTOSAVE_EXTRACT_ASYNC")
+        if user_autosave_extract_async is not None:
+            if isinstance(user_autosave_extract_async, str):
+                self._user_autosave_extract_async = user_autosave_extract_async.strip().lower() in ("1", "true", "yes", "on")
+            else:
+                self._user_autosave_extract_async = bool(user_autosave_extract_async)
+
         # ignore_patterns: list of regex patterns to filter from memory storage
         patterns = kwargs.get("ignore_patterns") or self._read_config_key("ignore_patterns")
         if patterns:
@@ -646,6 +680,174 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 logger.debug("Mnemosyne: invalid ignore pattern %r, skipping", pattern)
         return False
 
+    @staticmethod
+    def _is_low_value_user_turn(content: str) -> bool:
+        """Return True for chat dust that belongs in transcript context, not durable memory."""
+        text = (content or "").strip()
+        if len(text) < 12:
+            return True
+        lower = text.lower()
+        normalized = re.sub(r"\s+", " ", lower).strip(" .!?…")
+        if normalized in {
+            "hello", "hi", "hey", "yo", "thanks", "thank you", "ty", "tysm",
+            "ok", "okay", "k", "nice", "cool", "done", "continue", "go on",
+        }:
+            return True
+        if re.search(r"\b(review the conversation above|consider saving.*memory|has the user revealed|focus on:)\b", text, re.I | re.S):
+            return True
+        if re.search(r"\b[A-Za-z0-9+/]{120,}={0,2}\b", text):
+            return True
+        if text.count("?") and not re.search(
+            r"\b(remember|from now on|i prefer|i want|don't|do not|always|never|my name|my school|my setup|my workflow)\b",
+            lower,
+        ):
+            return True
+        return False
+
+    @classmethod
+    def _looks_durable_user_turn(cls, content: str) -> bool:
+        """Cheap prefilter for filtered/raw autosave modes."""
+        if cls._is_low_value_user_turn(content):
+            return False
+        lower = content.lower()
+        durable_markers = (
+            "remember", "from now on", "i prefer", "i want", "i need", "don't", "do not",
+            "always", "never", "my name", "my school", "my admin", "my setup", "my workflow",
+            "use ", "call ", "save this", "note that",
+        )
+        return any(marker in lower for marker in durable_markers)
+
+    @staticmethod
+    def _user_autosave_prompt(content: str) -> str:
+        return (
+            "Extract durable long-term memory facts from one user message.\n"
+            "Return ONLY a JSON array of strings, or [] if nothing should be saved.\n\n"
+            "Save only explicit facts, preferences, stable context, and user instructions that are likely to matter next week.\n"
+            "Do NOT save greetings, thanks, ordinary questions, current debugging chatter, task progress, PR/commit/issue numbers, "
+            "temporary deadlines, assistant/system/meta prompts, or anything merely inferred.\n"
+            "Rewrite each item as a concise, self-contained third-person memory about the user.\n\n"
+            f"User message:\n{content[:4000]}\n"
+        )
+
+    @classmethod
+    def _parse_user_autosave_extraction(cls, raw_output: str) -> List[str]:
+        """Parse the autosave extractor's JSON-array response defensively."""
+        if not raw_output:
+            return []
+        text = raw_output.strip()
+        if text.upper() in {"NO_MEMORY", "NO_FACTS", "[]"}:
+            return []
+        match = re.search(r"\[[\s\S]*\]", text)
+        if not match:
+            return []
+        try:
+            payload = json.loads(match.group(0))
+        except Exception:
+            return []
+        if not isinstance(payload, list):
+            return []
+        memories: List[str] = []
+        for item in payload[:5]:
+            if not isinstance(item, str):
+                continue
+            memory = re.sub(r"\s+", " ", item).strip()
+            if len(memory) < 20 or cls._is_low_value_user_turn(memory):
+                continue
+            memories.append(memory[:500])
+        return memories
+
+    def _extract_user_autosave_memories(self, content: str) -> List[str]:
+        """Use Mnemosyne's LLM fallback chain to extract durable user facts."""
+        if self._is_low_value_user_turn(content):
+            return []
+        try:
+            from mnemosyne.core import local_llm
+        except Exception:
+            return []
+        prompt = self._user_autosave_prompt(content)
+        try:
+            if not local_llm.llm_available():
+                return []
+            max_tokens = int(os.environ.get("MNEMOSYNE_AUTOSAVE_EXTRACT_MAX_TOKENS", "1024"))
+            attempted, host_text = local_llm._try_host_llm(prompt, max_tokens=max_tokens, temperature=0.0)
+            if attempted:
+                return self._parse_user_autosave_extraction(host_text or "")
+            raw = None
+            if local_llm.LLM_ENABLED and local_llm.LLM_BASE_URL:
+                raw = local_llm._call_remote_llm(prompt, temperature=0.0)
+            if not raw:
+                llm = local_llm._load_llm()
+                if llm is not None:
+                    raw = llm(prompt, max_new_tokens=max_tokens, stop=["</s>", "<|user|>"])
+            return self._parse_user_autosave_extraction(raw if isinstance(raw, str) else "")
+        except Exception as exc:
+            logger.debug("Mnemosyne user autosave extraction failed: %s", exc)
+            return []
+
+    def _remember_extracted_user_memories(self, content: str) -> None:
+        if not self._beam:
+            return
+        for memory in self._extract_user_autosave_memories(content):
+            self._beam.remember(
+                content=memory,
+                source="conversation_extract",
+                importance=0.65,
+                extract_entities=True,
+                veracity="stated",
+                metadata={"autosave_mode": "extract"},
+            )
+
+    def _queue_user_autosave_extraction(self, content: str) -> None:
+        """Run extract-mode autosave outside sync_turn's critical path.
+
+        A single daemon worker drains a FIFO queue. This keeps the chat turn
+        non-blocking without spawning one LLM extraction thread per message.
+        """
+        self._autosave_extract_queue.put(content)
+        with self._autosave_extract_lock:
+            if self._autosave_extract_worker and self._autosave_extract_worker.is_alive():
+                return
+            worker = threading.Thread(target=self._autosave_extract_worker_loop, daemon=True)
+            self._autosave_extract_worker = worker
+            worker.start()
+
+    def _autosave_extract_worker_loop(self) -> None:
+        while True:
+            try:
+                content = self._autosave_extract_queue.get_nowait()
+            except queue.Empty:
+                with self._autosave_extract_lock:
+                    if self._autosave_extract_queue.empty():
+                        self._autosave_extract_worker = None
+                        return
+                continue
+            try:
+                self._remember_extracted_user_memories(content)
+            except Exception as exc:
+                logger.debug("Mnemosyne async user autosave extraction failed: %s", exc)
+            finally:
+                self._autosave_extract_queue.task_done()
+
+    def _prune_autosave_extractors(self) -> None:
+        with self._autosave_extract_lock:
+            if self._autosave_extract_worker and not self._autosave_extract_worker.is_alive():
+                self._autosave_extract_worker = None
+
+    def _wait_for_autosave_extractors(self, timeout: float) -> None:
+        """Wait briefly for the queued extractor worker; primarily used by tests/shutdown."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            with self._autosave_extract_lock:
+                worker = self._autosave_extract_worker
+            if worker is None:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._prune_autosave_extractors()
+                return
+            worker.join(timeout=remaining)
+            self._prune_autosave_extractors()
+
     def _read_config_key(self, key: str) -> Any:
         """Read a single key from memory.mnemosyne in config.yaml."""
         try:
@@ -664,6 +866,8 @@ class MnemosyneMemoryProvider(MemoryProvider):
             {"key": "auto_sleep", "description": "Auto-run sleep() when working memory exceeds threshold. Set true to enable. Backward-compatible with MNEMOSYNE_AUTO_SLEEP_ENABLED env var.", "default": False},
             {"key": "sleep_threshold", "description": "Working memory count before auto-sleep triggers", "default": 50},
             {"key": "vector_type", "description": "Vector storage type (note: not yet wired to BeamMemory at runtime; reserved for future use)", "choices": ["float32", "int8", "bit"], "default": "int8"},
+            {"key": "user_autosave_mode", "description": "How sync_turn stores user messages: raw (legacy), filtered (durable-looking raw turns only), extract (LLM extracts durable facts), or off.", "choices": ["raw", "filtered", "extract", "off"], "default": "raw"},
+            {"key": "user_autosave_extract_async", "description": "When user_autosave_mode=extract, run LLM extraction through a single daemon worker queue so sync_turn stays fast without spawning one thread per turn. Set false for deterministic tests or hosts that require synchronous writes.", "default": True},
             {"key": "ignore_patterns", "description": "Regex patterns to filter from memory storage (one per line in config, or comma-separated). Memories matching any pattern are skipped.", "default": []},
             {"key": "profile_isolation", "description": "Enable per-profile memory isolation via Mnemosyne banks. Each Hermes profile gets its own SQLite database under mnemosyne/data/banks/<profile>/. Default false for backward compatibility.", "default": False},
         ]
@@ -924,14 +1128,34 @@ class MnemosyneMemoryProvider(MemoryProvider):
             return
         try:
             if user_content and len(user_content) > 5 and not self._should_filter(user_content):
-                self._beam.remember(
-                    content=f"[USER] {user_content[:500]}",
-                    source="conversation",
-                    importance=0.3,
-                    extract_entities=True,
-                )
-                # Check for identity-significant signals in user content
-                self._capture_identity_signals(user_content)
+                mode = self._user_autosave_mode
+                if mode in ("off", "false", "0", "none"):
+                    pass
+                elif mode == "extract":
+                    if self._user_autosave_extract_async:
+                        self._queue_user_autosave_extraction(user_content)
+                    else:
+                        self._remember_extracted_user_memories(user_content)
+                elif mode in ("filtered", "filter"):
+                    if self._looks_durable_user_turn(user_content):
+                        self._beam.remember(
+                            content=f"[USER] {user_content[:500]}",
+                            source="conversation",
+                            importance=0.3,
+                            extract_entities=True,
+                        )
+                else:
+                    self._beam.remember(
+                        content=f"[USER] {user_content[:500]}",
+                        source="conversation",
+                        importance=0.3,
+                        extract_entities=True,
+                    )
+                if mode not in ("off", "false", "0", "none"):
+                    # Check for identity-significant signals in user content.
+                    # Keep this independent of autosave mode so filtered/extract
+                    # modes don't suppress explicit identity memories.
+                    self._capture_identity_signals(user_content)
             if assistant_content and len(assistant_content) > 10 and not self._should_filter(assistant_content):
                 self._beam.remember(
                     content=f"[ASSISTANT] {assistant_content[:800]}",
@@ -1394,6 +1618,8 @@ class MnemosyneMemoryProvider(MemoryProvider):
                     self.SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
                 )
         self._session_end_thread = None
+
+        self._wait_for_autosave_extractors(timeout=self.SHUTDOWN_DRAIN_TIMEOUT_SECONDS)
 
         # Symmetric with initialize(): clear the Hermes host LLM backend so a
         # process that later uses Mnemosyne outside Hermes does not retain a

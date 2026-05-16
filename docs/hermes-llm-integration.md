@@ -68,9 +68,19 @@ MNEMOSYNE_HOST_LLM_MODEL=gpt-5.1-mini
 # small chunks and lossy multi-chunk summaries.
 MNEMOSYNE_HOST_LLM_N_CTX=32000
 
+# Optional: route through a dedicated Hermes auxiliary task instead of
+# compression. Defaults to compression for backward compatibility.
+MNEMOSYNE_HOST_LLM_TASK=memory
+
 # Existing global gate. When false, ALL LLM-backed memory operations
 # are disabled, including the host path.
 MNEMOSYNE_LLM_ENABLED=true
+
+# Optional: extract-mode user autosave runs through a single daemon worker
+# queue outside sync_turn by default, so slow host LLM calls do not block
+# replies or spawn one extraction thread per user turn. Set false only for
+# tests or hosts that require deterministic synchronous writes.
+MNEMOSYNE_AUTOSAVE_EXTRACT_ASYNC=true
 ```
 
 To control the default host model without Mnemosyne-specific overrides,
@@ -103,6 +113,18 @@ Fact extraction uses `temperature=0.0` so re-ingesting the same content
 produces the same facts. This avoids near-duplicate writes to the facts
 table when the same conversation is processed twice. Consolidation continues
 to use `temperature=0.3` — paraphrasing variance is acceptable there.
+
+## Extract-mode user autosave
+
+Hermes users can opt into `user_autosave_mode=extract` to save cleaned,
+durable user facts instead of every raw user turn. Extract mode uses the same
+Mnemosyne LLM chain as sleep/consolidation: host backend first, then the
+existing OpenAI-compatible remote endpoint, then local GGUF fallback.
+
+By default, extraction runs through a single background worker queue so slow
+LLM calls do not block `sync_turn()` or create one thread per turn. Set
+`user_autosave_extract_async=false` (or `MNEMOSYNE_AUTOSAVE_EXTRACT_ASYNC=false`)
+when tests or host integrations need deterministic synchronous writes.
 
 ## Session shutdown
 

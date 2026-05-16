@@ -14,8 +14,10 @@ Why this lives in ``hermes_memory_provider`` and not ``mnemosyne.core``:
 Behavior:
 
 - ``HermesAuxLLMBackend.complete()`` is the host-LLM entry point. It calls
-  ``call_llm(task="compression", ...)`` so Hermes handles auth, OAuth refresh,
-  Codex Responses API translation, and provider fallback.
+  ``call_llm(task=<configured task>, ...)`` so Hermes handles auth, OAuth refresh,
+  Codex Responses API translation, and provider fallback. The default task is
+  ``compression`` for compatibility; set ``MNEMOSYNE_HOST_LLM_TASK`` to route
+  through a dedicated Hermes memory task when available.
 - ``register_hermes_host_llm()`` installs the backend in the registry.
 - ``unregister_hermes_host_llm()`` removes it (called from
   ``MnemosyneMemoryProvider.shutdown()`` so a process that later runs Mnemosyne
@@ -30,6 +32,7 @@ extractable content) returns ``None``. The Mnemosyne caller treats that as
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -38,13 +41,17 @@ logger = logging.getLogger(__name__)
 class HermesAuxLLMBackend:
     """LLMBackend implementation that routes through Hermes' aux client.
 
-    The ``task`` attribute pins the Hermes auxiliary slot used for memory ops.
-    ``compression`` is the closest existing fit; introducing a Hermes-side
-    ``memory`` task is left as a follow-up.
+    The ``task`` attribute selects the Hermes auxiliary slot used for memory ops.
+    It defaults to ``compression`` for compatibility with existing Hermes
+    installs, but hosts can override it with ``MNEMOSYNE_HOST_LLM_TASK`` without
+    changing Mnemosyne core.
     """
 
     name = "hermes"
-    task = "compression"
+
+    @property
+    def task(self) -> str:
+        return os.environ.get("MNEMOSYNE_HOST_LLM_TASK", "compression").strip() or "compression"
 
     def complete(
         self,
