@@ -440,7 +440,9 @@ class EpisodicGraph:
                         WHERE (source = ? OR target = ?) AND weight >= ?
                     """, (mem, mem, min_weight))
 
-                for row in cursor.fetchall():
+                rows = cursor.fetchall()
+
+                for row in rows:
                     neighbor = row["target"] if row["source"] == mem else row["source"]
                     if neighbor not in seen:
                         next_level.add(neighbor)
