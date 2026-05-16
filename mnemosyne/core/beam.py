@@ -2057,6 +2057,122 @@ class BeamMemory:
             except Exception:
                 pass  # Veracity failures are non-blocking
 
+        # Phase 5: Proactive linking — auto-create graph edges to related memories
+        self._proactively_link(memory_id, content)
+
+    def _proactively_link(self, memory_id: str, content: str):
+        """Phase 5: Auto-create graph edges between new memory and related existing memories.
+
+        Two zero-LLM strategies:
+        1. Content similarity via recall() — top-K via FTS5 + vector
+        2. Entity overlap via shared facts in the graph
+
+        Gated behind MNEMOSYNE_PROACTIVE_LINKING=1 env var.
+        Non-blocking — failures never affect memory storage.
+        """
+        import os
+        if os.environ.get("MNEMOSYNE_PROACTIVE_LINKING", "0") != "1":
+            return
+        if self.episodic_graph is None:
+            return
+
+        try:
+            now = datetime.now().isoformat()
+
+            # --- Strategy 1: Content similarity via direct FTS5 ---
+            try:
+                # Build a broad FTS5 query from content keywords (skip very short content)
+                stop_words = frozenset({
+                    "the", "a", "an", "is", "was", "are", "were", "be", "been",
+                    "being", "have", "has", "had", "do", "does", "did", "will",
+                    "would", "could", "should", "may", "might", "can", "shall",
+                    "to", "of", "in", "for", "on", "with", "at", "by", "from",
+                    "as", "into", "through", "during", "before", "after", "above",
+                    "below", "between", "out", "off", "over", "under", "again",
+                    "further", "then", "once", "here", "there", "when", "where",
+                    "why", "how", "all", "each", "every", "both", "few", "more",
+                    "most", "other", "some", "such", "no", "nor", "not", "only",
+                    "own", "same", "so", "than", "too", "very", "just", "because",
+                    "about", "which", "who", "what", "this", "that", "these",
+                    "those", "it", "its", "i", "me", "my", "we", "our", "you",
+                    "your", "he", "him", "his", "she", "her", "they", "them",
+                    "their", "and", "but", "or", "if", "while",
+                })
+                words = [w.lower().strip(".,!?;:'\"()[]{}") for w in content.split()]
+                keywords = [w for w in words if len(w) > 2 and w not in stop_words]
+                keywords = [kw for kw in keywords if kw.isalpha()]  # FTS5-safe only
+                if len(keywords) >= 3:
+                    fts_query = " OR ".join(keywords)
+                    cursor = self.conn.execute(
+                        "SELECT DISTINCT id FROM fts_working WHERE fts_working MATCH ? ORDER BY rank LIMIT 5",
+                        (fts_query,)
+                    )
+                    similar_ids = [r["id"] for r in cursor.fetchall() if r["id"] != memory_id]
+
+                    similarity_count = 0
+                    for i, rid in enumerate(similar_ids[:5]):
+                        existing = self.episodic_graph.conn.execute(
+                            "SELECT 1 FROM graph_edges WHERE (source = ? AND target = ?) OR (source = ? AND target = ?)",
+                            (memory_id, rid, rid, memory_id)
+                        ).fetchone()
+                        if existing:
+                            continue
+                        weight = max(0.1, 1.0 - i * 0.2)
+                        self.episodic_graph.add_edge(GraphEdge(
+                            source=memory_id, target=rid,
+                            edge_type="related_to", weight=weight, timestamp=now,
+                        ))
+                        similarity_count += 1
+
+                    if similarity_count:
+                        logger.debug(
+                            "Proactive linking (similarity): %d edges for %s", similarity_count, memory_id
+                        )
+            except Exception:
+                logger.debug("Proactive linking similarity strategy failed for %s", memory_id, exc_info=True)
+
+            # --- Strategy 2: Entity overlap via shared entity mentions ---
+            try:
+                mention_rows = self.conn.execute(
+                    "SELECT value FROM annotations WHERE memory_id = ? AND kind = 'mentions'",
+                    (memory_id,)
+                ).fetchall()
+
+                entity_count = 0
+                for row in mention_rows:
+                    entity_val = row["value"]
+                    related = self.conn.execute(
+                        """SELECT DISTINCT memory_id FROM annotations
+                           WHERE kind = 'mentions' AND value = ?
+                             AND memory_id != ?
+                           LIMIT 5""",
+                        (entity_val, memory_id)
+                    ).fetchall()
+                    for match in related:
+                        rid = match["memory_id"]
+                        existing = self.episodic_graph.conn.execute(
+                            "SELECT 1 FROM graph_edges WHERE source = ? AND target = ? AND edge_type = 'references'",
+                            (memory_id, rid)
+                        ).fetchone()
+                        if existing:
+                            continue
+                        self.episodic_graph.add_edge(GraphEdge(
+                            source=memory_id, target=rid,
+                            edge_type="references", weight=0.8, timestamp=now,
+                        ))
+                        entity_count += 1
+
+                if entity_count:
+                    logger.debug(
+                        "Proactive linking (entity): %d edges for %s", entity_count, memory_id
+                    )
+            except Exception:
+                logger.debug("Proactive linking entity strategy failed for %s", memory_id, exc_info=True)
+
+        except Exception:
+            logger.debug("Proactive linking outer wrapper failed for %s", memory_id, exc_info=True)
+            # Non-blocking — never surface to caller
+
     def _add_temporal_triple(self, memory_id: str, timestamp: str, source: str, content: str):
         """Auto-generate temporal annotations for a memory.
 
