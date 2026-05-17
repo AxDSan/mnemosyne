@@ -187,7 +187,12 @@ class LLMClient:
         resp.raise_for_status()
         data = resp.json()
         self.call_count += 1
-        return data["choices"][0]["message"]["content"]
+        content = data["choices"][0]["message"].get("content")
+        if content is None:
+            finish_reason = data["choices"][0].get("finish_reason", "unknown")
+            print(f"    [DEBUG-API-NULL] model={model} finish_reason={finish_reason} tokens_used={data.get('usage', {}).get('total_tokens', '?')}", flush=True)
+            return ""  # Return empty string instead of None so callers don't choke
+        return content
 
     def close(self):
         pass
@@ -1426,32 +1431,42 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         # Critical: give the LLM the RAW retrieved context so it can SEE the dates it missed.
         # NOTE: using .format() instead of f-string to avoid crashes when pass1_ctx
         # contains curly braces from code snippets in the conversation.
-        gap_prompt = """You answered a temporal question but may have used wrong dates. Your job: extract the CORRECT date strings from the context below.
+        # Trim context aggressively to prevent length truncation on the gap analysis call.
+        # 2000 chars is enough to find dates; any more risks token overrun on small models.
+        ctx_trimmed = pass1_ctx if len(pass1_ctx) < 2000 else pass1_ctx[:2000] + "...[truncated]"
+        gap_prompt = """You are a precision entity extractor. Scan the context below and extract EXACT strings needed to answer the question.
 
 QUESTION: {question}
-YOUR ANSWER: {pass1_answer}
 
-RETRIEVED MEMORY CONTEXT (scan this for dates):
+RETRIEVED MEMORY CONTEXT:
 {pass1_ctx}
 
-TASK: Extract the exact ISO date strings (YYYY-MM-DD) and key entities the question needs.
-Output format (one per line, no other text):
-GAP: 2024-01-15
-GAP: 2024-03-15
-GAP: transaction management
-GAP: analytics deadline
+EXTRACTION RULES:
+- For "how many days between X and Y": extract BOTH date strings as GAP lines
+- For event ordering ("list the order", "walk me through"): extract SPECIFIC event phrases WITH their associated dates if present
+- For contradictions: extract the conflicting claim phrases
+- Extract ONLY strings that literally appear in the context
+- Output one per line, format: GAP: <exact string from context>
+- If nothing useful found: output NO_GAPS
+- No other text, no explanations
 
-Rules:
-- Extract dates that appear in the CONTEXT, even if you didn't use them in your answer.
-- For "how many days/weeks between X and Y" questions, extract BOTH date strings.
-- For event ordering questions, extract the event names/phrases.
-- If the context contains no relevant dates, output: NO_GAPS""".format(question=question, pass1_answer=pass1_answer, pass1_ctx=pass1_ctx)
+EXAMPLES:
+GAP: 2024-03-29
+GAP: 2024-04-19
+GAP: added user authentication module
+GAP: migrated to PostgreSQL""".format(question=question, pass1_ctx=ctx_trimmed)
         
         gap_messages = [
             {"role": "system", "content": "You extract exact entity strings from text for database filtering. Output ONLY 'GAP: ...' lines or 'NO_GAPS'. No pleasantries, no explanations."},
             {"role": "user", "content": gap_prompt},
         ]
-        gap_response = llm.chat(gap_messages, temperature=0.0, max_tokens=384)
+        try:
+            gap_response = llm.chat(gap_messages, temperature=0.0, max_tokens=1024)
+        except Exception as e:
+            import traceback
+            gap_response = None
+            print(f"    [DEBUG-GAP-EXCEPTION] {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
         
         # --- Parse gap queries (guard against None from LLM errors) ---
         gap_queries = []
@@ -1489,8 +1504,11 @@ Rules:
                     all_mems.append(gm)
             all_mems.sort(key=lambda m: m.get("score", 0), reverse=True)
             
-            # Rebuild context with augmented memories
+            # Rebuild context with augmented memories, trimmed for pass2
             pass2_ctx = _build_context(all_mems, recent_parts)
+            # Trim pass2 context to prevent output truncation
+            if len(pass2_ctx) > 6000:
+                pass2_ctx = pass2_ctx[:6000] + "...[truncated]"
             
             # Switch to Calculator prompt for TR/EO abilities
             if ability in {'TR', 'EO'}:
@@ -1503,14 +1521,14 @@ Follow this format strictly:
 3. FINAL ANSWER: [Provide only the number/duration]"""
                 pass2_messages = [
                     {"role": "system", "content": calc_prompt},
-                    {"role": "user", "content": f"{pass2_ctx}\n\nQUESTION: {question}\n\nANSWER:"},
+                    {"role": "user", "content": pass2_ctx + "\n\nQUESTION: " + question + "\n\nANSWER:"},
                 ]
             else:
                 pass2_messages = [
                     {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
-                    {"role": "user", "content": f"{pass2_ctx}\n\nQUESTION: {question}\n\nANSWER:"},
+                    {"role": "user", "content": pass2_ctx + "\n\nQUESTION: " + question + "\n\nANSWER:"},
                 ]
-            return _ret(llm.chat(pass2_messages, temperature=0.1, max_tokens=2048), all_mems)
+            return _ret(llm.chat(pass2_messages, temperature=0.1, max_tokens=4096), all_mems)
         
         # No gaps: return pass 1 answer as-is
         return _ret(pass1_answer, memories)
