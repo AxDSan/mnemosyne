@@ -1424,7 +1424,9 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         
         # --- Gap analysis: extract exact date/entity strings for Pass 2 FTS5 hard-filter ---
         # Critical: give the LLM the RAW retrieved context so it can SEE the dates it missed.
-        gap_prompt = f"""You answered a temporal question but may have used wrong dates. Your job: extract the CORRECT date strings from the context below.
+        # NOTE: using .format() instead of f-string to avoid crashes when pass1_ctx
+        # contains curly braces from code snippets in the conversation.
+        gap_prompt = """You answered a temporal question but may have used wrong dates. Your job: extract the CORRECT date strings from the context below.
 
 QUESTION: {question}
 YOUR ANSWER: {pass1_answer}
@@ -1443,7 +1445,7 @@ Rules:
 - Extract dates that appear in the CONTEXT, even if you didn't use them in your answer.
 - For "how many days/weeks between X and Y" questions, extract BOTH date strings.
 - For event ordering questions, extract the event names/phrases.
-- If the context contains no relevant dates, output: NO_GAPS"""
+- If the context contains no relevant dates, output: NO_GAPS""".format(question=question, pass1_answer=pass1_answer, pass1_ctx=pass1_ctx)
         
         gap_messages = [
             {"role": "system", "content": "You extract exact entity strings from text for database filtering. Output ONLY 'GAP: ...' lines or 'NO_GAPS'. No pleasantries, no explanations."},
@@ -1462,6 +1464,9 @@ Rules:
                     q = stripped[4:].strip()
                     if q and len(q) > 3:
                         gap_queries.append(q)
+        
+        # Debug: log gap analysis results
+        print(f"    [DEBUG-GAP] ability={ability} gap_response={gap_response[:200] if gap_response else 'None'} queries={gap_queries}", flush=True)
         
         # --- Pass 2: Targeted retrieval + re-answer ---
         if gap_queries:
