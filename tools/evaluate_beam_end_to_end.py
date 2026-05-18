@@ -1373,6 +1373,8 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     try:
         _nous_result = beam.nous_retrieve(question, ability=ability, top_k=top_k)
         if _nous_result and _nous_result.get("source") != "fallback" and _nous_result.get("context"):
+            _nous_facts = _nous_result.get("facts", [])
+            print(f"    [NOUS] {_nous_result['source']} hit for ability={ability}: {len(_nous_facts)} facts", flush=True)
             memories.insert(0, {
                 "content": f"[NOUS {_nous_result['source']}]\n{_nous_result['context']}",
                 "score": 0.95,
@@ -1652,11 +1654,28 @@ GAP: migrated to PostgreSQL""" % (question, ctx_trimmed))
             gap_memories = []
             gap_seen = set()
             for gq in gap_queries[:3]:
+                # Standard recall
                 for mem in _multi_strategy_recall(beam, gq, top_k, ability=ability):
                     ck = mem.get("content", "")[:80]
                     if ck not in gap_seen:
                         gap_seen.add(ck)
                         gap_memories.append(mem)
+                # NOUS structured recall for the same gap query
+                try:
+                    _nous_gap = beam.nous_retrieve(gq, ability=ability, top_k=5)
+                    if _nous_gap and _nous_gap.get("source") != "fallback" and _nous_gap.get("context"):
+                        _ng_key = _nous_gap["context"][:80]
+                        if _ng_key not in gap_seen:
+                            gap_seen.add(_ng_key)
+                            _ng_facts = _nous_gap.get("facts", [])
+                            print(f"      [NOUS-gap] {_nous_gap['source']} hit for gap=\"{gq[:60]}\": {len(_ng_facts)} facts", flush=True)
+                            gap_memories.insert(0, {
+                                "content": f"[NOUS {_nous_gap['source']}]\n{_nous_gap['context']}",
+                                "score": 0.95,
+                                "source": f"nous_gap_{_nous_gap['source']}",
+                            })
+                except Exception:
+                    pass
             
             # Merge: original + gap memories, deduplicate, re-sort
             all_mems = list(memories)
@@ -2230,21 +2249,31 @@ def main():
                 beam = BeamMemory(session_id=f"beam_{scale}_{conv['id']}",
                                    db_path=db_path, use_cloud=args.use_cloud)
 
-                # Ingest
+                # Ingest (includes per-batch consolidation via beam.sleep())
                 t0 = time.perf_counter()
                 stats = ingest_conversation(beam, conv["messages"])
                 ingest_time = time.perf_counter() - t0
+
+                # Post-ingestion consolidation sweep: catch any rows that the
+                # per-batch sleep loop didn't process (e.g. edge batches where
+                # no_op fired early). Knobs: AAAK compression used when
+                # MNEMOSYNE_LLM_ENABLED=false, SLEEP_BATCH_SIZE controls per-cycle
+                # row limit. Errors are non-fatal, logged to stats.
+                _consolidation_attempts = 0
+                while _consolidation_attempts < 50:
+                    try:
+                        _sr = beam.sleep()
+                        if _sr.get("status") in ("no_op", "error"):
+                            break
+                        _consolidation_attempts += 1
+                    except Exception as _se:
+                        stats.setdefault("post_ingest_sleep_errors", []).append(repr(_se))
+                        break
+                if _consolidation_attempts > 0:
+                    print(f"    [consolidation-sweep] consolidated {_consolidation_attempts} additional batch(es) post-ingest", flush=True)
+
                 print(f"    Ingested {len(conv['messages'])} msgs in {ingest_time:.1f}s "
                       f"(DB: {os.path.getsize(db_path)/1024:.0f}KB)")
-
-                # Consolidation: compress raw messages into episodic summaries.
-                # The historical 52.3% peak was with consolidation enabled.
-                # Episodic summaries surface cross-message patterns (timelines,
-                # contradictions, multi-hop chains) that raw retrieval misses.
-                # NOTE: beam.sleep() is disabled here — it hangs on 188 messages
-                # with 475% CPU usage for 45+ minutes. Needs investigation.
-                # For now, the TR timeline bypass + CR negation retrieval handle
-                # the cross-message patterns that consolidation would provide.
 
                 # Evaluate
                 conv_result = evaluate_conversation(
