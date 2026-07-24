@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+import mnemosyne.core.hygiene as hygiene_module
 from mnemosyne.cli import cmd_hygiene
 from mnemosyne.core.beam import BeamMemory, init_beam
 from mnemosyne.core.filters import SECRET_LABELED_PATTERNS
@@ -479,6 +480,77 @@ class TestAuditNoise:
         status = hygiene_status(db_path=db_path, include_noise_summary=False)
 
         assert "noise_summary" not in status
+
+    def test_hygiene_status_uses_supplied_readonly_connection(self, temp_db):
+        db_path, _beam = temp_db
+        readonly = open_readonly_doctor_db(db_path)
+        try:
+            status = hygiene_status(db_path=db_path, limit=10, conn=readonly)
+
+            assert readonly.execute("PRAGMA query_only").fetchone()[0] == 1
+            with pytest.raises(sqlite3.OperationalError):
+                readonly.execute("CREATE TABLE forbidden_hygiene_write (id INTEGER)")
+        finally:
+            readonly.close()
+
+        assert status["status"] == "ok"
+
+    @pytest.mark.parametrize(
+        ("command_args", "function_name"),
+        [
+            (["audit", "--json"], "audit_noise"),
+            (["status", "--json"], "hygiene_status"),
+        ],
+    )
+    def test_cmd_hygiene_read_commands_use_readonly_connection(
+        self, monkeypatch, tmp_path, capsys, command_args, function_name
+    ):
+        db_path = tmp_path / "mnemosyne.db"
+        writable = sqlite3.connect(db_path)
+        writable.execute(
+            """
+            CREATE TABLE working_memory (
+                id TEXT PRIMARY KEY, content TEXT, source TEXT, timestamp TEXT,
+                session_id TEXT, importance REAL, metadata_json TEXT
+            )
+            """
+        )
+        writable.commit()
+        writable.close()
+        monkeypatch.setattr("mnemosyne.cli.DATA_DIR", str(tmp_path))
+
+        original = getattr(hygiene_module, function_name)
+
+        def require_readonly_connection(*args, **kwargs):
+            conn = kwargs["conn"]
+            assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+            with pytest.raises(sqlite3.OperationalError):
+                conn.execute("CREATE TABLE forbidden_cli_write (id INTEGER)")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(hygiene_module, function_name, require_readonly_connection)
+
+        cmd_hygiene(command_args)
+
+        assert capsys.readouterr().err == ""
+
+    @pytest.mark.parametrize("command_args", [["audit"], ["status"]])
+    def test_cmd_hygiene_read_commands_report_readonly_open_errors(
+        self, monkeypatch, tmp_path, capsys, command_args
+    ):
+        db_path = tmp_path / "mnemosyne.db"
+        sqlite3.connect(db_path).close()
+        monkeypatch.setattr("mnemosyne.cli.DATA_DIR", str(tmp_path))
+
+        def fail_open(_db_path):
+            raise sqlite3.OperationalError("readonly connection failed")
+
+        monkeypatch.setattr("mnemosyne.doctor.open_readonly_doctor_db", fail_open)
+
+        with pytest.raises(SystemExit):
+            cmd_hygiene(command_args)
+
+        assert "readonly connection failed" in capsys.readouterr().err
 
     def test_noise_summary_is_pii_safe(self, temp_db):
         db_path, beam = temp_db
