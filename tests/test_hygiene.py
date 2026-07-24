@@ -539,6 +539,28 @@ class TestAuditNoise:
 
         assert status["status"] == "ok"
 
+    def test_hygiene_status_keeps_supplied_readonly_connection_open_when_noise_summary_fails(
+        self, temp_db, monkeypatch
+    ):
+        db_path, _beam = temp_db
+        readonly = open_readonly_doctor_db(db_path)
+        received_connection = None
+
+        def fail_noise_summary(*_args, **kwargs):
+            nonlocal received_connection
+            received_connection = kwargs["conn"]
+            raise sqlite3.OperationalError("noise summary failed")
+
+        monkeypatch.setattr(hygiene_module, "noise_summary", fail_noise_summary)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="noise summary failed"):
+                hygiene_status(db_path=db_path, limit=10, conn=readonly)
+
+            assert received_connection is readonly
+            assert readonly.execute("SELECT 1").fetchone()[0] == 1
+        finally:
+            readonly.close()
+
     @pytest.mark.parametrize(
         ("command_args", "function_name"),
         [
