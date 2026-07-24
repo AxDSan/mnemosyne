@@ -481,12 +481,22 @@ class TestAuditNoise:
 
         assert "noise_summary" not in status
 
-    def test_hygiene_status_uses_supplied_readonly_connection(self, temp_db):
+    def test_hygiene_status_uses_supplied_readonly_connection(self, temp_db, monkeypatch):
         db_path, _beam = temp_db
         readonly = open_readonly_doctor_db(db_path)
+        original_noise_summary = hygiene_module.noise_summary
+        received_connection = None
+
+        def capture_noise_summary(*args, **kwargs):
+            nonlocal received_connection
+            received_connection = kwargs["conn"]
+            return original_noise_summary(*args, **kwargs)
+
+        monkeypatch.setattr(hygiene_module, "noise_summary", capture_noise_summary)
         try:
             status = hygiene_status(db_path=db_path, limit=10, conn=readonly)
 
+            assert received_connection is readonly
             assert readonly.execute("PRAGMA query_only").fetchone()[0] == 1
             with pytest.raises(sqlite3.OperationalError):
                 readonly.execute("CREATE TABLE forbidden_hygiene_write (id INTEGER)")
@@ -520,9 +530,12 @@ class TestAuditNoise:
         monkeypatch.setattr("mnemosyne.cli.DATA_DIR", str(tmp_path))
 
         original = getattr(hygiene_module, function_name)
+        injected_connection = None
 
         def require_readonly_connection(*args, **kwargs):
+            nonlocal injected_connection
             conn = kwargs["conn"]
+            injected_connection = conn
             assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
             with pytest.raises(sqlite3.OperationalError):
                 conn.execute("CREATE TABLE forbidden_cli_write (id INTEGER)")
@@ -532,6 +545,9 @@ class TestAuditNoise:
 
         cmd_hygiene(command_args)
 
+        assert injected_connection is not None
+        with pytest.raises(sqlite3.ProgrammingError):
+            injected_connection.execute("SELECT 1")
         assert capsys.readouterr().err == ""
 
     @pytest.mark.parametrize("command_args", [["audit"], ["status"]])
