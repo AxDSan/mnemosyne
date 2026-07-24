@@ -498,6 +498,31 @@ class TestAuditNoise:
         with pytest.raises(sqlite3.ProgrammingError, match="closed"):
             owned_connections[0].execute("SELECT 1")
 
+    def test_hygiene_status_closes_owned_connection_when_audit_log_read_fails(self, temp_db, monkeypatch):
+        db_path, _beam = temp_db
+        original_connect = sqlite3.connect
+        owned_connections = []
+        read_error = sqlite3.OperationalError("audit log read failed")
+
+        def capture_connection(*args, **kwargs):
+            connection = original_connect(*args, **kwargs)
+            owned_connections.append(connection)
+            return connection
+
+        def fail_audit_log_read(*_args, **_kwargs):
+            raise read_error
+
+        monkeypatch.setattr(hygiene_module.sqlite3, "connect", capture_connection)
+        monkeypatch.setattr(hygiene_module, "_table_exists", fail_audit_log_read)
+
+        with pytest.raises(sqlite3.OperationalError, match="audit log read failed") as exc_info:
+            hygiene_status(db_path=db_path, include_noise_summary=False)
+
+        assert exc_info.value is read_error
+        assert len(owned_connections) == 1
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            owned_connections[0].execute("SELECT 1")
+
     def test_hygiene_status_can_skip_noise_summary_without_closing_supplied_readonly_connection(self, temp_db):
         db_path, _beam = temp_db
         readonly = open_readonly_doctor_db(db_path)
