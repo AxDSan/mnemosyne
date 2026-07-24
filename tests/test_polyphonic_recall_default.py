@@ -3,10 +3,11 @@
 The linear recall scorer only vector-searches episodic memory ("Uses
 sqlite-vec + FTS5 for episodic, FTS5 for working" -- BeamMemory.recall).
 Every memory starts in working memory, so until consolidation promotes it,
-recall was keyword-only and paraphrased questions returned nothing even when
-a stored fact was a strong embedding match. The Hermes provider therefore
-enables the polyphonic engine by default, while leaving an explicit
-MNEMOSYNE_POLYPHONIC_RECALL env var authoritative.
+recall is keyword-only and a paraphrased question returns nothing even when
+the stored fact is a strong embedding match. The Hermes providers expose
+polyphonic recall as a config key so that gap can be closed; it defaults to
+off (current behavior), and an explicit MNEMOSYNE_POLYPHONIC_RECALL env var
+stays authoritative over both config and the default.
 
 Following the convention in test_ab_toggles.py, the toggle is pinned at three
 levels: the default, the falsy/override paths, and -- so a refactor that drops
@@ -24,6 +25,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -197,17 +199,76 @@ class TestPolyphonicRecallDefault:
         assert entry.get("default") is False
 
 
+# Retrieval coverage runs in a child process. Loading the embedding backend
+# opens a large number of file descriptors and leaves module-level thread-local
+# database connections behind, which perturbs suite-wide assertions elsewhere
+# (tests/test_repair.py compares process-wide /proc/self/fd counts). A
+# subprocess gives real end-to-end coverage while guaranteeing that none of it
+# survives into the pytest process.
+_RETRIEVAL_CHILD = '''
+import json, os, sys
+
+provider_module = sys.argv[1]
+home = sys.argv[2]
+__import__(provider_module)
+Provider = sys.modules[provider_module].MnemosyneMemoryProvider
+
+provider = Provider()
+provider.initialize("polyphonic-retrieval", hermes_home=home, platform="cli",
+                    agent_context="primary", agent_identity="test")
+
+
+def recall_count(query):
+    raw = provider.handle_tool_call("mnemosyne_recall", {"query": query, "limit": 3})
+    payload = json.loads(raw) if isinstance(raw, str) else raw
+    return len(payload.get("results") or [])
+
+
+try:
+    provider.handle_tool_call("mnemosyne_remember", {
+        "content": "Casey is vegan; shared meals need genuinely vegan options.",
+        "source": "fact", "importance": 0.9, "scope": "global"})
+
+    paraphrase = "plant based diet, avoid animal products"
+    # recall() reads the gate per call, so it can be toggled directly.
+    os.environ["MNEMOSYNE_POLYPHONIC_RECALL"] = "1"
+    result = {"keyword": recall_count("vegan"), "enabled": recall_count(paraphrase)}
+    os.environ["MNEMOSYNE_POLYPHONIC_RECALL"] = "0"
+    result["disabled"] = recall_count(paraphrase)
+finally:
+    provider.shutdown()
+
+print("RESULT:" + json.dumps(result))
+'''
+
+
 @pytest.mark.parametrize("provider_cls", PROVIDER_PARAMS)
 class TestPolyphonicRecallRetrieval:
     """The toggle must surface in real recall results, not just an env var."""
 
     @staticmethod
-    def _recall_count(provider, query: str) -> int:
+    def _run_child(provider_cls, home, repo_root) -> dict:
         import json
+        import subprocess
 
-        raw = provider.handle_tool_call("mnemosyne_recall", {"query": query, "limit": 3})
-        payload = json.loads(raw) if isinstance(raw, str) else raw
-        return len(payload.get("results") or [])
+        env = dict(os.environ)
+        env["HERMES_HOME"] = str(home)
+        env["MNEMOSYNE_DATA_DIR"] = str(home / "mnemosyne" / "data")
+        env.pop("MNEMOSYNE_POLYPHONIC_RECALL", None)
+        env["PYTHONPATH"] = os.pathsep.join(
+            p for p in [str(repo_root), str(repo_root / "integrations" / "hermes" / "src"),
+                        env.get("PYTHONPATH", "")] if p
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", _RETRIEVAL_CHILD, provider_cls.__module__, str(home)],
+            capture_output=True, text=True, env=env, timeout=600,
+        )
+        marker = [ln for ln in completed.stdout.splitlines() if ln.startswith("RESULT:")]
+        assert marker, (
+            f"retrieval child failed (rc={completed.returncode})\n"
+            f"stdout:\n{completed.stdout[-2000:]}\nstderr:\n{completed.stderr[-2000:]}"
+        )
+        return json.loads(marker[-1][len("RESULT:"):])
 
     def test_paraphrase_retrieves_unconsolidated_memory(
         self, provider_cls, tmp_path, monkeypatch
@@ -224,46 +285,22 @@ class TestPolyphonicRecallRetrieval:
         if not embeddings.available():
             pytest.skip("embeddings backend unavailable")
 
+        # HERMES_HOME is pinned for the child too: the hermes_home kwarg alone
+        # is not enough, because parts of the database path resolve through the
+        # environment, which would read and write a real Mnemosyne store.
         home = tmp_path / "hermes_home"
         home.mkdir()
-        # The hermes_home kwarg alone is not enough: some paths resolve the
-        # database through the HERMES_HOME environment variable, so without
-        # this the test would read and write the developer's real Mnemosyne
-        # store instead of the temporary one.
-        monkeypatch.setenv("HERMES_HOME", str(home))
-        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(home / "mnemosyne" / "data"))
-        provider = provider_cls()
-        with patch.object(provider_cls, "_read_config_key", return_value=None):
-            provider.initialize(
-                "polyphonic-retrieval",
-                hermes_home=str(home),
-                platform="cli",
-                agent_context="primary",
-                agent_identity="test",
-            )
-        try:
-            provider.handle_tool_call("mnemosyne_remember", {
-                "content": "Casey is vegan; shared meals need genuinely vegan options.",
-                "source": "fact",
-                "importance": 0.9,
-                "scope": "global",
-            })
+        repo_root = Path(__file__).resolve().parents[1]
+        counts = self._run_child(provider_cls, home, repo_root)
 
-            # Literal keyword overlap works either way -- it is the FTS5 path.
-            assert self._recall_count(provider, "vegan") >= 1
+        # Literal keyword overlap works either way -- it is the FTS5 path.
+        assert counts["keyword"] >= 1
 
-            # The paraphrase shares no content words with the stored memory.
-            # recall() reads the gate per call, so it can be toggled directly.
-            paraphrase = "plant based diet, avoid animal products"
+        # The paraphrase shares no content words with the stored memory.
+        assert counts["enabled"] >= 1, (
+            "paraphrased query should retrieve the unconsolidated memory "
+            "with polyphonic recall enabled"
+        )
 
-            os.environ[ENV_VAR] = "1"
-            assert self._recall_count(provider, paraphrase) >= 1, (
-                "paraphrased query should retrieve the unconsolidated memory "
-                "with polyphonic recall enabled"
-            )
-
-            # Opt-out (the default) keeps the current linear behavior.
-            os.environ[ENV_VAR] = "0"
-            assert self._recall_count(provider, paraphrase) == 0
-        finally:
-            provider.shutdown()
+        # Opt-out (the default) keeps the current linear behavior.
+        assert counts["disabled"] == 0
