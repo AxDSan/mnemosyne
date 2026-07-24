@@ -6,6 +6,7 @@ Run with: pytest tests/test_mcp_server.py -v
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import pytest
@@ -449,6 +450,179 @@ class TestToolHandlers:
             with pytest.raises(RuntimeError, match="DB locked"):
                 handle_tool_call("mnemosyne_remember", {"content": "test"})
 
+    def test_hygiene_audit_default_uses_and_closes_exact_readonly_connection(
+        self, tmp_path, monkeypatch
+    ):
+        """Default-bank audits use one real query-only connection, never Mnemosyne."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        db_path = data_dir / "mnemosyne.db"
+        with sqlite3.connect(db_path) as writable:
+            writable.execute("CREATE TABLE audit_marker (id INTEGER)")
+
+        class _Report:
+            def to_dict(self):
+                return {"total_candidates": 0}
+
+        from mnemosyne.core import hygiene
+
+        captured = {}
+
+        def _audit_noise(**kwargs):
+            conn = kwargs["conn"]
+            captured.update(kwargs)
+            assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+            with pytest.raises(
+                sqlite3.OperationalError, match="attempt to write a readonly database"
+            ):
+                conn.execute("CREATE TABLE forbidden_write (id INTEGER)")
+            return _Report()
+
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+        monkeypatch.setattr(
+            mcp_tools,
+            "_create_instance",
+            lambda **_kwargs: pytest.fail("hygiene audit must not initialize Mnemosyne"),
+        )
+        monkeypatch.setattr(hygiene, "audit_noise", _audit_noise)
+
+        arguments = {
+            "limit": 17,
+            "tables": ["audit_marker"],
+            "min_score": 0.8,
+            "offset": 3,
+            "scan_all": True,
+            "batch_size": 11,
+        }
+        result = handle_tool_call("mnemosyne_hygiene_audit", arguments)
+
+        assert result == {
+            "status": "audited",
+            "report": {"total_candidates": 0},
+            "bank": "default",
+        }
+        assert captured == {
+            "db_path": db_path,
+            "limit": 17,
+            "tables": ["audit_marker"],
+            "min_score": 0.8,
+            "offset": 3,
+            "scan_all": True,
+            "batch_size": 11,
+            "conn": captured["conn"],
+        }
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            captured["conn"].execute("SELECT 1")
+
+    def test_hygiene_audit_closes_connection_when_audit_raises(self, tmp_path, monkeypatch):
+        """The read-only connection closes even if audit_noise raises."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        db_path = data_dir / "mnemosyne.db"
+        sqlite3.connect(db_path).close()
+
+        from mnemosyne.core import hygiene
+        from mnemosyne import doctor
+
+        captured = {}
+        real_open = doctor.open_readonly_doctor_db
+
+        def _open_readonly(path):
+            captured["conn"] = real_open(path)
+            return captured["conn"]
+
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+        monkeypatch.setattr(
+            mcp_tools,
+            "_create_instance",
+            lambda **_kwargs: pytest.fail("hygiene audit must not initialize Mnemosyne"),
+        )
+        monkeypatch.setattr(doctor, "open_readonly_doctor_db", _open_readonly)
+        monkeypatch.setattr(
+            hygiene,
+            "audit_noise",
+            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("audit failed")),
+        )
+
+        with pytest.raises(RuntimeError, match="audit failed"):
+            handle_tool_call("mnemosyne_hygiene_audit", {})
+
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            captured["conn"].execute("SELECT 1")
+
+    def test_hygiene_audit_readonly_open_failure_has_no_writable_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        """A missing default DB fails at the read-only open without running audit_noise."""
+        data_dir = tmp_path / "missing-data"
+        from mnemosyne.core import hygiene
+
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+        monkeypatch.setattr(
+            mcp_tools,
+            "_create_instance",
+            lambda **_kwargs: pytest.fail("hygiene audit must not initialize Mnemosyne"),
+        )
+        monkeypatch.setattr(
+            hygiene,
+            "audit_noise",
+            lambda **_kwargs: pytest.fail("audit must not run after readonly open failure"),
+        )
+
+        with pytest.raises(sqlite3.OperationalError):
+            handle_tool_call("mnemosyne_hygiene_audit", {})
+
+        assert not data_dir.exists()
+
+    def test_hygiene_audit_unknown_bank_never_initializes_or_creates_state(
+        self, tmp_path, monkeypatch
+    ):
+        """Unknown named banks fail before any manager/instance can create state."""
+        data_dir = tmp_path / "fresh-data"
+
+        def _snapshot(root):
+            return (
+                sorted(path.relative_to(root) for path in root.rglob("*"))
+                if root.exists()
+                else []
+            )
+
+        before = _snapshot(data_dir)
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+        monkeypatch.setattr(
+            mcp_tools,
+            "_create_instance",
+            lambda **_kwargs: pytest.fail("unknown bank must not initialize Mnemosyne"),
+        )
+
+        with pytest.raises(ValueError, match="Bank 'unknown' does not exist"):
+            handle_tool_call("mnemosyne_hygiene_audit", {"bank": "unknown"})
+
+        assert _snapshot(data_dir) == before
+        assert not (data_dir / "banks").exists()
+        assert not (data_dir / "config").exists()
+
+    def test_hygiene_audit_named_bank_requires_an_existing_database(
+        self, tmp_path, monkeypatch
+    ):
+        """A named bank directory without its DB is rejected without mutations."""
+        data_dir = tmp_path / "data"
+        bank_dir = data_dir / "banks" / "team"
+        bank_dir.mkdir(parents=True)
+        before = sorted(path.relative_to(data_dir) for path in data_dir.rglob("*"))
+
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+        monkeypatch.setattr(
+            mcp_tools,
+            "_create_instance",
+            lambda **_kwargs: pytest.fail("named-bank audit must not initialize Mnemosyne"),
+        )
+
+        with pytest.raises(FileNotFoundError, match="Database for bank 'team' does not exist"):
+            handle_tool_call("mnemosyne_hygiene_audit", {"bank": "team"})
+
+        assert sorted(path.relative_to(data_dir) for path in data_dir.rglob("*")) == before
+
     def test_hygiene_clean_rejects_invalid_candidates_json(self):
         """Invalid hygiene payloads return the documented MCP error instead of raising."""
         result = handle_tool_call(
@@ -569,6 +743,210 @@ class TestMCPIntegration:
         from mnemosyne import mcp_tools
         assert hasattr(mcp_tools, "TOOLS")
         assert hasattr(mcp_tools, "handle_tool_call")
+
+    def test_mcp_tools_fresh_import_does_not_materialize_default_state(self, tmp_path):
+        """A fresh MCP import must not initialize the legacy default database."""
+        data_dir = tmp_path / "data"
+        mnemosyne_home = tmp_path / "mnemosyne-home"
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(tmp_path / "home"),
+            "MNEMOSYNE_HOME": str(mnemosyne_home),
+            "MNEMOSYNE_DATA_DIR": str(data_dir),
+        })
+        script = """
+import json
+import os
+from pathlib import Path
+
+import mnemosyne.mcp_tools
+
+root = Path(os.environ["MNEMOSYNE_DATA_DIR"])
+print(json.dumps(sorted(str(path.relative_to(root)) for path in root.rglob("*")) if root.exists() else []))
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert json.loads(completed.stdout) == []
+        assert not data_dir.exists()
+        assert not (data_dir / "mnemosyne.db").exists()
+        assert not (data_dir / "mnemosyne.db-wal").exists()
+        assert not (data_dir / "mnemosyne.db-shm").exists()
+        assert not (data_dir / "config").exists()
+        assert not mnemosyne_home.exists()
+
+    def test_mcp_tools_runtime_type_hints_are_resolvable_without_default_state(self, tmp_path):
+        """Lazy imports must not break runtime type-hint consumers or create state."""
+        data_dir = tmp_path / "data"
+        mnemosyne_home = tmp_path / "mnemosyne-home"
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(tmp_path / "home"),
+            "MNEMOSYNE_HOME": str(mnemosyne_home),
+            "MNEMOSYNE_DATA_DIR": str(data_dir),
+        })
+        script = """
+import json
+import os
+from pathlib import Path
+import sys
+import typing
+
+import mnemosyne.mcp_tools as m
+
+assert typing.get_type_hints(m._create_instance)["return"] is typing.Any
+assert typing.get_type_hints(m._WrapperBatchAdapter.__init__)["mem"] is typing.Any
+assert "mnemosyne.core.memory" not in sys.modules
+root = Path(os.environ["MNEMOSYNE_DATA_DIR"])
+print(json.dumps(sorted(str(path.relative_to(root)) for path in root.rglob("*")) if root.exists() else []))
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert json.loads(completed.stdout) == []
+        assert not data_dir.exists()
+        assert not mnemosyne_home.exists()
+
+    def test_mcp_tools_public_mnemosyne_export_is_lazy_and_canonical(self, tmp_path):
+        """The legacy public export resolves to the canonical class on demand."""
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(tmp_path / "home"),
+            "MNEMOSYNE_HOME": str(tmp_path / "mnemosyne-home"),
+            "MNEMOSYNE_DATA_DIR": str(tmp_path / "data"),
+        })
+        script = """
+import json
+
+from mnemosyne.mcp_tools import Mnemosyne
+from mnemosyne.core.memory import Mnemosyne as CoreMnemosyne
+
+print(json.dumps({"is_canonical": Mnemosyne is CoreMnemosyne}))
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert json.loads(completed.stdout) == {"is_canonical": True}
+
+    def test_mcp_tools_star_import_preserves_legacy_export_surface(self, tmp_path):
+        """Star imports retain every old public name and resolve Mnemosyne canonically."""
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(tmp_path / "home"),
+            "MNEMOSYNE_HOME": str(tmp_path / "mnemosyne-home"),
+            "MNEMOSYNE_DATA_DIR": str(tmp_path / "data"),
+        })
+        expected = [
+            "ALL_TOOL_SCHEMAS",
+            "Any",
+            "BatchValidationError",
+            "BeamMemory",
+            "CallToolResult",
+            "Dict",
+            "ErrorData",
+            "List",
+            "Mnemosyne",
+            "Path",
+            "TOOLS",
+            "TextContent",
+            "Tool",
+            "apply_beam_batch",
+            "batch_validation_error_payload",
+            "dry_run_batch",
+            "get_tool_definitions",
+            "handle_tool_call",
+            "json",
+            "math",
+            "os",
+            "sqlite3",
+            "validate_batch_operations",
+        ]
+        script = f"""
+import json
+
+ns = {{}}
+exec("from mnemosyne.mcp_tools import *", ns)
+from mnemosyne.core.memory import Mnemosyne as CoreMnemosyne
+
+names = sorted(name for name in ns if name != "__builtins__")
+assert names == {expected!r}
+assert ns["Mnemosyne"] is CoreMnemosyne
+assert not {{"TYPE_CHECKING", "TypeAlias", "MnemosyneInstance"}} & ns.keys()
+print(json.dumps({{"names": names, "count": len(names)}}))
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert json.loads(completed.stdout) == {"names": expected, "count": len(expected)}
+
+    def test_named_bank_hygiene_audit_in_fresh_process_creates_no_default_state(self, tmp_path):
+        """A real named-bank audit never initializes default state in a fresh process."""
+        data_dir = tmp_path / "data"
+        named_db = data_dir / "banks" / "team" / "mnemosyne.db"
+        named_db.parent.mkdir(parents=True)
+        sqlite3.connect(named_db).close()
+        before = sorted(str(path.relative_to(data_dir)) for path in data_dir.rglob("*"))
+        mnemosyne_home = tmp_path / "mnemosyne-home"
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(tmp_path / "home"),
+            "MNEMOSYNE_HOME": str(mnemosyne_home),
+            "MNEMOSYNE_DATA_DIR": str(data_dir),
+        })
+        script = """
+import json
+import os
+from pathlib import Path
+
+from mnemosyne.mcp_tools import handle_tool_call
+
+root = Path(os.environ["MNEMOSYNE_DATA_DIR"])
+result = handle_tool_call("mnemosyne_hygiene_audit", {"bank": "team"})
+after = sorted(str(path.relative_to(root)) for path in root.rglob("*"))
+print(json.dumps({"result": result, "after": after}))
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        payload = json.loads(completed.stdout)
+        assert payload["result"]["status"] == "audited"
+        assert payload["result"]["bank"] == "team"
+        assert payload["after"] == before
+        assert not (data_dir / "mnemosyne.db").exists()
+        assert not (data_dir / "mnemosyne.db-wal").exists()
+        assert not (data_dir / "mnemosyne.db-shm").exists()
+        assert not (data_dir / "config").exists()
+        assert not mnemosyne_home.exists()
 
     def test_get_tool_definitions_returns_all(self):
         """get_tool_definitions returns all registered tools."""

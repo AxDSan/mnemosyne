@@ -219,6 +219,29 @@ def bank_exists_read_only(name: str, data_dir: Path = None) -> bool:
     return (banks_dir / name).is_dir()
 
 
+def get_bank_db_path_read_only(name: str, data_dir: Path = None) -> Path:
+    """Resolve an existing bank database path without initializing bank state.
+
+    This is the read-only counterpart to ``BankManager.get_bank_db_path`` for
+    inspection paths. It validates bank names but never constructs a
+    ``BankManager`` (whose constructor creates ``banks/``). The default bank
+    retains its legacy location; named banks must already have both their bank
+    directory and database file on disk.
+    """
+    _validate_bank_name(name)
+    resolved: Path = data_dir or _default_data_dir()
+    if name == "default":
+        return resolved / "mnemosyne.db"
+
+    if not bank_exists_read_only(name, data_dir=resolved):
+        raise ValueError(f"Bank '{name}' does not exist")
+
+    db_path = resolved / "banks" / name / "mnemosyne.db"
+    if not db_path.is_file():
+        raise FileNotFoundError(f"Database for bank '{name}' does not exist")
+    return db_path
+
+
 # Module-level convenience functions
 def create_bank(name: str, data_dir: Path = None) -> Path:
     """Create a new memory bank."""
