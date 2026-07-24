@@ -1325,7 +1325,18 @@ _POLYPHONIC_ENV = "MNEMOSYNE_POLYPHONIC_RECALL"
 # operator-supplied one (must never be clobbered). Comparing against the
 # written value keeps this independent of import order, so an env var loaded
 # from .env after this module is imported still counts as external.
+#
+# _polyphonic_lock serializes the read-check-write below across threads.
+# Hermes' MemoryManager runs background sync/prefetch work on daemon
+# threads, so two provider instances in one profile process can call
+# _apply_provider_config() concurrently. In practice both always resolve
+# the same target (kwargs are never used for this key in the framework;
+# every instance in a process reads the same config.yaml), so the race is
+# a redundant identical write rather than a wrong one -- but making the
+# check-then-write atomic removes the question entirely rather than
+# relying on that being true forever.
 _provider_managed_polyphonic: Optional[str] = None
+_polyphonic_lock = threading.Lock()
 
 
 class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
@@ -1611,19 +1622,20 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # this provider wrote earlier is refreshed, so re-initializing with a
         # different config (session switch, second profile in-process) applies.
         global _provider_managed_polyphonic
-        _current_polyphonic = os.environ.get(_POLYPHONIC_ENV)
-        if _current_polyphonic is None or _current_polyphonic == _provider_managed_polyphonic:
-            polyphonic = kwargs.get("polyphonic_recall")
-            if polyphonic is None:
-                polyphonic = self._read_config_key("polyphonic_recall")
-            if polyphonic is None:
-                polyphonic = False
-            if isinstance(polyphonic, str):
-                polyphonic_enabled = polyphonic.strip().lower() in ("true", "1", "yes", "on")
-            else:
-                polyphonic_enabled = bool(polyphonic)
-            _provider_managed_polyphonic = "1" if polyphonic_enabled else "0"
-            os.environ[_POLYPHONIC_ENV] = _provider_managed_polyphonic
+        with _polyphonic_lock:
+            _current_polyphonic = os.environ.get(_POLYPHONIC_ENV)
+            if _current_polyphonic is None or _current_polyphonic == _provider_managed_polyphonic:
+                polyphonic = kwargs.get("polyphonic_recall")
+                if polyphonic is None:
+                    polyphonic = self._read_config_key("polyphonic_recall")
+                if polyphonic is None:
+                    polyphonic = False
+                if isinstance(polyphonic, str):
+                    polyphonic_enabled = polyphonic.strip().lower() in ("true", "1", "yes", "on")
+                else:
+                    polyphonic_enabled = bool(polyphonic)
+                _provider_managed_polyphonic = "1" if polyphonic_enabled else "0"
+                os.environ[_POLYPHONIC_ENV] = _provider_managed_polyphonic
 
         shared_surface_path = kwargs.get("shared_surface_path")
         if shared_surface_path is None:

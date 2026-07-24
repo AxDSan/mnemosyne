@@ -270,9 +270,7 @@ class TestPolyphonicRecallRetrieval:
         )
         return json.loads(marker[-1][len("RESULT:"):])
 
-    def test_paraphrase_retrieves_unconsolidated_memory(
-        self, provider_cls, tmp_path, monkeypatch
-    ):
+    def test_paraphrase_retrieves_unconsolidated_memory(self, provider_cls, tmp_path):
         """Opting in makes a working-memory fact reachable by paraphrase.
 
         The opt-out preserves the linear path, where the vector voice never
