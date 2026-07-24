@@ -474,12 +474,21 @@ class TestAuditNoise:
         assert status["audit_log"]["total_entries"] == 0
         assert status["audit_log"]["by_action"] == {}
 
-    def test_hygiene_status_can_skip_noise_summary(self, temp_db):
+    def test_hygiene_status_can_skip_noise_summary_without_closing_supplied_readonly_connection(self, temp_db):
         db_path, _beam = temp_db
+        readonly = open_readonly_doctor_db(db_path)
+        try:
+            status = hygiene_status(
+                db_path=db_path,
+                include_noise_summary=False,
+                conn=readonly,
+            )
 
-        status = hygiene_status(db_path=db_path, include_noise_summary=False)
-
-        assert "noise_summary" not in status
+            assert "noise_summary" not in status
+            assert status["status"] == "ok"
+            assert readonly.execute("SELECT 1").fetchone()[0] == 1
+        finally:
+            readonly.close()
 
     def test_hygiene_status_uses_supplied_readonly_connection(self, temp_db, monkeypatch):
         db_path, _beam = temp_db
@@ -549,6 +558,42 @@ class TestAuditNoise:
         with pytest.raises(sqlite3.ProgrammingError):
             injected_connection.execute("SELECT 1")
         assert capsys.readouterr().err == ""
+
+    @pytest.mark.parametrize(
+        ("command_args", "function_name"),
+        [
+            (["audit"], "audit_noise"),
+            (["status"], "hygiene_status"),
+        ],
+    )
+    def test_cmd_hygiene_read_commands_close_connection_after_hygiene_error(
+        self, monkeypatch, tmp_path, capsys, command_args, function_name
+    ):
+        db_path = tmp_path / "mnemosyne.db"
+        sqlite3.connect(db_path).close()
+        monkeypatch.setattr("mnemosyne.cli.DATA_DIR", str(tmp_path))
+
+        connection = None
+
+        def capture_readonly_connection(path):
+            nonlocal connection
+            connection = open_readonly_doctor_db(path)
+            return connection
+
+        def fail_after_connection(*_args, **kwargs):
+            assert kwargs["conn"] is connection
+            raise sqlite3.OperationalError("hygiene read failed")
+
+        monkeypatch.setattr("mnemosyne.doctor.open_readonly_doctor_db", capture_readonly_connection)
+        monkeypatch.setattr(hygiene_module, function_name, fail_after_connection)
+
+        with pytest.raises(SystemExit):
+            cmd_hygiene(command_args)
+
+        assert connection is not None
+        with pytest.raises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+        assert "hygiene read failed" in capsys.readouterr().err
 
     @pytest.mark.parametrize("command_args", [["audit"], ["status"]])
     def test_cmd_hygiene_read_commands_report_readonly_open_errors(
