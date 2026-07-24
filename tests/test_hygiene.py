@@ -474,6 +474,30 @@ class TestAuditNoise:
         assert status["audit_log"]["total_entries"] == 0
         assert status["audit_log"]["by_action"] == {}
 
+    def test_hygiene_status_can_skip_noise_summary_with_owned_connection(self, temp_db, monkeypatch):
+        db_path, _beam = temp_db
+        original_connect = sqlite3.connect
+        owned_connections = []
+
+        def capture_connection(*args, **kwargs):
+            connection = original_connect(*args, **kwargs)
+            owned_connections.append(connection)
+            return connection
+
+        def unexpected_noise_summary(*_args, **_kwargs):
+            raise AssertionError("noise_summary must not be called when disabled")
+
+        monkeypatch.setattr(hygiene_module.sqlite3, "connect", capture_connection)
+        monkeypatch.setattr(hygiene_module, "noise_summary", unexpected_noise_summary)
+
+        status = hygiene_status(db_path=db_path, include_noise_summary=False)
+
+        assert status["status"] == "ok"
+        assert "noise_summary" not in status
+        assert len(owned_connections) == 1
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            owned_connections[0].execute("SELECT 1")
+
     def test_hygiene_status_can_skip_noise_summary_without_closing_supplied_readonly_connection(self, temp_db):
         db_path, _beam = temp_db
         readonly = open_readonly_doctor_db(db_path)
