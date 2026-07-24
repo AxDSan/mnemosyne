@@ -209,7 +209,9 @@ class TestPolyphonicRecallRetrieval:
         payload = json.loads(raw) if isinstance(raw, str) else raw
         return len(payload.get("results") or [])
 
-    def test_paraphrase_retrieves_unconsolidated_memory(self, provider_cls, tmp_path):
+    def test_paraphrase_retrieves_unconsolidated_memory(
+        self, provider_cls, tmp_path, monkeypatch
+    ):
         """Opting in makes a working-memory fact reachable by paraphrase.
 
         The opt-out preserves the linear path, where the vector voice never
@@ -224,6 +226,12 @@ class TestPolyphonicRecallRetrieval:
 
         home = tmp_path / "hermes_home"
         home.mkdir()
+        # The hermes_home kwarg alone is not enough: some paths resolve the
+        # database through the HERMES_HOME environment variable, so without
+        # this the test would read and write the developer's real Mnemosyne
+        # store instead of the temporary one.
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(home / "mnemosyne" / "data"))
         provider = provider_cls()
         with patch.object(provider_cls, "_read_config_key", return_value=None):
             provider.initialize(
