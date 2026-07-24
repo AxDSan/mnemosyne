@@ -531,6 +531,7 @@ class TestAuditNoise:
 
             assert received_connection is readonly
             assert readonly.execute("PRAGMA query_only").fetchone()[0] == 1
+            readonly.execute("PRAGMA query_only = OFF")
             with pytest.raises(sqlite3.OperationalError):
                 readonly.execute("CREATE TABLE forbidden_hygiene_write (id INTEGER)")
         finally:
@@ -570,6 +571,7 @@ class TestAuditNoise:
             conn = kwargs["conn"]
             injected_connection = conn
             assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+            conn.execute("PRAGMA query_only = OFF")
             with pytest.raises(sqlite3.OperationalError):
                 conn.execute("CREATE TABLE forbidden_cli_write (id INTEGER)")
             return original(*args, **kwargs)
