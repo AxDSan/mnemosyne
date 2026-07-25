@@ -16,6 +16,7 @@ import json
 import hashlib
 import logging
 import threading
+import tempfile
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 from pathlib import Path
@@ -766,11 +767,18 @@ class Mnemosyne:
             "sync_events_count": len(export.get("sync_events", [])),
         }
 
-    def import_from_file(self, input_path: str, force: bool = False) -> Dict:
+    def import_from_file(
+        self,
+        input_path: str,
+        force: bool = False,
+        dry_run: bool = False,
+        _owned_store_connections: Optional[List[Any]] = None,
+    ) -> Dict:
         """
         Import Mnemosyne data from a JSON file produced by export_to_file().
         Idempotent by default: skips existing records.
-        Set force=True to overwrite.
+        Set force=True to overwrite. Set dry_run=True to validate and return
+        the normal import statistics without changing the active database.
         Returns import statistics.
 
         Accepts schema versions 1.0 (pre-E6), 1.1 (post-E6), 1.2 (post-sync),
@@ -778,6 +786,107 @@ class Mnemosyne:
         those events are imported with idempotency based on ``event_hash``.
         Sections absent from older exports are treated as no-ops.
         """
+        if dry_run:
+            with tempfile.TemporaryDirectory(prefix="mnemosyne-import-") as temp_dir:
+                clone_path = Path(temp_dir) / "mnemosyne.db"
+                clone_connection = sqlite3.connect(str(clone_path))
+                try:
+                    # SQLite's backup API captures the active WAL state; copying
+                    # only the database file would miss uncheckpointed writes.
+                    self.conn.backup(clone_connection)
+                finally:
+                    clone_connection.close()
+
+                # Both core and BEAM use module-level thread-local caches.
+                # Constructing the isolated clone replaces their active entries,
+                # so preserve the caller's complete current cache state before
+                # construction and put it back after clone cleanup.
+                from mnemosyne.core import beam as beam_module
+
+                thread_local_states = [
+                    (local, dict(vars(local)))
+                    for local in (_thread_local, beam_module._thread_local)
+                ]
+                clone_store_connections = []
+                # QueryCache is lazy instance state on BeamMemory rather than
+                # part of BEAM's connection cache.  Keep the caller's cache
+                # identity so a clone can never close it during cleanup.
+                caller_beam_query_cache = getattr(self.beam, "_query_cache", None)
+                isolated = None
+                try:
+                    isolated = Mnemosyne(
+                        session_id=self.session_id,
+                        db_path=clone_path,
+                        bank=self.bank,
+                        author_id=self.author_id,
+                        author_type=self.author_type,
+                        channel_id=self.channel_id,
+                    )
+                    return isolated.import_from_file(
+                        input_path,
+                        force=force,
+                        _owned_store_connections=clone_store_connections,
+                    )
+                finally:
+                    # Enhanced recall can lazily create a QueryCache on the
+                    # isolated BeamMemory.  Its SQLite connection is separate
+                    # from beam_module._thread_local.conn, so close it before
+                    # the temporary clone directory disappears.  Capture a
+                    # thread-local cache too for compatibility with any cache
+                    # implementation that stores it there in the future.
+                    clone_query_caches = []
+                    if isolated is not None:
+                        cache = getattr(isolated.beam, "_query_cache", None)
+                        if cache is not None and cache is not caller_beam_query_cache:
+                            clone_query_caches.append(cache)
+                    for local, original_state in thread_local_states:
+                        cache = getattr(local, "_query_cache", None)
+                        if cache is not None and cache is not original_state.get("_query_cache"):
+                            clone_query_caches.append(cache)
+                    closed_query_caches = set()
+                    for cache in clone_query_caches:
+                        if id(cache) in closed_query_caches:
+                            continue
+                        closed_query_caches.add(id(cache))
+                        try:
+                            cache.close()
+                        except Exception:
+                            pass
+
+                    # File import constructs standalone stores for triples,
+                    # annotations, and canonical facts. They are not part of
+                    # Mnemosyne's thread-local caches, so close their clone
+                    # connections explicitly even when the import raises.
+                    closed_connections = set()
+                    for connection in clone_store_connections:
+                        if id(connection) in closed_connections:
+                            continue
+                        closed_connections.add(id(connection))
+                        try:
+                            connection.close()
+                        except Exception:
+                            pass
+
+                    # Close only connections that the clone installed, then
+                    # restore every pre-clone cache attribute.  In particular,
+                    # do not close an active caller connection merely because a
+                    # clone replaced its thread-local entry.
+                    for local, original_state in thread_local_states:
+                        if getattr(local, "db_path", None) == str(clone_path):
+                            connection = getattr(local, "conn", None)
+                            if connection is not None and connection is not original_state.get("conn"):
+                                try:
+                                    connection.close()
+                                except Exception:
+                                    pass
+
+                        # Restoring the captured dictionary also removes clone
+                        # state when this thread had no prior cache entry.
+                        for attribute in list(vars(local)):
+                            delattr(local, attribute)
+                        for attribute, value in original_state.items():
+                            setattr(local, attribute, value)
+
         from mnemosyne.core.triples import TripleStore
         from mnemosyne.core.annotations import AnnotationStore
         from mnemosyne.core.canonical import CanonicalStore
@@ -852,11 +961,15 @@ class Mnemosyne:
 
         # Triples (current-truth temporal facts)
         triples = TripleStore(db_path=self.db_path)
+        if _owned_store_connections is not None:
+            _owned_store_connections.append(triples.conn)
         t_stats = triples.import_all(data.get("triples", []), force=force)
         stats["triples"] = t_stats
 
         # Annotations (post-E6 schema 1.1; absent from 1.0 backups)
         annotations = AnnotationStore(db_path=self.db_path)
+        if _owned_store_connections is not None:
+            _owned_store_connections.append(annotations.conn)
         a_stats = annotations.import_all(data.get("annotations", []), force=force)
         stats["annotations"] = a_stats
 
@@ -864,6 +977,8 @@ class Mnemosyne:
         # a no-op, so older exports import unchanged. import_all is idempotent
         # and honors force, matching triples/annotations.
         canonical = CanonicalStore(db_path=self.db_path)
+        if _owned_store_connections is not None:
+            _owned_store_connections.append(canonical.conn)
         c_stats = canonical.import_all(data.get("canonical_facts", []), force=force)
         stats["canonical"] = c_stats
 

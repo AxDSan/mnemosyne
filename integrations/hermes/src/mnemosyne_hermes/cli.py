@@ -488,7 +488,7 @@ def mnemosyne_command(args):
             print("       hermes mnemosyne import --list-providers")
             return 1
         try:
-            stats = mem.import_from_file(input_path, force=force)
+            stats = mem.import_from_file(input_path, force=force, dry_run=dry_run)
             beam_stats = stats.get("beam", {})
             legacy_stats = stats.get("legacy", {})
             triples_stats = stats.get("triples", {})
@@ -498,7 +498,13 @@ def mnemosyne_command(args):
             print(f"  Legacy: +{legacy_stats.get('inserted', 0)}")
             print(f"  Triples: +{triples_stats.get('inserted', 0)}")
             if force:
-                print(f"  (force mode: overwrites applied)")
+                print(
+                    "  (force mode: overwrites would be applied)"
+                    if dry_run
+                    else "  (force mode: overwrites applied)"
+                )
+            if dry_run:
+                print("  (dry-run mode: no memories were written)")
         except Exception as e:
             print(f"Import failed: {e}")
             return 1

@@ -3512,12 +3512,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 "error": "Either input_path (for file import) or provider "
                          "(for cross-provider import) is required",
             })
-        stats = mem.import_from_file(input_path, force=force)
-        self._audit_event(
-            "import", bank="private", source_tool="mnemosyne_import",
-            metadata={"input_path": input_path, "force": force, "stats": stats},
-        )
-        return json.dumps({"status": "imported", "stats": stats})
+        stats = mem.import_from_file(input_path, force=force, dry_run=dry_run)
+        if not dry_run:
+            self._audit_event(
+                "import", bank="private", source_tool="mnemosyne_import",
+                metadata={"input_path": input_path, "force": force, "stats": stats},
+            )
+        return json.dumps({"status": "imported", "stats": stats, "dry_run": dry_run})
 
     def _handle_diagnose(self, args: Dict[str, Any]) -> str:
         from mnemosyne.diagnose import run_diagnostics

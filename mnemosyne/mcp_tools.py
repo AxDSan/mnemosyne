@@ -920,8 +920,8 @@ def _handle_import(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
     if not input_path:
         return {"error": "Either input_path (for file import) or provider (for cross-provider import) is required"}
-    stats = mem.import_from_file(input_path, force=force)
-    return {"status": "imported", "stats": stats}
+    stats = mem.import_from_file(input_path, force=force, dry_run=dry_run)
+    return {"status": "imported", "stats": stats, "dry_run": dry_run}
 
 
 def _handle_diagnose(arguments: Dict[str, Any]) -> Dict[str, Any]:
