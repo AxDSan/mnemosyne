@@ -209,16 +209,22 @@ def test_prefetch_injects_only_relevant_model_slots(tmp_path, monkeypatch):
     store.remember("default", "model:user", "communication_style", "Prefers concise diagnostic answers without flattery.")
     store.remember("default", "model:project", "music_notes", "Ambient playlist tags include drone and texture.")
 
-    pr_block = provider.prefetch("how should we structure this PR strategy")
+    pr_query = "how should we structure this PR strategy"
+    provider.queue_prefetch(pr_query)
+    pr_block = provider.prefetch(pr_query)
     assert "## Mnemosyne Model Context" in pr_block
     assert "pr strategy" in pr_block
     assert "upstreamable PRs" in pr_block
     assert "Ambient playlist" not in pr_block
 
-    shell_block = provider.prefetch("what command checks disk usage")
+    shell_query = "what command checks disk usage"
+    provider.queue_prefetch(shell_query)
+    shell_block = provider.prefetch(shell_query)
     assert "## Mnemosyne Model Context" not in shell_block
 
-    style_block = provider.prefetch("what communication style should you use")
+    style_query = "what communication style should you use"
+    provider.queue_prefetch(style_query)
+    style_block = provider.prefetch(style_query)
     assert "communication style" in style_block
     assert "concise diagnostic" in style_block
 

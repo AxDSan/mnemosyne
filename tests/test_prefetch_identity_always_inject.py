@@ -76,7 +76,8 @@ def test_identity_surfaces_on_non_matching_generic_query(provider_factory):
         "session-A",
     )
     # A short, generic opener with zero semantic overlap with the identity.
-    block = p.prefetch("Hi")
+    p.queue_prefetch("Hi", session_id="session-A")
+    block = p.prefetch("Hi", session_id="session-A")
     assert "[IDENTITY]" in block
     assert "Contact A is the lead engineer on the payments team." in block
 
@@ -91,12 +92,14 @@ def test_identity_does_not_leak_across_sessions(provider_factory):
     )
 
     pb = provider_factory("session-B")
-    block_b = pb.prefetch("Hi")
+    pb.queue_prefetch("Hi", session_id="session-B")
+    block_b = pb.prefetch("Hi", session_id="session-B")
     assert "Contact A" not in block_b
     assert "[IDENTITY]" not in block_b
 
     # Sanity: session A still sees its own identity.
-    block_a = pa.prefetch("Hi")
+    pa.queue_prefetch("Hi", session_id="session-A")
+    block_a = pa.prefetch("Hi", session_id="session-A")
     assert "Contact A is the lead engineer on the payments team." in block_a
 
 
@@ -118,7 +121,8 @@ def test_no_duplicate_when_query_matches_identity(provider_factory):
         }]
 
     p._beam.recall = fake_recall
-    block = p.prefetch("who is the lead engineer on payments")
+    p.queue_prefetch("who is the lead engineer on payments", session_id="session-A")
+    block = p.prefetch("who is the lead engineer on payments", session_id="session-A")
     # The identity content appears exactly once across the whole block.
     assert block.count(identity_text) == 1
 
@@ -127,5 +131,6 @@ def test_no_identity_rows_is_a_noop(provider_factory):
     """With no identity rows, behavior is unchanged (no [IDENTITY] block)."""
     p = provider_factory("session-A")
     p._beam.recall = lambda **kwargs: []
-    block = p.prefetch("Hi")
+    p.queue_prefetch("Hi", session_id="session-A")
+    block = p.prefetch("Hi", session_id="session-A")
     assert "[IDENTITY]" not in block

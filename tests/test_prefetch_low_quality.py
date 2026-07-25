@@ -51,6 +51,7 @@ def test_prefetch_drops_fragments_and_keeps_real_memory(monkeypatch):
     provider = MnemosyneMemoryProvider()
     provider._beam = FakeBeam()
 
+    provider.queue_prefetch("what matters most")
     block = provider.prefetch("what matters most")
 
     assert "Paris is the capital of France" in block

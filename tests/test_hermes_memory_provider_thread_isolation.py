@@ -185,8 +185,11 @@ def test_prefetch_scopes_to_thread(tmp_path, monkeypatch):
 
     # Prefetch with a query broad enough to match all memories.
     # prefetch() returns formatted string, not JSON.
-    prefetch_a_output = prov_a.prefetch(query="animals nature sky ocean")
-    prefetch_b_output = prov_b.prefetch(query="animals nature sky ocean")
+    query = "animals nature sky ocean"
+    prov_a.queue_prefetch(query=query)
+    prov_b.queue_prefetch(query=query)
+    prefetch_a_output = prov_a.prefetch(query=query)
+    prefetch_b_output = prov_b.prefetch(query=query)
 
     # Thread A should see its session memory + global
     assert "Secret A: the sky is green" in prefetch_a_output, \

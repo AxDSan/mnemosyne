@@ -35,6 +35,7 @@ def test_prefetch_excludes_assistant_transcript_rows():
          "importance": 0.8, "score": 0.7, "keyword_score": 0.7, "trust_tier": "STATED"},
     ])
 
+    p.queue_prefetch("Mnemosyne injection correction")
     block = p.prefetch("Mnemosyne injection correction")
 
     assert "distilled correction" in block
@@ -51,6 +52,7 @@ def test_prefetch_requires_topic_signal_not_importance_only():
          "importance": 0.7, "score": 0.6, "keyword_score": 0.6, "trust_tier": "STATED"},
     ])
 
+    p.queue_prefetch("make Mnemosyne memory-context injection more relevant")
     block = p.prefetch("make Mnemosyne memory-context injection more relevant")
 
     assert "topical relevance" in block

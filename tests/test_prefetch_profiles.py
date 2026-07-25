@@ -48,6 +48,7 @@ def test_general_is_the_default_and_passes_no_tuning_weights():
         {"content": "Paris is the capital of France", "timestamp": "2026-05-14T12:00:00Z",
          "importance": 0.9, "score": 0.9, "keyword_score": 0.9, "trust_tier": "STATED"},
     ])
+    p.queue_prefetch("capital of France")
     block = p.prefetch("capital of France")
     assert block.startswith("## Mnemosyne Context")
     assert "Paris is the capital of France" in block
@@ -61,6 +62,7 @@ def test_social_chat_passes_its_tuning_to_recall():
         {"content": "the team ships on Friday", "timestamp": "2026-05-14T12:00:00Z",
          "importance": 0.9, "score": 0.4, "keyword_score": 0.4, "trust_tier": "STATED"},
     ])
+    p.queue_prefetch("when do we ship")
     p.prefetch("when do we ship")
     assert p._beam.last_kwargs["importance_weight"] == 0.6
     assert p._beam.last_kwargs["temporal_weight"] == 0.35
@@ -78,6 +80,7 @@ def test_registered_source_is_merged():
     p._prefetch_profile = "t-merge"
     p.register_prefetch_source(
         "dummy", lambda q, *, session_id="": [{"content": "Lake Baikal is the deepest lake"}])
+    p.queue_prefetch("geography")
     block = p.prefetch("geography")
     assert "Paris is the capital of France" in block
     assert "Lake Baikal is the deepest lake" in block
@@ -99,6 +102,7 @@ def test_dedup_collapses_duplicate_content_across_sources():
     p._prefetch_profile = "t-dedup"
     p.register_prefetch_source(
         "dummy", lambda q, *, session_id="": [{"content": "Mount Everest is the tallest mountain"}])
+    p.queue_prefetch("mountains")
     block = p.prefetch("mountains")
     assert block.count("Mount Everest is the tallest mountain") == 1
 
@@ -112,6 +116,7 @@ def test_env_content_chars_override_beats_profile(monkeypatch):
         {"content": long_content, "timestamp": "2026-05-14T12:00:00Z",
          "importance": 0.9, "score": 0.9, "keyword_score": 0.9, "trust_tier": "STATED"},
     ])
+    p.queue_prefetch("everest")
     block = p.prefetch("everest")
     assert "tail" not in block          # truncated by the env limit
     assert block.rstrip().endswith("...")
@@ -129,6 +134,7 @@ def test_prefetch_excludes_assistant_transcript_rows_by_default():
          "importance": 0.8, "score": 0.7, "keyword_score": 0.7, "trust_tier": "STATED"},
     ])
 
+    p.queue_prefetch("Mnemosyne injection correction")
     block = p.prefetch("Mnemosyne injection correction")
 
     assert "distilled correction" in block
@@ -145,6 +151,7 @@ def test_prefetch_does_not_let_importance_alone_inject_weak_raw_chat():
          "importance": 0.7, "score": 0.6, "keyword_score": 0.6, "trust_tier": "STATED"},
     ])
 
+    p.queue_prefetch("make Mnemosyne memory-context injection more relevant")
     block = p.prefetch("make Mnemosyne memory-context injection more relevant")
 
     assert "topical relevance" in block
@@ -161,6 +168,7 @@ def test_prefetch_semantic_dedup_keeps_distilled_variant_over_raw_duplicate():
          "importance": 0.85, "score": 0.75, "keyword_score": 0.75, "trust_tier": "STATED"},
     ])
 
+    p.queue_prefetch("Mnemosyne injection relevance hardening")
     block = p.prefetch("Mnemosyne injection relevance hardening")
 
     assert "Operators want Mnemosyne" in block
@@ -177,6 +185,7 @@ def test_prefetch_default_caps_injection_to_five_relevance_sorted_rows():
     ]
     p = _provider("general", rows)
 
+    p.queue_prefetch("relevant distilled memory")
     block = p.prefetch("relevant distilled memory")
 
     injected = [line for line in block.splitlines() if "Relevant distilled memory" in line]
@@ -190,6 +199,7 @@ def test_prefetch_collapses_content_newlines_inside_memory_rows():
          "importance": 0.8, "score": 0.7, "keyword_score": 0.7, "trust_tier": "STATED"},
     ])
 
+    p.queue_prefetch("Mnemosyne injection line")
     block = p.prefetch("Mnemosyne injection line")
 
     assert "first line second line" in block

@@ -129,6 +129,7 @@ def test_provider_config_defaults_match(provider_modules):
     assert root_config["default_scope"]["choices"] == ["session", "global"]
     assert root_config["default_scope"]["default"] == "session"
     assert root_config["tools"]["default"] is None
+    assert root_config["prefetch_cache_size"]["default"] == 50
 
 
 def test_auto_sleep_runtime_default_enabled(monkeypatch, provider_modules):
@@ -758,6 +759,592 @@ def test_provider_sync_turn_zero_limit_means_untruncated(monkeypatch, provider_m
         "[USER] user-content",
         "[ASSISTANT] assistant-content",
     ]
+
+
+def _cache_provider(module):
+    """Build a minimal live provider without invoking a real Beam recall."""
+    provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+    provider._beam = object()
+    provider._agent_context = ""
+    provider._skip_contexts = set()
+    provider._session_id = "provider-session"
+    # The packaged provider retries initialization at the public hook boundary.
+    provider._maybe_retry_init = lambda: None
+    return provider
+
+
+def _install_renderer(provider):
+    calls = []
+    cache_lock_violations = []
+
+    def render(query, *, session_id=""):
+        # Cache synchronization must not be held while the potentially slow
+        # render/Beam path is running.
+        if provider._prefetch_cache_lock.acquire(blocking=False):
+            provider._prefetch_cache_lock.release()
+        else:
+            cache_lock_violations.append((query, session_id))
+        calls.append((query, session_id))
+        return f"rendered:{query}:{session_id}"
+
+    provider._render_prefetch = render
+    return calls, cache_lock_violations
+
+
+@pytest.mark.parametrize("provider_name", ["hermes_memory_provider", "mnemosyne_hermes"])
+def test_prefetch_cache_cold_miss_does_not_render_in_foreground(provider_modules, provider_name):
+    """A cold pre-LLM lookup must not wait for the potentially slow recall path."""
+    provider = _cache_provider(provider_modules[provider_name])
+    calls = []
+    renderer_started = threading.Event()
+    renderer_release = threading.Event()
+
+    def slow_render(query, *, session_id=""):
+        calls.append((query, session_id))
+        renderer_started.set()
+        renderer_release.wait(timeout=1)
+        return f"rendered:{query}:{session_id}"
+
+    provider._render_prefetch = slow_render
+    try:
+        assert provider.prefetch("cold query", session_id="session-a") == ""
+        assert calls == []
+        assert not renderer_started.is_set()
+    finally:
+        renderer_release.set()
+
+    diagnostics = provider._prefetch_cache_diagnostics()
+    assert diagnostics["hits"] == 0
+    assert diagnostics["misses"] == 1
+    assert diagnostics["warm_completed"] == 0
+
+
+def test_queue_prefetch_serializes_full_render_with_sync_turn_write(provider_modules):
+    """A caller-owned warm render cannot overlap the provider's sync-turn DB phase."""
+    for module in provider_modules.values():
+        provider = _new_provider(module, roles=("user",))
+        write_entered = threading.Event()
+        release_write = threading.Event()
+        render_started = threading.Event()
+
+        class BlockingBeam:
+            def remember(self, **_kwargs):
+                write_entered.set()
+                assert release_write.wait(timeout=1), "test did not release sync_turn"
+
+        provider._beam = BlockingBeam()
+        lock = _ObservedLock()
+        provider._beam_access_lock = lock
+
+        def controlled_render(_query, *, session_id=""):
+            # Rendering must retain Beam serialization but never the cache lock.
+            assert provider._prefetch_cache_lock.acquire(blocking=False)
+            provider._prefetch_cache_lock.release()
+            render_started.set()
+            return f"rendered:{session_id}"
+
+        provider._render_prefetch = controlled_render
+        sync_worker = threading.Thread(
+            target=lambda: provider.sync_turn("sufficient user content", "")
+        )
+        warm_worker = threading.Thread(
+            target=lambda: provider.queue_prefetch("query", session_id="session-a")
+        )
+        sync_worker.start()
+        assert write_entered.wait(timeout=1), "sync_turn did not reach its protected write"
+        lock.waiting.clear()
+        warm_worker.start()
+        try:
+            assert lock.waiting.wait(timeout=1), "warm render did not attempt the shared Beam lock"
+            assert not render_started.is_set(), "warm render overlapped sync_turn's protected write"
+        finally:
+            release_write.set()
+        sync_worker.join(timeout=1)
+        warm_worker.join(timeout=1)
+        assert not sync_worker.is_alive()
+        assert not warm_worker.is_alive()
+        assert render_started.is_set()
+        # The committed sync turn may invalidate the just-warmed entry; this
+        # regression proves serialization, not cache publication ordering.
+        assert provider._prefetch_cache_diagnostics()["warm_completed"] == 1
+
+
+def test_prefetch_cache_normalizes_exact_warm_hits_and_never_spawns_threads(
+    monkeypatch, provider_modules
+):
+    """Warm results are reusable only after NFKC/case/whitespace normalization."""
+    for module in provider_modules.values():
+        provider = _cache_provider(module)
+        provider._ensure_prefetch_cache()
+        calls, cache_lock_violations = _install_renderer(provider)
+        original_threading = module.threading
+        created_threads = []
+
+        class TrackingThreading:
+            def Thread(self, *args, **kwargs):
+                created_threads.append((args, kwargs))
+                return original_threading.Thread(*args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(original_threading, name)
+
+        # Replace only this provider module's binding. The proxy delegates every
+        # non-Thread attribute to stdlib threading, avoiding process-wide state.
+        monkeypatch.setattr(module, "threading", TrackingThreading())
+        provider.queue_prefetch("  ＣＡＦＥ\u3000PLAN  ", session_id="session-a")
+        assert provider.prefetch("cafe plan", session_id="session-a") == "rendered:  ＣＡＦＥ\u3000PLAN  :session-a"
+        assert calls == [("  ＣＡＦＥ\u3000PLAN  ", "session-a")]
+        assert cache_lock_violations == []
+        assert created_threads == []
+        diagnostics = provider._prefetch_cache_diagnostics()
+        assert diagnostics["hits"] == 1
+        assert diagnostics["misses"] == 0
+        assert diagnostics["warm_completed"] == 1
+
+
+@pytest.mark.parametrize("provider_name", ["hermes_memory_provider", "mnemosyne_hermes"])
+def test_prefetch_cache_uses_strict_session_and_normalized_query_match(
+    monkeypatch, provider_modules, provider_name
+):
+    """A digest collision cannot leak a warm result across query or session boundaries."""
+    collision_hash = types.SimpleNamespace(sha256=lambda _payload: types.SimpleNamespace(hexdigest=lambda: "same"))
+    module = provider_modules[provider_name]
+    provider = _cache_provider(module)
+    calls, cache_lock_violations = _install_renderer(provider)
+    monkeypatch.setattr(module, "hashlib", collision_hash)
+
+    provider.queue_prefetch("alpha", session_id="session-a")
+    assert provider.prefetch("beta", session_id="session-a") == ""
+    assert calls == [("alpha", "session-a")]
+    assert provider.prefetch("alpha", session_id="session-b") == ""
+    assert calls == [("alpha", "session-a")]
+    assert provider.prefetch("  ALPHA  ", session_id="session-a") == "rendered:alpha:session-a"
+    assert calls == [("alpha", "session-a")]
+    assert cache_lock_violations == []
+    diagnostics = provider._prefetch_cache_diagnostics()
+    assert diagnostics["hits"] == 1
+    assert diagnostics["misses"] == 2
+
+
+def test_prefetch_cache_lru_zero_config_and_schema_parity(tmp_path, provider_modules):
+    """Cache capacity is bounded, recent hits refresh LRU order, and zero stores nothing."""
+    observed = {}
+    for name, module in provider_modules.items():
+        provider = _cache_provider(module)
+        provider._prefetch_cache_size = 2
+        calls, cache_lock_violations = _install_renderer(provider)
+        provider.queue_prefetch("one", session_id="s")
+        provider.queue_prefetch("two", session_id="s")
+        assert provider.prefetch("one", session_id="s") == "rendered:one:s"
+        provider.queue_prefetch("three", session_id="s")
+        assert provider.prefetch("one", session_id="s") == "rendered:one:s"
+        assert provider.prefetch("two", session_id="s") == ""
+        provider._prefetch_cache_size = 0
+        provider._invalidate_prefetch_cache()
+        provider.queue_prefetch("zero", session_id="s")
+        assert provider.prefetch("zero", session_id="s") == ""
+        assert cache_lock_violations == []
+        observed[name] = {
+            "calls": calls,
+            "diagnostics": provider._prefetch_cache_diagnostics(),
+        }
+
+        hermes_home = tmp_path / name
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "memory:\n  provider: mnemosyne\n  mnemosyne:\n    prefetch_cache_size: 0\n"
+        )
+        configured = _provider_for_config(module, hermes_home)
+        configured._apply_provider_config({})
+        assert configured._prefetch_cache_size == 0
+        configured._apply_provider_config({"prefetch_cache_size": 3})
+        assert configured._prefetch_cache_size == 3
+
+    assert observed["hermes_memory_provider"]["calls"] == observed["mnemosyne_hermes"]["calls"]
+    assert observed["hermes_memory_provider"]["calls"] == [
+        ("one", "s"), ("two", "s"), ("three", "s"), ("zero", "s"),
+    ]
+    for result in observed.values():
+        assert result["diagnostics"]["entries"] == 0
+        assert result["diagnostics"]["evictions"] == 1
+        assert result["diagnostics"]["warm_completed"] == 4
+        assert result["diagnostics"]["misses"] == 2
+
+
+def test_prefetch_cache_rejects_late_warm_after_epoch_invalidation(provider_modules):
+    """A reinitialize/invalidation race cannot publish context from the old epoch."""
+    for module in provider_modules.values():
+        provider = _cache_provider(module)
+        provider._ensure_prefetch_cache()
+
+        def late_render(_query, *, session_id=""):
+            provider._invalidate_prefetch_cache()
+            return f"late:{session_id}"
+
+        provider._render_prefetch = late_render
+        provider.queue_prefetch("old query", session_id="old-session")
+        assert provider._prefetch_cache == {}
+        assert provider._prefetch_cache_diagnostics()["warm_completed"] == 1
+
+
+def test_prefetch_cache_invalidates_only_after_successful_writes_including_memory_hook(
+    monkeypatch, provider_modules
+):
+    """Failed/staged writes keep a warm result; completed mutations invalidate it."""
+    for module in provider_modules.values():
+        provider = _cache_provider(module)
+        invalidations = []
+        original_invalidate = provider._invalidate_prefetch_cache
+
+        def record_invalidate():
+            invalidations.append("invalidate")
+            original_invalidate()
+
+        provider._invalidate_prefetch_cache = record_invalidate
+        provider._default_scope = "session"
+        provider._audit_event = lambda *_args, **_kwargs: None
+
+        monkeypatch.setattr(module, "_write_approval_enabled", lambda: False)
+        monkeypatch.setattr(module, "apply_beam_batch", lambda *_args, **_kwargs: {"status": "failed"})
+        assert json.loads(provider._handle_batch({"operations": [{"action": "remember", "content": "x"}]}))["status"] == "failed"
+        assert invalidations == []
+        monkeypatch.setattr(module, "apply_beam_batch", lambda *_args, **_kwargs: {"status": "ok"})
+        assert json.loads(provider._handle_batch({"operations": [{"action": "remember", "content": "x"}]}))["status"] == "ok"
+        assert invalidations == ["invalidate"]
+
+        staged_writes = []
+        monkeypatch.setattr(module, "_write_approval_enabled", lambda: True)
+        monkeypatch.setattr(
+            module,
+            "_stage_pending_write",
+            lambda payload: staged_writes.append(payload) or f"pending-{len(staged_writes)}",
+        )
+        monkeypatch.setattr(
+            module,
+            "apply_beam_batch",
+            lambda *_args, **_kwargs: pytest.fail("approval-gated batch must not write"),
+        )
+        staged = json.loads(provider._handle_batch({"operations": [{"action": "remember", "content": "x"}]}))
+        assert staged["status"] == "staged"
+        staged_ids = staged.get("pending_ids") or [item["pending_id"] for item in staged["staged"]]
+        assert staged_ids == ["pending-1"]
+        assert staged.get("count", staged.get("staged_count")) == 1
+        assert len(staged_writes) == 1
+        assert staged_writes[0]["tool"] == "mnemosyne_batch"
+        assert staged_writes[0]["action"] == "remember"
+        assert staged_writes[0]["scope"] == "session"
+        assert invalidations == ["invalidate"]
+
+        class FailingBeam:
+            def remember(self, **_kwargs):
+                raise RuntimeError("write failed")
+
+        provider._beam = FailingBeam()
+        provider.on_memory_write("add", "user", "private write")
+        provider.on_memory_write("delete", "user", "private write")
+        assert invalidations == ["invalidate"]
+
+        class SuccessBeam:
+            def remember(self, **_kwargs):
+                return "memory-id"
+
+        provider._beam = SuccessBeam()
+        provider.on_memory_write("replace", "agent", "private write")
+        assert invalidations == ["invalidate", "invalidate"]
+
+        class TaskStore:
+            retired = False
+
+            def forget(self, *_args):
+                return self.retired
+
+        store = TaskStore()
+        provider._beam = types.SimpleNamespace(canonical=store)
+        provider._canonical_owner = lambda: "owner"
+        assert json.loads(provider._handle_task_progress({"action": "clear", "task": "job"}))["status"] == "cleared"
+        assert invalidations == ["invalidate", "invalidate"]
+        store.retired = True
+        assert json.loads(provider._handle_task_progress({"action": "clear", "task": "job"}))["status"] == "cleared"
+        assert invalidations == ["invalidate", "invalidate", "invalidate"]
+
+
+def test_sync_turn_invalidates_after_committed_write_even_if_identity_capture_fails(provider_modules):
+    """A post-commit identity-capture failure cannot leave a warm result stale."""
+    for module in provider_modules.values():
+        provider = _new_provider(module, roles=("user",))
+        invalidations = []
+        provider._invalidate_prefetch_cache = lambda: invalidations.append("invalidate")
+
+        class PartialBeam:
+            def __init__(self):
+                self.calls = 0
+
+            def remember(self, **_kwargs):
+                self.calls += 1
+                if self.calls == 2:
+                    raise RuntimeError("identity capture failed after user commit")
+
+        provider._beam = PartialBeam()
+        del provider._capture_identity_signals
+        provider.sync_turn("I feel like a capable engineer", "")
+        assert provider._beam.calls == 2
+        assert invalidations == ["invalidate"]
+        assert provider._sync_turn_diagnostics()["failed"] == 1
+
+        class FailingBeam:
+            def remember(self, **_kwargs):
+                raise RuntimeError("user write failed before commit")
+
+        provider = _new_provider(module, roles=("user",))
+        provider._beam = FailingBeam()
+        provider._invalidate_prefetch_cache = lambda: invalidations.append("unexpected")
+        provider.sync_turn("ordinary user content", "")
+        assert invalidations == ["invalidate"]
+
+        provider = _new_provider(module, roles=())
+        provider._invalidate_prefetch_cache = lambda: invalidations.append("unexpected")
+        provider.sync_turn("ordinary user content", "")
+        assert invalidations == ["invalidate"]
+
+
+@pytest.mark.parametrize(
+    ("sleep_status", "expected_invalidations"),
+    [("no_op", 0), ("consolidated", 1)],
+)
+def test_prefetch_cache_sleep_workers_invalidate_only_after_consolidation(
+    monkeypatch, provider_modules, sleep_status, expected_invalidations
+):
+    """Auto- and session-end sleep preserve warm cache when no consolidation occurs."""
+    for module in provider_modules.values():
+        class SourceBeam:
+            session_id = "session"
+            db_path = "test.db"
+            author_id = "author"
+            author_type = "agent"
+            channel_id = "channel"
+
+            def get_working_stats(self):
+                return {"total": 2}
+
+            def _count_unconsolidated_before(self, _cutoff):
+                return 1
+
+            def sleep(self):
+                return {"status": sleep_status}
+
+        class IsolatedBeam:
+            def __init__(self, **_kwargs):
+                pass
+
+            def sleep(self):
+                return {"status": sleep_status}
+
+        monkeypatch.setattr(module, "_get_beam_class", lambda: IsolatedBeam)
+        for worker in ("auto", "session_end"):
+            provider = _cache_provider(module)
+            provider._beam = SourceBeam()
+            provider._beam_access_lock = threading.Lock()
+            provider._auto_sleep_threshold = 1
+            provider._AUTO_SLEEP_TIMEOUT_SECONDS = 1
+            provider.SESSION_END_SLEEP_TIMEOUT_SECONDS = 1
+            provider._reserve_reflection_budget = lambda _source: None
+            provider._ensure_prefetch_cache()
+            provider._prefetch_cache["warm"] = "cached result"
+            invalidations = []
+            original_invalidate = provider._invalidate_prefetch_cache
+
+            def record_invalidate():
+                invalidations.append("invalidate")
+                original_invalidate()
+
+            provider._invalidate_prefetch_cache = record_invalidate
+            if worker == "auto":
+                provider._maybe_auto_sleep()
+            else:
+                provider.on_session_end(messages=[])
+                provider._session_end_thread.join(timeout=1)
+
+            assert invalidations == ["invalidate"] * expected_invalidations
+            assert (provider._prefetch_cache == {}) is (expected_invalidations == 1)
+
+
+@pytest.mark.parametrize(
+    ("path", "result", "expected_invalidations"),
+    [
+        ("provider", {"imported": 0, "skipped": 1, "failed": 1}, 0),
+        ("provider", {"imported": 1, "skipped": 0, "failed": 0}, 1),
+        (
+            "file",
+            {
+                "beam": {"working_memory": {"inserted": 0, "skipped": 2, "overwritten": 0}},
+                "triples": {"inserted": 0, "skipped": 1, "overwritten": 0},
+            },
+            0,
+        ),
+        (
+            "file",
+            {
+                "beam": {"scratchpad": {"inserted": 0, "updated": 1}},
+                "triples": {"inserted": 0, "skipped": 0, "overwritten": 1},
+            },
+            1,
+        ),
+    ],
+)
+def test_prefetch_cache_import_invalidates_only_after_successful_writes(
+    monkeypatch, provider_modules, path, result, expected_invalidations
+):
+    """Provider and file imports leave warm cache intact for zero-write outcomes."""
+    from mnemosyne.core import importers
+    from mnemosyne.core import memory as memory_module
+    from mnemosyne.core.importers.base import ImporterResult
+
+    class FakeMemory:
+        def __init__(self, **_kwargs):
+            pass
+
+        def import_from_file(self, _input_path, *, force):
+            assert force is False
+            return result
+
+    monkeypatch.setattr(memory_module, "Mnemosyne", FakeMemory)
+    for module in provider_modules.values():
+        provider = _cache_provider(module)
+        provider._beam = types.SimpleNamespace(db_path="test.db")
+        provider._session_id = "session"
+        provider._audit_event = lambda *_args, **_kwargs: None
+        invalidations = []
+        provider._invalidate_prefetch_cache = lambda: invalidations.append("invalidate")
+
+        if path == "provider":
+            importer_result = ImporterResult("fake", **result)
+            monkeypatch.setattr(importers, "import_from_provider", lambda *_args, **_kwargs: importer_result)
+            payload = json.loads(provider._handle_import({"provider": "fake", "api_key": "key"}))
+            assert payload["imported"] == result["imported"]
+        else:
+            payload = json.loads(provider._handle_import({"input_path": "export.json"}))
+            assert payload["stats"] == result
+
+        assert invalidations == ["invalidate"] * expected_invalidations
+
+
+@pytest.mark.parametrize("provider_name", ["hermes_memory_provider", "mnemosyne_hermes"])
+def test_prefetch_cache_invalidates_after_successful_tool_mutations(
+    monkeypatch, provider_modules, provider_name
+):
+    """Every successful mutation invalidates after its write in both provider copies."""
+    module = provider_modules[provider_name]
+    provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+    invalidations = []
+
+    class Graph:
+        def add_edge(self, edge):
+            self.edge = edge
+
+    class Beam:
+        db_path = "test.db"
+        episodic_graph = Graph()
+
+        def scratchpad_write(self, content):
+            self.written = content
+            return "pad-1"
+
+        def scratchpad_clear(self):
+            self.cleared = True
+
+    provider._beam = Beam()
+    provider._invalidate_prefetch_cache = lambda: invalidations.append("invalidate")
+    monkeypatch.setattr(module, "_get_triple_module", lambda: (lambda *_args, **_kwargs: "triple-1", None))
+    monkeypatch.setattr("mnemosyne.core.triples.end_triple", lambda *_args, **_kwargs: 1)
+
+    assert json.loads(provider._handle_triple_add({"subject": "a", "predicate": "is", "object": "b"})) == {
+        "status": "stored", "triple_id": "triple-1"
+    }
+    assert json.loads(provider._handle_triple_end({"subject": "a", "predicate": "is"})) == {
+        "status": "ended", "count": 1
+    }
+    assert json.loads(provider._handle_graph_link({
+        "source_id": "memory-a", "target_id": "memory-b", "relationship": "related",
+    }))["status"] == "linked"
+    assert json.loads(provider._handle_scratchpad_write({"content": "working note"})) == {
+        "status": "written", "id": "pad-1"
+    }
+    assert json.loads(provider._handle_scratchpad_clear({})) == {"status": "cleared"}
+    assert invalidations == ["invalidate"] * 5
+
+
+@pytest.mark.parametrize("provider_name", ["hermes_memory_provider", "mnemosyne_hermes"])
+def test_prefetch_cache_skips_invalidations_for_tool_failures_and_noops(
+    monkeypatch, provider_modules, provider_name
+):
+    """Validation errors, failed writes, and a zero-count end leave warm results intact."""
+    module = provider_modules[provider_name]
+    provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+    invalidations = []
+
+    class FailingGraph:
+        def add_edge(self, _edge):
+            raise RuntimeError("graph write failed")
+
+    class FailingBeam:
+        db_path = "test.db"
+        episodic_graph = FailingGraph()
+
+        def scratchpad_write(self, _content):
+            raise RuntimeError("scratchpad write failed")
+
+        def scratchpad_clear(self):
+            raise RuntimeError("scratchpad clear failed")
+
+    provider._beam = FailingBeam()
+    provider._invalidate_prefetch_cache = lambda: invalidations.append("invalidate")
+    monkeypatch.setattr(module, "_get_triple_module", lambda: (lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("triple add failed")), None))
+    monkeypatch.setattr("mnemosyne.core.triples.end_triple", lambda *_args, **_kwargs: 0)
+
+    assert "error" in json.loads(provider._handle_triple_add({}))
+    assert json.loads(provider._handle_triple_end({"subject": "a", "predicate": "is"})) == {
+        "status": "ended", "count": 0
+    }
+    assert "error" in json.loads(provider._handle_graph_link({"source_id": "", "target_id": "b", "relationship": "related"}))
+    assert "error" in json.loads(provider._handle_scratchpad_write({"content": "  "}))
+    with pytest.raises(RuntimeError, match="triple add failed"):
+        provider._handle_triple_add({"subject": "a", "predicate": "is", "object": "b"})
+    with pytest.raises(RuntimeError, match="graph write failed"):
+        provider._handle_graph_link({"source_id": "a", "target_id": "b", "relationship": "related"})
+    with pytest.raises(RuntimeError, match="scratchpad write failed"):
+        provider._handle_scratchpad_write({"content": "working note"})
+    with pytest.raises(RuntimeError, match="scratchpad clear failed"):
+        provider._handle_scratchpad_clear({})
+    assert invalidations == []
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_prefetch_cache_diagnostics_are_present_on_both_paths_and_private(
+    monkeypatch, provider_modules, active
+):
+    """Diagnostics publish counters only—never warm query/session/content values."""
+    secret_query = "QUERY-SECRET-998"
+    secret_session = "SESSION-SECRET-998"
+
+    def fake_run_diagnostics(**_kwargs):
+        return {"checks_total": 0, "key_findings": [], "entries": []}
+
+    monkeypatch.setattr("mnemosyne.diagnose.run_diagnostics", fake_run_diagnostics)
+    for module in provider_modules.values():
+        provider = _cache_provider(module)
+        provider._profile_isolation_enabled = False
+        provider._sync_turn_diagnostics = lambda: {}
+        _calls, cache_lock_violations = _install_renderer(provider)
+        provider.queue_prefetch(secret_query, session_id=secret_session)
+        provider._beam = object() if active else None
+        payload = json.loads(provider._handle_diagnose({}))
+        cache = payload["prefetch_cache"]
+        assert cache["capacity"] == 50
+        assert cache["warm_completed"] == 1
+        assert cache["entries"] == 1
+        assert cache_lock_violations == []
+        assert secret_query not in json.dumps(payload)
+        assert secret_session not in json.dumps(payload)
 
 
 def test_sync_adapter_schema_and_lifecycle_surface_match(sync_modules):

@@ -15,12 +15,15 @@ a standalone plugin deployed through the plugin system.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
 import sys
 import threading
 import time
+import unicodedata
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -1414,6 +1417,16 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Generic extra-source registry: name -> fn(query, *, session_id) -> hits|str.
         # A profile opts a source in via its `sources`. "bank" is built in.
         self._prefetch_sources: Dict[str, Callable[..., Any]] = {}
+        # Provider-local ephemeral cache for Hermes' background prefetch hook.
+        # It intentionally never uses Mnemosyne's persistent QueryCache.
+        self._prefetch_cache_size = 50
+        self._prefetch_cache_lock = threading.Lock()
+        self._prefetch_cache: OrderedDict[Tuple[str, str], Tuple[str, str]] = OrderedDict()
+        self._prefetch_cache_epoch = 0
+        self._prefetch_cache_telemetry: Dict[str, Any] = {
+            "hits": 0, "misses": 0, "evictions": 0, "warm_completed": 0,
+            "warm_failed": 0, "last_duration_ms": None, "total_duration_ms": 0.0,
+        }
         # Profile memory isolation: when enabled, each Hermes profile gets its own
         # Mnemosyne bank (separate SQLite DB). Default OFF for backward compatibility.
         self._profile_isolation_enabled = False
@@ -1514,6 +1527,104 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         except Exception:
             return False
 
+    def _ensure_prefetch_cache(self):
+        """Lazily initialize private cache state for ``__new__`` test instances."""
+        lock = self.__dict__.setdefault("_prefetch_cache_lock", threading.Lock())
+        with lock:
+            self.__dict__.setdefault("_prefetch_cache", OrderedDict())
+            self.__dict__.setdefault("_prefetch_cache_epoch", 0)
+            self.__dict__.setdefault("_prefetch_cache_size", 50)
+            self.__dict__.setdefault("_prefetch_cache_telemetry", {
+                "hits": 0, "misses": 0, "evictions": 0, "warm_completed": 0,
+                "warm_failed": 0, "last_duration_ms": None, "total_duration_ms": 0.0,
+            })
+        return lock
+
+    @staticmethod
+    def _normalized_prefetch_query(query: str) -> str:
+        return " ".join(unicodedata.normalize("NFKC", str(query)).casefold().split())
+
+    def _prefetch_cache_key(self, query: str, session_id: str) -> Tuple[Tuple[str, str], str]:
+        normalized = self._normalized_prefetch_query(query)
+        effective_session_id = str(session_id or getattr(self, "_session_id", ""))
+        return (effective_session_id, hashlib.sha256(normalized.encode("utf-8")).hexdigest()), normalized
+
+    def _prefetch_cache_diagnostics(self) -> Dict[str, Any]:
+        lock = self._ensure_prefetch_cache()
+        with lock:
+            telemetry = self._prefetch_cache_telemetry
+            completed = telemetry["warm_completed"]
+            return {
+                "enabled": self._prefetch_cache_size > 0,
+                "capacity": self._prefetch_cache_size,
+                "entries": len(self._prefetch_cache),
+                "hits": telemetry["hits"], "misses": telemetry["misses"],
+                "evictions": telemetry["evictions"], "warm_completed": completed,
+                "warm_failed": telemetry["warm_failed"],
+                "last_duration_ms": telemetry["last_duration_ms"],
+                "average_duration_ms": (telemetry["total_duration_ms"] / completed) if completed else None,
+            }
+
+    def _invalidate_prefetch_cache(self) -> None:
+        lock = self._ensure_prefetch_cache()
+        with lock:
+            self._prefetch_cache.clear()
+            self._prefetch_cache_epoch += 1
+
+    @staticmethod
+    def _import_stats_have_mutation(stats: Dict[str, Any]) -> bool:
+        """Return whether file-import statistics record a completed write."""
+        mutation_counts = {
+            "imported", "inserted", "overwritten", "updated",
+            "imported_renumbered", "embeddings_inserted",
+        }
+        for key, value in stats.items():
+            if key in mutation_counts and isinstance(value, (int, float)) and not isinstance(value, bool):
+                if value > 0:
+                    return True
+            elif isinstance(value, dict) and MnemosyneMemoryProvider._import_stats_have_mutation(value):
+                return True
+        return False
+
+    def _record_prefetch_warm(self, *, failed: bool, duration_ms: float) -> None:
+        lock = self._ensure_prefetch_cache()
+        with lock:
+            telemetry = self._prefetch_cache_telemetry
+            telemetry["last_duration_ms"] = duration_ms
+            if failed:
+                telemetry["warm_failed"] += 1
+            else:
+                telemetry["warm_completed"] += 1
+                telemetry["total_duration_ms"] += duration_ms
+
+    def _warm_prefetch(self, query: str, session_id: str) -> None:
+        lock = self._ensure_prefetch_cache()
+        key, normalized = self._prefetch_cache_key(query, session_id)
+        with lock:
+            epoch = self._prefetch_cache_epoch
+        started = time.perf_counter()
+        try:
+            # The warm path touches Beam-owned SQLite state beyond recall
+            # (canonical/model slots and identity SQL), so serialize the entire
+            # render—not just a helper's recall call—with sync_turn writes.
+            # The cache lock was released above and is never held while rendering.
+            with self._ensure_beam_access_lock():
+                rendered = self._render_prefetch(query, session_id=session_id)
+        except Exception:
+            self._record_prefetch_warm(failed=True, duration_ms=(time.perf_counter() - started) * 1000.0)
+            logger.debug("Mnemosyne background prefetch failed", exc_info=True)
+            return
+        duration_ms = (time.perf_counter() - started) * 1000.0
+        self._record_prefetch_warm(failed=False, duration_ms=duration_ms)
+        with lock:
+            if self._prefetch_cache_size <= 0 or self._prefetch_cache_epoch != epoch:
+                return
+            self._prefetch_cache[key] = (normalized, rendered)
+            self._prefetch_cache.move_to_end(key)
+            while len(self._prefetch_cache) > self._prefetch_cache_size:
+                self._prefetch_cache.popitem(last=False)
+                self._prefetch_cache_telemetry["evictions"] += 1
+
     def _apply_provider_config(self, kwargs: Dict[str, Any]) -> None:
         """Apply provider-specific config from Hermes kwargs or config.yaml.
 
@@ -1538,6 +1649,22 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             except (TypeError, ValueError):
                 logger.warning("Mnemosyne: invalid sleep_threshold=%r, keeping %d",
                                sleep_threshold, self._auto_sleep_threshold)
+
+        # prefetch_cache_size: kwargs > config.yaml > default 50. Zero disables
+        # storage; only caller-background queue_prefetch() may still render.
+        prefetch_cache_size = kwargs.get("prefetch_cache_size")
+        if prefetch_cache_size is None:
+            prefetch_cache_size = self._read_config_key("prefetch_cache_size")
+        if prefetch_cache_size is not None:
+            try:
+                parsed_cache_size = max(0, int(prefetch_cache_size))
+            except (TypeError, ValueError):
+                logger.warning("Mnemosyne: invalid prefetch_cache_size=%r, keeping %d",
+                               prefetch_cache_size, self._prefetch_cache_size)
+            else:
+                if parsed_cache_size != self._prefetch_cache_size:
+                    self._prefetch_cache_size = parsed_cache_size
+                    self._invalidate_prefetch_cache()
 
         # reflect guardrails: prefer kwargs, then memory.mnemosyne.reflect,
         # then flat memory.mnemosyne keys, then env/defaults set in __init__.
@@ -1752,6 +1879,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         return [
             {"key": "auto_sleep", "description": "Auto-run sleep() when working memory exceeds threshold. Set false to disable. Backward-compatible with MNEMOSYNE_AUTO_SLEEP_ENABLED env var.", "default": True},
             {"key": "sleep_threshold", "description": "Working memory count before auto-sleep triggers", "default": 50},
+            {"key": "prefetch_cache_size", "description": "Bounded per-provider background recall cache capacity. Zero disables storage; cache misses return empty while queue_prefetch can still warm in caller background.", "default": 50},
             {"key": "reflect", "description": "Reflection/sleep guardrails. Supports disabled_for_cron (default true) and max_calls_per_session (default 3; negative disables cap). Env: MNEMOSYNE_REFLECT_DISABLED_FOR_CRON, MNEMOSYNE_REFLECT_MAX_CALLS_PER_SESSION.", "default": {"disabled_for_cron": True, "max_calls_per_session": 3}},
             {"key": "vector_type", "description": "Vector storage type (note: not yet wired to BeamMemory at runtime; reserved for future use)", "choices": ["float32", "int8", "bit"], "default": "int8"},
             {"key": "ignore_patterns", "description": "Regex patterns to filter from memory storage (one per line in config, or comma-separated). Memories matching any pattern are skipped.", "default": []},
@@ -1848,6 +1976,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         """Initialize Mnemosyne beam for this session."""
+        # A replacement session must never consume a prior session's warmed
+        # context; advancing the epoch also rejects an in-flight old render.
+        self._invalidate_prefetch_cache()
         # C27: clear stale state from any prior init attempt so a re-init
         # returns the provider to a clean slate. _beam reset is critical
         # for the primary->skip-context re-init case (codex review finding
@@ -2003,8 +2134,25 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         built-in memory-bank source and cannot be overridden here."""
         if name and name != "bank":
             self._prefetch_sources[name] = fn
+            self._invalidate_prefetch_cache()
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        """Return a strict session/query cache hit, otherwise an empty result."""
+        if not self._beam or self._agent_context in self._skip_contexts:
+            return ""
+        lock = self._ensure_prefetch_cache()
+        key, normalized = self._prefetch_cache_key(query, session_id)
+        with lock:
+            if self._prefetch_cache_size > 0:
+                cached = self._prefetch_cache.get(key)
+                if cached is not None and cached[0] == normalized:
+                    self._prefetch_cache.move_to_end(key)
+                    self._prefetch_cache_telemetry["hits"] += 1
+                    return cached[1]
+            self._prefetch_cache_telemetry["misses"] += 1
+        return ""
+
+    def _render_prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall relevant context for injection, driven by the active profile.
 
         The profile selects which sources to merge (default: just the memory
@@ -2207,8 +2355,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             # sessions) should never bypass session scoping.
             if author_id:
                 recall_kwargs["author_id"] = author_id
-            with self._ensure_beam_access_lock():
-                results = self._beam.recall(**recall_kwargs)
+            results = self._beam.recall(**recall_kwargs)
             if not results:
                 return ""
             # Filter out low-relevance results to prevent context pollution.
@@ -2259,7 +2406,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        pass
+        """Warm the cache in Hermes' caller-owned background execution context."""
+        if not self._beam or self._agent_context in self._skip_contexts:
+            return
+        self._warm_prefetch(query, session_id)
 
     def _ensure_sync_turn_telemetry(self) -> None:
         """Initialize sync_turn telemetry for tests that construct via __new__."""
@@ -2320,6 +2470,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 int(self._sync_turn_telemetry.get("max_queue_length") or 0),
                 in_flight,
             )
+        wrote_memory = False
         try:
             with self._ensure_beam_access_lock():
                 if "user" in self._sync_roles and user_content and len(user_content) > 5 and not self._should_filter(user_content):
@@ -2332,6 +2483,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         scope=self._default_scope,
                         extract_entities=True,
                     )
+                    wrote_memory = True
                     self._capture_identity_signals(user_content)
                 if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10 and not self._should_filter(assistant_content):
                     assistant_limit = _sync_turn_assistant_limit()
@@ -2343,6 +2495,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         scope=self._default_scope,
                         extract_entities=True,
                     )
+                    wrote_memory = True
+            if wrote_memory:
+                self._invalidate_prefetch_cache()
             self._turn_count += 1
             if self._auto_sleep_enabled and self._turn_count % 10 == 0:
                 self._maybe_auto_sleep()
@@ -2350,6 +2505,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 self._sync_turn_telemetry["completed"] += 1
                 self._sync_turn_telemetry["last_error"] = None
         except Exception as e:
+            # remember() can commit before identity capture raises. Preserve the
+            # mutation boundary even though this turn is reported as failed.
+            if wrote_memory:
+                self._invalidate_prefetch_cache()
             with self._sync_turn_lock:
                 self._sync_turn_telemetry["failed"] += 1
                 self._sync_turn_telemetry["last_error"] = self._sanitize_sync_turn_error(e)
@@ -2445,7 +2604,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                             channel_id=beam_ref.channel_id,
                         )
                         with beam_lock:
-                            sleep_beam.sleep()
+                            result = sleep_beam.sleep()
+                        if result.get("status") == "consolidated":
+                            self._invalidate_prefetch_cache()
                     except Exception as inner:
                         logger.debug("Mnemosyne auto-sleep worker failed: %s", inner)
                 sleep_thread = threading.Thread(target=_sleep_isolated, daemon=True)
@@ -2641,6 +2802,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             metadata=metadata,
             veracity=veracity,
         )
+        self._invalidate_prefetch_cache()
         self._audit_event(
             "remember", memory_id=memory_id, bank="private",
             scope=scope, source_tool="mnemosyne_remember",
@@ -2686,7 +2848,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 "message": f"{len(staged)} writes staged for approval. Use mnemosyne_apply_pending to commit.",
             })
 
-        return json.dumps(apply_beam_batch(
+        result = apply_beam_batch(
             self._beam,
             normalized,
             default_scope=self._default_scope,
@@ -2694,7 +2856,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             remember_source_tool="mnemosyne_batch",
             audit_event=self._audit_event,
             extract_defaults_global=False,
-        ))
+        )
+        if result.get("status") == "ok":
+            self._invalidate_prefetch_cache()
+        return json.dumps(result)
 
     def _handle_recall(self, args: Dict[str, Any]) -> str:
         query = args.get("query", "")
@@ -2839,6 +3004,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             memory_id=stable_id,
             veracity=veracity,
         )
+        self._invalidate_prefetch_cache()
         self._audit_event(
             "shared_remember", memory_id=memory_id, bank="surface",
             scope="global", source_tool="mnemosyne_shared_remember",
@@ -2878,6 +3044,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps({"error": "memory_id is required"})
         ok = self._surface_beam.forget_working(memory_id)
         if ok:
+            self._invalidate_prefetch_cache()
             self._audit_event(
                 "shared_forget", memory_id=memory_id, bank="surface",
                 source_tool="mnemosyne_shared_forget",
@@ -2904,6 +3071,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         working = self._beam.get_working_stats()
         episodic = self._beam.get_episodic_stats()
         if not dry_run:
+            if result.get("status") == "consolidated":
+                self._invalidate_prefetch_cache()
             self._audit_event(
                 "sleep", bank="private", source_tool="mnemosyne_sleep",
                 metadata={"all_sessions": all_sessions, "status": result.get("status")},
@@ -2928,6 +3097,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             metadata={"replacement_id": replacement_id, "invalidated": ok} if replacement_id else {"invalidated": ok},
         )
         if ok:
+            self._invalidate_prefetch_cache()
             return json.dumps({"status": "invalidated", "memory_id": memory_id})
         return json.dumps({"status": "memory_not_found", "memory_id": memory_id})
 
@@ -3028,6 +3198,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 "memory_id": memory_id,
             })
 
+        self._invalidate_prefetch_cache()
+
         # Audit log if available
         try:
             if hasattr(self, "_audit_event"):
@@ -3074,6 +3246,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                                valid_until=valid_until, source=source,
                                confidence=confidence, supersede=supersede,
                                db_path=self._beam.db_path)
+        self._invalidate_prefetch_cache()
         return json.dumps({"status": "stored", "triple_id": triple_id})
 
     def _handle_triple_end(self, args: Dict[str, Any]) -> str:
@@ -3086,6 +3259,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         from mnemosyne.core.triples import end_triple
         n = end_triple(subject, predicate, object=obj, valid_until=valid_until,
                        db_path=self._beam.db_path)
+        if n:
+            self._invalidate_prefetch_cache()
         return json.dumps({"status": "ended", "count": n})
 
     def _handle_triple_query(self, args: Dict[str, Any]) -> str:
@@ -3126,6 +3301,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             source=source, confidence=confidence,
         )
         status = row.pop("status", "stored")
+        self._invalidate_prefetch_cache()
         self._audit_event(
             "remember_canonical", bank="canonical",
             source_tool="mnemosyne_remember_canonical",
@@ -3188,6 +3364,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             store = CanonicalStore(db_path=self._beam.db_path, conn=self._beam.conn)
             self._beam.canonical = store
         retired = store.forget(owner_id, category, name)
+        if retired:
+            self._invalidate_prefetch_cache()
         return json.dumps({"retired": retired, "owner_id": owner_id,
                            "category": category, "name": name})
 
@@ -3278,6 +3456,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             except Exception as exc:
                 failed.append({"id": pid, "error": str(exc)})
 
+        if applied:
+            self._invalidate_prefetch_cache()
         return json.dumps({
             "applied": applied,
             "failed": failed,
@@ -3372,6 +3552,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 name=task,
                 body=body,
             )
+            self._invalidate_prefetch_cache()
             self._audit_event(
                 "task_progress_set",
                 bank="private",
@@ -3412,7 +3593,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         elif action == "clear":
             if not task:
                 return json.dumps({"error": "task is required for clear"})
-            store.forget(owner_id, "task:progress", task)
+            retired = store.forget(owner_id, "task:progress", task)
+            if retired:
+                self._invalidate_prefetch_cache()
             return json.dumps({"status": "cleared", "task": task})
 
         else:
@@ -3423,6 +3606,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if not content:
             return json.dumps({"error": "Content is required"})
         pad_id = self._beam.scratchpad_write(content)
+        self._invalidate_prefetch_cache()
         return json.dumps({"status": "written", "id": pad_id})
 
     def _handle_scratchpad_read(self, args: Dict[str, Any]) -> str:
@@ -3431,6 +3615,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def _handle_scratchpad_clear(self, args: Dict[str, Any]) -> str:
         self._beam.scratchpad_clear()
+        self._invalidate_prefetch_cache()
         return json.dumps({"status": "cleared"})
 
     def _handle_export(self, args: Dict[str, Any]) -> str:
@@ -3449,6 +3634,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         content = args.get("content")
         importance = args.get("importance")
         ok = self._beam.update_working(memory_id, content=content, importance=importance)
+        if ok:
+            self._invalidate_prefetch_cache()
         return json.dumps({
             "status": "updated" if ok else "not_found",
             "memory_id": memory_id,
@@ -3460,6 +3647,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps({"error": "memory_id is required"})
         ok = self._beam.forget_working(memory_id)
         if ok:
+            self._invalidate_prefetch_cache()
             self._audit_event(
                 "forget", memory_id=memory_id, bank="private",
                 source_tool="mnemosyne_forget",
@@ -3505,6 +3693,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 dry_run=dry_run,
                 channel_id=channel_id,
             )
+            if not dry_run and result.imported > 0:
+                self._invalidate_prefetch_cache()
             return json.dumps(result.to_dict())
 
         if not input_path:
@@ -3513,6 +3703,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                          "(for cross-provider import) is required",
             })
         stats = mem.import_from_file(input_path, force=force)
+        if self._import_stats_have_mutation(stats):
+            self._invalidate_prefetch_cache()
         self._audit_event(
             "import", bank="private", source_tool="mnemosyne_import",
             metadata={"input_path": input_path, "force": force, "stats": stats},
@@ -3520,6 +3712,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         return json.dumps({"status": "imported", "stats": stats})
 
     def _handle_diagnose(self, args: Dict[str, Any]) -> str:
+        # Snapshot cache telemetry before taking the Beam lock; it never exposes
+        # query/session/content values and must not contend with rendering.
+        prefetch_cache = self._prefetch_cache_diagnostics()
         from mnemosyne.diagnose import run_diagnostics
         repair_requested = bool(args.get("repair_vec_working", False))
         dry_run = bool(args.get("dry_run", False))
@@ -3530,7 +3725,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if self._profile_isolation_enabled and self._beam is not None:
             diagnostic_kwargs["bank"] = self._resolve_profile_bank()
         if self._beam is None:
-            return json.dumps(run_diagnostics(**diagnostic_kwargs), indent=2, default=str)
+            result = run_diagnostics(**diagnostic_kwargs)
+            result["prefetch_cache"] = prefetch_cache
+            return json.dumps(result, indent=2, default=str)
 
         # The active provider bank shares its SQLite database with auto_sleep's
         # separate Beam connection. Keep every active-bank diagnostic access in
@@ -3539,6 +3736,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         with self._ensure_beam_access_lock():
             result = run_diagnostics(**diagnostic_kwargs)
             result["sync_turn"] = self._sync_turn_diagnostics()
+            result["prefetch_cache"] = prefetch_cache
 
             active_db = None
             try:
@@ -3630,6 +3828,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             timestamp=datetime.now().isoformat(),
         )
         self._beam.episodic_graph.add_edge(edge)
+        self._invalidate_prefetch_cache()
         return json.dumps({
             "status": "linked",
             "source": source_id,
@@ -3674,7 +3873,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         author_type=beam_ref.author_type,
                         channel_id=beam_ref.channel_id,
                     )
-                    sleep_beam.sleep()
+                    result = sleep_beam.sleep()
+                    if result.get("status") == "consolidated":
+                        self._invalidate_prefetch_cache()
                 except Exception as inner:
                     logger.debug("Mnemosyne session-end sleep failed: %s", inner)
 
@@ -3701,6 +3902,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 importance=0.7 if target == "user" else 0.5,
                 scope=scope,
             )
+            self._invalidate_prefetch_cache()
         except Exception as e:
             logger.debug("Mnemosyne mirror write failed: %s", e)
 
@@ -3714,6 +3916,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     SHUTDOWN_DRAIN_TIMEOUT_SECONDS = _parse_env_float("MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT", 2)
 
     def shutdown(self) -> None:
+        # Reject any late prefetch worker before tearing down this provider.
+        self._invalidate_prefetch_cache()
         # If session_end's daemon thread is still consolidating when shutdown
         # arrives, briefly wait for it. Otherwise clearing the host backend
         # next would race with the in-flight summarize/extract call and a

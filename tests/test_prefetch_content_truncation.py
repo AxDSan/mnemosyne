@@ -40,6 +40,7 @@ def test_prefetch_preserves_full_memory_content_by_default(monkeypatch):
     provider = MnemosyneMemoryProvider()
     provider._beam = FakeBeam(long_content)
 
+    provider.queue_prefetch("critical tail fact")
     rendered = provider.prefetch("critical tail fact")
 
     assert "critical-tail-fact-survives" in rendered
@@ -56,6 +57,7 @@ def test_prefetch_content_limit_is_opt_in_and_word_boundary(monkeypatch):
     provider = MnemosyneMemoryProvider()
     provider._beam = FakeBeam("alpha beta gamma delta")
 
+    provider.queue_prefetch("alpha")
     rendered = provider.prefetch("alpha")
 
     assert "alpha beta..." in rendered

@@ -66,7 +66,20 @@ def test_diagnose_without_active_beam_keeps_base_diagnostics(monkeypatch):
 
     result = json.loads(provider._handle_diagnose({}))
 
-    assert result == {"checks_total": 1, "key_findings": ["base finding"]}
+    assert result["checks_total"] == 1
+    assert result["key_findings"] == ["base finding"]
+    assert result["prefetch_cache"] == {
+        "enabled": True,
+        "capacity": 50,
+        "entries": 0,
+        "hits": 0,
+        "misses": 0,
+        "evictions": 0,
+        "warm_completed": 0,
+        "warm_failed": 0,
+        "last_duration_ms": None,
+        "average_duration_ms": None,
+    }
 
 
 def test_diagnose_reports_count_error_without_failing(tmp_path, monkeypatch):

@@ -93,6 +93,7 @@ def test_retry_waits_for_the_interval(monkeypatch):
 
     # _retry_init_at is ~60s in the future; surface calls must not retry yet.
     provider.system_prompt_block()
+    provider.queue_prefetch("query")
     provider.prefetch("query")
     assert calls["n"] == attempts_after_init
 
