@@ -38,6 +38,7 @@ def test_get_working_memory_respects_global_cross_session_visibility(temp_db):
     cross_session_global = reader.get(global_id)
     assert cross_session_global is not None
     assert cross_session_global["id"] == global_id
+    assert cross_session_global["memory_store"] == "working"
     assert reader.get(private_id) is None
 
 
