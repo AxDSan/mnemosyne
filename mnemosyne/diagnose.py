@@ -349,7 +349,11 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False, 
         summary["key_findings"].append("sqlite-vec not available - install with: pip install sqlite-vec")
         summary["fixable"].append("sqlite_vec")
     if embed_ok and vec_ok and ep_vec and ep_vec["status"] == "0":
-        summary["key_findings"].append("Both fastembed and sqlite-vec are available but episodic vectors=0 - memories may not have been consolidated yet. Run: hermes mnemosyne sleep")
+        summary["key_findings"].append(
+            "Both fastembed and sqlite-vec are available but episodic vectors=0 - "
+            "memories may not have been consolidated yet. Use the mnemosyne_sleep "
+            "tool or call BeamMemory.sleep()."
+        )
     if embed_ok and vec_ok and ep_vec and int(ep_vec["status"]) > 0:
         vtype = ep_vec_type["status"] if ep_vec_type else "unknown"
         msg = f"Semantic search is active with {ep_vec['status']} vectors in episodic memory (backend: {vtype})"

@@ -37,6 +37,30 @@ def test_diagnose_treats_ctransformers_as_optional(tmp_path, monkeypatch):
     assert ctransformers["status"] not in {"MISSING", "ERROR"}
 
 
+def test_diagnose_vector_guidance_uses_valid_sleep_actions(tmp_path, monkeypatch):
+    monkeypatch.setattr(diagnose, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(
+        diagnose,
+        "collect_runtime_diagnostics",
+        lambda: {
+            "checks": [
+                {"category": "deps", "check": "embeddings_available", "status": "YES", "detail": ""},
+                {"category": "deps", "check": "sqlite_vec_available", "status": "YES", "detail": ""},
+            ]
+        },
+    )
+
+    summary = diagnose.run_diagnostics()
+
+    finding = next(
+        finding for finding in summary["key_findings"] if "episodic vectors=0" in finding
+    )
+    assert "mnemosyne_sleep" in finding
+    assert "BeamMemory.sleep()" in finding
+    assert "hermes" + " mnemosyne sleep" not in finding
+
+
 def test_memory_orphan_diagnostics_tolerates_missing_optional_tables(tmp_path):
     db_path = tmp_path / "legacy.db"
     conn = sqlite3.connect(db_path)

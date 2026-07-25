@@ -562,6 +562,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._agent_context = "primary"
         self._turn_count = 0
         self._sync_turn_lock = threading.Lock()
+        # Serialize Beam/SQLite access with the auto_sleep daemon. Separate
+        # connections to the same WAL database must not run Beam work together.
+        self._beam_access_lock = threading.Lock()
         self._sync_turn_telemetry: Dict[str, Any] = {
             "pending_queue_length": 0,
             "max_queue_length": 0,
@@ -1235,18 +1238,19 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             # sessions) should never bypass session scoping.
             if author_id:
                 recall_kwargs["author_id"] = author_id
-            results = self._beam.recall(**recall_kwargs)
+            with self._ensure_beam_access_lock():
+                results = self._beam.recall(**recall_kwargs)
 
-            canonical_rows: List[Dict[str, Any]] = []
-            try:
-                store = getattr(self._beam, "canonical", None)
-                if store is None:
-                    from mnemosyne.core.canonical import CanonicalStore
-                    store = CanonicalStore(db_path=self._beam.db_path, conn=self._beam.conn)
-                    self._beam.canonical = store
-                canonical_rows = _canonical_prefetch_rows(store, self._canonical_owner(), query)
-            except Exception:
-                canonical_rows = []
+                canonical_rows: List[Dict[str, Any]] = []
+                try:
+                    store = getattr(self._beam, "canonical", None)
+                    if store is None:
+                        from mnemosyne.core.canonical import CanonicalStore
+                        store = CanonicalStore(db_path=self._beam.db_path, conn=self._beam.conn)
+                        self._beam.canonical = store
+                    canonical_rows = _canonical_prefetch_rows(store, self._canonical_owner(), query)
+                except Exception:
+                    canonical_rows = []
 
             if not results and not canonical_rows:
                 return ""
@@ -1303,6 +1307,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         """Initialize sync_turn telemetry for tests that construct via __new__."""
         if not hasattr(self, "_sync_turn_lock"):
             self._sync_turn_lock = threading.Lock()
+        self._ensure_beam_access_lock()
         if not hasattr(self, "_sync_turn_telemetry"):
             self._sync_turn_telemetry = {
                 "pending_queue_length": 0,
@@ -1319,6 +1324,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 "last_error": None,
                 "in_flight": 0,
             }
+
+    def _ensure_beam_access_lock(self):
+        """Return the per-provider Beam lock, including for __new__ test instances."""
+        try:
+            return self._beam_access_lock
+        except AttributeError:
+            # setdefault atomically publishes one per-instance lock when
+            # concurrent __new__ callers both need lazy initialization.
+            return self.__dict__.setdefault("_beam_access_lock", threading.Lock())
 
     def _sync_turn_diagnostics(self) -> Dict[str, Any]:
         """Return a PII-safe snapshot of sync_turn telemetry."""
@@ -1350,28 +1364,29 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 in_flight,
             )
         try:
-            if "user" in self._sync_roles and user_content and len(user_content) > 5 and not self._should_filter(user_content):
-                user_limit = _sync_turn_user_limit()
-                uc = user_content[:user_limit] if user_limit > 0 else user_content
-                self._beam.remember(
-                    content=f"[USER] {uc}",
-                    source="conversation",
-                    importance=0.5,
-                    scope=self._default_scope,
-                    extract_entities=True,
-                )
-                # Check for identity-significant signals in user content
-                self._capture_identity_signals(user_content)
-            if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10 and not self._should_filter(assistant_content):
-                assistant_limit = _sync_turn_assistant_limit()
-                ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
-                self._beam.remember(
-                    content=f"[ASSISTANT] {ac}",
-                    source="conversation",
-                    importance=0.15,
-                    scope=self._default_scope,
-                    extract_entities=True,
-                )
+            with self._ensure_beam_access_lock():
+                if "user" in self._sync_roles and user_content and len(user_content) > 5 and not self._should_filter(user_content):
+                    user_limit = _sync_turn_user_limit()
+                    uc = user_content[:user_limit] if user_limit > 0 else user_content
+                    self._beam.remember(
+                        content=f"[USER] {uc}",
+                        source="conversation",
+                        importance=0.5,
+                        scope=self._default_scope,
+                        extract_entities=True,
+                    )
+                    # Check for identity-significant signals in user content
+                    self._capture_identity_signals(user_content)
+                if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10 and not self._should_filter(assistant_content):
+                    assistant_limit = _sync_turn_assistant_limit()
+                    ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
+                    self._beam.remember(
+                        content=f"[ASSISTANT] {ac}",
+                        source="conversation",
+                        importance=0.15,
+                        scope=self._default_scope,
+                        extract_entities=True,
+                    )
             self._turn_count += 1
             if self._auto_sleep_enabled and self._turn_count % 10 == 0:
                 self._maybe_auto_sleep()
@@ -1458,8 +1473,31 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     return
 
                 logger.info("Mnemosyne auto-sleep: working=%d, eligible=%d > threshold=%d", working, eligible, self._auto_sleep_threshold)
-                sleep_fn = self._beam.sleep_all_sessions if hasattr(self._beam, "sleep_all_sessions") else self._beam.sleep
-                sleep_thread = threading.Thread(target=sleep_fn, daemon=True)
+                # The daemon must own a separate BeamMemory/SQLite connection.
+                # The source Beam selects the compatible sleep operation, but is
+                # never used from the worker thread (see root provider #498).
+                beam_ref = self._beam
+                if beam_ref is None:
+                    return
+                sleep_all_sessions = hasattr(beam_ref, "sleep_all_sessions")
+                beam_lock = self._ensure_beam_access_lock()
+
+                def _sleep_isolated():
+                    try:
+                        BeamClass = _get_beam_class()
+                        sleep_beam = BeamClass(
+                            session_id=beam_ref.session_id,
+                            db_path=beam_ref.db_path,
+                            author_id=beam_ref.author_id,
+                            author_type=beam_ref.author_type,
+                            channel_id=beam_ref.channel_id,
+                        )
+                        with beam_lock:
+                            (sleep_beam.sleep_all_sessions if sleep_all_sessions else sleep_beam.sleep)()
+                    except Exception as inner:
+                        logger.debug("Mnemosyne auto-sleep worker failed: %s", inner)
+
+                sleep_thread = threading.Thread(target=_sleep_isolated, daemon=True)
                 sleep_thread.start()
                 sleep_thread.join(timeout=self._AUTO_SLEEP_TIMEOUT_SECONDS)
                 if sleep_thread.is_alive():
@@ -2425,46 +2463,66 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def _handle_diagnose(self, args: Dict[str, Any]) -> str:
         from mnemosyne.diagnose import run_diagnostics
-        result = run_diagnostics()
-        if self._beam is not None:
+        repair_requested = bool(args.get("repair_vec_working", False))
+        dry_run = bool(args.get("dry_run", False))
+        diagnostic_kwargs: Dict[str, Any] = {
+            "repair_vec_working": repair_requested,
+            "dry_run": dry_run,
+        }
+        if self._profile_isolation_enabled and self._beam is not None:
+            diagnostic_kwargs["bank"] = self._resolve_profile_bank()
+        if self._beam is None:
+            return json.dumps(run_diagnostics(**diagnostic_kwargs), indent=2, default=str)
+
+        # The active provider bank shares its SQLite database with auto_sleep.
+        # Serialize the complete active-bank diagnostic operation (#498).
+        with self._ensure_beam_access_lock():
+            result = run_diagnostics(**diagnostic_kwargs)
             result["sync_turn"] = self._sync_turn_diagnostics()
 
-        # run_diagnostics() reports Mnemosyne's legacy/default DB path. When
-        # Hermes profile isolation is enabled, the active provider may use a
-        # profile bank instead (mnemosyne/data/banks/<profile>/mnemosyne.db).
-        # Surface the active provider DB too so operators do not mistake the
-        # diagnostic default path for the live memory bank.
-        active_db = None
-        try:
-            if self._beam is not None:
-                active_db = getattr(self._beam, "db_path", None)
-        except Exception:
             active_db = None
-
-        if active_db:
-            result["active_provider_db_path"] = str(active_db)
-            result["profile_isolation_enabled"] = bool(self._profile_isolation_enabled)
-            result.setdefault("key_findings", []).append(
-                f"Active Hermes Mnemosyne provider DB: {active_db}"
-            )
             try:
-                import sqlite3
-                from mnemosyne.diagnose import _memory_orphan_diagnostics
-                con = sqlite3.connect(str(active_db))
-                try:
-                    cur = con.cursor()
-                    result["active_provider_counts"] = {
-                        "working_memory": cur.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0],
-                        "episodic_memory": cur.execute("SELECT COUNT(*) FROM episodic_memory").fetchone()[0],
-                        "facts": cur.execute("SELECT COUNT(*) FROM facts").fetchone()[0],
-                    }
-                    result["active_provider_orphan_diagnostics"] = _memory_orphan_diagnostics(con)
-                finally:
-                    con.close()
-            except Exception as exc:
-                result["active_provider_counts_error"] = str(exc)
+                active_db = getattr(self._beam, "db_path", None)
+            except Exception:
+                active_db = None
 
-        return json.dumps(result, indent=2, default=str)
+            if active_db:
+                result["active_provider_db_path"] = str(active_db)
+                result["profile_isolation_enabled"] = bool(self._profile_isolation_enabled)
+                result.setdefault("key_findings", []).append(
+                    f"Active Hermes Mnemosyne provider DB: {active_db}"
+                )
+                try:
+                    import sqlite3
+                    from mnemosyne.diagnose import _memory_orphan_diagnostics
+                    con = sqlite3.connect(str(active_db))
+                    try:
+                        cur = con.cursor()
+                        result["active_provider_counts"] = {
+                            "working_memory": cur.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0],
+                            "episodic_memory": cur.execute("SELECT COUNT(*) FROM episodic_memory").fetchone()[0],
+                            "facts": cur.execute("SELECT COUNT(*) FROM facts").fetchone()[0],
+                        }
+                        result["active_provider_orphan_diagnostics"] = _memory_orphan_diagnostics(con)
+                    finally:
+                        con.close()
+                    try:
+                        from mnemosyne.core.beam import repair_vec_working as _repair_vec_working, vec_working_coverage
+                        if repair_requested:
+                            result["active_provider_vec_working_repair"] = _repair_vec_working(
+                                self._beam.conn, dry_run=dry_run
+                            )
+                            result["active_provider_vec_working"] = result[
+                                "active_provider_vec_working_repair"
+                            ].get("after", {})
+                        else:
+                            result["active_provider_vec_working"] = vec_working_coverage(self._beam.conn)
+                    except Exception as exc:
+                        result["active_provider_vec_working_error"] = str(exc)
+                except Exception as exc:
+                    result["active_provider_counts_error"] = str(exc)
+
+            return json.dumps(result, indent=2, default=str)
 
     def _handle_recall_diagnostics(self, args: Dict[str, Any]) -> str:
         """Return recall path diagnostics (fallback rates, tier hit counts).
