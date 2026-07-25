@@ -472,12 +472,25 @@ class AnnotationStore:
                 else:
                     explicit_no_collision.append(item)
 
+            # No id-collision, but the ``idx_annot_unique`` index on
+            # ``(memory_id, kind, value)`` can still reject an insert when
+            # that triple already exists under a *different* id (common on
+            # cross-instance import). Treat it as the same logical
+            # annotation and skip -- crashing here would abort the whole
+            # import and roll back every prior row (mirrors the renumber
+            # path below, and keeps import idempotent / re-runnable).
             for item in explicit_no_collision:
-                _insert_with_id(item, item["id"])
-                stats["inserted"] += 1
+                try:
+                    _insert_with_id(item, item["id"])
+                    stats["inserted"] += 1
+                except sqlite3.IntegrityError:
+                    stats["skipped"] += 1
             for item in no_id:
-                _insert_without_id(item)
-                stats["inserted"] += 1
+                try:
+                    _insert_without_id(item)
+                    stats["inserted"] += 1
+                except sqlite3.IntegrityError:
+                    stats["skipped"] += 1
 
             for item in collisions:
                 row_id = item["id"]
