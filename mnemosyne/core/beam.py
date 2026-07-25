@@ -4227,7 +4227,7 @@ class BeamMemory:
             SELECT id, content, source, timestamp, session_id,
                    importance, metadata_json, veracity, created_at
             FROM working_memory
-            WHERE id = ? AND session_id = ?
+            WHERE id = ? AND (session_id = ? OR scope = 'global')
         """, (memory_id, self.session_id))
         row = cursor.fetchone()
         if row:

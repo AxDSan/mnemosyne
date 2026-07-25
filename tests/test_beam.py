@@ -21,6 +21,26 @@ def temp_db():
         yield db_path
 
 
+def test_get_working_memory_respects_global_cross_session_visibility(temp_db):
+    writer = BeamMemory(session_id="session-a", db_path=temp_db)
+    global_id = writer.remember("global get visibility", source="test", scope="global")
+    private_id = writer.remember("private get visibility", source="test", scope="session")
+
+    # Same-session lookup remains available for both visibility scopes.
+    same_session_global = writer.get(global_id)
+    same_session_private = writer.get(private_id)
+    assert same_session_global is not None
+    assert same_session_global["id"] == global_id
+    assert same_session_private is not None
+    assert same_session_private["id"] == private_id
+
+    reader = BeamMemory(session_id="session-b", db_path=temp_db)
+    cross_session_global = reader.get(global_id)
+    assert cross_session_global is not None
+    assert cross_session_global["id"] == global_id
+    assert reader.get(private_id) is None
+
+
 class _FakeAnnotations:
     def __init__(self, rows):
         self._rows = rows
