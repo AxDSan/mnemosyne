@@ -506,6 +506,45 @@ class TestCodexReviewFinding3AnnotationsUniqueIndex(_TwoStoreFixture, unittest.T
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["source"], "A")
 
+    def test_new_id_colliding_content_skips_without_crash(self):
+        # Regression: the (memory_id, kind, value) unique index can also
+        # be violated by a row that does NOT collide on id -- it lands in
+        # the ``explicit_no_collision`` bucket. Pre-fix that bucket did
+        # not catch IntegrityError, so a single such row aborted the
+        # ENTIRE import and rolled back every prior row (making import
+        # non-re-runnable after a partial run). It must skip instead.
+        self.dst.add("mem-1", "fact", "same value", source="A")  # id=1
+        imported = [{
+            "id": 999,  # no id-collision with the existing id=1
+            "memory_id": "mem-1", "kind": "fact", "value": "same value",
+            "source": "B", "confidence": 0.5,
+            "created_at": "2099-01-01T00:00:00",
+        }]
+        stats = self.dst.import_all(imported)
+        self.assertEqual(stats["skipped"], 1)
+        self.assertEqual(stats["inserted"], 0)
+        rows = self.dst.export_all()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["source"], "A")  # original preserved
+
+    def test_new_id_colliding_row_does_not_abort_whole_batch(self):
+        # The colliding row must not take unrelated rows down with it:
+        # a fresh row in the same batch still imports.
+        self.dst.add("mem-1", "fact", "same value")  # id=1
+        imported = [
+            {"id": 999, "memory_id": "mem-1", "kind": "fact",
+             "value": "same value", "source": "B"},          # collides -> skip
+            {"id": 1000, "memory_id": "mem-2", "kind": "fact",
+             "value": "brand new", "source": "C"},           # fresh   -> insert
+        ]
+        stats = self.dst.import_all(imported)
+        self.assertEqual(stats["skipped"], 1)
+        self.assertEqual(stats["inserted"], 1)
+        # Sum-of-stats invariant holds.
+        self.assertEqual(sum(stats.values()), len(imported))
+        values = {r["value"] for r in self.dst.export_all()}
+        self.assertIn("brand new", values)
+
 
 class TestCodexReviewFinding4TransactionRollback(_TwoStoreFixture, unittest.TestCase):
     """Finding #4: if any insert fails mid-batch, the transaction must
