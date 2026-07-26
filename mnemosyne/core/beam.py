@@ -8456,11 +8456,21 @@ class BeamMemory:
                 # the claim survives -- the rows show as consolidated but
                 # without a summary. That's preferable to a phantom-summary-
                 # without-claim race the previous ordering allowed.
+                # Summary importance inherits the batch's strongest source
+                # (clamped to [0.6, 0.85]) instead of a flat 0.6, so a
+                # summary of high-importance memories ranks near them in
+                # the recall blend. All-default batches (0.5 rows) keep
+                # the historical 0.6 exactly; the 0.85 cap keeps a summary
+                # from outranking the originals it summarizes.
+                peak_importance = max(
+                    (float(item.get("importance") or 0.0) for item in items),
+                    default=0.0,
+                )
                 self.consolidate_to_episodic(
                     summary=summary,
                     source_wm_ids=ids,
                     source="sleep_consolidation",
-                    importance=0.6,
+                    importance=min(max(0.6, peak_importance), 0.85),
                     scope=aggregated_scope,
                     valid_until=aggregated_valid_until,
                     veracity=aggregated_veracity,
