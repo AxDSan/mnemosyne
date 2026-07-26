@@ -207,6 +207,10 @@ except Exception:
 import os
 import re
 
+_VERSION_STRING_RE = re.compile(
+    r'([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)\s+v?(\d+\.\d+(?:\.\d+)?)'
+)
+
 # On Fly.io and other ephemeral VMs, only ~/.hermes is persisted.
 # Default to the legacy Hermes path so memories survive restarts.
 _DEFAULT_ROOT = Path(
@@ -4748,7 +4752,7 @@ class BeamMemory:
 
         # Version strings — two patterns:
         # Pattern A: "PostgreSQL v14.2", "Docker 27.1.1" (name directly before version)
-        for m in _re.finditer(r'([A-Z][a-zA-Z]+(?:\s*[A-Z][a-zA-Z]+)*)\s+v?(\d+\.\d+(?:\.\d+)?)', content):
+        for m in _VERSION_STRING_RE.finditer(content):
             name = m.group(1).strip()
             ver = m.group(2)
             key = f"{name.lower().replace(' ', '_')}_version"
