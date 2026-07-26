@@ -207,6 +207,7 @@ def test_core_file_import_dry_run_matches_clone_and_preserves_all_rows(
     assert active_core_conn.execute("SELECT 1").fetchone()[0] == 1
     assert active_beam_conn.execute("SELECT 1").fetchone()[0] == 1
     assert clone_dirs
+    assert all(clone_dir.parent == target.db_path.parent for clone_dir in clone_dirs)
     assert all(not clone_dir.exists() for clone_dir in clone_dirs)
 
     clone_path = tmp_path / "normal-import-clone.db"
@@ -391,6 +392,26 @@ def test_core_file_import_dry_run_closes_clone_store_connections_on_error(
     caller_query_cache.close()
 
 
+def test_core_file_import_dry_run_rejects_unsupported_export_without_mutation(
+    tmp_path, monkeypatch
+):
+    export_path = _export_source(tmp_path)
+    export = json.loads(export_path.read_text(encoding="utf-8"))
+    export["mnemosyne_export"]["version"] = "unsupported"
+    export_path.write_text(json.dumps(export), encoding="utf-8")
+    target = _target(tmp_path)
+    before = _table_snapshot(target.db_path)
+    clone_dirs = _capture_dry_run_clone_dirs(monkeypatch)
+
+    with pytest.raises(ValueError, match="Unsupported export version: unsupported"):
+        target.import_from_file(str(export_path), force=True, dry_run=True)
+
+    assert _table_snapshot(target.db_path) == before
+    assert clone_dirs
+    assert all(clone_dir.parent == target.db_path.parent for clone_dir in clone_dirs)
+    assert all(not clone_dir.exists() for clone_dir in clone_dirs)
+
+
 def test_mcp_file_import_dry_run_has_stable_output_and_no_mutation(tmp_path, monkeypatch):
     export_path = _export_source(tmp_path)
     target = _target(tmp_path)
@@ -543,3 +564,31 @@ def test_hermes_cli_file_import_forwards_dry_run_and_keeps_exit_compat(
     assert normal_output.count("  (force mode: overwrites applied)") == 1
     assert "  (force mode: overwrites would be applied)" not in normal_output
     assert "  (dry-run mode: no memories were written)" not in normal_output
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    ["hermes_memory_provider.cli", "mnemosyne_hermes.cli"],
+)
+def test_hermes_cli_file_import_dry_run_failure_preserves_data(
+    tmp_path, monkeypatch, module_name
+):
+    export_path = _export_source(tmp_path)
+    target = _target(tmp_path, name=f"failure-{module_name.replace('.', '-')}")
+    before = _table_snapshot(target.db_path)
+    original_mnemosyne = Mnemosyne
+
+    def cli_memory_factory(**kwargs):
+        if kwargs.get("db_path") is not None:
+            return original_mnemosyne(**kwargs)
+        return target
+
+    def fail_import(*_args, **_kwargs):
+        raise ValueError("forced dry-run validation failure")
+
+    monkeypatch.setattr(target, "import_from_file", fail_import)
+    monkeypatch.setattr("mnemosyne.core.memory.Mnemosyne", cli_memory_factory)
+    cli = importlib.import_module(module_name)
+
+    assert cli.mnemosyne_command(_cli_args(export_path)) == 1
+    assert _table_snapshot(target.db_path) == before

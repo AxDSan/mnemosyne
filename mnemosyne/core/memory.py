@@ -78,6 +78,51 @@ def _get_connection(db_path = None) -> sqlite3.Connection:
     return _thread_local.conn
 
 
+def _close_dry_run_clone(
+    thread_local_states: List[tuple[Any, Dict[str, Any]]],
+    clone_store_connections: List[Any],
+    clone_query_caches: List[Any],
+) -> None:
+    """Close clone-only resources and restore caller-owned thread-local state."""
+    closed_query_caches = set()
+    for cache in clone_query_caches:
+        if id(cache) in closed_query_caches:
+            continue
+        closed_query_caches.add(id(cache))
+        try:
+            cache.close()
+        except Exception:
+            pass
+
+    closed_connections = set()
+    for connection in clone_store_connections:
+        if id(connection) in closed_connections:
+            continue
+        closed_connections.add(id(connection))
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+    for local, original_state in thread_local_states:
+        # The clone replaces a thread-local connection when it initializes.
+        # Close any replacement by identity before restoring the caller state;
+        # this is robust to string-versus-Path cache keys and derived clone paths.
+        connection = getattr(local, "conn", None)
+        if connection is not None and connection is not original_state.get("conn"):
+            try:
+                connection.close()
+            except Exception:
+                pass
+        try:
+            for attribute in list(vars(local)):
+                delattr(local, attribute)
+            for attribute, value in original_state.items():
+                setattr(local, attribute, value)
+        except Exception:
+            logger.debug("Unable to fully restore dry-run thread-local state", exc_info=True)
+
+
 def init_db(db_path: Path = None):
     """Initialize legacy database schema + BEAM schema"""
     conn = _get_connection(db_path)
@@ -787,7 +832,9 @@ class Mnemosyne:
         Sections absent from older exports are treated as no-ops.
         """
         if dry_run:
-            with tempfile.TemporaryDirectory(prefix="mnemosyne-import-") as temp_dir:
+            with tempfile.TemporaryDirectory(
+                prefix="mnemosyne-import-", dir=str(Path(self.db_path).parent)
+            ) as temp_dir:
                 clone_path = Path(temp_dir) / "mnemosyne.db"
                 clone_connection = sqlite3.connect(str(clone_path))
                 try:
@@ -843,49 +890,11 @@ class Mnemosyne:
                         cache = getattr(local, "_query_cache", None)
                         if cache is not None and cache is not original_state.get("_query_cache"):
                             clone_query_caches.append(cache)
-                    closed_query_caches = set()
-                    for cache in clone_query_caches:
-                        if id(cache) in closed_query_caches:
-                            continue
-                        closed_query_caches.add(id(cache))
-                        try:
-                            cache.close()
-                        except Exception:
-                            pass
-
-                    # File import constructs standalone stores for triples,
-                    # annotations, and canonical facts. They are not part of
-                    # Mnemosyne's thread-local caches, so close their clone
-                    # connections explicitly even when the import raises.
-                    closed_connections = set()
-                    for connection in clone_store_connections:
-                        if id(connection) in closed_connections:
-                            continue
-                        closed_connections.add(id(connection))
-                        try:
-                            connection.close()
-                        except Exception:
-                            pass
-
-                    # Close only connections that the clone installed, then
-                    # restore every pre-clone cache attribute.  In particular,
-                    # do not close an active caller connection merely because a
-                    # clone replaced its thread-local entry.
-                    for local, original_state in thread_local_states:
-                        if getattr(local, "db_path", None) == str(clone_path):
-                            connection = getattr(local, "conn", None)
-                            if connection is not None and connection is not original_state.get("conn"):
-                                try:
-                                    connection.close()
-                                except Exception:
-                                    pass
-
-                        # Restoring the captured dictionary also removes clone
-                        # state when this thread had no prior cache entry.
-                        for attribute in list(vars(local)):
-                            delattr(local, attribute)
-                        for attribute, value in original_state.items():
-                            setattr(local, attribute, value)
+                    _close_dry_run_clone(
+                        thread_local_states,
+                        clone_store_connections,
+                        clone_query_caches,
+                    )
 
         from mnemosyne.core.triples import TripleStore
         from mnemosyne.core.annotations import AnnotationStore
