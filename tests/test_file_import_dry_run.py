@@ -502,11 +502,14 @@ def test_hermes_file_import_dry_run_preserves_data_and_audit_rows(
 
     assert normal_result["status"] == "imported"
     assert normal_result["dry_run"] is False
+    assert normal_result["stats"] == dry_run_result["stats"]
     assert calls == [
         (str(export_path), True, True),
         (str(export_path), True, False),
     ]
-    assert len(_table_snapshot(db_path)[audit_table]) == len(before[audit_table]) + 1
+    after_normal = _table_snapshot(db_path)
+    assert len(after_normal[audit_table]) == len(before[audit_table]) + 1
+    _assert_imported_store_rows(after_normal)
     if provider._audit is not None:
         provider._audit.close()
 
