@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
+## [3.15.1] - 2026-07-27
+
+### Fixed
+
+- **MEMORIA instruction extraction inverted "whenever X" into "never X" (#507).** The
+  regex-based instruction extractor had no leading word boundary on its negation/modal
+  alternatives, so under `re.IGNORECASE` a keyword like `never` matched *inside* a longer
+  word: `"Good - whenever needed we can use it."` was stored as the instruction
+  `"never needed we can use it"`. Since `memoria_instructions` rows are surfaced at recall
+  as user constraints, an inverted instruction is worse than a missed one. The same class
+  of bug affected German (`nie` inside `Knie`). Added a leading `\b` to all five locale
+  instruction patterns (en/de/ru/it/es).
+
 ## [3.15.0] - 2026-07-20
 
 ### Fixed
