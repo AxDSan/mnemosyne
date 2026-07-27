@@ -207,6 +207,10 @@ except Exception:
 import os
 import re
 
+_VERSION_STRING_RE = re.compile(
+    r'([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)\s+v?(\d+\.\d+(?:\.\d+)?)'
+)
+
 # On Fly.io and other ephemeral VMs, only ~/.hermes is persisted.
 # Default to the legacy Hermes path so memories survive restarts.
 _DEFAULT_ROOT = Path(
@@ -3985,6 +3989,25 @@ class BeamMemory:
                 )
         return rows
 
+    def _invalidate_query_cache(self) -> None:
+        """Clear the existing enhanced-recall cache without creating an empty one."""
+        cache = getattr(self, "_query_cache", None)
+        if cache is not None:
+            cache.invalidate()
+            return
+        if QueryCache is None:
+            return
+
+        cache_db = self.db_path.parent / "query_cache.db"
+        if not cache_db.exists():
+            return
+
+        cache = QueryCache(db_path=cache_db)
+        try:
+            cache.invalidate()
+        finally:
+            cache.close()
+
     def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
         """
         Mark a memory as invalid/superseded.
@@ -4001,6 +4024,7 @@ class BeamMemory:
         """, (now, replacement_id, memory_id, self.session_id))
         if cursor.rowcount > 0:
             self.conn.commit()
+            self._invalidate_query_cache()
             return True
         # Try episodic_memory
         cursor.execute("""
@@ -4008,8 +4032,11 @@ class BeamMemory:
             SET valid_until = ?, superseded_by = ?
             WHERE id = ? AND (session_id = ? OR scope = 'global')
         """, (now, replacement_id, memory_id, self.session_id))
+        invalidated = cursor.rowcount > 0
         self.conn.commit()
-        return cursor.rowcount > 0
+        if invalidated:
+            self._invalidate_query_cache()
+        return invalidated
 
     def _detect_conflicts(self, rows: List[Dict], similarity_threshold: float = 0.88) -> List[tuple]:
         """
@@ -4754,7 +4781,7 @@ class BeamMemory:
 
         # Version strings — two patterns:
         # Pattern A: "PostgreSQL v14.2", "Docker 27.1.1" (name directly before version)
-        for m in _re.finditer(r'([A-Z][a-zA-Z]+(?:\s*[A-Z][a-zA-Z]+)*)\s+v?(\d+\.\d+(?:\.\d+)?)', content):
+        for m in _VERSION_STRING_RE.finditer(content):
             name = m.group(1).strip()
             ver = m.group(2)
             key = f"{name.lower().replace(' ', '_')}_version"
