@@ -567,6 +567,9 @@ def test_hermes_cli_file_import_forwards_dry_run_and_keeps_exit_compat(
     assert normal_output.count("  (force mode: overwrites applied)") == 1
     assert "  (force mode: overwrites would be applied)" not in normal_output
     assert "  (dry-run mode: no memories were written)" not in normal_output
+    after_normal = _table_snapshot(target.db_path)
+    assert after_normal != before
+    _assert_imported_store_rows(after_normal)
 
 
 @pytest.mark.parametrize(
