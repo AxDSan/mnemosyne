@@ -38,6 +38,7 @@
 - [Hermes Plugin (23 tools)](#hermes-plugin-23-tools)
 - [Mnemosyne Sync](#mnemosyne-sync)
 - [Contributing](#contributing)
+- [Sponsors](#sponsors)
 - [Support](#support)
 - [License](#license)
 
@@ -450,6 +451,27 @@ Full docs: [`docs/`](docs/README.md) . Changelog: [`CHANGELOG.md`](CHANGELOG.md)
 ## Sponsors
 
 Mnemosyne development is supported by companies providing compute credits (LLM, embedding, GPU), hosting, and developer tooling. See the full list and sponsorship policy at **[mnemosyne.site/partners](https://mnemosyne.site/partners)**.
+
+### Compute Partners
+
+<div align="center">
+
+<a href="https://www.atlascloud.ai/">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/partners/atlas-cloud-white.png">
+    <img src="assets/partners/atlas-cloud-black.png" alt="Atlas Cloud" width="280">
+  </picture>
+</a>
+
+</div>
+
+**[Atlas Cloud](https://www.atlascloud.ai/)** -- a full-modal AI inference platform: one API for 300+ curated LLM, image, and video models, so you connect once instead of maintaining a vendor integration per modality. Their OpenAI-compatible endpoint works with Mnemosyne and the Hermes plugin out of the box.
+
+Atlas Cloud provides inference credits used for nightly recall benchmarks, multi-model parity tests, and OpenAI-compatible provider coverage. Budget-friendly API access is available through their [coding plan](https://www.atlascloud.ai/console/coding-plan).
+
+*Sponsored. Compute Partners are disclosed material connections under FTC Endorsement Guides (16 CFR Part 255). Sponsors have no editorial control over benchmark methodology or results.*
+
+### Partner with us
 
 If your company runs an OSS credits program and wants to partner, open an issue tagged `sponsorship` or email `sponsors@mnemosyne.site`.
 
