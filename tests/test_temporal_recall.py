@@ -112,6 +112,39 @@ class TestParseQueryTime(unittest.TestCase):
         result = _parse_query_time("2026-04-29")
         self.assertEqual(result, datetime(2026, 4, 29, 0, 0, 0, tzinfo=timezone.utc))
 
+    def test_blank_string_returns_now(self):
+        """Empty string -> current UTC time (issue #555).
+
+        The mnemosyne_recall tool schema previously declared query_time with
+        ``"default": ""``, so MCP harnesses that send declared defaults deliver
+        "" rather than omitting the field. That must not be an error.
+        """
+        result = _parse_query_time("")
+        self.assertIsInstance(result, datetime)
+        self.assertEqual(result.tzinfo, timezone.utc)
+        self.assertLess((datetime.now(timezone.utc) - result).total_seconds(), 1.0)
+
+    def test_whitespace_string_returns_now(self):
+        """Whitespace-only string is treated as unset, not as a bad timestamp."""
+        for blank in ("   ", "\t", "\n"):
+            with self.subTest(blank=repr(blank)):
+                result = _parse_query_time(blank)
+                self.assertEqual(result.tzinfo, timezone.utc)
+                self.assertLess(
+                    (datetime.now(timezone.utc) - result).total_seconds(), 1.0
+                )
+
+    def test_recall_tool_schema_does_not_declare_blank_default(self):
+        """The schema must not advertise a default that means 'unset' (issue #555)."""
+        from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
+
+        recall = next(
+            schema for schema in ALL_TOOL_SCHEMAS
+            if schema["name"] == "mnemosyne_recall"
+        )
+        query_time = recall["parameters"]["properties"]["query_time"]
+        self.assertNotIn("default", query_time)
+
     def test_invalid_string_raises(self):
         """Invalid string raises ValueError."""
         with self.assertRaises(ValueError):

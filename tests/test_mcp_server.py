@@ -387,6 +387,53 @@ class TestToolHandlers:
         assert kwargs["fts_weight"] == 0.3
         assert kwargs["importance_weight"] == 0.1
 
+    def test_handle_recall_normalizes_blank_query_time(self, mock_mnemosyne):
+        """Blank query_time reaches Mnemosyne.recall() as unset, not as "" (#555).
+
+        Harnesses built against the older schema sent the declared default "",
+        which used to reach _parse_query_time and raise.
+        """
+        for blank in ("", "   ", "\t"):
+            mock_mnemosyne.recall.reset_mock()
+            with patch("mnemosyne.mcp_tools._create_instance", return_value=mock_mnemosyne):
+                handle_tool_call("mnemosyne_recall", {
+                    "query": "test query",
+                    "bank": "default",
+                    "query_time": blank,
+                })
+            _, kwargs = mock_mnemosyne.recall.call_args
+            assert kwargs["query_time"] is None, f"blank {blank!r} not normalized"
+
+    def test_handle_recall_preserves_explicit_query_time(self, mock_mnemosyne):
+        """A real ISO timestamp is forwarded untouched."""
+        with patch("mnemosyne.mcp_tools._create_instance", return_value=mock_mnemosyne):
+            handle_tool_call("mnemosyne_recall", {
+                "query": "test query",
+                "bank": "default",
+                "query_time": "2026-04-29T12:00:00",
+            })
+        _, kwargs = mock_mnemosyne.recall.call_args
+        assert kwargs["query_time"] == "2026-04-29T12:00:00"
+
+    def test_handle_recall_does_not_swallow_falsey_non_strings(self, mock_mnemosyne):
+        """0/False/[] are type errors, not "unset" — they must not become None.
+
+        Guards against normalizing with `or None`, which would silently accept
+        them and suppress _parse_query_time's TypeError.
+        """
+        for bad in (0, False, []):
+            mock_mnemosyne.recall.reset_mock()
+            with patch("mnemosyne.mcp_tools._create_instance", return_value=mock_mnemosyne):
+                handle_tool_call("mnemosyne_recall", {
+                    "query": "test query",
+                    "bank": "default",
+                    "query_time": bad,
+                })
+            _, kwargs = mock_mnemosyne.recall.call_args
+            # Identity, not equality: 0 == False in Python, so `==` would let a
+            # bool/int mix-up pass. The exact object must be forwarded.
+            assert kwargs["query_time"] is bad, f"{bad!r} not forwarded unchanged"
+
     def test_handle_sleep(self, mock_mnemosyne):
         """handle_sleep returns consolidation stats."""
         with patch("mnemosyne.mcp_tools._create_instance", return_value=mock_mnemosyne):

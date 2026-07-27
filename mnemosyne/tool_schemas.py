@@ -61,8 +61,7 @@ RECALL_SCHEMA = {
             },
             "query_time": {
                 "type": "string",
-                "description": "ISO timestamp to treat as 'now' for temporal scoring. Default is current time.",
-                "default": "",
+                "description": "ISO timestamp to treat as 'now' for temporal scoring. Omit to use the current time.",
             },
             "temporal_halflife": {
                 "type": "number",

@@ -1458,12 +1458,19 @@ def _recency_decay(timestamp_str: str, halflife_hours: float = RECENCY_HALFLIFE_
 def _parse_query_time(query_time: Optional[Union[str, datetime]]) -> datetime:
     """Parse query_time parameter into a timezone-aware UTC datetime object.
 
-    - None -> current UTC time
+    - None (or a blank/whitespace-only string) -> current UTC time
     - str  -> parsed from ISO format and normalized to UTC
     - datetime -> normalized to UTC
     Naive values are treated as UTC for backward compatibility.
+
+    A blank string is treated as "unset" for compatibility with callers that
+    send ``""`` to mean "omitted" — notably MCP harnesses built against the
+    older ``mnemosyne_recall`` schema, which declared ``query_time`` with
+    ``"default": ""`` (see #555). Non-string falsey values are still rejected.
     """
     if query_time is None:
+        return datetime.now(timezone.utc)
+    if isinstance(query_time, str) and not query_time.strip():
         return datetime.now(timezone.utc)
     if isinstance(query_time, datetime):
         return _normalize_datetime_utc(query_time)
