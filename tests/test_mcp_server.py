@@ -430,7 +430,9 @@ class TestToolHandlers:
                     "query_time": bad,
                 })
             _, kwargs = mock_mnemosyne.recall.call_args
-            assert kwargs["query_time"] is not None, f"{bad!r} silently treated as unset"
+            # Identity, not equality: 0 == False in Python, so `==` would let a
+            # bool/int mix-up pass. The exact object must be forwarded.
+            assert kwargs["query_time"] is bad, f"{bad!r} not forwarded unchanged"
 
     def test_handle_sleep(self, mock_mnemosyne):
         """handle_sleep returns consolidation stats."""
