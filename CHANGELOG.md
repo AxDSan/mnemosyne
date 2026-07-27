@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
+## [Unreleased]
+
+### Fixed
+
+- **`mnemosyne_recall` crashed on its own schema default (#555).** The tool schema declared `query_time` with `"default": ""`, but `_parse_query_time` mapped only `None` to "now" — a blank string fell through to the ISO parser and raised `Invalid query_time format: ''`. Any MCP harness that sends declared defaults could not call `mnemosyne_recall` at all. Blank and whitespace-only values are now treated as unset, the MCP handler normalizes `""` to `None` (matching the `or None` idiom already used for `valid_until` and `as_of`), and the schema no longer advertises a default that means "omitted". Thanks @dalkommatt for the report and the diagnosis.
+- **Enhanced Recall served invalidated rows until TTL expiry (#550, #554).** `BeamMemory.invalidate()` now clears the query cache after a successful update, including the persisted `query_cache.db` when the instance has no in-memory cache of its own. Missing or unauthorized IDs leave the cache untouched. Remaining gaps are tracked in #552 (live peer coherence), #553 (`forget_working`) and #556 (`remember`/update paths).
+- **Catastrophic regex backtracking in version-string extraction (#544).** The pattern used by `extract_and_store_facts` could be driven into exponential backtracking by Title-Case input, hanging every `remember()` and import on attacker- or user-supplied content. The separator is now `\s+`, which makes each whitespace-delimited word consumable exactly one way. Behavioral equivalence was verified across a 200,000-string fuzz with zero differences.
+
 ## [3.15.0] - 2026-07-20
 
 ### Fixed

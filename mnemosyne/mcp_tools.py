@@ -332,7 +332,7 @@ def _handle_recall(arguments: Dict[str, Any]) -> Dict[str, Any]:
     top_k = int(arguments.get("limit", arguments.get("top_k", 5)))
     bank = _resolve_bank(arguments)
     temporal_weight = arguments.get("temporal_weight", 0.0)
-    query_time = arguments.get("query_time")
+    query_time = arguments.get("query_time") or None
     temporal_halflife = arguments.get("temporal_halflife", 24)
     vec_weight = arguments.get("vec_weight")
     fts_weight = arguments.get("fts_weight")
