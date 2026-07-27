@@ -65,6 +65,6 @@ def test_version_regex_preserves_public_extraction(tmp_path, text, expected_pair
         if expected_pair is None:
             assert not version_pairs
         else:
-            assert expected_pair in version_pairs
+            assert version_pairs == {expected_pair}
     finally:
         beam.conn.close()
