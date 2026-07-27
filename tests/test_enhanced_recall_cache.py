@@ -54,6 +54,137 @@ def _call(memory: BeamMemory, query: str = "private query", **kwargs):
     )
 
 
+def _close_memory(memory: BeamMemory | None) -> None:
+    if memory is None:
+        return
+    try:
+        cache = getattr(memory, "_query_cache", None)
+        if cache is not None:
+            cache.close()
+    finally:
+        memory.conn.close()
+
+
+def test_successful_invalidate_clears_persisted_enhanced_recall_cache(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    db_path = tmp_path / "memories.db"
+    memory = None
+    fresh = None
+    try:
+        memory = BeamMemory(session_id="session-a", db_path=db_path)
+        memory_id = memory.remember(
+            "issue 550 persistent cache invalidation sentinel",
+            source="test",
+            importance=1.0,
+        )
+        warm = _call(memory, "issue 550 persistent cache invalidation sentinel", top_k=3)
+        assert memory_id in {result["id"] for result in warm}
+        assert _call(memory, "issue 550 persistent cache invalidation sentinel", top_k=3) == warm
+        assert memory._query_cache is not None
+
+        cache_version = memory._query_cache.stats()["version"]
+        assert memory.invalidate("missing-memory") is False
+        assert memory._query_cache.stats()["version"] == cache_version
+
+        assert memory.invalidate(memory_id) is True
+        assert memory._query_cache.stats()["version"] == cache_version + 1
+        current = _call(memory, "issue 550 persistent cache invalidation sentinel", top_k=3)
+        assert memory_id not in {result["id"] for result in current}
+
+        fresh = BeamMemory(session_id="session-a", db_path=db_path)
+        reloaded = _call(fresh, "issue 550 persistent cache invalidation sentinel", top_k=3)
+        assert memory_id not in {result["id"] for result in reloaded}
+    finally:
+        try:
+            _close_memory(fresh)
+        finally:
+            _close_memory(memory)
+
+
+def test_invalidate_without_local_query_cache_clears_persisted_enhanced_recall_cache(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    db_path = tmp_path / "memories.db"
+    source = None
+    invalidator = None
+    fresh = None
+    try:
+        source = BeamMemory(session_id="session-a", db_path=db_path)
+        memory_id = source.remember(
+            "issue 554 cross-instance persistent cache invalidation sentinel",
+            source="test",
+            importance=1.0,
+        )
+        warm = _call(source, "issue 554 cross-instance persistent cache invalidation sentinel", top_k=3)
+        assert memory_id in {result["id"] for result in warm}
+        assert source._query_cache is not None
+
+        cache_db = db_path.parent / "query_cache.db"
+        assert cache_db.is_file()
+        invalidator = BeamMemory(session_id="session-a", db_path=db_path)
+        assert not hasattr(invalidator, "_query_cache")
+        assert invalidator.invalidate(memory_id) is True
+
+        fresh = BeamMemory(session_id="session-a", db_path=db_path)
+        reloaded = _call(fresh, "issue 554 cross-instance persistent cache invalidation sentinel", top_k=3)
+        assert memory_id not in {result["id"] for result in reloaded}
+    finally:
+        try:
+            _close_memory(fresh)
+        finally:
+            try:
+                _close_memory(invalidator)
+            finally:
+                _close_memory(source)
+
+
+def test_successful_invalidate_episodic_memory_invalidates_enhanced_recall_cache(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    memory = None
+    fresh = None
+    try:
+        memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+        episodic_id = memory.consolidate_to_episodic(
+            "issue 550 episodic cache invalidation sentinel",
+            source_wm_ids=[],
+            source="test",
+            importance=1.0,
+        )
+
+        warm = _call(memory, "issue 550 episodic cache invalidation sentinel", top_k=3)
+        episodic_result = next(result for result in warm if result["id"] == episodic_id)
+        assert episodic_result["tier"] == "episodic"
+        assert memory._query_cache is not None
+
+        cache_version = memory._query_cache.stats()["version"]
+        assert memory.invalidate(episodic_id) is True
+        assert memory._query_cache.stats()["version"] == cache_version + 1
+        fresh = BeamMemory(session_id="session-a", db_path=memory.db_path)
+        current = _call(fresh, "issue 550 episodic cache invalidation sentinel", top_k=3)
+        assert fresh._query_cache is not None
+        assert episodic_id not in {result["id"] for result in current}
+    finally:
+        try:
+            _close_memory(fresh)
+        finally:
+            _close_memory(memory)
+
+
 def test_v2_request_digest_is_opaque_persisted_and_exact_hits_once(enhanced):
     memory, calls = enhanced
 
