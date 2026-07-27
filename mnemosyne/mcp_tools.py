@@ -332,7 +332,13 @@ def _handle_recall(arguments: Dict[str, Any]) -> Dict[str, Any]:
     top_k = int(arguments.get("limit", arguments.get("top_k", 5)))
     bank = _resolve_bank(arguments)
     temporal_weight = arguments.get("temporal_weight", 0.0)
-    query_time = arguments.get("query_time") or None
+    query_time = arguments.get("query_time")
+    # "" (and whitespace) means "omitted" for callers built against the older
+    # schema (#555). Deliberately narrower than `or None`, which both misses
+    # whitespace-only strings (truthy) and swallows falsey non-strings such as
+    # 0/False/[] that must still reach _parse_query_time's TypeError.
+    if isinstance(query_time, str) and not query_time.strip():
+        query_time = None
     temporal_halflife = arguments.get("temporal_halflife", 24)
     vec_weight = arguments.get("vec_weight")
     fts_weight = arguments.get("fts_weight")
