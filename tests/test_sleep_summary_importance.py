@@ -99,3 +99,46 @@ class TestSleepSummaryImportance:
         importances = _summary_importances(temp_db)
         assert len(importances) == 1
         assert importances[0] == pytest.approx(0.75)
+
+    def test_malformed_importance_does_not_orphan_the_batch(self, temp_db):
+        """Legacy text / non-finite importance must not raise after the
+        claim commit (which would leave rows claimed with no summary).
+        Malformed values are skipped; valid peers still set the peak."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        # SQLite columns are dynamically typed: seed one text value, one
+        # +Inf, one NULL, and one valid 0.75 in the same batch.
+        _seed_old_wm(temp_db, "s1", [0.5])
+        conn = sqlite3.connect(str(temp_db))
+        ts = (datetime.now() - timedelta(hours=200)).isoformat()
+        conn.executemany(
+            "INSERT INTO working_memory "
+            "(id, content, source, timestamp, session_id, importance) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("bad-text", "legacy text importance", "conversation", ts, "s1", "high"),
+                ("bad-inf", "non-finite importance", "conversation", ts, "s1", float("inf")),
+                ("bad-null", "null importance", "conversation", ts, "s1", None),
+                ("good-075", "valid importance", "conversation", ts, "s1", 0.75),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        result = beam.sleep(dry_run=False)
+        assert result["status"] == "consolidated"
+
+        # The summary was written (no orphaned claim) and the valid 0.75
+        # peer set the peak; malformed values were ignored.
+        importances = _summary_importances(temp_db)
+        assert len(importances) == 1
+        assert importances[0] == pytest.approx(0.75)
+
+        # Every claimed row has a summary behind it: no row is left
+        # consolidated_at-marked in a batch that failed to summarize.
+        conn = sqlite3.connect(str(temp_db))
+        unclaimed = conn.execute(
+            "SELECT COUNT(*) FROM working_memory "
+            "WHERE session_id = 's1' AND consolidated_at IS NULL"
+        ).fetchone()[0]
+        conn.close()
+        assert unclaimed == 0

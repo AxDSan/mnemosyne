@@ -8462,10 +8462,18 @@ class BeamMemory:
                 # the recall blend. All-default batches (0.5 rows) keep
                 # the historical 0.6 exactly; the 0.85 cap keeps a summary
                 # from outranking the originals it summarizes.
-                peak_importance = max(
-                    (float(item.get("importance") or 0.0) for item in items),
-                    default=0.0,
-                )
+                # Legacy banks can hold non-numeric or non-finite
+                # importance (SQLite columns are dynamically typed) and
+                # this runs AFTER the claim commit, so a raise here would
+                # orphan the claimed rows. Skip malformed values instead.
+                peak_importance = 0.0
+                for item in items:
+                    try:
+                        candidate = float(item.get("importance") or 0.0)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(candidate) and candidate > peak_importance:
+                        peak_importance = candidate
                 self.consolidate_to_episodic(
                     summary=summary,
                     source_wm_ids=ids,
