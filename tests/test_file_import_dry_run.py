@@ -427,7 +427,7 @@ def test_mcp_file_import_dry_run_has_stable_output_and_no_mutation(tmp_path, mon
     second = mcp_tools._handle_import(arguments)
 
     assert first == second
-    assert first["status"] == "imported"
+    assert first["status"] == "dry_run"
     assert first["dry_run"] is True
     assert _table_snapshot(target.db_path) == before
 
@@ -491,7 +491,7 @@ def test_hermes_file_import_dry_run_preserves_data_and_audit_rows(
         {"input_path": str(export_path), "force": True, "dry_run": True}
     ))
 
-    assert dry_run_result["status"] == "imported"
+    assert dry_run_result["status"] == "dry_run"
     assert dry_run_result["dry_run"] is True
     assert calls == [(str(export_path), True, True)]
     assert _table_snapshot(db_path) == before

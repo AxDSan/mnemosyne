@@ -2462,7 +2462,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 "import", bank="private", source_tool="mnemosyne_import",
                 metadata={"input_path": input_path, "force": force, "stats": stats},
             )
-        return json.dumps({"status": "imported", "stats": stats, "dry_run": dry_run})
+        return json.dumps({"status": "dry_run" if dry_run else "imported", "stats": stats, "dry_run": dry_run})
 
     def _handle_diagnose(self, args: Dict[str, Any]) -> str:
         from mnemosyne.diagnose import run_diagnostics
