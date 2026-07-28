@@ -332,6 +332,21 @@ def test_runtime_diagnostics_marks_sqlite_vec_available_only_after_loading(monke
     )
 
 
+def test_runtime_diagnostics_reports_embedding_model_and_dim():
+    """The doctor surface reports the configured embedding model AND its
+    resolved dimension, so operators can verify MNEMOSYNE_EMBEDDING_DIM /
+    model-table resolution without inspecting a traceback."""
+    from mnemosyne import runtime_diagnostics
+
+    result = runtime_diagnostics.collect_runtime_diagnostics()
+    checks = {entry["check"]: entry for entry in result["checks"]}
+
+    assert checks["embeddings_model"]["status"] == "OK"
+    dim = checks["embeddings_dim"]
+    assert dim["status"] == "OK"
+    assert int(dim["detail"]) > 0
+
+
 @pytest.mark.parametrize(
     ("raw_python_path", "safe_python_executable"),
     [
