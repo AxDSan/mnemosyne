@@ -46,6 +46,8 @@ def register(ctx):
     """Bridge to hermes_memory_provider for memory provider discovery."""
     try:
         from .hermes_memory_provider import register_memory_provider
-    except ModuleNotFoundError:
-        return  # Bridge module not available — tools/hooks still load via hermes_plugin
+    except ModuleNotFoundError as exc:
+        if exc.name != f"{__package__}.hermes_memory_provider":
+            raise  # Transitive dependency missing inside the module — let it propagate
+        return  # Bridge module genuinely absent — tools/hooks still load via hermes_plugin
     register_memory_provider(ctx)
