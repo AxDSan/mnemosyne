@@ -33,3 +33,19 @@ try:
     __all__ = ["register", "__version__", "__author__"]
 except ImportError:
     __all__ = ["__version__", "__author__"]
+
+
+# ---- Memory Provider bridge ----
+# The Hermes memory provider discovery system (plugins/memory/__init__.py)
+# calls load_memory_provider("mnemosyne"), which looks for
+# register_memory_provider or MemoryProvider in this top-level __init__.py.
+# The actual MnemosyneMemoryProvider lives in hermes_memory_provider/__init__.py.
+# This bridge function delegates to it so the memory provider system can
+# discover and load the provider.
+def register(ctx):
+    """Bridge to hermes_memory_provider for memory provider discovery."""
+    try:
+        from .hermes_memory_provider import register_memory_provider
+        register_memory_provider(ctx)
+    except Exception:
+        pass  # Graceful degradation — tools/hooks still load via hermes_plugin
