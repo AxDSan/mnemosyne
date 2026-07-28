@@ -79,3 +79,27 @@ exclude = ["tests*", "benchmark*", "_benchmarks*", "scripts*", "docs*", "assets*
 
 [tool.setuptools.dynamic]
 version = {attr = "mnemosyne.__version__"}
+
+# ---------------------------------------------------------------------------
+# Ruff configuration (CI-enforced subset).
+#
+# Only a sliver of ruff's ruleset is enforced in CI today; the gating
+# rubric lives in `.github/workflows/ci.yml` so contributors can see at
+# a glance what blocks merge. This `[tool.ruff.lint]` section exists
+# for two reasons:
+#   (1) documents the rule families the project cares about
+#   (2) lets `ruff check` (run with no `--select`) match CI exactly,
+#       which makes `pre-commit` and editor integrations useful.
+#
+# If you add or remove rules here, mirror the change in ci.yml so the
+# two stay in sync.
+# ---------------------------------------------------------------------------
+[tool.ruff.lint]
+# Pyflakes (F): unused imports, undefined names, dead locals, etc.
+# We deliberately stay on the "F" + "RUF022" subset rather than turning
+# on a broader lint rubric — see `.github/workflows/ci.yml` for the
+# gating rubric and PR history for the discussion (PR #483 followup).
+select = [
+    "F",        # pyflakes (F401 unused imports, F841 dead locals, etc.)
+    "RUF022",   # `__all__` should be defined when a module re-exports symbols
+]  # superset of E9,F63,F7,F82; no need to enable them here
