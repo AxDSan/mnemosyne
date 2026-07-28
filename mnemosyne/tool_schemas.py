@@ -5,7 +5,9 @@ Import from this module rather than defining schemas inline:
     from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
 
 Every schema dict uses the key "parameters" (JSON Schema style).
-The MCP server layer renames it to "inputSchema" at registration time.
+The MCP server layer renames it to "input_schema" at registration time
+(matching the ``mcp`` SDK 2.x ``Tool.input_schema`` model field — was
+``inputSchema`` on the wire in SDK 1.x).
 """
 
 from typing import Dict, Any, List

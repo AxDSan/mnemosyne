@@ -90,26 +90,54 @@ def _resolve_sse_auth(host: str) -> Tuple[bool, Optional[str]]:
 # Server Setup
 # ---------------------------------------------------------------------------
 
+def _build_mcp_server() -> Server:
+    """Build an MCP ``Server`` instance wired to the mnemosyne tool handlers.
+
+    Returns a ``mcp.server.lowlevel.server.Server`` with ``on_list_tools`` and
+    ``on_call_tool`` callbacks installed. Used by both the stdio transport
+    (see ``_run_stdio``) and the SSE transport (see ``_build_sse_app``) so the
+    registration logic stays in one place.
+
+    Migrated from ``mcp`` SDK 1.x to 2.x: the 1.x ``@server.list_tools()`` and
+    ``@server.call_tool()`` decorators were removed in 2.0. The 2.x
+    ``mcp.server.lowlevel.server.Server`` accepts the same callbacks as
+    ``on_list_tools``/``on_call_tool`` keyword arguments on the constructor.
+
+    The ``on_call_tool`` signature also changed in 2.x: callbacks now receive
+    ``(ctx, params)`` where ``params`` is a ``CallToolRequestParams`` carrying
+    ``.name`` and ``.arguments``. The handler returns a ``CallToolResult``
+    instead of a raw list of ``TextContent``.
+    """
+    from mcp.types import CallToolResult, Tool
+
+    async def _on_list_tools(ctx, params):  # noqa: ARG001 — ctx/params unused
+        raw = get_tool_definitions()
+        # The dict from get_tool_definitions() uses ``inputSchema`` (the wire
+        # field name); ``mcp.types.Tool`` accepts it via Pydantic alias and
+        # normalizes to ``input_schema`` on the model. **t spreads both.
+        return [Tool(**t) for t in raw]
+
+    async def _on_call_tool(ctx, params):  # noqa: ARG001 — ctx unused
+        try:
+            result = handle_tool_call(params.name, params.arguments)
+            content = [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+        except Exception as e:
+            content = [TextContent(type="text", text=json.dumps({"status": "error", "message": str(e)}, indent=2))]
+        return CallToolResult(content=content)
+
+    return Server(
+        "mnemosyne",
+        on_list_tools=_on_list_tools,
+        on_call_tool=_on_call_tool,
+    )
+
+
 async def _run_stdio() -> None:
     """Run MCP server over stdio transport."""
     if not _MCP_AVAILABLE:
         raise RuntimeError("MCP not installed. Run: pip install mnemosyne-memory[mcp]")
 
-    server = Server("mnemosyne")
-
-    @server.list_tools()
-    async def list_tools():
-        from mcp.types import Tool
-        raw = get_tool_definitions()
-        return [Tool(**t) for t in raw]
-
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict) -> list:
-        try:
-            result = handle_tool_call(name, arguments)
-            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
-        except Exception as e:
-            return [TextContent(type="text", text=json.dumps({"status": "error", "message": str(e)}, indent=2))]
+    server = _build_mcp_server()
 
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
@@ -145,21 +173,7 @@ def _build_sse_app(host: str = "127.0.0.1"):
     # /messages/ and Starlette Mount path-prefix matching needs it to
     # agree. Route("/messages") would 404 on every client POST.
     transport = SseServerTransport("/messages/")
-    server = Server("mnemosyne")
-
-    @server.list_tools()
-    async def list_tools():
-        from mcp.types import Tool
-        raw = get_tool_definitions()
-        return [Tool(**t) for t in raw]
-
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict) -> list:
-        try:
-            result = handle_tool_call(name, arguments)
-            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
-        except Exception as e:
-            return [TextContent(type="text", text=json.dumps({"status": "error", "message": str(e)}, indent=2))]
+    server = _build_mcp_server()
 
     async def handle_sse(request):
         async with transport.connect_sse(request.scope, request.receive, request._send) as streams:

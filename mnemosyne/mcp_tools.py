@@ -69,8 +69,15 @@ def __getattr__(name: str) -> Any:
 TOOLS: List[Dict[str, Any]] = []
 for _s in ALL_TOOL_SCHEMAS:
     _t = dict(_s)
-    if "parameters" in _t:
-        _t["inputSchema"] = _t.pop("parameters")
+    # ``mcp`` SDK 2.x renamed the wire field on ``Tool`` from the camelCase
+    # ``inputSchema`` (1.x) to the snake_case ``input_schema``. The
+    # canonical Python-side key matches the model field. Pydantic still
+    # accepts the camelCase alias on construction, but internal code that
+    # reads ``tool["input_schema"]`` is the only fully-supported path.
+    if "inputSchema" in _t:
+        _t["input_schema"] = _t.pop("inputSchema")
+    elif "parameters" in _t:
+        _t["input_schema"] = _t.pop("parameters")
     TOOLS.append(_t)
 
 # ---------------------------------------------------------------------------
@@ -78,10 +85,10 @@ for _s in ALL_TOOL_SCHEMAS:
 # ---------------------------------------------------------------------------
 
 def _get_schema(name: str) -> Dict[str, Any]:
-    """Extract inputSchema from TOOLS by tool name."""
+    """Extract input_schema from TOOLS by tool name."""
     for tool in TOOLS:
         if tool["name"] == name:
-            return tool["inputSchema"]
+            return tool["input_schema"]
     raise KeyError(f"Tool not found: {name}")
 
 class _SchemaProxy:
@@ -1193,6 +1200,7 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
 # New typing-only implementation details deliberately stay private to stars.
 __all__ = [
     "ALL_TOOL_SCHEMAS",
+    "TOOLS",
     "Any",
     "BatchValidationError",
     "BeamMemory",
@@ -1202,7 +1210,6 @@ __all__ = [
     "List",
     "Mnemosyne",
     "Path",
-    "TOOLS",
     "TextContent",
     "Tool",
     "apply_beam_batch",

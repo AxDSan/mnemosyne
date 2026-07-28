@@ -61,8 +61,10 @@ class TestToolSchemas:
     def test_tool_schemas_are_valid_json(self):
         """Each tool schema must be valid JSON-serializable."""
         for tool in TOOLS:
-            # Schema must be serializable
-            dumped = json.dumps(tool["inputSchema"])
+            # Schema must be serializable. ``mcp`` SDK 2.x renamed the wire
+            # field to ``input_schema`` (was ``inputSchema`` in 1.x); the
+            # schema dict in ``TOOLS`` uses the new key.
+            dumped = json.dumps(tool["input_schema"])
             loaded = json.loads(dumped)
             assert loaded["type"] == "object"
             assert "properties" in loaded
@@ -70,7 +72,7 @@ class TestToolSchemas:
     def test_remember_schema_has_required_fields(self):
         """mnemosyne_remember requires 'content'."""
         remember_tool = next(t for t in TOOLS if t["name"] == "mnemosyne_remember")
-        schema = remember_tool["inputSchema"]
+        schema = remember_tool["input_schema"]
         assert "required" in schema
         assert "content" in schema["required"]
         assert "properties" in schema
@@ -85,7 +87,7 @@ class TestToolSchemas:
     def test_recall_schema_has_required_fields(self):
         """mnemosyne_recall requires 'query'."""
         recall_tool = next(t for t in TOOLS if t["name"] == "mnemosyne_recall")
-        schema = recall_tool["inputSchema"]
+        schema = recall_tool["input_schema"]
         assert "required" in schema
         assert "query" in schema["required"]
         assert "limit" in schema["properties"]
@@ -104,7 +106,7 @@ class TestToolSchemas:
 
     def test_batch_schema_has_operations(self):
         batch_tool = next(t for t in TOOLS if t["name"] == "mnemosyne_batch")
-        schema = batch_tool["inputSchema"]
+        schema = batch_tool["input_schema"]
         assert "operations" in schema["required"]
         assert schema["properties"]["operations"]["type"] == "array"
         assert schema["properties"]["operations"]["maxItems"] == 50
@@ -1004,11 +1006,14 @@ print(json.dumps({"result": result, "after": after}))
         assert "mnemosyne_remember" in names
 
     def test_tool_definitions_convertible_to_tool_pydantic(self):
-        """Tool dict definitions must be compatible with mcp SDK 1.x Tool Pydantic model.
+        """Tool dict definitions must be compatible with the ``mcp`` SDK 2.x Tool Pydantic model.
 
-        The SDK 1.x list_tools handler expects Tool() instances with typed fields.
-        If get_tool_definitions() returns dicts with unexpected keys or missing
-        required fields, Tool(**t) will raise a ValidationError.
+        The SDK 2.x ``Tool`` model exposes ``input_schema`` (snake_case) as
+        its canonical Python field; ``inputSchema`` is still accepted as a
+        Pydantic alias on construction. This test asserts both paths:
+        (a) ``Tool(**t)`` constructs without raising; (b) the constructed
+        ``Tool`` carries the same schema as the source dict regardless of
+        which key the dict used.
         """
         try:
             from mcp.types import Tool
@@ -1021,7 +1026,10 @@ print(json.dumps({"result": result, "after": after}))
             assert isinstance(tool, Tool)
             assert tool.name == t["name"]
             assert tool.description == t.get("description")
-            assert tool.inputSchema == t["inputSchema"]
+            # Pydantic normalizes both ``inputSchema`` (1.x alias) and
+            # ``input_schema`` (2.x canonical) to ``tool.input_schema``.
+            expected = t.get("input_schema", t.get("inputSchema"))
+            assert tool.input_schema == expected
 
     def test_top_level_cli_forwards_mcp_arguments(self, tmp_path):
         """`mnemosyne mcp ...` must pass subcommand args to the MCP parser."""
