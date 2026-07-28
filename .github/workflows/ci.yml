@@ -103,10 +103,19 @@ jobs:
           # NUL-delimited so paths with spaces / newlines survive.
           # No `|| true` — if the diff walker itself breaks, the step
           # should fail loudly rather than silently skipping lint.
-          mapfile -d '' -t CHANGED < <(
-            git diff --name-only --diff-filter=ACMRT -z \
-              "${BASE_REF}...HEAD" -- '*.py'
-          )
+          #
+          # Why a temp file instead of a process substitution feeding
+          # `mapfile`: mapfile reports the exit code of the array
+          # *assignment*, not the substituted command, so a failing
+          # `git diff` would leave `CHANGED` empty and exit 0 — silently
+          # bypassing the PR lint gate. Writing to a file first lets
+          # `set -e` observe and propagate the failure (the script
+          # aborts before `mapfile` runs).
+          changed_files="$(mktemp)"
+          trap 'rm -f "${changed_files}"' EXIT
+          git diff --name-only --diff-filter=ACMRT -z \
+            "${BASE_REF}...HEAD" -- '*.py' > "${changed_files}"
+          mapfile -d '' -t CHANGED < "${changed_files}"
           if [ "${#CHANGED[@]}" -eq 0 ]; then
             echo "No Python files changed — skipping F-rules sweep."
             exit 0
