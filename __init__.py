@@ -46,6 +46,6 @@ def register(ctx):
     """Bridge to hermes_memory_provider for memory provider discovery."""
     try:
         from .hermes_memory_provider import register_memory_provider
-        register_memory_provider(ctx)
-    except Exception:
-        pass  # Graceful degradation — tools/hooks still load via hermes_plugin
+    except ImportError:
+        return  # Bridge module not available — tools/hooks still load via hermes_plugin
+    register_memory_provider(ctx)
