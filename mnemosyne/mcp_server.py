@@ -108,22 +108,29 @@ def _build_mcp_server() -> Server:
     ``.name`` and ``.arguments``. The handler returns a ``CallToolResult``
     instead of a raw list of ``TextContent``.
     """
-    from mcp.types import CallToolResult, Tool
+    from mcp.types import CallToolResult, ListToolsResult, Tool
 
     async def _on_list_tools(ctx, params):  # noqa: ARG001 — ctx/params unused
         raw = get_tool_definitions()
         # The dict from get_tool_definitions() uses ``inputSchema`` (the wire
         # field name); ``mcp.types.Tool`` accepts it via Pydantic alias and
         # normalizes to ``input_schema`` on the model. **t spreads both.
-        return [Tool(**t) for t in raw]
+        # SDK 2.x contract: the callback must return a ListToolsResult
+        # wrapper, not a bare list of Tool objects.
+        return ListToolsResult(tools=[Tool(**t) for t in raw])
 
     async def _on_call_tool(ctx, params):  # noqa: ARG001 — ctx unused
         try:
             result = handle_tool_call(params.name, params.arguments)
             content = [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+            return CallToolResult(content=content)
         except Exception as e:
+            # SDK 2.x contract: return a CallToolResult with is_error=True so
+            # clients can distinguish implementation failures from successful
+            # calls. Preserves the existing error payload shape for backward
+            # compatibility with any caller already parsing the error content.
             content = [TextContent(type="text", text=json.dumps({"status": "error", "message": str(e)}, indent=2))]
-        return CallToolResult(content=content)
+            return CallToolResult(content=content, is_error=True)
 
     return Server(
         "mnemosyne",

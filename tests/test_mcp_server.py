@@ -1031,6 +1031,115 @@ print(json.dumps({"result": result, "after": after}))
             expected = t.get("input_schema", t.get("inputSchema"))
             assert tool.input_schema == expected
 
+    def test_build_mcp_server_list_tools_returns_listtoolsresult(self):
+        """SDK 2.x contract: the tools/list callback must return a ListToolsResult.
+
+        Regression test for the CodeRabbit finding on PR #571 (round 2):
+        ``_on_list_tools`` must wrap the Tool list in ``ListToolsResult(tools=...)``
+        rather than returning a bare list. The SDK 2.x low-level server expects
+        a ``ListToolsResult`` object — a bare list breaks the ``tools/list``
+        response contract for both stdio and SSE transports.
+        """
+        try:
+            from mcp.types import ListToolsResult, Tool
+            from mnemosyne.mcp_server import _build_mcp_server
+        except ImportError:
+            pytest.skip("mcp SDK not installed")
+
+        server = _build_mcp_server()
+        # SDK 2.x exposes handlers via get_request_handler("tools/list"|"tools/call").
+        # The returned HandlerEntry carries the actual async callable in .handler.
+        entry = server.get_request_handler("tools/list") if hasattr(server, "get_request_handler") else None
+        if entry is None or not hasattr(entry, "handler"):
+            pytest.skip("mcp SDK 2.x handler introspection not available")
+        on_list_tools = entry.handler
+
+        import asyncio
+        result = asyncio.get_event_loop().run_until_complete(
+            on_list_tools(ctx=None, params=None)
+        )
+        assert isinstance(result, ListToolsResult), (
+            f"tools/list callback must return ListToolsResult, got {type(result).__name__}"
+        )
+        assert isinstance(result.tools, list)
+        assert all(isinstance(t, Tool) for t in result.tools)
+        assert len(result.tools) >= 25  # matches test_all_tools_present
+
+    def test_build_mcp_server_call_tool_returns_is_error_on_failure(self):
+        """SDK 2.x contract: tools/call must return CallToolResult with is_error=True on failure.
+
+        Regression test for the CodeRabbit finding on PR #571 (round 2):
+        the ``_on_call_tool`` exception path must set ``is_error=True`` so MCP
+        clients can distinguish implementation failures from successful calls.
+        Preserves the existing error payload shape for backward compatibility.
+        """
+        try:
+            from mcp.types import CallToolResult
+            from mnemosyne.mcp_server import _build_mcp_server
+        except ImportError:
+            pytest.skip("mcp SDK not installed")
+
+        server = _build_mcp_server()
+        entry = server.get_request_handler("tools/call") if hasattr(server, "get_request_handler") else None
+        if entry is None or not hasattr(entry, "handler"):
+            pytest.skip("mcp SDK 2.x handler introspection not available")
+        on_call_tool = entry.handler
+
+        # Construct a params-shaped object with empty name → handle_tool_call
+        # raises before returning a valid result. This is the path that was
+        # previously returning a successful-looking CallToolResult with error
+        # content instead of a flagged failure.
+        class _Params:
+            name = ""
+            arguments = {}
+
+        import asyncio
+        result = asyncio.get_event_loop().run_until_complete(
+            on_call_tool(ctx=None, params=_Params())
+        )
+        assert isinstance(result, CallToolResult)
+        assert result.is_error is True, (
+            "tools/call failure path must set is_error=True for SDK 2.x contract"
+        )
+        # Error payload preserved for backward compatibility
+        import json as _json
+        assert len(result.content) >= 1
+        payload = _json.loads(result.content[0].text)
+        assert payload.get("status") == "error"
+
+    def test_build_mcp_server_call_tool_success_returns_is_error_false(self):
+        """SDK 2.x contract: successful tools/call must return is_error=False (or unset)."""
+        try:
+            from mcp.types import CallToolResult
+            from mnemosyne.mcp_server import _build_mcp_server
+        except ImportError:
+            pytest.skip("mcp SDK not installed")
+
+        server = _build_mcp_server()
+        entry = server.get_request_handler("tools/call") if hasattr(server, "get_request_handler") else None
+        if entry is None or not hasattr(entry, "handler"):
+            pytest.skip("mcp SDK 2.x handler introspection not available")
+        on_call_tool = entry.handler
+
+        # Use a real tool definition and call it through the path. We mock
+        # handle_tool_call to return a minimal valid result so we don't need
+        # the full DB-backed stack here.
+        import asyncio
+        from unittest.mock import patch
+
+        class _Params:
+            name = "mnemosyne_stats"
+            arguments = {}
+
+        with patch("mnemosyne.mcp_server.handle_tool_call", return_value={"status": "ok"}):
+            result = asyncio.get_event_loop().run_until_complete(
+                on_call_tool(ctx=None, params=_Params())
+            )
+        assert isinstance(result, CallToolResult)
+        assert not result.is_error, (
+            "successful tools/call must have is_error=False (or None)"
+        )
+
     def test_top_level_cli_forwards_mcp_arguments(self, tmp_path):
         """`mnemosyne mcp ...` must pass subcommand args to the MCP parser."""
         env = os.environ.copy()
