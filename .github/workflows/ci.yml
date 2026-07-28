@@ -35,7 +35,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad1d0ea2ff160c0a8b6ee1bf
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           # Fetch enough history for `git diff origin/main...HEAD` to
           # work on PR builds. Default depth=1 breaks this — `Actions
@@ -87,19 +87,35 @@ jobs:
       # ------------------------------------------------------------------
       - name: Check F-rules on changed files (PRs only)
         if: github.event_name == 'pull_request'
+        env:
+          # Pin the PR base ref from the workflow event into the shell
+          # environment so we don't have to splice it through ${{ }}
+          # inside the bash script (which interacts poorly with quoting
+          # and would let a hostile base.ref break out of the string).
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           set -euo pipefail
-          BASE_REF="origin/${{ github.event.pull_request.base.ref }}"
-          git fetch --depth=1 origin "${{ github.event.pull_request.base.ref }}"
-          CHANGED=$(git diff --name-only --diff-filter=ACMRT "${BASE_REF}...HEAD" -- '*.py' || true)
-          if [ -z "${CHANGED}" ]; then
+          # Fetch the base branch explicitly (shallow — we only need
+          # the diff walker) and resolve BASE_REF after the fetch so
+          # `origin/${PR_BASE_REF}` exists locally.
+          git fetch --depth=1 origin "${PR_BASE_REF}"
+          BASE_REF="origin/${PR_BASE_REF}"
+          # NUL-delimited so paths with spaces / newlines survive.
+          # No `|| true` — if the diff walker itself breaks, the step
+          # should fail loudly rather than silently skipping lint.
+          mapfile -d '' -t CHANGED < <(
+            git diff --name-only --diff-filter=ACMRT -z \
+              "${BASE_REF}...HEAD" -- '*.py'
+          )
+          if [ "${#CHANGED[@]}" -eq 0 ]; then
             echo "No Python files changed — skipping F-rules sweep."
             exit 0
           fi
           echo "Python files changed on this PR:"
-          printf '  - %s\n' ${CHANGED}
-          # shellcheck disable=SC2086
-          ruff check --select F,RUF022 ${CHANGED}
+          printf '  - %s\n' "${CHANGED[@]}"
+          # `--` so a path like `--something.py` is treated as a
+          # positional argument rather than a ruff option.
+          ruff check --select F,RUF022 -- "${CHANGED[@]}"
 
   test:
     runs-on: ubuntu-latest
