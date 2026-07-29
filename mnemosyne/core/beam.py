@@ -207,6 +207,10 @@ except Exception:
 import os
 import re
 
+_VERSION_STRING_RE = re.compile(
+    r'([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)\s+v?(\d+\.\d+(?:\.\d+)?)'
+)
+
 # On Fly.io and other ephemeral VMs, only ~/.hermes is persisted.
 # Default to the legacy Hermes path so memories survive restarts.
 _DEFAULT_ROOT = Path(
@@ -1454,12 +1458,19 @@ def _recency_decay(timestamp_str: str, halflife_hours: float = RECENCY_HALFLIFE_
 def _parse_query_time(query_time: Optional[Union[str, datetime]]) -> datetime:
     """Parse query_time parameter into a timezone-aware UTC datetime object.
 
-    - None -> current UTC time
+    - None (or a blank/whitespace-only string) -> current UTC time
     - str  -> parsed from ISO format and normalized to UTC
     - datetime -> normalized to UTC
     Naive values are treated as UTC for backward compatibility.
+
+    A blank string is treated as "unset" for compatibility with callers that
+    send ``""`` to mean "omitted" — notably MCP harnesses built against the
+    older ``mnemosyne_recall`` schema, which declared ``query_time`` with
+    ``"default": ""`` (see #555). Non-string falsey values are still rejected.
     """
     if query_time is None:
+        return datetime.now(timezone.utc)
+    if isinstance(query_time, str) and not query_time.strip():
         return datetime.now(timezone.utc)
     if isinstance(query_time, datetime):
         return _normalize_datetime_utc(query_time)
@@ -3979,6 +3990,25 @@ class BeamMemory:
                 )
         return rows
 
+    def _invalidate_query_cache(self) -> None:
+        """Clear the existing enhanced-recall cache without creating an empty one."""
+        cache = getattr(self, "_query_cache", None)
+        if cache is not None:
+            cache.invalidate()
+            return
+        if QueryCache is None:
+            return
+
+        cache_db = self.db_path.parent / "query_cache.db"
+        if not cache_db.exists():
+            return
+
+        cache = QueryCache(db_path=cache_db)
+        try:
+            cache.invalidate()
+        finally:
+            cache.close()
+
     def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
         """
         Mark a memory as invalid/superseded.
@@ -3995,6 +4025,7 @@ class BeamMemory:
         """, (now, replacement_id, memory_id, self.session_id))
         if cursor.rowcount > 0:
             self.conn.commit()
+            self._invalidate_query_cache()
             return True
         # Try episodic_memory
         cursor.execute("""
@@ -4002,8 +4033,11 @@ class BeamMemory:
             SET valid_until = ?, superseded_by = ?
             WHERE id = ? AND (session_id = ? OR scope = 'global')
         """, (now, replacement_id, memory_id, self.session_id))
+        invalidated = cursor.rowcount > 0
         self.conn.commit()
-        return cursor.rowcount > 0
+        if invalidated:
+            self._invalidate_query_cache()
+        return invalidated
 
     def _detect_conflicts(self, rows: List[Dict], similarity_threshold: float = 0.88) -> List[tuple]:
         """
@@ -4518,7 +4552,7 @@ class BeamMemory:
             'sequence': r'((?:first|second|third|fourth|fifth|finally|next|then|after that)[^.,;!?\n]{15,120})',
             'instruction_false_positives': ['i think you should leave', 'should behave', 'their work style'],
             'instruction_imperative': 'always|never|remember|use|keep|avoid|ensure|check|verify|run|test|build|deploy|push|pull|merge|commit|close|open|update|install|configure|set|enable|disable|add|remove|create|delete|start|stop|restart|reload|reset|try|implement|write|read|switch|move|copy|rename|send|reply|respond',
-            'instruction': r'(?:always|never|must|must not|should(?: not)?(?=\s+(?:you|we|i|one)\s+(?:IMPVERBS))|need(?:s)? to(?: not)?|required to|prefer(?: not)? to|want to(?: avoid| ensure| use| keep))\s+([^.,;!?\n]{10,200})',
+            'instruction': r'\b(?:always|never|must|must not|should(?: not)?(?=\s+(?:you|we|i|one)\s+(?:IMPVERBS))|need(?:s)? to(?: not)?|required to|prefer(?: not)? to|want to(?: avoid| ensure| use| keep))\s+([^.,;!?\n]{10,200})',
             'preference': r'(?:'
                 # First person (original) and second person
                 r'(?:I|You|you|YOU)(?: |\')?(?:like|love|prefer|hate|dislike|enjoy|use|stick with|switched to|moved to|changed to|want|need|tend to|usually|would rather|don\'t like|don\'t want|not a fan of|am okay with|am comfortable with|am used to|am happy with|am tired of|am sick of|prefer not to|try to avoid|find it easier to|find it better to|find it useful to)'
@@ -4547,7 +4581,7 @@ class BeamMemory:
                 'sollte sich',
             ],
             'instruction_imperative': 'immer|nie|niemals|merke|denk|verwende|nutze|behalte|vermeide|stelle sicher|prüfe|überprüfe|teste|baue|implementiere|schreibe|lösche|installiere|konfiguriere|aktualisiere|erstelle|entferne|starte|stoppe|setze|aktiviere|deaktiviere|füge hinzu|benenne um|sende|antworte',
-            'instruction': r'(?:immer|nie|niemals|muss|darf nicht|sollte(?: nicht)?(?=\s+(?:du|wir|ich|man|ihr)\s+(?:IMPVERBS))|braucht|benötigt|möchte(?: vermeiden|sicherstellen|nutzen|behalten)|will(?: nicht)?)\s+([^.,;!?\n]{10,200})',
+            'instruction': r'\b(?:immer|nie|niemals|muss|darf nicht|sollte(?: nicht)?(?=\s+(?:du|wir|ich|man|ihr)\s+(?:IMPVERBS))|braucht|benötigt|möchte(?: vermeiden|sicherstellen|nutzen|behalten)|will(?: nicht)?)\s+([^.,;!?\n]{10,200})',
             'preference': r'(?:Ich(?: |\')?(?:mag|liebe|bevorzuge|hasse|mag nicht|nutze|verwende|benutze|bin bei geblieben|habe gewechselt zu|bin umgestiegen auf|bin umgestellt auf|will|möchte|brauche|tendiere zu|normalerweise|würde lieber|finde es einfacher|finde es besser|finde es nützlich|bin zufrieden mit|bin okay mit|bin es leid|versuche zu vermeiden))\s+([^.,;!?\n]{10,200})',
             'event_keywords': ['treffen', 'meeting', 'termin', 'anruf', 'geplant', 'passiert', 'stattgefunden', 'fällig', 'release', 'deadline', 'veröffentlicht', 'deployed', 'gestartet', 'begonnen', 'beendet', 'abgeschlossen', 'konferenz', 'workshop', 'termin'],
             'named_months': r'((?:Januar|Februar|März|April|Mai|Juni|Juli|August|September|Oktober|November|Dezember|Jan|Feb|Mär|Apr|Mai|Jun|Jul|Aug|Sep|Okt|Nov|Dez)\s+\d{1,2}(?:\.)?\s*(?:\d{4})?)',
@@ -4562,7 +4596,7 @@ class BeamMemory:
             'preference': r'(?:(?:Я(?: |\')?(?:люблю|ненавижу|предпочитаю|терпеть не могу|не люблю|не нравится|использую|пользуюсь|остаюсь на|перешёл на|переключился на|хочу|нуждаюсь|обычно|скорее|предпочитаю не|стараюсь избегать|привык|надоело|устал от|доволен|устраивает))|мне\s+(?:нравится|не нравится|проще|удобнее|лень|надоело)|терпеть не могу|надоело|привык|устраивает)\s+([^.,;!?\n]{3,200})',
             'event_keywords': ['встреча', 'созвон', 'запланировано', 'состоялось', 'произошло', 'планирую', 'будет', 'дедлайн', 'релиз', 'запуск', 'деплой', 'опубликовано', 'начал', 'начался', 'закончил', 'завершил', 'событие', 'конференция', 'воркшоп', 'встреча'],
             'named_months': r'((?:(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря|янв|фев|мар|апр|май|июн|июл|авг|сен|окт|ноя|дек)\s+\d{1,2}(?:-го)?,?\s*(?:\d{4})?)|(?:\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)(?:\s+\d{4})?))',
-            'instruction': r'(?:всегда|никогда|должен|не должен|нужно|не нужно|обязательно|нельзя|не забывай|запомни|помни|следует|стоит)\\s+([^.,;!?\\n]{6,200})',
+            'instruction': r'\b(?:всегда|никогда|должен|не должен|нужно|не нужно|обязательно|нельзя|не забывай|запомни|помни|следует|стоит)\\s+([^.,;!?\\n]{6,200})',
         },
         'it': {
             'negation': r"((?:Non(?: |')?(?:ho|ho mai|mai|non)\s+[^.,;!?\n]{15,120}))",
@@ -4579,7 +4613,7 @@ class BeamMemory:
                 'dovrebbe bastare',
             ],
             'instruction_imperative': 'sempre|mai|ricorda|usa|tieni|evita|assicurati|controlla|verifica|esegui|testa|costruisci|distribuisci|fai push|fai pull|fai merge|chiudi|apri|aggiorna|installa|configura|imposta|abilita|disabilita|aggiungi|rimuovi|crea|elimina|avvia|ferma|riavvia|resetta|prova|implementa|scrivi|leggi|passa|sposta|copia|rinomina|invia|rispondi',
-            'instruction': r'(?:sempre|mai|non deve|non devono|dovrebbe(?: non)?(?=\s+(?:tu|voi|noi|io|si)\s+(?:IMPVERBS))|ha bisogno di|deve|devono|preferisci(?: non)?|vuole(?: evitare|assicurarsi|usare|tenere))\s+([^.,;!?\n]{10,200})',
+            'instruction': r'\b(?:sempre|mai|non deve|non devono|dovrebbe(?: non)?(?=\s+(?:tu|voi|noi|io|si)\s+(?:IMPVERBS))|ha bisogno di|deve|devono|preferisci(?: non)?|vuole(?: evitare|assicurarsi|usare|tenere))\s+([^.,;!?\n]{10,200})',
             'preference': r"(?:Io(?: |')?(?:mi piace|amo|preferisco|odio|non mi piace|uso|utilizzo|sono passato a|ho cambiato a|voglio|ho bisogno|tendo a|di solito|preferirei|non mi piace per niente|non voglio|non sono un fan di|mi va bene|mi trovo bene|sono abituato a|sono felice con|sono stanco di|cerco di evitare|trovo piu facile|trovo meglio|trovo utile))\s+([^.,;!?\n]{10,200})",
             'event_keywords': ['riunione', 'chiamata', 'incontro', 'programmato', 'successo', 'accaduto', 'pianifico', 'sara il', 'scadenza', 'rilascio', 'lancio', 'pubblicato', 'iniziato', 'cominciato', 'finito', 'completato', 'evento', 'conferenza', 'workshop', 'appuntamento'],
             'named_months': r'((?:(?:Gennaio|Febbraio|Marzo|Aprile|Maggio|Giugno|Luglio|Agosto|Settembre|Ottobre|Novembre|Dicembre|gen|feb|mar|apr|mag|giu|lug|ago|set|ott|nov|dic)\s+\d{1,2}(?:°)?,?\s*(?:\d{4})?))',
@@ -4617,7 +4651,7 @@ class BeamMemory:
                 'nunca lo he', 'nunca lo había', 'nunca había',
             ],
             'instruction_imperative': 'siempre|nunca|recuerda|recordad|recuerde|recuerden|haz|haced|haga|hagan|usa|usad|use|usen|mantén|mantened|mantenga|mantengan|evita|evitad|evite|eviten|asegúrate|aseguraos|asegúrese|asegúrense|asegurate|aseguraos|asegurese|asegurense|verifica|verificad|verifique|verifiquen|comprueba|comprobad|compruebe|comprueben|revisa|revisad|revise|revisen|ejecuta|ejecutad|ejecute|ejecuten|prueba|probad|pruebe|prueben|pon|poned|ponga|pongan|configura|configurad|configure|configuren|instala|instalad|instale|instalen|actualiza|actualizad|actualice|actualicen|borra|borrad|borre|borren|guarda|guardad|guarde|guarden|busca|buscad|busque|busquen|despliega|desplegad|despliegue|desplieguen|crea|cread|cree|creen|memoriza|memorizad|memorice|memoricen|graba|grabad|grabe|graben|añade|añadid|añada|añadan|anade|anadid|anada|anadan|cambia|cambiad|cambie|cambien|arregla|arreglad|arregle|arreglen|sube|subid|suba|suban|baja|bajad|baje|bajen|carga|cargad|cargue|carguen|descarga|descargad|descargue|descarguen|comprime|comprimid|comprima|compriman|descomprime|descomprimid|descomprima|descompriman|copia|copiad|copie|copien|mueve|moved|mueva|muevan',
-            'instruction': r'(?:siempre|nunca|hay\s+que|deb(?:es|éis|e|en|o|emos|éis|en)\s+|tienes\s+que|tenéis\s+que|tiene\s+que|tienen\s+que|es\s+necesario|es\s+importante|es\s+mejor|es\s+aconsejable|asegúrate\s+de|asegurate\s+de|record(?:ad|a|e|en)\s+|no\s+olvid(?:es|éis|e|en|ad)\s+)([^.,;!?¿¡\\n]{10,200})',
+            'instruction': r'\b(?:siempre|nunca|hay\s+que|deb(?:es|éis|e|en|o|emos|éis|en)\s+|tienes\s+que|tenéis\s+que|tiene\s+que|tienen\s+que|es\s+necesario|es\s+importante|es\s+mejor|es\s+aconsejable|asegúrate\s+de|asegurate\s+de|record(?:ad|a|e|en)\s+|no\s+olvid(?:es|éis|e|en|ad)\s+)([^.,;!?¿¡\\n]{10,200})',
             'preference': r'(?:(?:yo|a mí|a mi)\s+)?(?:me\s+(?:gusta|encanta|mola|flipa|chifla|va\s+bien|resulta\s+(?:cómodo|comodo|útil|util|fácil|facil|mejor))|no\s+me\s+(?:gusta|mola|interesa|va|conviene)|prefiero|preferiría|preferiria|odian?|odio|detesto|no\s+soporto|me\s+molesta|me\s+duele|no\s+quiero|paso\s+de|estoy\s+(?:harto|cansado)\s+de|estoy\s+acostumbrado\s+a|suelo\s+usar|suelo\s+trabajar|me\s+siento\s+cómodo|comodo\s+con|no\s+soy\s+fan\s+de|he\s+(?:empezado|dejado|comenzado|terminado)\s+(?:a|de)|dejé|deje|descarte|descarté|eliminé|elimine|cambié|cambie|me\s+quedo\s+con|me\s+decanto\s+por|disfruto|me\s+hace\s+feliz|estoy\s+(?:a\s+gusto|probando))\s+([^.,;!?¿¡\\n]{10,200})',
             'event_keywords': [
                 'reunión', 'reunion', 'llamada', 'cita', 'meeting', 'daily',
@@ -4748,7 +4782,7 @@ class BeamMemory:
 
         # Version strings — two patterns:
         # Pattern A: "PostgreSQL v14.2", "Docker 27.1.1" (name directly before version)
-        for m in _re.finditer(r'([A-Z][a-zA-Z]+(?:\s*[A-Z][a-zA-Z]+)*)\s+v?(\d+\.\d+(?:\.\d+)?)', content):
+        for m in _VERSION_STRING_RE.finditer(content):
             name = m.group(1).strip()
             ver = m.group(2)
             key = f"{name.lower().replace(' ', '_')}_version"
