@@ -132,6 +132,9 @@ finally:
 
     env_dir = tmp_path / "env"
     env_dir.mkdir()
+    # An existing non-weight config prevents auto-seeding from copying the
+    # environment into YAML, so these values must come from env fallback.
+    (env_dir / "config.yaml").write_text("cross_session: false\n")
     env_result = _run(
         script,
         env={

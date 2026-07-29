@@ -6827,7 +6827,7 @@ class BeamMemory:
                 recall_kwargs.get("fts_weight"),
                 recall_kwargs.get("importance_weight"),
             )
-            resolved_weights = _normalize_weights(*raw_weights)
+            resolved_weights = _resolve_recall_weights(*raw_weights).as_tuple()
             if (all(weight is None for weight in raw_weights)
                     and os.environ.get("MNEMOSYNE_QUERY_INTENT", "0") == "1"
                     and classify_intent is not None and adjust_weights is not None):

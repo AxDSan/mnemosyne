@@ -326,6 +326,47 @@ def test_pipeline_flags_and_process_ranking_configuration_change_digest(enhanced
     assert memory._enhanced_recall_cache_key(**common) != baseline
 
 
+def test_private_enhanced_cache_key_weight_fallback_honors_yaml_over_env(
+    enhanced, monkeypatch, tmp_path: Path
+):
+    """Private cache-key fallback uses the same YAML-resolved weights as scoring."""
+    memory, _ = enhanced
+    data_dir = tmp_path / "config"
+    data_dir.mkdir()
+    (data_dir / "config.yaml").write_text(
+        "vec_weight: 0\nfts_weight: 1\nimportance_weight: 0\n"
+    )
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("MNEMOSYNE_VEC_WEIGHT", "1")
+    monkeypatch.setenv("MNEMOSYNE_FTS_WEIGHT", "0")
+    monkeypatch.setenv("MNEMOSYNE_IMPORTANCE_WEIGHT", "1")
+    MnemosyneConfig.reset_instance()
+    common = dict(
+        original_query="private query",
+        expanded_query="private query",
+        top_k=3,
+        runtime=SimpleNamespace(cross_session=False),
+        use_weibull=False,
+        use_mmr=False,
+        use_intent=False,
+        use_synonyms=False,
+        use_associative=False,
+        associative_depth=1,
+        mmr_lambda=0.7,
+        recall_kwargs={},
+    )
+    try:
+        expected_weights = beam_module._resolve_recall_weights(None, None, None).as_tuple()
+        assert expected_weights == (0.0, 1.0, 0.0)
+
+        fallback_key = memory._enhanced_recall_cache_key(**common)
+        expected_key = memory._enhanced_recall_cache_key(**common, weights=expected_weights)
+
+        assert fallback_key == expected_key
+    finally:
+        MnemosyneConfig.reset_instance()
+
+
 def test_enhanced_recall_reloaded_weight_snapshot_misses_cache_and_changes_key(
     enhanced, monkeypatch, tmp_path: Path
 ):
