@@ -9,6 +9,7 @@ store proposals or apply them.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
@@ -76,6 +77,25 @@ def _coerce_evidence_ids(value: Any) -> List[str]:
     return ids
 
 
+def coerce_confidence(value: Any, default: float) -> float:
+    """Return value as a finite float, or default.
+
+    Confidence reaches this module from two unhardened directions: LLM
+    JSON (json.loads round-trips NaN and Infinity, so a model can emit
+    them as literals) and persisted metadata_json on legacy banks (any
+    JSON type, including strings). Non-numeric and non-finite values
+    degrade to the caller's default instead of raising. NaN in
+    particular must never survive as a float: it compares False against
+    every threshold, so downstream gates of the form
+    ``confidence < minimum`` silently pass it.
+    """
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) else default
+
+
 def parse_model_update_proposals(
     raw: str,
     *,
@@ -104,10 +124,7 @@ def parse_model_update_proposals(
             continue
         if category not in allowed:
             continue
-        try:
-            confidence = float(item.get("confidence", 0.0))
-        except (TypeError, ValueError):
-            confidence = 0.0
+        confidence = coerce_confidence(item.get("confidence", 0.0), 0.0)
         if confidence <= 0.0:
             continue
         confidence = max(0.0, min(1.0, confidence))
@@ -367,7 +384,7 @@ def apply_model_refresh_proposal(
         metadata["name"],
         metadata["body"],
         source="sleep_model_refresh",
-        confidence=float(metadata.get("confidence") or 0.5),
+        confidence=coerce_confidence(metadata.get("confidence"), 0.5),
     )
     metadata["status"] = "applied"
     metadata["applied_by"] = validator or "system"
@@ -426,10 +443,7 @@ def maybe_auto_apply_model_refresh_proposal(
             validator="sleep_model_refresh_auto_validation",
         )
         return False
-    try:
-        confidence = float(metadata.get("confidence") or 0.0)
-    except (TypeError, ValueError):
-        confidence = 0.0
+    confidence = coerce_confidence(metadata.get("confidence"), 0.0)
 
     evidence_ids = [str(x) for x in (metadata.get("evidence_ids") or []) if str(x).strip()]
     source_wm_ids = {str(x) for x in (metadata.get("source_wm_ids") or []) if str(x).strip()}
