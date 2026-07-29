@@ -26,7 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 def _make_mock_hermes_plugin(tmpdir: Path) -> Path:
     """Create a mock hermes_plugin package."""
     pkg = tmpdir / "hermes_plugin"
-    pkg.mkdir()
+    pkg.mkdir(parents=True)
     (pkg / "__init__.py").write_text(
         textwrap.dedent("""\
             def register(ctx):
@@ -47,11 +47,11 @@ def test_hermes_plugin_register_not_shadowed():
         plugin_package = plugin_parent / "mnemosyne"
         plugin_package.symlink_to(REPO_ROOT, target_is_directory=True)
 
-        script = textwrap.dedent(f"""\
+        script = textwrap.dedent("""\
             import sys
-            sys.path.insert(0, {str(mock_root)!r})
-            sys.path.insert(0, {str(plugin_parent)!r})
-            blocked = {{{str(REPO_ROOT)!r}, {str(REPO_ROOT.parent)!r}}}
+            sys.path.insert(0, {mock_root!r})
+            sys.path.insert(0, {plugin_parent!r})
+            blocked = {{{repo_root!r}, {repo_parent!r}}}
             sys.path = [p for p in sys.path if p not in blocked]
 
             import mnemosyne
@@ -62,8 +62,8 @@ def test_hermes_plugin_register_not_shadowed():
             )
             result = mnemosyne.register("dummy_ctx")
             assert result == "hermes_plugin_register_called", (
-                f"mnemosyne.register returned {result!r}, "
-                "expected 'hermes_plugin_register_called' — "
+                "mnemosyne.register returned " + repr(result) + ", "
+                "expected 'hermes_plugin_register_called' - "
                 "register was shadowed"
             )
 
@@ -77,11 +77,16 @@ def test_hermes_plugin_register_not_shadowed():
 
             # 3. __all__ must include register (existing contract)
             assert 'register' in mnemosyne.__all__, (
-                f"register missing from __all__: {mnemosyne.__all__}"
+                "register missing from __all__: " + repr(mnemosyne.__all__)
             )
 
             print("PASS")
-        """)
+        """).format(
+            mock_root=mock_root,
+            plugin_parent=plugin_parent,
+            repo_root=REPO_ROOT,
+            repo_parent=REPO_ROOT.parent,
+        )
 
         result = subprocess.run(
             [sys.executable, "-W", "ignore::DeprecationWarning", "-c", script],
@@ -109,11 +114,11 @@ def test_register_memory_provider_bridge_delegates():
         plugin_package = plugin_parent / "mnemosyne"
         plugin_package.symlink_to(REPO_ROOT, target_is_directory=True)
 
-        script = textwrap.dedent(f"""\
+        script = textwrap.dedent("""\
             import sys
-            sys.path.insert(0, {str(mock_root)!r})
-            sys.path.insert(0, {str(plugin_parent)!r})
-            blocked = {{{str(REPO_ROOT)!r}, {str(REPO_ROOT.parent)!r}}}
+            sys.path.insert(0, {mock_root!r})
+            sys.path.insert(0, {plugin_parent!r})
+            blocked = {{{repo_root!r}, {repo_parent!r}}}
             sys.path = [p for p in sys.path if p not in blocked]
 
             import mnemosyne
@@ -135,7 +140,12 @@ def test_register_memory_provider_bridge_delegates():
             assert mnemosyne.register("x") == "hermes_plugin_register_called"
 
             print("PASS")
-        """)
+        """).format(
+            mock_root=mock_root,
+            plugin_parent=plugin_parent,
+            repo_root=REPO_ROOT,
+            repo_parent=REPO_ROOT.parent,
+        )
 
         result = subprocess.run(
             [sys.executable, "-W", "ignore::DeprecationWarning", "-c", script],
