@@ -16,22 +16,23 @@ Then open http://localhost:8081 in your browser.
 
 import argparse
 import logging
-import os
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from mnemosyne.core.banks import _default_data_dir, _validate_bank_name
 
 logger = logging.getLogger("mnemosyne-browser")
 
 
 def _resolve_db_path(bank: str = "default") -> str:
     """Resolve the Mnemosyne database path for a given bank."""
-    data_dir = Path(
-        os.environ.get("MNEMOSYNE_DATA_DIR")
-        or os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")) + "/mnemosyne/data"
-    )
-    return str(data_dir / f"{bank}.db")
+    data_dir = _default_data_dir()
+    if bank == "default":
+        return str(data_dir / "mnemosyne.db")
+    _validate_bank_name(bank)
+    return str(data_dir / "banks" / bank / "mnemosyne.db")
 
 
 # ── Database Queries ──────────────────────────────────────────────────
@@ -39,7 +40,7 @@ def _resolve_db_path(bank: str = "default") -> str:
 
 def _get_connection(db_path: str) -> sqlite3.Connection:
     """Get a read-only connection to the Mnemosyne database."""
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only = 1")
     return conn
@@ -194,7 +195,7 @@ PAGE_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Mnemosyne Memory Browser</title>
 <style>
-  :root {
+  :root {{
     --bg: #faf9f6;
     --surface: #ffffff;
     --border: #e2e0dc;
@@ -205,44 +206,44 @@ PAGE_HTML = """<!DOCTYPE html>
     --success: #5a8a6a;
     --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
     --font-mono: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
-  }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: var(--font); background: var(--bg); color: var(--text); line-height: 1.6; }
-  .header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 1rem 2rem; display: flex; align-items: center; gap: 1.5rem; flex-wrap: wrap; }
-  .header h1 { font-size: 1.25rem; font-weight: 600; white-space: nowrap; }
-  .header h1 span { color: var(--accent); }
-  .stats { display: flex; gap: 1.5rem; font-size: 0.85rem; }
-  .stat { color: var(--text-secondary); }
-  .stat strong { color: var(--text); }
-  .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
-  .filters { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.5rem; margin-bottom: 1.5rem; display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; }
-  .filters input, .filters select { padding: 0.5rem 0.75rem; border: 1px solid var(--border); border-radius: 6px; font-size: 0.875rem; background: var(--surface); color: var(--text); }
-  .filters input[type="text"] { flex: 1; min-width: 200px; }
-  .filters button { padding: 0.5rem 1.25rem; background: var(--accent); color: white; border: none; border-radius: 6px; font-size: 0.875rem; cursor: pointer; }
-  .filters button:hover { opacity: 0.9; }
-  .memory-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.5rem; margin-bottom: 0.75rem; }
-  .memory-card:hover { border-color: var(--accent); }
-  .memory-meta { display: flex; gap: 1rem; font-size: 0.75rem; color: var(--text-secondary); margin-bottom: 0.5rem; flex-wrap: wrap; }
-  .memory-meta .tag { background: var(--accent-light); color: var(--accent); padding: 0.125rem 0.5rem; border-radius: 4px; font-weight: 500; }
-  .memory-content { font-size: 0.9rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
-  .empty { text-align: center; padding: 3rem; color: var(--text-secondary); }
-  .pagination { display: flex; justify-content: center; gap: 0.5rem; margin-top: 1.5rem; }
-  .pagination a { padding: 0.5rem 0.75rem; border: 1px solid var(--border); border-radius: 6px; text-decoration: none; color: var(--text); font-size: 0.875rem; }
-  .pagination a:hover { background: var(--accent-light); border-color: var(--accent); }
-  .pagination a.active { background: var(--accent); color: white; border-color: var(--accent); }
-  .detail { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; }
-  .detail h2 { font-size: 1rem; margin-bottom: 1rem; }
-  .detail .field { margin-bottom: 0.75rem; }
-  .detail .field-label { font-size: 0.75rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; }
-  .detail .field-value { font-size: 0.9rem; }
-  .back { display: inline-block; margin-bottom: 1rem; color: var(--accent); text-decoration: none; font-size: 0.875rem; }
-  .back:hover { text-decoration: underline; }
-  @media (max-width: 768px) {
-    .header { padding: 1rem; flex-direction: column; align-items: flex-start; }
-    .container { padding: 1rem; }
-    .filters { flex-direction: column; }
-    .filters input[type="text"] { min-width: auto; width: 100%; }
-  }
+  }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ font-family: var(--font); background: var(--bg); color: var(--text); line-height: 1.6; }}
+  .header {{ background: var(--surface); border-bottom: 1px solid var(--border); padding: 1rem 2rem; display: flex; align-items: center; gap: 1.5rem; flex-wrap: wrap; }}
+  .header h1 {{ font-size: 1.25rem; font-weight: 600; white-space: nowrap; }}
+  .header h1 span {{ color: var(--accent); }}
+  .stats {{ display: flex; gap: 1.5rem; font-size: 0.85rem; }}
+  .stat {{ color: var(--text-secondary); }}
+  .stat strong {{ color: var(--text); }}
+  .container {{ max-width: 1200px; margin: 0 auto; padding: 2rem; }}
+  .filters {{ background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.5rem; margin-bottom: 1.5rem; display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; }}
+  .filters input, .filters select {{ padding: 0.5rem 0.75rem; border: 1px solid var(--border); border-radius: 6px; font-size: 0.875rem; background: var(--surface); color: var(--text); }}
+  .filters input[type="text"] {{ flex: 1; min-width: 200px; }}
+  .filters button {{ padding: 0.5rem 1.25rem; background: var(--accent); color: white; border: none; border-radius: 6px; font-size: 0.875rem; cursor: pointer; }}
+  .filters button:hover {{ opacity: 0.9; }}
+  .memory-card {{ background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.5rem; margin-bottom: 0.75rem; }}
+  .memory-card:hover {{ border-color: var(--accent); }}
+  .memory-meta {{ display: flex; gap: 1rem; font-size: 0.75rem; color: var(--text-secondary); margin-bottom: 0.5rem; flex-wrap: wrap; }}
+  .memory-meta .tag {{ background: var(--accent-light); color: var(--accent); padding: 0.125rem 0.5rem; border-radius: 4px; font-weight: 500; }}
+  .memory-content {{ font-size: 0.9rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }}
+  .empty {{ text-align: center; padding: 3rem; color: var(--text-secondary); }}
+  .pagination {{ display: flex; justify-content: center; gap: 0.5rem; margin-top: 1.5rem; }}
+  .pagination a {{ padding: 0.5rem 0.75rem; border: 1px solid var(--border); border-radius: 6px; text-decoration: none; color: var(--text); font-size: 0.875rem; }}
+  .pagination a:hover {{ background: var(--accent-light); border-color: var(--accent); }}
+  .pagination a.active {{ background: var(--accent); color: white; border-color: var(--accent); }}
+  .detail {{ background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; }}
+  .detail h2 {{ font-size: 1rem; margin-bottom: 1rem; }}
+  .detail .field {{ margin-bottom: 0.75rem; }}
+  .detail .field-label {{ font-size: 0.75rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; }}
+  .detail .field-value {{ font-size: 0.9rem; }}
+  .back {{ display: inline-block; margin-bottom: 1rem; color: var(--accent); text-decoration: none; font-size: 0.875rem; }}
+  .back:hover {{ text-decoration: underline; }}
+  @media (max-width: 768px) {{
+    .header {{ padding: 1rem; flex-direction: column; align-items: flex-start; }}
+    .container {{ padding: 1rem; }}
+    .filters {{ flex-direction: column; }}
+    .filters input[type="text"] {{ min-width: auto; width: 100%; }}
+  }}
 </style>
 </head>
 <body>

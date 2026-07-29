@@ -6,6 +6,7 @@ Run with: pytest tests/test_mcp_server.py -v
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import pytest
@@ -60,8 +61,10 @@ class TestToolSchemas:
     def test_tool_schemas_are_valid_json(self):
         """Each tool schema must be valid JSON-serializable."""
         for tool in TOOLS:
-            # Schema must be serializable
-            dumped = json.dumps(tool["inputSchema"])
+            # Schema must be serializable. ``mcp`` SDK 2.x renamed the wire
+            # field to ``input_schema`` (was ``inputSchema`` in 1.x); the
+            # schema dict in ``TOOLS`` uses the new key.
+            dumped = json.dumps(tool["input_schema"])
             loaded = json.loads(dumped)
             assert loaded["type"] == "object"
             assert "properties" in loaded
@@ -69,7 +72,7 @@ class TestToolSchemas:
     def test_remember_schema_has_required_fields(self):
         """mnemosyne_remember requires 'content'."""
         remember_tool = next(t for t in TOOLS if t["name"] == "mnemosyne_remember")
-        schema = remember_tool["inputSchema"]
+        schema = remember_tool["input_schema"]
         assert "required" in schema
         assert "content" in schema["required"]
         assert "properties" in schema
@@ -84,7 +87,7 @@ class TestToolSchemas:
     def test_recall_schema_has_required_fields(self):
         """mnemosyne_recall requires 'query'."""
         recall_tool = next(t for t in TOOLS if t["name"] == "mnemosyne_recall")
-        schema = recall_tool["inputSchema"]
+        schema = recall_tool["input_schema"]
         assert "required" in schema
         assert "query" in schema["required"]
         assert "limit" in schema["properties"]
@@ -103,7 +106,7 @@ class TestToolSchemas:
 
     def test_batch_schema_has_operations(self):
         batch_tool = next(t for t in TOOLS if t["name"] == "mnemosyne_batch")
-        schema = batch_tool["inputSchema"]
+        schema = batch_tool["input_schema"]
         assert "operations" in schema["required"]
         assert schema["properties"]["operations"]["type"] == "array"
         assert schema["properties"]["operations"]["maxItems"] == 50
@@ -386,6 +389,53 @@ class TestToolHandlers:
         assert kwargs["fts_weight"] == 0.3
         assert kwargs["importance_weight"] == 0.1
 
+    def test_handle_recall_normalizes_blank_query_time(self, mock_mnemosyne):
+        """Blank query_time reaches Mnemosyne.recall() as unset, not as "" (#555).
+
+        Harnesses built against the older schema sent the declared default "",
+        which used to reach _parse_query_time and raise.
+        """
+        for blank in ("", "   ", "\t"):
+            mock_mnemosyne.recall.reset_mock()
+            with patch("mnemosyne.mcp_tools._create_instance", return_value=mock_mnemosyne):
+                handle_tool_call("mnemosyne_recall", {
+                    "query": "test query",
+                    "bank": "default",
+                    "query_time": blank,
+                })
+            _, kwargs = mock_mnemosyne.recall.call_args
+            assert kwargs["query_time"] is None, f"blank {blank!r} not normalized"
+
+    def test_handle_recall_preserves_explicit_query_time(self, mock_mnemosyne):
+        """A real ISO timestamp is forwarded untouched."""
+        with patch("mnemosyne.mcp_tools._create_instance", return_value=mock_mnemosyne):
+            handle_tool_call("mnemosyne_recall", {
+                "query": "test query",
+                "bank": "default",
+                "query_time": "2026-04-29T12:00:00",
+            })
+        _, kwargs = mock_mnemosyne.recall.call_args
+        assert kwargs["query_time"] == "2026-04-29T12:00:00"
+
+    def test_handle_recall_does_not_swallow_falsey_non_strings(self, mock_mnemosyne):
+        """0/False/[] are type errors, not "unset" — they must not become None.
+
+        Guards against normalizing with `or None`, which would silently accept
+        them and suppress _parse_query_time's TypeError.
+        """
+        for bad in (0, False, []):
+            mock_mnemosyne.recall.reset_mock()
+            with patch("mnemosyne.mcp_tools._create_instance", return_value=mock_mnemosyne):
+                handle_tool_call("mnemosyne_recall", {
+                    "query": "test query",
+                    "bank": "default",
+                    "query_time": bad,
+                })
+            _, kwargs = mock_mnemosyne.recall.call_args
+            # Identity, not equality: 0 == False in Python, so `==` would let a
+            # bool/int mix-up pass. The exact object must be forwarded.
+            assert kwargs["query_time"] is bad, f"{bad!r} not forwarded unchanged"
+
     def test_handle_sleep(self, mock_mnemosyne):
         """handle_sleep returns consolidation stats."""
         with patch("mnemosyne.mcp_tools._create_instance", return_value=mock_mnemosyne):
@@ -448,6 +498,179 @@ class TestToolHandlers:
         with patch("mnemosyne.mcp_tools._create_instance", return_value=mock_mnemosyne):
             with pytest.raises(RuntimeError, match="DB locked"):
                 handle_tool_call("mnemosyne_remember", {"content": "test"})
+
+    def test_hygiene_audit_default_uses_and_closes_exact_readonly_connection(
+        self, tmp_path, monkeypatch
+    ):
+        """Default-bank audits use one real query-only connection, never Mnemosyne."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        db_path = data_dir / "mnemosyne.db"
+        with sqlite3.connect(db_path) as writable:
+            writable.execute("CREATE TABLE audit_marker (id INTEGER)")
+
+        class _Report:
+            def to_dict(self):
+                return {"total_candidates": 0}
+
+        from mnemosyne.core import hygiene
+
+        captured = {}
+
+        def _audit_noise(**kwargs):
+            conn = kwargs["conn"]
+            captured.update(kwargs)
+            assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+            with pytest.raises(
+                sqlite3.OperationalError, match="attempt to write a readonly database"
+            ):
+                conn.execute("CREATE TABLE forbidden_write (id INTEGER)")
+            return _Report()
+
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+        monkeypatch.setattr(
+            mcp_tools,
+            "_create_instance",
+            lambda **_kwargs: pytest.fail("hygiene audit must not initialize Mnemosyne"),
+        )
+        monkeypatch.setattr(hygiene, "audit_noise", _audit_noise)
+
+        arguments = {
+            "limit": 17,
+            "tables": ["audit_marker"],
+            "min_score": 0.8,
+            "offset": 3,
+            "scan_all": True,
+            "batch_size": 11,
+        }
+        result = handle_tool_call("mnemosyne_hygiene_audit", arguments)
+
+        assert result == {
+            "status": "audited",
+            "report": {"total_candidates": 0},
+            "bank": "default",
+        }
+        assert captured == {
+            "db_path": db_path,
+            "limit": 17,
+            "tables": ["audit_marker"],
+            "min_score": 0.8,
+            "offset": 3,
+            "scan_all": True,
+            "batch_size": 11,
+            "conn": captured["conn"],
+        }
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            captured["conn"].execute("SELECT 1")
+
+    def test_hygiene_audit_closes_connection_when_audit_raises(self, tmp_path, monkeypatch):
+        """The read-only connection closes even if audit_noise raises."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        db_path = data_dir / "mnemosyne.db"
+        sqlite3.connect(db_path).close()
+
+        from mnemosyne.core import hygiene
+        from mnemosyne import doctor
+
+        captured = {}
+        real_open = doctor.open_readonly_doctor_db
+
+        def _open_readonly(path):
+            captured["conn"] = real_open(path)
+            return captured["conn"]
+
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+        monkeypatch.setattr(
+            mcp_tools,
+            "_create_instance",
+            lambda **_kwargs: pytest.fail("hygiene audit must not initialize Mnemosyne"),
+        )
+        monkeypatch.setattr(doctor, "open_readonly_doctor_db", _open_readonly)
+        monkeypatch.setattr(
+            hygiene,
+            "audit_noise",
+            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("audit failed")),
+        )
+
+        with pytest.raises(RuntimeError, match="audit failed"):
+            handle_tool_call("mnemosyne_hygiene_audit", {})
+
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            captured["conn"].execute("SELECT 1")
+
+    def test_hygiene_audit_readonly_open_failure_has_no_writable_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        """A missing default DB fails at the read-only open without running audit_noise."""
+        data_dir = tmp_path / "missing-data"
+        from mnemosyne.core import hygiene
+
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+        monkeypatch.setattr(
+            mcp_tools,
+            "_create_instance",
+            lambda **_kwargs: pytest.fail("hygiene audit must not initialize Mnemosyne"),
+        )
+        monkeypatch.setattr(
+            hygiene,
+            "audit_noise",
+            lambda **_kwargs: pytest.fail("audit must not run after readonly open failure"),
+        )
+
+        with pytest.raises(sqlite3.OperationalError):
+            handle_tool_call("mnemosyne_hygiene_audit", {})
+
+        assert not data_dir.exists()
+
+    def test_hygiene_audit_unknown_bank_never_initializes_or_creates_state(
+        self, tmp_path, monkeypatch
+    ):
+        """Unknown named banks fail before any manager/instance can create state."""
+        data_dir = tmp_path / "fresh-data"
+
+        def _snapshot(root):
+            return (
+                sorted(path.relative_to(root) for path in root.rglob("*"))
+                if root.exists()
+                else []
+            )
+
+        before = _snapshot(data_dir)
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+        monkeypatch.setattr(
+            mcp_tools,
+            "_create_instance",
+            lambda **_kwargs: pytest.fail("unknown bank must not initialize Mnemosyne"),
+        )
+
+        with pytest.raises(ValueError, match="Bank 'unknown' does not exist"):
+            handle_tool_call("mnemosyne_hygiene_audit", {"bank": "unknown"})
+
+        assert _snapshot(data_dir) == before
+        assert not (data_dir / "banks").exists()
+        assert not (data_dir / "config").exists()
+
+    def test_hygiene_audit_named_bank_requires_an_existing_database(
+        self, tmp_path, monkeypatch
+    ):
+        """A named bank directory without its DB is rejected without mutations."""
+        data_dir = tmp_path / "data"
+        bank_dir = data_dir / "banks" / "team"
+        bank_dir.mkdir(parents=True)
+        before = sorted(path.relative_to(data_dir) for path in data_dir.rglob("*"))
+
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+        monkeypatch.setattr(
+            mcp_tools,
+            "_create_instance",
+            lambda **_kwargs: pytest.fail("named-bank audit must not initialize Mnemosyne"),
+        )
+
+        with pytest.raises(FileNotFoundError, match="Database for bank 'team' does not exist"):
+            handle_tool_call("mnemosyne_hygiene_audit", {"bank": "team"})
+
+        assert sorted(path.relative_to(data_dir) for path in data_dir.rglob("*")) == before
 
     def test_hygiene_clean_rejects_invalid_candidates_json(self):
         """Invalid hygiene payloads return the documented MCP error instead of raising."""
@@ -570,6 +793,210 @@ class TestMCPIntegration:
         assert hasattr(mcp_tools, "TOOLS")
         assert hasattr(mcp_tools, "handle_tool_call")
 
+    def test_mcp_tools_fresh_import_does_not_materialize_default_state(self, tmp_path):
+        """A fresh MCP import must not initialize the legacy default database."""
+        data_dir = tmp_path / "data"
+        mnemosyne_home = tmp_path / "mnemosyne-home"
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(tmp_path / "home"),
+            "MNEMOSYNE_HOME": str(mnemosyne_home),
+            "MNEMOSYNE_DATA_DIR": str(data_dir),
+        })
+        script = """
+import json
+import os
+from pathlib import Path
+
+import mnemosyne.mcp_tools
+
+root = Path(os.environ["MNEMOSYNE_DATA_DIR"])
+print(json.dumps(sorted(str(path.relative_to(root)) for path in root.rglob("*")) if root.exists() else []))
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert json.loads(completed.stdout) == []
+        assert not data_dir.exists()
+        assert not (data_dir / "mnemosyne.db").exists()
+        assert not (data_dir / "mnemosyne.db-wal").exists()
+        assert not (data_dir / "mnemosyne.db-shm").exists()
+        assert not (data_dir / "config").exists()
+        assert not mnemosyne_home.exists()
+
+    def test_mcp_tools_runtime_type_hints_are_resolvable_without_default_state(self, tmp_path):
+        """Lazy imports must not break runtime type-hint consumers or create state."""
+        data_dir = tmp_path / "data"
+        mnemosyne_home = tmp_path / "mnemosyne-home"
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(tmp_path / "home"),
+            "MNEMOSYNE_HOME": str(mnemosyne_home),
+            "MNEMOSYNE_DATA_DIR": str(data_dir),
+        })
+        script = """
+import json
+import os
+from pathlib import Path
+import sys
+import typing
+
+import mnemosyne.mcp_tools as m
+
+assert typing.get_type_hints(m._create_instance)["return"] is typing.Any
+assert typing.get_type_hints(m._WrapperBatchAdapter.__init__)["mem"] is typing.Any
+assert "mnemosyne.core.memory" not in sys.modules
+root = Path(os.environ["MNEMOSYNE_DATA_DIR"])
+print(json.dumps(sorted(str(path.relative_to(root)) for path in root.rglob("*")) if root.exists() else []))
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert json.loads(completed.stdout) == []
+        assert not data_dir.exists()
+        assert not mnemosyne_home.exists()
+
+    def test_mcp_tools_public_mnemosyne_export_is_lazy_and_canonical(self, tmp_path):
+        """The legacy public export resolves to the canonical class on demand."""
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(tmp_path / "home"),
+            "MNEMOSYNE_HOME": str(tmp_path / "mnemosyne-home"),
+            "MNEMOSYNE_DATA_DIR": str(tmp_path / "data"),
+        })
+        script = """
+import json
+
+from mnemosyne.mcp_tools import Mnemosyne
+from mnemosyne.core.memory import Mnemosyne as CoreMnemosyne
+
+print(json.dumps({"is_canonical": Mnemosyne is CoreMnemosyne}))
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert json.loads(completed.stdout) == {"is_canonical": True}
+
+    def test_mcp_tools_star_import_preserves_legacy_export_surface(self, tmp_path):
+        """Star imports retain every old public name and resolve Mnemosyne canonically."""
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(tmp_path / "home"),
+            "MNEMOSYNE_HOME": str(tmp_path / "mnemosyne-home"),
+            "MNEMOSYNE_DATA_DIR": str(tmp_path / "data"),
+        })
+        expected = [
+            "ALL_TOOL_SCHEMAS",
+            "Any",
+            "BatchValidationError",
+            "BeamMemory",
+            "CallToolResult",
+            "Dict",
+            "ErrorData",
+            "List",
+            "Mnemosyne",
+            "Path",
+            "TOOLS",
+            "TextContent",
+            "Tool",
+            "apply_beam_batch",
+            "batch_validation_error_payload",
+            "dry_run_batch",
+            "get_tool_definitions",
+            "handle_tool_call",
+            "json",
+            "math",
+            "os",
+            "sqlite3",
+            "validate_batch_operations",
+        ]
+        script = f"""
+import json
+
+ns = {{}}
+exec("from mnemosyne.mcp_tools import *", ns)
+from mnemosyne.core.memory import Mnemosyne as CoreMnemosyne
+
+names = sorted(name for name in ns if name != "__builtins__")
+assert names == {expected!r}
+assert ns["Mnemosyne"] is CoreMnemosyne
+assert not {{"TYPE_CHECKING", "TypeAlias", "MnemosyneInstance"}} & ns.keys()
+print(json.dumps({{"names": names, "count": len(names)}}))
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert json.loads(completed.stdout) == {"names": expected, "count": len(expected)}
+
+    def test_named_bank_hygiene_audit_in_fresh_process_creates_no_default_state(self, tmp_path):
+        """A real named-bank audit never initializes default state in a fresh process."""
+        data_dir = tmp_path / "data"
+        named_db = data_dir / "banks" / "team" / "mnemosyne.db"
+        named_db.parent.mkdir(parents=True)
+        sqlite3.connect(named_db).close()
+        before = sorted(str(path.relative_to(data_dir)) for path in data_dir.rglob("*"))
+        mnemosyne_home = tmp_path / "mnemosyne-home"
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(tmp_path / "home"),
+            "MNEMOSYNE_HOME": str(mnemosyne_home),
+            "MNEMOSYNE_DATA_DIR": str(data_dir),
+        })
+        script = """
+import json
+import os
+from pathlib import Path
+
+from mnemosyne.mcp_tools import handle_tool_call
+
+root = Path(os.environ["MNEMOSYNE_DATA_DIR"])
+result = handle_tool_call("mnemosyne_hygiene_audit", {"bank": "team"})
+after = sorted(str(path.relative_to(root)) for path in root.rglob("*"))
+print(json.dumps({"result": result, "after": after}))
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        payload = json.loads(completed.stdout)
+        assert payload["result"]["status"] == "audited"
+        assert payload["result"]["bank"] == "team"
+        assert payload["after"] == before
+        assert not (data_dir / "mnemosyne.db").exists()
+        assert not (data_dir / "mnemosyne.db-wal").exists()
+        assert not (data_dir / "mnemosyne.db-shm").exists()
+        assert not (data_dir / "config").exists()
+        assert not mnemosyne_home.exists()
+
     def test_get_tool_definitions_returns_all(self):
         """get_tool_definitions returns all registered tools."""
         tools = get_tool_definitions()
@@ -579,16 +1006,16 @@ class TestMCPIntegration:
         assert "mnemosyne_remember" in names
 
     def test_tool_definitions_convertible_to_tool_pydantic(self):
-        """Tool dict definitions must be compatible with mcp SDK 1.x Tool Pydantic model.
+        """Tool dict definitions must be compatible with the ``mcp`` SDK 2.x Tool Pydantic model.
 
-        The SDK 1.x list_tools handler expects Tool() instances with typed fields.
-        If get_tool_definitions() returns dicts with unexpected keys or missing
-        required fields, Tool(**t) will raise a ValidationError.
+        The SDK 2.x ``Tool`` model exposes ``input_schema`` (snake_case) as
+        its canonical Python field; ``inputSchema`` is still accepted as a
+        Pydantic alias on construction. This test asserts both paths:
+        (a) ``Tool(**t)`` constructs without raising; (b) the constructed
+        ``Tool`` carries the same schema as the source dict regardless of
+        which key the dict used.
         """
-        try:
-            from mcp.types import Tool
-        except ImportError:
-            pytest.skip("mcp SDK not installed")
+        from mcp.types import Tool
 
         tools = get_tool_definitions()
         for t in tools:
@@ -596,7 +1023,189 @@ class TestMCPIntegration:
             assert isinstance(tool, Tool)
             assert tool.name == t["name"]
             assert tool.description == t.get("description")
-            assert tool.inputSchema == t["inputSchema"]
+            # Pydantic normalizes both ``inputSchema`` (1.x alias) and
+            # ``input_schema`` (2.x canonical) to ``tool.input_schema``.
+            expected = t.get("input_schema", t.get("inputSchema"))
+            assert tool.input_schema == expected
+
+        # Keep the legacy-only wire shape covered even though the current
+        # normalizer emits the SDK 2.x canonical key.
+        legacy = dict(tools[0])
+        legacy["inputSchema"] = legacy.pop("input_schema")
+        legacy_tool = Tool(**legacy)
+        assert legacy_tool.input_schema == legacy["inputSchema"]
+
+    def test_mcp_client_request_surface_returns_typed_results(self):
+        """Real SDK client requests exercise list/call registration and dispatch."""
+        from mcp import ClientSession
+        from mcp.shared.memory import create_client_server_memory_streams
+        from mcp.types import CallToolResult, ListToolsResult
+        from mnemosyne.mcp_server import _build_mcp_server
+
+        import asyncio
+        import contextlib
+        from unittest.mock import patch
+
+        async def exercise():
+            server = _build_mcp_server()
+            async with create_client_server_memory_streams() as (client_streams, server_streams):
+                server_task = asyncio.create_task(
+                    server.run(*server_streams, server.create_initialization_options())
+                )
+                try:
+                    async with ClientSession(*client_streams) as client:
+                        await client.initialize()
+                        listed = await client.list_tools()
+                        assert isinstance(listed, ListToolsResult)
+                        assert len(listed.tools) >= 25
+                        with patch(
+                            "mnemosyne.mcp_server.handle_tool_call",
+                            return_value={"status": "ok"},
+                        ) as handle_call:
+                            success = await client.call_tool("mnemosyne_stats", None)
+                        assert isinstance(success, CallToolResult)
+                        assert success.is_error is False
+                        handle_call.assert_called_once_with("mnemosyne_stats", {})
+                finally:
+                    server_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await server_task
+
+        asyncio.run(exercise())
+
+    def test_transport_builders_share_mcp_server(self):
+        """stdio and SSE transport setup both obtain the shared server builder."""
+        from mnemosyne import mcp_server
+
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+
+        async def exercise_stdio():
+            fake_server = type(
+                "FakeServer",
+                (),
+                {
+                    "run": AsyncMock(),
+                    "create_initialization_options": lambda self: object(),
+                },
+            )()
+
+            class _StdioContext:
+                async def __aenter__(self):
+                    return (object(), object())
+
+                async def __aexit__(self, *args):
+                    return False
+
+            with (
+                patch.object(mcp_server, "_build_mcp_server", return_value=fake_server) as build,
+                patch.object(mcp_server, "stdio_server", return_value=_StdioContext()),
+            ):
+                await mcp_server._run_stdio()
+            build.assert_called_once_with()
+            fake_server.run.assert_awaited_once()
+
+        asyncio.run(exercise_stdio())
+
+        with patch.object(mcp_server, "_build_mcp_server", return_value=object()) as build:
+            app = mcp_server._build_sse_app(host="127.0.0.1")
+        build.assert_called_once_with()
+        sse_route = next(route for route in app.routes if getattr(route, "path", None) == "/sse")
+        assert any(cell.cell_contents is build.return_value for cell in (sse_route.endpoint.__closure__ or ()))
+
+    def test_build_mcp_server_list_tools_returns_listtoolsresult(self):
+        """SDK 2.x contract: the tools/list callback must return a ListToolsResult.
+
+        Regression test for the CodeRabbit finding on PR #571 (round 2):
+        ``_on_list_tools`` must wrap the Tool list in ``ListToolsResult(tools=...)``
+        rather than returning a bare list. The SDK 2.x low-level server expects
+        a ``ListToolsResult`` object — a bare list breaks the ``tools/list``
+        response contract for both stdio and SSE transports.
+        """
+        from mcp.types import ListToolsResult, Tool
+        from mnemosyne.mcp_server import _build_mcp_server
+
+        server = _build_mcp_server()
+        entry = server.get_request_handler("tools/list")
+        assert entry is not None
+        assert callable(entry.handler)
+        on_list_tools = entry.handler
+
+        import asyncio
+        result = asyncio.run(on_list_tools(ctx=None, params=None))
+        assert isinstance(result, ListToolsResult), (
+            f"tools/list callback must return ListToolsResult, got {type(result).__name__}"
+        )
+        assert isinstance(result.tools, list)
+        assert all(isinstance(t, Tool) for t in result.tools)
+        assert len(result.tools) >= 25  # matches test_all_tools_present
+
+    def test_build_mcp_server_call_tool_returns_is_error_on_failure(self):
+        """SDK 2.x contract: tools/call must return CallToolResult with is_error=True on failure.
+
+        Regression test for the CodeRabbit finding on PR #571 (round 2):
+        the ``_on_call_tool`` exception path must set ``is_error=True`` so MCP
+        clients can distinguish implementation failures from successful calls.
+        Preserves the existing error payload shape for backward compatibility.
+        """
+        from mcp.types import CallToolResult
+        from mnemosyne.mcp_server import _build_mcp_server
+
+        server = _build_mcp_server()
+        entry = server.get_request_handler("tools/call")
+        assert entry is not None
+        assert callable(entry.handler)
+        on_call_tool = entry.handler
+
+        # Construct a params-shaped object with empty name → handle_tool_call
+        # raises before returning a valid result. This is the path that was
+        # previously returning a successful-looking CallToolResult with error
+        # content instead of a flagged failure.
+        class _Params:
+            name = ""
+            arguments = {}
+
+        import asyncio
+        result = asyncio.run(on_call_tool(ctx=None, params=_Params()))
+        assert isinstance(result, CallToolResult)
+        assert result.is_error is True, (
+            "tools/call failure path must set is_error=True for SDK 2.x contract"
+        )
+        # Error payload preserved for backward compatibility
+        import json as _json
+        assert len(result.content) >= 1
+        payload = _json.loads(result.content[0].text)
+        assert payload.get("status") == "error"
+
+    def test_build_mcp_server_call_tool_success_returns_is_error_false(self):
+        """SDK 2.x contract: successful tools/call must return is_error=False (or unset)."""
+        from mcp.types import CallToolResult
+        from mnemosyne.mcp_server import _build_mcp_server
+
+        server = _build_mcp_server()
+        entry = server.get_request_handler("tools/call")
+        assert entry is not None
+        assert callable(entry.handler)
+        on_call_tool = entry.handler
+
+        # Use a real tool definition and call it through the path. We mock
+        # handle_tool_call to return a minimal valid result so we don't need
+        # the full DB-backed stack here.
+        import asyncio
+        from unittest.mock import patch
+
+        class _Params:
+            name = "mnemosyne_stats"
+            arguments = None
+
+        with patch("mnemosyne.mcp_server.handle_tool_call", return_value={"status": "ok"}) as handle_call:
+            result = asyncio.run(on_call_tool(ctx=None, params=_Params()))
+        handle_call.assert_called_once_with("mnemosyne_stats", {})
+        assert isinstance(result, CallToolResult)
+        assert not result.is_error, (
+            "successful tools/call must have is_error=False (or None)"
+        )
+        assert json.loads(result.content[0].text) == {"status": "ok"}
 
     def test_top_level_cli_forwards_mcp_arguments(self, tmp_path):
         """`mnemosyne mcp ...` must pass subcommand args to the MCP parser."""
@@ -663,7 +1272,7 @@ class TestImportGuard:
     def test_mcp_server_raises_without_mcp(self):
         """MCP server raises helpful error if mcp not installed."""
         from mnemosyne.mcp_server import _MCP_AVAILABLE, _run_stdio
-        
+
         if _MCP_AVAILABLE:
             # mcp is installed — verify the server function exists and the flag is True
             assert _MCP_AVAILABLE is True

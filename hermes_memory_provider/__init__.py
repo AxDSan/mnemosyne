@@ -2207,7 +2207,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             # sessions) should never bypass session scoping.
             if author_id:
                 recall_kwargs["author_id"] = author_id
-            with self._beam_access_lock:
+            with self._ensure_beam_access_lock():
                 results = self._beam.recall(**recall_kwargs)
             if not results:
                 return ""
@@ -2265,8 +2265,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         """Initialize sync_turn telemetry for tests that construct via __new__."""
         if not hasattr(self, "_sync_turn_lock"):
             self._sync_turn_lock = threading.Lock()
-        if not hasattr(self, "_beam_access_lock"):
-            self._beam_access_lock = threading.Lock()
+        self._ensure_beam_access_lock()
         if not hasattr(self, "_sync_turn_telemetry"):
             self._sync_turn_telemetry = {
                 "pending_queue_length": 0,
@@ -2283,6 +2282,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 "last_error": None,
                 "in_flight": 0,
             }
+
+    def _ensure_beam_access_lock(self):
+        """Return the per-provider Beam lock, including for __new__ test instances."""
+        try:
+            return self._beam_access_lock
+        except AttributeError:
+            # setdefault atomically publishes one per-instance lock when
+            # concurrent __new__ callers both need lazy initialization.
+            return self.__dict__.setdefault("_beam_access_lock", threading.Lock())
 
     def _sync_turn_diagnostics(self) -> Dict[str, Any]:
         """Return a PII-safe snapshot of sync_turn telemetry."""
@@ -2313,7 +2321,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 in_flight,
             )
         try:
-            with self._beam_access_lock:
+            with self._ensure_beam_access_lock():
                 if "user" in self._sync_roles and user_content and len(user_content) > 5 and not self._should_filter(user_content):
                     user_limit = _sync_turn_user_limit()
                     uc = user_content[:user_limit] if user_limit > 0 else user_content
@@ -2425,7 +2433,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 # main thread's sync_turn() writes, causing episodic INSERT
                 # failures (commit rolled back by concurrent main-thread writes).
                 beam_ref = self._beam
-                beam_lock = self._beam_access_lock
+                beam_lock = self._ensure_beam_access_lock()
                 def _sleep_isolated():
                     try:
                         BeamClass = _get_beam_class()
@@ -2913,13 +2921,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         replacement_id = args.get("replacement_id", None) or None
         if not memory_id:
             return json.dumps({"error": "memory_id is required"})
-        self._beam.invalidate(memory_id, replacement_id=replacement_id if replacement_id else None)
+        ok = self._beam.invalidate(memory_id, replacement_id=replacement_id)
         self._audit_event(
             "invalidate", memory_id=memory_id, bank="private",
             source_tool="mnemosyne_invalidate",
-            metadata={"replacement_id": replacement_id} if replacement_id else None,
+            metadata={"replacement_id": replacement_id, "invalidated": ok} if replacement_id else {"invalidated": ok},
         )
-        return json.dumps({"status": "invalidated", "memory_id": memory_id})
+        if ok:
+            return json.dumps({"status": "invalidated", "memory_id": memory_id})
+        return json.dumps({"status": "memory_not_found", "memory_id": memory_id})
 
     def _handle_validate(self, args: Dict[str, Any]) -> str:
         """Collaborative attestation: any agent can attest, update, invalidate,
@@ -3513,59 +3523,66 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         from mnemosyne.diagnose import run_diagnostics
         repair_requested = bool(args.get("repair_vec_working", False))
         dry_run = bool(args.get("dry_run", False))
-        result = run_diagnostics(repair_vec_working=repair_requested, dry_run=dry_run)
-        if self._beam is not None:
+        diagnostic_kwargs: Dict[str, Any] = {
+            "repair_vec_working": repair_requested,
+            "dry_run": dry_run,
+        }
+        if self._profile_isolation_enabled and self._beam is not None:
+            diagnostic_kwargs["bank"] = self._resolve_profile_bank()
+        if self._beam is None:
+            return json.dumps(run_diagnostics(**diagnostic_kwargs), indent=2, default=str)
+
+        # The active provider bank shares its SQLite database with auto_sleep's
+        # separate Beam connection. Keep every active-bank diagnostic access in
+        # one critical section so checkpointing cannot invalidate statements in
+        # the other connection (#498).
+        with self._ensure_beam_access_lock():
+            result = run_diagnostics(**diagnostic_kwargs)
             result["sync_turn"] = self._sync_turn_diagnostics()
 
-        # run_diagnostics() reports Mnemosyne's legacy/default DB path. When
-        # Hermes profile isolation is enabled, the active provider may use a
-        # profile bank instead (mnemosyne/data/banks/<profile>/mnemosyne.db).
-        # Surface the active provider DB too so operators do not mistake the
-        # diagnostic default path for the live memory bank.
-        active_db = None
-        try:
-            if self._beam is not None:
-                active_db = getattr(self._beam, "db_path", None)
-        except Exception:
             active_db = None
-
-        if active_db:
-            result["active_provider_db_path"] = str(active_db)
-            result["profile_isolation_enabled"] = bool(self._profile_isolation_enabled)
-            result.setdefault("key_findings", []).append(
-                f"Active Hermes Mnemosyne provider DB: {active_db}"
-            )
             try:
-                import sqlite3
-                from mnemosyne.diagnose import _memory_orphan_diagnostics
-                con = sqlite3.connect(str(active_db))
-                try:
-                    cur = con.cursor()
-                    result["active_provider_counts"] = {
-                        "working_memory": cur.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0],
-                        "episodic_memory": cur.execute("SELECT COUNT(*) FROM episodic_memory").fetchone()[0],
-                        "facts": cur.execute("SELECT COUNT(*) FROM facts").fetchone()[0],
-                    }
-                    result["active_provider_orphan_diagnostics"] = _memory_orphan_diagnostics(con)
-                finally:
-                    con.close()
-                try:
-                    from mnemosyne.core.beam import repair_vec_working as _repair_vec_working, vec_working_coverage
-                    if repair_requested and self._beam is not None:
-                        result["active_provider_vec_working_repair"] = _repair_vec_working(
-                            self._beam.conn, dry_run=dry_run
-                        )
-                        result["active_provider_vec_working"] = result[
-                            "active_provider_vec_working_repair"
-                        ].get("after", {})
-                    elif self._beam is not None:
-                        result["active_provider_vec_working"] = vec_working_coverage(self._beam.conn)
-                except Exception as exc:
-                    result["active_provider_vec_working_error"] = str(exc)
-            except Exception as exc:
-                result["active_provider_counts_error"] = str(exc)
+                active_db = getattr(self._beam, "db_path", None)
+            except Exception:
+                active_db = None
 
-        return json.dumps(result, indent=2, default=str)
+            if active_db:
+                result["active_provider_db_path"] = str(active_db)
+                result["profile_isolation_enabled"] = bool(self._profile_isolation_enabled)
+                result.setdefault("key_findings", []).append(
+                    f"Active Hermes Mnemosyne provider DB: {active_db}"
+                )
+                try:
+                    import sqlite3
+                    from mnemosyne.diagnose import _memory_orphan_diagnostics
+                    con = sqlite3.connect(str(active_db))
+                    try:
+                        cur = con.cursor()
+                        result["active_provider_counts"] = {
+                            "working_memory": cur.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0],
+                            "episodic_memory": cur.execute("SELECT COUNT(*) FROM episodic_memory").fetchone()[0],
+                            "facts": cur.execute("SELECT COUNT(*) FROM facts").fetchone()[0],
+                        }
+                        result["active_provider_orphan_diagnostics"] = _memory_orphan_diagnostics(con)
+                    finally:
+                        con.close()
+                    try:
+                        from mnemosyne.core.beam import repair_vec_working as _repair_vec_working, vec_working_coverage
+                        if repair_requested:
+                            result["active_provider_vec_working_repair"] = _repair_vec_working(
+                                self._beam.conn, dry_run=dry_run
+                            )
+                            result["active_provider_vec_working"] = result[
+                                "active_provider_vec_working_repair"
+                            ].get("after", {})
+                        else:
+                            result["active_provider_vec_working"] = vec_working_coverage(self._beam.conn)
+                    except Exception as exc:
+                        result["active_provider_vec_working_error"] = str(exc)
+                except Exception as exc:
+                    result["active_provider_counts_error"] = str(exc)
+
+            return json.dumps(result, indent=2, default=str)
 
     def _handle_graph_query(self, args: Dict[str, Any]) -> str:
         seed_id = args.get("seed_memory_id", "").strip()

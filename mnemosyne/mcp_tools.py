@@ -11,7 +11,7 @@ Usage:
 All imports are guarded — this module loads safely even if mcp is not installed.
 """
 
-from typing import Dict, Any, List
+from typing import TYPE_CHECKING, Dict, Any, List, TypeAlias
 import json
 import math
 import os
@@ -29,7 +29,6 @@ except ImportError:
     CallToolResult = None
     ErrorData = None
 
-from mnemosyne.core.memory import Mnemosyne
 from mnemosyne.core.beam import BeamMemory, _guarded_transaction
 
 from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
@@ -41,6 +40,28 @@ from mnemosyne.batch_tool import (
     validate_batch_operations,
 )
 
+if TYPE_CHECKING:
+    from mnemosyne.core.memory import Mnemosyne
+
+    MnemosyneInstance: TypeAlias = Mnemosyne
+else:
+    # Runtime type-hint resolution must not import core.memory.
+    MnemosyneInstance: TypeAlias = Any
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily retain the historical public ``Mnemosyne`` export.
+
+    Importing ``mnemosyne.core.memory`` initializes legacy default-memory
+    state, so only an explicit compatibility access may trigger that import.
+    """
+    if name == "Mnemosyne":
+        from mnemosyne.core.memory import Mnemosyne
+
+        return Mnemosyne
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 # ---------------------------------------------------------------------------
 # Tool Definitions
 # ---------------------------------------------------------------------------
@@ -48,8 +69,15 @@ from mnemosyne.batch_tool import (
 TOOLS: List[Dict[str, Any]] = []
 for _s in ALL_TOOL_SCHEMAS:
     _t = dict(_s)
-    if "parameters" in _t:
-        _t["inputSchema"] = _t.pop("parameters")
+    # ``mcp`` SDK 2.x renamed the wire field on ``Tool`` from the camelCase
+    # ``inputSchema`` (1.x) to the snake_case ``input_schema``. The
+    # canonical Python-side key matches the model field. Pydantic still
+    # accepts the camelCase alias on construction, but internal code that
+    # reads ``tool["input_schema"]`` is the only fully-supported path.
+    if "inputSchema" in _t:
+        _t["input_schema"] = _t.pop("inputSchema")
+    elif "parameters" in _t:
+        _t["input_schema"] = _t.pop("parameters")
     TOOLS.append(_t)
 
 # ---------------------------------------------------------------------------
@@ -57,10 +85,10 @@ for _s in ALL_TOOL_SCHEMAS:
 # ---------------------------------------------------------------------------
 
 def _get_schema(name: str) -> Dict[str, Any]:
-    """Extract inputSchema from TOOLS by tool name."""
+    """Extract input_schema from TOOLS by tool name."""
     for tool in TOOLS:
         if tool["name"] == name:
-            return tool["inputSchema"]
+            return tool["input_schema"]
     raise KeyError(f"Tool not found: {name}")
 
 class _SchemaProxy:
@@ -126,14 +154,22 @@ def _shared_db_path() -> Path:
 
 def _create_instance(session_id: str = None, author_id: str = None,
                      author_type: str = None, channel_id: str = None,
-                     bank: str = "default") -> Mnemosyne:
+                     bank: str = "default") -> MnemosyneInstance:
     """Create a fresh Mnemosyne instance for each MCP connection.
 
     Identity is resolved from:
     1. Explicit args (from tool call or constructor)
     2. Environment variables (MNEMOSYNE_AUTHOR_ID, etc.)
     3. None (backward compatible, no identity tracking)
+
+    ``MnemosyneInstance`` resolves to ``Any`` at runtime so type-hint
+    resolution remains side-effect-free, while static checkers use the
+    TYPE_CHECKING Mnemosyne alias above.
     """
+    # Importing core.memory initializes the legacy default database, so keep it
+    # on this mutation-capable construction path rather than at MCP import time.
+    from mnemosyne.core.memory import Mnemosyne
+
     auth = author_id or os.environ.get("MNEMOSYNE_AUTHOR_ID")
     auth_type = author_type or os.environ.get("MNEMOSYNE_AUTHOR_TYPE")
     chan = channel_id or os.environ.get("MNEMOSYNE_CHANNEL_ID") or session_id or "default"
@@ -190,7 +226,8 @@ def _serialize(obj):
 class _WrapperBatchAdapter:
     """Expose Mnemosyne wrapper mutations through the Beam batch interface."""
 
-    def __init__(self, mem: Mnemosyne):
+    def __init__(self, mem: MnemosyneInstance):
+        """Adapt a Mnemosyne instance without resolving its import at runtime."""
         self._mem = mem
         self.conn = mem.beam.conn
         self.wrapper_events = []
@@ -303,6 +340,12 @@ def _handle_recall(arguments: Dict[str, Any]) -> Dict[str, Any]:
     bank = _resolve_bank(arguments)
     temporal_weight = arguments.get("temporal_weight", 0.0)
     query_time = arguments.get("query_time")
+    # "" (and whitespace) means "omitted" for callers built against the older
+    # schema (#555). Deliberately narrower than `or None`, which both misses
+    # whitespace-only strings (truthy) and swallows falsey non-strings such as
+    # 0/False/[] that must still reach _parse_query_time's TypeError.
+    if isinstance(query_time, str) and not query_time.strip():
+        query_time = None
     temporal_halflife = arguments.get("temporal_halflife", 24)
     vec_weight = arguments.get("vec_weight")
     fts_weight = arguments.get("fts_weight")
@@ -962,11 +1005,12 @@ def _handle_graph_link(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 def _handle_hygiene_audit(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_hygiene_audit tool call."""
+    from mnemosyne.core.banks import get_bank_db_path_read_only
     from mnemosyne.core.hygiene import audit_noise
+    from mnemosyne.doctor import open_readonly_doctor_db
 
     bank = _resolve_bank(arguments)
-    mem = _create_instance(bank=bank)
-    db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
+    db_path = get_bank_db_path_read_only(bank)
 
     limit = arguments.get("limit", 200)
     min_score = arguments.get("min_score", 0.3)
@@ -975,15 +1019,20 @@ def _handle_hygiene_audit(arguments: Dict[str, Any]) -> Dict[str, Any]:
     scan_all = arguments.get("scan_all", False)
     batch_size = arguments.get("batch_size", 1000)
 
-    report = audit_noise(
-        db_path=db_path,
-        limit=limit,
-        tables=tables,
-        min_score=min_score,
-        offset=offset,
-        scan_all=scan_all,
-        batch_size=batch_size,
-    )
+    conn = open_readonly_doctor_db(db_path)
+    try:
+        report = audit_noise(
+            db_path=db_path,
+            limit=limit,
+            tables=tables,
+            min_score=min_score,
+            offset=offset,
+            scan_all=scan_all,
+            batch_size=batch_size,
+            conn=conn,
+        )
+    finally:
+        conn.close()
     return {
         "status": "audited",
         "report": report.to_dict(),
@@ -1143,3 +1192,34 @@ def handle_tool_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
 def get_tool_definitions() -> List[Dict[str, Any]]:
     """Return all tool definitions for MCP server registration."""
     return TOOLS
+
+
+# Keep the exact pre-lazy-import star-import surface.  ``Mnemosyne`` remains
+# lazy through ``__getattr__`` above, but star imports historically resolved it
+# because this module had no ``__all__`` and held the class in its globals.
+# New typing-only implementation details deliberately stay private to stars.
+__all__ = [
+    "ALL_TOOL_SCHEMAS",
+    "TOOLS",
+    "Any",
+    "BatchValidationError",
+    "BeamMemory",
+    "CallToolResult",
+    "Dict",
+    "ErrorData",
+    "List",
+    "Mnemosyne",
+    "Path",
+    "TextContent",
+    "Tool",
+    "apply_beam_batch",
+    "batch_validation_error_payload",
+    "dry_run_batch",
+    "get_tool_definitions",
+    "handle_tool_call",
+    "json",
+    "math",
+    "os",
+    "sqlite3",
+    "validate_batch_operations",
+]

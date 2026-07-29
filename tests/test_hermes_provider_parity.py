@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib
 import json
 import sys
+import threading
+import types
 from pathlib import Path
 
 import pytest
@@ -374,6 +376,335 @@ def _new_provider(module, *, scope="session", roles=("user", "assistant")):
     provider._auto_sleep_enabled = False
     provider._audit_event = lambda *args, **kwargs: None
     return provider
+
+
+@pytest.mark.parametrize(
+    ("profile_isolation", "has_active_beam", "args", "expected_kwargs"),
+    [
+        (
+            True,
+            True,
+            {"repair_vec_working": True, "dry_run": True},
+            {
+                "repair_vec_working": True,
+                "dry_run": True,
+                "bank": "isolated-profile",
+            },
+        ),
+        (
+            True,
+            True,
+            {},
+            {
+                "repair_vec_working": False,
+                "dry_run": False,
+                "bank": "isolated-profile",
+            },
+        ),
+        (False, True, {}, {"repair_vec_working": False, "dry_run": False}),
+        (True, False, {}, {"repair_vec_working": False, "dry_run": False}),
+    ],
+)
+def test_provider_diagnose_forwards_options_and_routes_only_active_isolated_bank(
+    monkeypatch, provider_modules, profile_isolation, has_active_beam, args, expected_kwargs
+):
+    """Both shipped providers must preserve diagnose options and active-bank routing."""
+    calls = []
+
+    def fake_run_diagnostics(**kwargs):
+        calls.append(kwargs)
+        return {"checks_total": 0, "key_findings": [], "entries": []}
+
+    monkeypatch.setattr("mnemosyne.diagnose.run_diagnostics", fake_run_diagnostics)
+
+    observed = {}
+    for name, module in provider_modules.items():
+        provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+        provider._beam = object() if has_active_beam else None
+        provider._profile_isolation_enabled = profile_isolation
+        provider._sync_turn_diagnostics = lambda: {}
+
+        def resolve_profile_bank():
+            if not (profile_isolation and has_active_beam):
+                pytest.fail("inactive or non-isolated diagnostics must not resolve a named bank")
+            return "isolated-profile"
+
+        provider._resolve_profile_bank = resolve_profile_bank
+        json.loads(provider._handle_diagnose(args))
+        observed[name] = calls[-1]
+
+    assert len(calls) == len(provider_modules)
+    assert observed == {name: expected_kwargs for name in provider_modules}
+
+
+class _ObservedLock:
+    """A real lock with a deterministic signal when a worker tries to enter it."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.waiting = threading.Event()
+
+    def acquire(self, *args, **kwargs):
+        self.waiting.set()
+        return self._lock.acquire(*args, **kwargs)
+
+    def release(self):
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *args):
+        self.release()
+
+
+def test_provider_lazy_beam_lock_initialization_is_thread_safe(monkeypatch, provider_modules):
+    """Concurrent __new__ callers publish and receive one lock in both providers."""
+    real_lock = threading.Lock
+
+    for module in provider_modules.values():
+        module_threading = module.threading
+        provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+        creation_barrier = threading.Barrier(2)
+        created = []
+        returned = []
+        failures = []
+
+        def racing_lock():
+            # Each worker has already observed a missing lock before either
+            # candidate can be constructed. This makes the old check-then-set
+            # implementation reliably install and return separate locks.
+            creation_barrier.wait(timeout=1)
+            candidate = real_lock()
+            created.append(candidate)
+            return candidate
+
+        def get_lock():
+            try:
+                returned.append(provider._ensure_beam_access_lock())
+            except BaseException as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        workers = [threading.Thread(target=get_lock) for _ in range(2)]
+        # `threading` is a shared stdlib module, so replace only this provider
+        # module's binding rather than patching threading.Lock process-wide.
+        monkeypatch.setattr(module, "threading", types.SimpleNamespace(Lock=racing_lock))
+        try:
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=1)
+        finally:
+            monkeypatch.setattr(module, "threading", module_threading)
+
+        assert not any(worker.is_alive() for worker in workers)
+        assert failures == []
+        assert len(created) == 2
+        assert len(returned) == 2
+        assert returned[0] is returned[1]
+        assert provider._beam_access_lock is returned[0]
+
+
+def test_provider_diagnose_waits_for_held_active_beam_lock(monkeypatch, provider_modules):
+    """Both providers serialize active diagnostics with auto-sleep Beam access."""
+    started = threading.Event()
+
+    def fake_run_diagnostics(**_kwargs):
+        started.set()
+        return {"checks_total": 0, "key_findings": [], "entries": []}
+
+    monkeypatch.setattr("mnemosyne.diagnose.run_diagnostics", fake_run_diagnostics)
+
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+        provider._beam = type("Beam", (), {"db_path": None})()
+        provider._profile_isolation_enabled = False
+        provider._sync_turn_diagnostics = lambda: {}
+        lock = _ObservedLock()
+        provider._beam_access_lock = lock
+        lock.acquire()
+        lock.waiting.clear()
+        result = []
+        worker = threading.Thread(target=lambda: result.append(provider._handle_diagnose({})))
+        try:
+            worker.start()
+            assert lock.waiting.wait(timeout=1), "diagnostics did not attempt the active Beam lock"
+            assert not started.is_set(), "diagnostics ran while Beam access was held"
+        finally:
+            lock.release()
+            worker.join(timeout=1)
+        assert not worker.is_alive(), "diagnostics did not finish after Beam access was released"
+        assert started.is_set()
+        assert json.loads(result[0])["checks_total"] == 0
+        started.clear()
+
+
+def test_provider_diagnose_reports_isolated_bank_not_populated_default(
+    tmp_path, monkeypatch, provider_modules
+):
+    """Provider diagnostics must report named-bank counts instead of default-bank counts."""
+    from mnemosyne import diagnose
+    from mnemosyne.core.memory import Mnemosyne
+
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(diagnose, "LOG_DIR", tmp_path / "logs")
+
+    default_memory = Mnemosyne(session_id="default-session")
+    default_memory.beam.remember("default one", source="test")
+    default_memory.beam.remember("default two", source="test")
+    isolated_memory = Mnemosyne(session_id="isolated-session", bank="isolated-profile")
+    isolated_memory.beam.remember("isolated one", source="test")
+
+    def active_bank_rows():
+        """Snapshot the source rows a vec_working repair is allowed to inspect."""
+        conn = isolated_memory.beam.conn
+        snapshot: dict[str, object] = {}
+        for table in ("working_memory", "memory_embeddings", "vec_working"):
+            try:
+                columns = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+                order_column = columns[0]
+                snapshot[table] = conn.execute(
+                    f"SELECT * FROM {table} ORDER BY {order_column}"
+                ).fetchall()
+            except Exception as exc:
+                snapshot[table] = ("unavailable", type(exc).__name__)
+        return snapshot
+
+    def vec_working_output(result):
+        return {
+            key: result[key]
+            for key in (
+                "active_provider_vec_working",
+                "active_provider_vec_working_error",
+                "active_provider_vec_working_repair",
+            )
+            if key in result
+        }
+
+    observed = {}
+    for name, module in provider_modules.items():
+        provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+        provider._beam = isolated_memory.beam
+        provider._profile_isolation_enabled = True
+        provider._resolve_profile_bank = lambda: "isolated-profile"
+        provider._sync_turn_diagnostics = lambda: {}
+
+        result = json.loads(provider._handle_diagnose({}))
+        entries = {entry["check"]: entry["status"] for entry in result["entries"]}
+        source_before_dry_run = active_bank_rows()
+        dry_run = json.loads(provider._handle_diagnose({"repair_vec_working": True, "dry_run": True}))
+        source_after_dry_run = active_bank_rows()
+        assert source_after_dry_run == source_before_dry_run
+        observed[name] = {
+            "resolved_bank": result["resolved_bank"],
+            "working_total": entries["working_total"],
+            "db_path": entries["db_path"],
+            "vec_working": vec_working_output(result),
+            "vec_working_dry_run": vec_working_output(dry_run),
+        }
+
+    assert {
+        name: {key: observed[name][key] for key in ("resolved_bank", "working_total", "db_path")}
+        for name in provider_modules
+    } == {
+        name: {
+            "resolved_bank": "isolated-profile",
+            "working_total": "1",
+            "db_path": str(isolated_memory.db_path),
+        }
+        for name in provider_modules
+    }
+    for result in observed.values():
+        assert set(result["vec_working"]) & {
+            "active_provider_vec_working",
+            "active_provider_vec_working_error",
+        }
+        assert set(result["vec_working_dry_run"]) & {
+            "active_provider_vec_working_repair",
+            "active_provider_vec_working_error",
+        }
+        repair = result["vec_working_dry_run"].get("active_provider_vec_working_repair")
+        if repair is not None:
+            assert repair["status"] == "dry_run"
+            assert repair["inserted"] == 0
+            assert repair["after"] == repair["before"]
+    assert observed["hermes_memory_provider"]["vec_working"] == observed["mnemosyne_hermes"]["vec_working"]
+    assert observed["hermes_memory_provider"]["vec_working_dry_run"] == observed["mnemosyne_hermes"][
+        "vec_working_dry_run"
+    ]
+
+
+def test_packaged_provider_auto_sleep_uses_worker_local_beam(monkeypatch, provider_modules):
+    """The packaged daemon must never pass its main-thread Beam into sleep."""
+    module = provider_modules["mnemosyne_hermes"]
+    provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+    source_calls = []
+    worker_beams = []
+
+    class SourceBeam:
+        session_id = "session-a"
+        db_path = "/tmp/isolated.db"
+        author_id = "author-a"
+        author_type = "user"
+        channel_id = "channel-a"
+
+        def get_working_stats(self):
+            return {"total": 2}
+
+        def _count_unconsolidated_before(self, _cutoff):
+            return 1
+
+        def sleep_all_sessions(self):
+            source_calls.append("sleep_all_sessions")
+
+        def sleep(self):
+            source_calls.append("sleep")
+
+    class WorkerBeam:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            worker_beams.append(self)
+
+        def sleep_all_sessions(self):
+            source_calls.append(("worker", "sleep_all_sessions"))
+
+        def sleep(self):
+            source_calls.append(("worker", "sleep"))
+
+    class InlineThread:
+        def __init__(self, *, target, daemon):
+            assert daemon is True
+            self._target = target
+
+        def start(self):
+            self._target()
+
+        def join(self, timeout=None):
+            assert timeout == provider._AUTO_SLEEP_TIMEOUT_SECONDS
+
+        def is_alive(self):
+            return False
+
+    provider._beam = SourceBeam()
+    provider._auto_sleep_threshold = 1
+    provider._beam_access_lock = threading.Lock()
+    provider._reserve_reflection_budget = lambda _reason: None
+    monkeypatch.setattr(module, "_get_beam_class", lambda: WorkerBeam)
+    monkeypatch.setattr(module, "threading", types.SimpleNamespace(Thread=InlineThread))
+
+    provider._maybe_auto_sleep()
+
+    assert len(worker_beams) == 1
+    assert worker_beams[0] is not provider._beam
+    assert worker_beams[0].kwargs == {
+        "session_id": "session-a",
+        "db_path": "/tmp/isolated.db",
+        "author_id": "author-a",
+        "author_type": "user",
+        "channel_id": "channel-a",
+    }
+    assert source_calls == [("worker", "sleep_all_sessions")]
 
 
 def test_provider_remember_extract_uses_default_scope(provider_modules):

@@ -5,10 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
+## [Unreleased]
+
+### Fixed
+
+- **MEMORIA instruction extraction inverted "whenever X" into "never X" (#507).** The instruction pattern was not word-boundary anchored, so `never` matched inside `whenever` and the extractor stored the opposite of what the user said — on a production bank, "Good - whenever needed we can use it." was recorded as the instruction "never needed we can use it". All five locale patterns (en/de/ru/it/es) are now anchored with a leading `\b`. Genuine instructions are unaffected, including those preceded by another word or punctuation ("Note: never push to main", "wherever you go, always run the tests"). Reported by @Axmr1 from a 61-row production audit; original diagnosis and fix approach from @Sanjays2402 (#508) and @Souptik96 (#549).
+- **`mnemosyne_recall` crashed on its own schema default (#555).** The tool schema declared `query_time` with `"default": ""`, but `_parse_query_time` mapped only `None` to "now" — a blank string fell through to the ISO parser and raised `Invalid query_time format: ''`. Any MCP harness that sends declared defaults could not call `mnemosyne_recall` at all. Blank and whitespace-only values are now treated as unset, the MCP handler normalizes `""` to `None` (matching the `or None` idiom already used for `valid_until` and `as_of`), and the schema no longer advertises a default that means "omitted". Thanks @dalkommatt for the report and the diagnosis.
+- **Enhanced Recall served invalidated rows until TTL expiry (#550, #554).** `BeamMemory.invalidate()` now clears the query cache after a successful update, including the persisted `query_cache.db` when the instance has no in-memory cache of its own. Missing or unauthorized IDs leave the cache untouched. Remaining gaps are tracked in #552 (live peer coherence), #553 (`forget_working`) and #556 (`remember`/update paths).
+- **Catastrophic regex backtracking in version-string extraction (#544).** The pattern used by `extract_and_store_facts` could be driven into exponential backtracking by Title-Case input, hanging every `remember()` and import on attacker- or user-supplied content. The separator is now `\s+`, which makes each whitespace-delimited word consumable exactly one way. Behavioral equivalence was verified across a 200,000-string fuzz with zero differences.
+
 ## [3.15.0] - 2026-07-20
 
 ### Fixed
 
+- **Memory browser startup and bank resolution (#532).** The browser now renders its CSS template safely, resolves the default and named-bank databases using the canonical paths, and opens databases read-only so a missing path cannot create an empty database.
 - **Trim-before-embedding race (#491).** Working-memory embedding storage now atomically checks that its parent row still exists. If trimming or concurrent deletion removes the parent before the fallback insert executes, both fallback and `vec_working` writes become a clean no-op instead of logging an embedding-storage failure.
 - **Jina v2 base embedding models silently fell back to 384 dimensions.** The
   `jinaai/jina-embeddings-v2-base-{es,en,de,zh,code}` models output 768-dim

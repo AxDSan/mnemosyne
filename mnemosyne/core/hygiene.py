@@ -513,11 +513,21 @@ def doctor_hygiene_summary(
 
 
 def hygiene_status(
-    db_path: Path, *, include_noise_summary: bool = True, limit: int = 200
+    db_path: Path,
+    *,
+    include_noise_summary: bool = True,
+    limit: int = 200,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> Dict[str, Any]:
-    """Return PII-safe hygiene status and optional current noise summary."""
+    """Return PII-safe hygiene status and optional current noise summary.
+
+    A caller may supply a read-only connection, which remains caller-owned and
+    is also used for the optional noise summary.
+    """
     status: Dict[str, Any] = {"status": "ok", "audit_log": {}}
-    conn = sqlite3.connect(str(db_path))
+    owns_connection = conn is None
+    if conn is None:
+        conn = sqlite3.connect(str(db_path))
     try:
         if _table_exists(conn, "hygiene_audit_log"):
             total = int(conn.execute("SELECT COUNT(*) FROM hygiene_audit_log").fetchone()[0])
@@ -537,10 +547,15 @@ def hygiene_status(
         else:
             status["audit_log"] = {"present": False, "total_entries": 0, "by_action": {}}
     finally:
-        conn.close()
+        if owns_connection:
+            conn.close()
 
     if include_noise_summary:
-        status["noise_summary"] = noise_summary(db_path=db_path, limit=limit)
+        status["noise_summary"] = noise_summary(
+            db_path=db_path,
+            limit=limit,
+            conn=None if owns_connection else conn,
+        )
     return status
 
 

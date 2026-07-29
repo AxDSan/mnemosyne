@@ -1196,6 +1196,7 @@ def cmd_hygiene(args):
         hygiene_status,
         restore_archived,
     )
+    from mnemosyne.doctor import open_readonly_doctor_db
 
     if not args or args[0] in ("--help", "-h"):
         print("Usage: mnemosyne hygiene audit|status|clean|restore [options]")
@@ -1239,7 +1240,9 @@ def cmd_hygiene(args):
         if not db_path.exists():
             _fail(f"Database not found at {db_path}")
 
+        conn = None
         try:
+            conn = open_readonly_doctor_db(db_path)
             report = audit_noise(
                 db_path=db_path,
                 limit=limit,
@@ -1247,9 +1250,13 @@ def cmd_hygiene(args):
                 offset=offset,
                 scan_all=scan_all,
                 batch_size=batch_size,
+                conn=conn,
             )
         except (ValueError, sqlite3.Error) as e:
             _fail(str(e))
+        finally:
+            if conn is not None:
+                conn.close()
 
         if as_json:
             print(json.dumps(report.to_dict(), indent=2))
@@ -1286,10 +1293,15 @@ def cmd_hygiene(args):
         db_path = Path(DATA_DIR) / "mnemosyne.db"
         if not db_path.exists():
             _fail(f"Database not found at {db_path}")
+        conn = None
         try:
-            status = hygiene_status(db_path=db_path, limit=limit)
+            conn = open_readonly_doctor_db(db_path)
+            status = hygiene_status(db_path=db_path, limit=limit, conn=conn)
         except (ValueError, sqlite3.Error) as e:
             _fail(str(e))
+        finally:
+            if conn is not None:
+                conn.close()
         if as_json:
             print(json.dumps(status, indent=2))
         else:
