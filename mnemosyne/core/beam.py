@@ -22,6 +22,7 @@ import json
 import hashlib
 import threading
 import math
+from dataclasses import dataclass
 
 from mnemosyne.core.config import resolve_beam_runtime
 
@@ -1397,6 +1398,74 @@ def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, co
         conn.commit()
 
 
+@dataclass(frozen=True)
+class _RecallWeightSnapshot:
+    """The normalized scoring weights fixed for one recall request."""
+
+    vec: float
+    fts: float
+    importance: float
+
+    def as_tuple(self) -> tuple[float, float, float]:
+        return (self.vec, self.fts, self.importance)
+
+
+_DEFAULT_RECALL_WEIGHTS = (0.5, 0.3, 0.2)
+
+
+def _normalize_recall_weight_values(
+    vec_weight: Any,
+    fts_weight: Any,
+    importance_weight: Any,
+) -> _RecallWeightSnapshot:
+    """Normalize one finite request snapshot, or return the safe defaults.
+
+    Compatibility policy: ordinary negative values remain clamped and an
+    all-zero triplet still falls back to the historical defaults.  If any
+    resolved component is NaN or infinite (or normalization overflows), use
+    ``(0.5, 0.3, 0.2)`` for the whole request rather than letting a partial
+    value poison scoring or enhanced-cache material.
+    """
+    try:
+        values = (float(vec_weight), float(fts_weight), float(importance_weight))
+    except (TypeError, ValueError, OverflowError):
+        return _RecallWeightSnapshot(*_DEFAULT_RECALL_WEIGHTS)
+    if not all(math.isfinite(value) for value in values):
+        return _RecallWeightSnapshot(*_DEFAULT_RECALL_WEIGHTS)
+
+    clamped = tuple(max(0.0, value) for value in values)
+    total = sum(clamped)
+    if total == 0.0 or not math.isfinite(total):
+        return _RecallWeightSnapshot(*_DEFAULT_RECALL_WEIGHTS)
+
+    normalized = tuple(value / total for value in clamped)
+    if not all(math.isfinite(value) for value in normalized):
+        return _RecallWeightSnapshot(*_DEFAULT_RECALL_WEIGHTS)
+    return _RecallWeightSnapshot(*normalized)
+
+
+def _resolve_recall_weights(
+    vec_weight: Optional[float],
+    fts_weight: Optional[float],
+    importance_weight: Optional[float],
+) -> _RecallWeightSnapshot:
+    """Resolve one finite atomic snapshot with config.yaml > env > defaults."""
+    from mnemosyne.core.config import get_config
+
+    config = get_config()
+    configured = config.get_many({
+        "vec_weight": _DEFAULT_RECALL_WEIGHTS[0],
+        "fts_weight": _DEFAULT_RECALL_WEIGHTS[1],
+        "importance_weight": _DEFAULT_RECALL_WEIGHTS[2],
+    })
+
+    return _normalize_recall_weight_values(
+        vec_weight if vec_weight is not None else configured["vec_weight"],
+        fts_weight if fts_weight is not None else configured["fts_weight"],
+        importance_weight if importance_weight is not None else configured["importance_weight"],
+    )
+
+
 def _normalize_weights(vec_weight: Optional[float], fts_weight: Optional[float],
                        importance_weight: Optional[float]) -> tuple[float, float, float]:
     """
@@ -1409,21 +1478,10 @@ def _normalize_weights(vec_weight: Optional[float], fts_weight: Optional[float],
 
     After normalization: vw + fw + iw == 1.0
     """
-    vw = vec_weight if vec_weight is not None else float(os.environ.get("MNEMOSYNE_VEC_WEIGHT", "0.5"))
-    fw = fts_weight if fts_weight is not None else float(os.environ.get("MNEMOSYNE_FTS_WEIGHT", "0.3"))
-    iw = importance_weight if importance_weight is not None else float(os.environ.get("MNEMOSYNE_IMPORTANCE_WEIGHT", "0.2"))
-
-    # Clamp to non-negative
-    vw = max(0.0, vw)
-    fw = max(0.0, fw)
-    iw = max(0.0, iw)
-
-    total = vw + fw + iw
-    if total == 0.0:
-        # All zero = revert to defaults
-        return (0.5, 0.3, 0.2)
-
-    return (vw / total, fw / total, iw / total)
+    vw = vec_weight if vec_weight is not None else os.environ.get("MNEMOSYNE_VEC_WEIGHT", "0.5")
+    fw = fts_weight if fts_weight is not None else os.environ.get("MNEMOSYNE_FTS_WEIGHT", "0.3")
+    iw = importance_weight if importance_weight is not None else os.environ.get("MNEMOSYNE_IMPORTANCE_WEIGHT", "0.2")
+    return _normalize_recall_weight_values(vw, fw, iw).as_tuple()
 
 
 def _normalize_datetime_utc(dt: datetime) -> datetime:
@@ -5477,7 +5535,8 @@ class BeamMemory:
                fts_weight: float = None,
                importance_weight: float = None,
                explain: bool = False,
-               _cross_session: Optional[bool] = None) -> List[Dict]:
+               _cross_session: Optional[bool] = None,
+               _resolved_weights: Optional[_RecallWeightSnapshot] = None) -> List[Dict]:
         """
         Hybrid recall across working_memory + episodic_memory.
         Uses sqlite-vec + FTS5 for episodic, FTS5 for working.
@@ -5565,7 +5624,10 @@ class BeamMemory:
         query_words = _recall_tokens(query_lower)
 
         # ---- Configurable hybrid scoring setup (Phase 4) ----
-        vw, fw, iw = _normalize_weights(vec_weight, fts_weight, importance_weight)
+        weight_snapshot = _resolved_weights or _resolve_recall_weights(
+            vec_weight, fts_weight, importance_weight,
+        )
+        vw, fw, iw = weight_snapshot.as_tuple()
         _explain_trace = None
         if explain:
             from mnemosyne.core.recall_diagnostics import RecallExplainTrace
@@ -5598,6 +5660,7 @@ class BeamMemory:
         # If any weight was explicitly passed by the caller, skip intent
         # adjustment -- explicit caller weights win.
         if (os.environ.get("MNEMOSYNE_QUERY_INTENT", "0") == "1"
+                and _resolved_weights is None
                 and vec_weight is None and fts_weight is None
                 and importance_weight is None):
             try:
@@ -5607,6 +5670,7 @@ class BeamMemory:
                     base_vec=vw, base_fts=fw, base_importance=iw,
                     intent=_intent,
                 )
+                vw, fw, iw = _normalize_recall_weight_values(vw, fw, iw).as_tuple()
             except Exception:
                 logger.debug("query intent adjustment failed, using default weights", exc_info=True)
 
@@ -6737,6 +6801,7 @@ class BeamMemory:
         associative_depth: int,
         mmr_lambda: float,
         recall_kwargs: Dict[str, Any],
+        weights: Optional[tuple[float, float, float]] = None,
     ) -> str:
         """Build a versioned opaque key for one effective enhanced request."""
         def canonicalize(value: Any) -> Any:
@@ -6750,28 +6815,33 @@ class BeamMemory:
                 return [canonicalize(item) for item in value]
             if isinstance(value, set):
                 return sorted(canonicalize(item) for item in value)
-            if value is None or isinstance(value, (str, int, float, bool)):
+            if isinstance(value, float):
+                return value if math.isfinite(value) else None
+            if value is None or isinstance(value, (str, int, bool)):
                 return value
             return str(value)
 
-        raw_weights = (
-            recall_kwargs.get("vec_weight"),
-            recall_kwargs.get("fts_weight"),
-            recall_kwargs.get("importance_weight"),
-        )
-        resolved_weights = _normalize_weights(*raw_weights)
-        if (all(weight is None for weight in raw_weights)
-                and os.environ.get("MNEMOSYNE_QUERY_INTENT", "0") == "1"
-                and classify_intent is not None and adjust_weights is not None):
-            try:
-                resolved_weights = adjust_weights(
-                    base_vec=resolved_weights[0],
-                    base_fts=resolved_weights[1],
-                    base_importance=resolved_weights[2],
-                    intent=classify_intent(expanded_query),
-                )
-            except Exception:
-                logger.debug("query intent adjustment failed while building cache key", exc_info=True)
+        if weights is None:
+            raw_weights = (
+                recall_kwargs.get("vec_weight"),
+                recall_kwargs.get("fts_weight"),
+                recall_kwargs.get("importance_weight"),
+            )
+            resolved_weights = _normalize_weights(*raw_weights)
+            if (all(weight is None for weight in raw_weights)
+                    and os.environ.get("MNEMOSYNE_QUERY_INTENT", "0") == "1"
+                    and classify_intent is not None and adjust_weights is not None):
+                try:
+                    resolved_weights = adjust_weights(
+                        base_vec=resolved_weights[0],
+                        base_fts=resolved_weights[1],
+                        base_importance=resolved_weights[2],
+                        intent=classify_intent(expanded_query),
+                    )
+                except Exception:
+                    logger.debug("query intent adjustment failed while building cache key", exc_info=True)
+        else:
+            resolved_weights = weights
 
         temporal_halflife = recall_kwargs.get("temporal_halflife")
         if temporal_halflife is None:
@@ -6873,29 +6943,56 @@ class BeamMemory:
 
         original_query = query
         expanded_query = query
+        raw_weights = (
+            kwargs.get("vec_weight"),
+            kwargs.get("fts_weight"),
+            kwargs.get("importance_weight"),
+        )
+        weight_snapshot = _resolve_recall_weights(*raw_weights)
+        intent_adjusted_weights = False
 
         # 1. Query intent classification
-        if use_intent and classify_intent is not None:
+        if (all(weight is None for weight in raw_weights)
+                and use_intent and classify_intent is not None):
             intent = classify_intent(query)
             if intent.category != "general" and adjust_weights is not None:
-                vec_weight, fts_weight, importance_weight = _normalize_weights(
-                    kwargs.pop("vec_weight", None),
-                    kwargs.pop("fts_weight", None),
-                    kwargs.pop("importance_weight", None),
-                )
                 vw, fw, iw = adjust_weights(
-                    base_vec=vec_weight,
-                    base_fts=fts_weight,
-                    base_importance=importance_weight,
+                    base_vec=weight_snapshot.vec,
+                    base_fts=weight_snapshot.fts,
+                    base_importance=weight_snapshot.importance,
                     intent=intent,
                 )
-                kwargs["vec_weight"] = vw
-                kwargs["fts_weight"] = fw
-                kwargs["importance_weight"] = iw
+                weight_snapshot = _normalize_recall_weight_values(vw, fw, iw)
+                intent_adjusted_weights = True
+                kwargs["vec_weight"] = weight_snapshot.vec
+                kwargs["fts_weight"] = weight_snapshot.fts
+                kwargs["importance_weight"] = weight_snapshot.importance
 
         # 2. Synonym expansion
         if use_synonyms and expand_query is not None:
             expanded_query = expand_query(query)
+
+        if (not intent_adjusted_weights
+                and all(weight is None for weight in raw_weights)
+                and os.environ.get("MNEMOSYNE_QUERY_INTENT", "0") == "1"
+                and classify_intent is not None and adjust_weights is not None):
+            try:
+                vw, fw, iw = adjust_weights(
+                    base_vec=weight_snapshot.vec,
+                    base_fts=weight_snapshot.fts,
+                    base_importance=weight_snapshot.importance,
+                    intent=classify_intent(expanded_query),
+                )
+                weight_snapshot = _normalize_recall_weight_values(vw, fw, iw)
+            except Exception:
+                logger.debug("query intent adjustment failed while resolving enhanced weights", exc_info=True)
+
+        # The opaque cache key contains raw recall kwargs too.  Store the
+        # effective finite snapshot there, so an explicit ``inf``/``nan``
+        # cannot enter key material even though it was safely defaulted above.
+        kwargs["vec_weight"] = weight_snapshot.vec
+        kwargs["fts_weight"] = weight_snapshot.fts
+        kwargs["importance_weight"] = weight_snapshot.importance
 
         # 3. Query cache check.  Opaque v2 keys use QueryCache's exact-only
         # path, so no semantic tier can reuse a different effective request.
@@ -6914,6 +7011,7 @@ class BeamMemory:
             associative_depth=associative_depth,
             mmr_lambda=mmr_lambda,
             recall_kwargs=kwargs,
+            weights=weight_snapshot.as_tuple(),
         )
         cached = None
         if use_cache and not explain and QueryCache is not None:
@@ -6930,7 +7028,11 @@ class BeamMemory:
 
         # 4. Run base recall with expanded query
         results = self.recall(
-            expanded_query, top_k=top_k * 2, _cross_session=runtime.cross_session, **kwargs
+            expanded_query,
+            top_k=top_k * 2,
+            _cross_session=runtime.cross_session,
+            _resolved_weights=weight_snapshot,
+            **kwargs,
         )
         if explain:
             return results

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ import pytest
 
 from mnemosyne.core import beam as beam_module
 from mnemosyne.core.beam import BeamMemory
+from mnemosyne.core.config import MnemosyneConfig, get_config
 from mnemosyne.core.query_cache import QueryCache
 
 
@@ -322,6 +324,162 @@ def test_pipeline_flags_and_process_ranking_configuration_change_digest(enhanced
     monkeypatch.undo()
     monkeypatch.setattr(beam_module, "weibull_boost", None)
     assert memory._enhanced_recall_cache_key(**common) != baseline
+
+
+def test_enhanced_recall_reloaded_weight_snapshot_misses_cache_and_changes_key(
+    enhanced, monkeypatch, tmp_path: Path
+):
+    """A cache key is bound to the one effective config-resolved weight snapshot."""
+    memory, calls = enhanced
+    data_dir = tmp_path / "config"
+    data_dir.mkdir()
+    config_path = data_dir / "config.yaml"
+    config_path.write_text("vec_weight: 0\nfts_weight: 1\nimportance_weight: 0\n")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("MNEMOSYNE_VEC_WEIGHT", "1")
+    monkeypatch.setenv("MNEMOSYNE_FTS_WEIGHT", "0")
+    monkeypatch.setenv("MNEMOSYNE_IMPORTANCE_WEIGHT", "1")
+    MnemosyneConfig.reset_instance()
+
+    original_key = memory._enhanced_recall_cache_key
+    original_resolver = beam_module._resolve_recall_weights
+    observed = []
+    resolutions = []
+
+    def capture_resolver(*args, **kwargs):
+        snapshot = original_resolver(*args, **kwargs)
+        resolutions.append(snapshot)
+        return snapshot
+
+    def capture_key(*args, **kwargs):
+        observed.append(kwargs["weights"])
+        return original_key(*args, **kwargs)
+
+    monkeypatch.setattr(beam_module, "_resolve_recall_weights", capture_resolver)
+    monkeypatch.setattr(memory, "_enhanced_recall_cache_key", capture_key)
+    _call(memory, "reloadable cache weights")
+    _call(memory, "reloadable cache weights")
+    assert len(calls) == 1
+    assert len(resolutions) == 2
+    assert observed == [(0.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+
+    config_path.write_text("vec_weight: 1\nfts_weight: 0\nimportance_weight: 0\n")
+    get_config().reload()
+    _call(memory, "reloadable cache weights")
+    assert len(calls) == 2
+    assert len(resolutions) == 3
+    assert observed[-1] == (1.0, 0.0, 0.0)
+
+
+def test_enhanced_recall_reload_boundary_uses_one_complete_weight_generation(
+    enhanced, monkeypatch, tmp_path: Path
+):
+    """Enhanced cache-key and base recall share one non-hybrid config snapshot."""
+    memory, calls = enhanced
+    data_dir = tmp_path / "config"
+    data_dir.mkdir()
+    config_path = data_dir / "config.yaml"
+    old_generation = (1.0, 0.0, 0.0)
+    new_generation = (0.0, 1.0, 0.0)
+    config_path.write_text("vec_weight: 1\nfts_weight: 0\nimportance_weight: 0\n")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+    MnemosyneConfig.reset_instance()
+    config = get_config()
+    original_maybe_reload = config._maybe_reload
+    reads = 0
+    observed_key_weights = []
+    original_key = memory._enhanced_recall_cache_key
+
+    def reload_before_second_legacy_read():
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            config_path.write_text("vec_weight: 0\nfts_weight: 1\nimportance_weight: 0\n")
+            config.reload()
+        else:
+            original_maybe_reload()
+
+    def capture_key(*args, **kwargs):
+        observed_key_weights.append(kwargs["weights"])
+        return original_key(*args, **kwargs)
+
+    monkeypatch.setattr(config, "_maybe_reload", reload_before_second_legacy_read)
+    monkeypatch.setattr(memory, "_enhanced_recall_cache_key", capture_key)
+    _call(memory, "atomic enhanced snapshot")
+
+    base_weights = calls[0][2]["_resolved_weights"].as_tuple()
+    assert base_weights in {old_generation, new_generation}
+    assert observed_key_weights == [base_weights]
+
+
+def test_enhanced_nonfinite_yaml_weight_uses_finite_cache_material_and_score(
+    enhanced, monkeypatch, tmp_path: Path
+):
+    """A YAML .inf weight cannot reach enhanced cache material or base scoring."""
+    memory, calls = enhanced
+    data_dir = tmp_path / "config"
+    data_dir.mkdir()
+    (data_dir / "config.yaml").write_text(
+        "vec_weight: .inf\nfts_weight: 0.3\nimportance_weight: 0.2\n"
+    )
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+    MnemosyneConfig.reset_instance()
+    observed = []
+    original_key = memory._enhanced_recall_cache_key
+
+    def capture_key(*args, **kwargs):
+        observed.append((kwargs["weights"], kwargs["recall_kwargs"].copy()))
+        return original_key(*args, **kwargs)
+
+    monkeypatch.setattr(memory, "_enhanced_recall_cache_key", capture_key)
+    results = _call(memory, "finite enhanced cache")
+
+    base_weights = calls[0][2]["_resolved_weights"].as_tuple()
+    assert base_weights == pytest.approx((0.5, 0.3, 0.2))
+    assert observed[0][0] == pytest.approx(base_weights)
+    assert all(math.isfinite(value) for value in observed[0][0])
+    assert all(math.isfinite(observed[0][1][key]) for key in (
+        "vec_weight", "fts_weight", "importance_weight",
+    ))
+    assert math.isfinite(results[0]["score"])
+
+
+@pytest.mark.parametrize(
+    "huge_weight", [10 ** 10_000, -(10 ** 10_000)], ids=["positive", "negative"]
+)
+def test_enhanced_extreme_python_int_uses_defaults_and_finite_cache_material(
+    enhanced, monkeypatch, huge_weight
+):
+    """Enhanced recall sanitizes one overflowing explicit weight before cache use."""
+    memory, calls = enhanced
+    observed = []
+    original_key = memory._enhanced_recall_cache_key
+
+    def capture_key(*args, **kwargs):
+        key = original_key(*args, **kwargs)
+        observed.append((key, kwargs["weights"], kwargs["recall_kwargs"].copy()))
+        return key
+
+    monkeypatch.setattr(memory, "_enhanced_recall_cache_key", capture_key)
+    results = _call(
+        memory,
+        "extreme enhanced weight sentinel",
+        vec_weight=huge_weight,
+        fts_weight=0.8,
+        importance_weight=0.2,
+    )
+
+    base_weights = calls[0][2]["_resolved_weights"].as_tuple()
+    assert base_weights == (0.5, 0.3, 0.2)
+    assert observed[0][1] == base_weights
+    assert all(math.isfinite(value) for value in observed[0][1])
+    assert all(math.isfinite(observed[0][2][key]) for key in (
+        "vec_weight", "fts_weight", "importance_weight",
+    ))
+    assert "nan" not in repr(observed[0]).lower()
+    assert "inf" not in repr(observed[0]).lower()
+    assert all(math.isfinite(result["score"]) for result in results)
+
 
 
 def test_sessions_cross_session_and_sibling_databases_are_isolated(monkeypatch, tmp_path: Path):

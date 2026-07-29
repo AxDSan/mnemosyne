@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -87,3 +88,129 @@ reader._beam.conn.close()
         env={"HERMES_HOME": str(hermes_home), "MNEMOSYNE_CROSS_SESSION": env_value, "MNEMOSYNE_DATA_DIR": ""},
     )
     assert result.stdout.strip() == expected
+
+
+def test_direct_core_recall_weights_honor_yaml_env_and_defaults(tmp_path: Path):
+    """The real Beam scoring consumer resolves weights as YAML > env > defaults."""
+    script = """
+import json
+import os
+from pathlib import Path
+from mnemosyne.core.beam import BeamMemory
+
+memory = BeamMemory(session_id="weights", db_path=Path(os.environ["TEST_DB"]))
+try:
+    memory.remember("recall weight runtime sentinel", source="test", importance=0.9)
+    payload = memory.recall("recall weight runtime sentinel", top_k=3, explain=True)
+    print(json.dumps(payload["explain"]["weights"], sort_keys=True))
+finally:
+    memory.conn.close()
+"""
+
+    yaml_dir = tmp_path / "yaml"
+    yaml_dir.mkdir()
+    (yaml_dir / "config.yaml").write_text(
+        "vec_weight: 0\nfts_weight: 1\nimportance_weight: 0\n"
+    )
+    yaml_result = _run(
+        script,
+        env={
+            "MNEMOSYNE_DATA_DIR": str(yaml_dir),
+            "MNEMOSYNE_VEC_WEIGHT": "1",
+            "MNEMOSYNE_FTS_WEIGHT": "0",
+            "MNEMOSYNE_IMPORTANCE_WEIGHT": "1",
+            "MNEMOSYNE_NO_EMBEDDINGS": "1",
+            "TEST_DB": str(tmp_path / "yaml.db"),
+        },
+    )
+    assert json.loads(yaml_result.stdout) == {
+        "fts": 1.0,
+        "importance": 0.0,
+        "temporal": 0.0,
+        "vec": 0.0,
+    }
+
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    env_result = _run(
+        script,
+        env={
+            "MNEMOSYNE_DATA_DIR": str(env_dir),
+            "MNEMOSYNE_VEC_WEIGHT": "0",
+            "MNEMOSYNE_FTS_WEIGHT": "1",
+            "MNEMOSYNE_IMPORTANCE_WEIGHT": "0",
+            "MNEMOSYNE_NO_EMBEDDINGS": "1",
+            "TEST_DB": str(tmp_path / "env.db"),
+        },
+    )
+    assert json.loads(env_result.stdout) == {
+        "fts": 1.0,
+        "importance": 0.0,
+        "temporal": 0.0,
+        "vec": 0.0,
+    }
+
+    defaults_dir = tmp_path / "defaults"
+    defaults_dir.mkdir()
+    defaults_result = _run(
+        script,
+        env={
+            "MNEMOSYNE_DATA_DIR": str(defaults_dir),
+            "MNEMOSYNE_NO_EMBEDDINGS": "1",
+            "TEST_DB": str(tmp_path / "defaults.db"),
+        },
+    )
+    assert json.loads(defaults_result.stdout) == {
+        "fts": 0.3,
+        "importance": 0.2,
+        "temporal": 0.0,
+        "vec": 0.5,
+    }
+
+
+def test_both_hermes_provider_recall_surfaces_honor_yaml_over_env(tmp_path: Path):
+    """Both provider tool routes reach Beam with the YAML-resolved weights."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "config.yaml").write_text(
+        "vec_weight: 0\nfts_weight: 1\nimportance_weight: 0\n"
+    )
+    script = """
+import importlib
+import json
+import os
+
+Provider = importlib.import_module(os.environ["PROVIDER_MODULE"]).MnemosyneMemoryProvider
+provider = Provider()
+provider.initialize("weights", hermes_home=os.environ["HERMES_HOME"])
+assert provider._beam is not None
+try:
+    provider._beam.remember("provider recall weight sentinel", source="test", importance=0.9)
+    response = json.loads(provider._handle_recall({
+        "query": "provider recall weight sentinel", "limit": 3, "explain": True,
+    }))
+    print(json.dumps(response["explain"]["weights"], sort_keys=True))
+finally:
+    provider._beam.conn.close()
+"""
+    for provider_module in ("hermes_memory_provider", "mnemosyne_hermes"):
+        provider_home = tmp_path / provider_module
+        provider_home.mkdir()
+        result = _run(
+            script,
+            env={
+                "PROVIDER_MODULE": provider_module,
+                "HERMES_HOME": str(provider_home),
+                "MNEMOSYNE_DATA_DIR": str(data_dir),
+                "MNEMOSYNE_VEC_WEIGHT": "1",
+                "MNEMOSYNE_FTS_WEIGHT": "0",
+                "MNEMOSYNE_IMPORTANCE_WEIGHT": "1",
+                "MNEMOSYNE_NO_EMBEDDINGS": "1",
+            },
+        )
+        assert json.loads(result.stdout) == {
+            "fts": 1.0,
+            "importance": 0.0,
+            "temporal": 0.0,
+            "vec": 0.0,
+        }

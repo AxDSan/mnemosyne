@@ -4,6 +4,8 @@ import os
 import tempfile
 from pathlib import Path
 
+import pytest
+
 
 def test_query_intent_classification_and_weight_adjustment():
     from mnemosyne.core.query_intent import adjust_weights, classify_intent
@@ -66,8 +68,47 @@ def test_explicit_recall_weights_override_query_intent(monkeypatch):
         assert results
 
 
+def test_public_enhanced_recall_keeps_explicit_weights_from_query_intent(monkeypatch):
+    """Enhanced intent classification must not rewrite public caller weights."""
+    from mnemosyne.core import beam as beam_module
+    from mnemosyne.core.memory import Mnemosyne
+
+    adjust_calls = []
+
+    def fail_if_adjusted(*args, **kwargs):
+        adjust_calls.append((args, kwargs))
+        raise AssertionError("explicit recall weights must skip intent adjustment")
+
+    monkeypatch.setattr(beam_module, "adjust_weights", fail_if_adjusted)
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_QUERY_INTENT", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        memory = Mnemosyne(session_id="test", db_path=Path(tmpdir) / "mnemosyne.db")
+        try:
+            memory.remember("Last week we changed the deployment workflow", importance=0.7)
+
+            payload = memory.recall(
+                "what happened last week",
+                top_k=5,
+                vec_weight=0.2,
+                fts_weight=0.7,
+                importance_weight=0.1,
+                explain=True,
+            )
+
+            assert payload["explain"]["weights"] == pytest.approx({
+                "vec": 0.2, "fts": 0.7, "importance": 0.1, "temporal": 0.0,
+            })
+            assert adjust_calls == []
+        finally:
+            memory.conn.close()
+
+
 def test_public_enhanced_recall_resolves_weight_defaults_and_overrides(monkeypatch):
     from mnemosyne.core import beam as beam_module
+    from mnemosyne.core.config import MnemosyneConfig
     from mnemosyne.core.memory import Mnemosyne
 
     observed_base_weights = []
@@ -86,6 +127,11 @@ def test_public_enhanced_recall_resolves_weight_defaults_and_overrides(monkeypat
     monkeypatch.delenv("MNEMOSYNE_IMPORTANCE_WEIGHT", raising=False)
 
     with tempfile.TemporaryDirectory() as tmpdir:
+        config_dir = Path(tmpdir) / "config"
+        config_dir.mkdir()
+        (config_dir / "config.yaml").write_text("cross_session: false\n")
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(config_dir))
+        MnemosyneConfig.reset_instance()
         db_path = Path(tmpdir) / "mnemosyne.db"
         memory = Mnemosyne(session_id="test", db_path=db_path)
         try:
@@ -112,8 +158,8 @@ def test_public_enhanced_recall_resolves_weight_defaults_and_overrides(monkeypat
                 for weights in observed_base_weights
             ] == [
                 (0.5, 0.3, 0.2),
-                (0.0, 1.0, 0.0),
                 (0.2, 0.7, 0.1),
             ]
         finally:
             memory.conn.close()
+            MnemosyneConfig.reset_instance()
