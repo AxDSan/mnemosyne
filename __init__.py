@@ -42,7 +42,7 @@ except ImportError:
 # The actual MnemosyneMemoryProvider lives in hermes_memory_provider/__init__.py.
 # This bridge function delegates to it so the memory provider system can
 # discover and load the provider.
-def register(ctx):
+def register_memory_provider(ctx):
     """Bridge to hermes_memory_provider for memory provider discovery."""
     try:
         from .hermes_memory_provider import register_memory_provider
