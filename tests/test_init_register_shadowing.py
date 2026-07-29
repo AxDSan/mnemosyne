@@ -82,10 +82,10 @@ def test_hermes_plugin_register_not_shadowed():
 
             print("PASS")
         """).format(
-            mock_root=mock_root,
-            plugin_parent=plugin_parent,
-            repo_root=REPO_ROOT,
-            repo_parent=REPO_ROOT.parent,
+            mock_root=str(mock_root),
+            plugin_parent=str(plugin_parent),
+            repo_root=str(REPO_ROOT),
+            repo_parent=str(REPO_ROOT.parent),
         )
 
         result = subprocess.run(
@@ -141,10 +141,10 @@ def test_register_memory_provider_bridge_delegates():
 
             print("PASS")
         """).format(
-            mock_root=mock_root,
-            plugin_parent=plugin_parent,
-            repo_root=REPO_ROOT,
-            repo_parent=REPO_ROOT.parent,
+            mock_root=str(mock_root),
+            plugin_parent=str(plugin_parent),
+            repo_root=str(REPO_ROOT),
+            repo_parent=str(REPO_ROOT.parent),
         )
 
         result = subprocess.run(
