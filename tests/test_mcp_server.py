@@ -1129,16 +1129,18 @@ print(json.dumps({"result": result, "after": after}))
 
         class _Params:
             name = "mnemosyne_stats"
-            arguments = {}
+            arguments = None
 
-        with patch("mnemosyne.mcp_server.handle_tool_call", return_value={"status": "ok"}):
+        with patch("mnemosyne.mcp_server.handle_tool_call", return_value={"status": "ok"}) as handle_call:
             result = asyncio.get_event_loop().run_until_complete(
                 on_call_tool(ctx=None, params=_Params())
             )
+        handle_call.assert_called_once_with("mnemosyne_stats", {})
         assert isinstance(result, CallToolResult)
         assert not result.is_error, (
             "successful tools/call must have is_error=False (or None)"
         )
+        assert json.loads(result.content[0].text) == {"status": "ok"}
 
     def test_top_level_cli_forwards_mcp_arguments(self, tmp_path):
         """`mnemosyne mcp ...` must pass subcommand args to the MCP parser."""

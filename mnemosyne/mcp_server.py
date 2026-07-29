@@ -121,7 +121,7 @@ def _build_mcp_server() -> Server:
 
     async def _on_call_tool(ctx, params):  # noqa: ARG001 — ctx unused
         try:
-            result = handle_tool_call(params.name, params.arguments)
+            result = handle_tool_call(params.name, params.arguments or {})
             content = [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
             return CallToolResult(content=content)
         except Exception as e:
