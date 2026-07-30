@@ -188,11 +188,23 @@ def _call_llm(prompt: str, system: str = "") -> str:
     except Exception:
         pass
 
-    # Fallback to cloud extraction client
+    # Fallback to the cloud extraction client.
+    #
+    # This path was dead. It imported ExtractionConfig and ExtractionClient
+    # from mnemosyne.core.extraction, which exports neither: they live in
+    # the mnemosyne.extraction package. The ImportError was swallowed by the
+    # bare except below, so the fallback silently never ran and only the
+    # local GGUF path could ever produce a belief. It also passed a config
+    # object positionally to ExtractionClient(model=...), which would have
+    # been wrong even with the right import.
+    #
+    # MNEMOSYNE_SHMR_MODEL, when set, overrides the model for harmonization
+    # only. Harmonization is a reasoning task and may warrant a stronger
+    # model than extraction. That variable was previously read at import and
+    # then never used.
     try:
-        from mnemosyne.core.extraction import ExtractionConfig, ExtractionClient
-        config = ExtractionConfig()
-        client = ExtractionClient(config)
+        from mnemosyne.extraction import ExtractionClient
+        client = ExtractionClient(model=SHMR_MODEL or None)
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -201,7 +213,7 @@ def _call_llm(prompt: str, system: str = "") -> str:
         if result:
             return result
     except Exception:
-        pass
+        logger.debug("SHMR cloud fallback failed", exc_info=True)
 
     return ""
 
@@ -356,8 +368,19 @@ def harmonize(beam, batch_size: int = None, max_iterations: int = None,
               similarity_threshold: float = None) -> Dict:
     """Run one harmonic cycle over recent memories.
 
-    Called automatically by mnemosyne_sleep() after consolidation.
-    Can also be called directly via MCP tool for on-demand harmonization.
+    NOT wired into anything. There is no caller in the shipped code: sleep()
+    does not invoke it, there is no MCP tool, and there is no CLI subcommand.
+    Call it directly if you want it:
+
+        from mnemosyne.core.shmr import harmonize
+        harmonize(beam)
+
+    Requires embeddings unconditionally (candidate collection calls embed
+    without a guard) and an LLM to produce any beliefs at all. Without a
+    reachable LLM it returns normally with beliefs_generated=0 and
+    status="no_convergence", which is indistinguishable from the model
+    failing to converge. Check your LLM configuration before reading
+    anything into that result.
 
     Args:
         beam: BeamMemory instance

@@ -1451,6 +1451,14 @@ def cmd_profile(args):
             if idx + 1 < len(rest):
                 config_path_arg = rest[idx + 1]
 
+        # Captured before the write so the vec_type notice below can tell
+        # whether the value actually changed.
+        try:
+            from mnemosyne.core.config import get_config as _get_config
+            _prev_vec_type = _get_config().get("vec_type")
+        except Exception:
+            _prev_vec_type = None
+
         success, errors = apply_profile(name, config_path=config_path_arg, dry_run=dry_run)
         if not success:
             print(f"Failed to apply profile '{name}':", file=sys.stderr)
@@ -1458,9 +1466,26 @@ def cmd_profile(args):
                 print(f"  {e}", file=sys.stderr)
             raise SystemExit(1)
         mode = "DRY RUN" if dry_run else "APPLIED"
-        print(f"[{mode}] Profile '{name}' — {len(get_profile(name))} settings")
+        applied = get_profile(name) or {}
+        print(f"[{mode}] Profile '{name}' — {len(applied)} settings")
         if not dry_run:
             print("Run 'mnemosyne config reload' to apply changes to a running process.")
+            # vec_type is the one REQUIRES_RESTART key in TEMPLATE_KEYS, and
+            # every profile sets it. 'config reload' cannot apply it, and the
+            # sqlite-vec tables are locked to the type they were created with,
+            # so a change here needs a restart plus a reindex. Saying only
+            # "run config reload" is misleading whenever it changed.
+            try:
+                if applied.get("vec_type") and applied["vec_type"] != _prev_vec_type:
+                    print(
+                        f"\nvec_type changed {_prev_vec_type or '(unset)'} -> "
+                        f"{applied['vec_type']}. This one needs more than a reload:\n"
+                        "  1. restart the process (vec_type is read at startup)\n"
+                        "  2. run 'mnemosyne reindex' to rebuild the vector tables\n"
+                        "Existing vectors are not converted in place."
+                    )
+            except Exception:
+                pass
 
     elif sub == "show":
         if len(rest) < 1:

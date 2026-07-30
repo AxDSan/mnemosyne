@@ -43,7 +43,7 @@ All seven are read at **module import time** and cannot be changed afterwards. O
 | `MNEMOSYNE_SHMR_HARMONY_THRESHOLD` | `0.60` | Minimum harmony score to accept beliefs | no |
 | `MNEMOSYNE_SHMR_MIN_CLUSTER_SIZE` | `2` | Minimum candidates to run, and minimum cluster size to keep | no |
 | `MNEMOSYNE_SHMR_TEMPERATURE` | `0.2` | Sampling temperature for the harmonization call | no |
-| `MNEMOSYNE_SHMR_MODEL` | `""` | **Read but never used.** The value is assigned and referenced nowhere; the LLM call does not pass a model | no |
+| `MNEMOSYNE_SHMR_MODEL` | `""` | Model override for the cloud fallback. Empty uses the extraction default | no |
 
 > **`config.yaml` does not reach SHMR.** These keys exist in `ENV_VAR_MAP`, but the module never consults `MnemosyneConfig`. The defaults declared in `config.py` also disagree with the real ones above (it declares `shmr_max_iterations: 10`, `shmr_harmony_threshold: 0.5`, `shmr_min_cluster_size: 3`, `shmr_temperature: 0.3`). Trust this table and set environment variables.
 
@@ -51,7 +51,9 @@ All seven are read at **module import time** and cannot be changed afterwards. O
 
 **Embeddings are required.** Candidate collection calls `embed` without a guard, so `harmonize()` raises on an install with embeddings disabled. This is the one hard requirement.
 
-**An LLM is required to produce anything.** The call tries the local GGUF path first, accepting the result only if it is longer than 10 characters, then falls back to the cloud extraction client. Both paths swallow exceptions.
+**An LLM is required to produce anything.** The call tries the local GGUF path first, accepting the result only if it is longer than 10 characters, then falls back to the cloud extraction client. Both paths swallow exceptions, though the cloud path now logs at debug level.
+
+The cloud fallback was dead until recently: it imported `ExtractionConfig` and `ExtractionClient` from `mnemosyne.core.extraction`, which exports neither, and the resulting `ImportError` was swallowed. Only the local GGUF path could produce a belief. If you evaluated SHMR before that fix and saw nothing, that is why.
 
 Without a reachable LLM, `harmonize()` does not fail loudly. Each iteration finds empty output and continues, all iterations are consumed per cluster, and the function returns normally with `beliefs_generated: 0` and `status: no_convergence`, having still written a resonance-log row. **There is no signal distinguishing "no LLM available" from "the model could not reach a coherent belief."** If you get `no_convergence`, verify your LLM configuration before concluding anything about your data.
 

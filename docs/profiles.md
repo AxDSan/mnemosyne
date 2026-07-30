@@ -76,7 +76,7 @@ mnemosyne profile apply quality
 mnemosyne reindex
 ```
 
-`mnemosyne profile apply` prints only "Run 'mnemosyne config reload' to apply changes", which is insufficient advice whenever `vec_type` changed. Check `mnemosyne profile show` against your current config before applying.
+`mnemosyne profile apply` detects this and prints the restart-and-reindex steps whenever `vec_type` actually changes, so you will not silently end up with vector tables in the wrong format.
 
 ## CLI
 
@@ -84,7 +84,7 @@ mnemosyne reindex
 mnemosyne profile list                                  # all built-ins with rating bars
 mnemosyne profile apply <name> [--dry-run] [--config <path>]
 mnemosyne profile show <name>                            # key = value, sorted
-mnemosyne profile create <name> [description...]         # see the caveat below
+mnemosyne profile create <name> [description...]         # persisted to disk
 
 mnemosyne config reload                                  # re-read config.yaml
 mnemosyne config get <key>
@@ -96,7 +96,9 @@ mnemosyne config migrate                                 # import current env va
 
 `config set` warns when the key requires a restart.
 
-> **`profile create` does not persist.** It writes into an in-memory dict that is discarded when the process exits, and `profile list` never returns user profiles anyway. Since each CLI invocation is a fresh process, a profile created this way is unreachable even from the very next command. Treat it as non-functional. To capture your own configuration, copy `config.yaml`, or add a profile to `PROFILES` in `mnemosyne/core/profiles.py`.
+`profile create` captures your current configuration as a named profile, written to `<config dir>/profiles/<name>.json`. It persists across processes and appears in `profile list` alongside the built-ins.
+
+Built-in profiles are never modified; a user profile with the same name as a built-in does not shadow it.
 
 ## config.yaml
 

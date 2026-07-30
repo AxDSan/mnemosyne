@@ -611,13 +611,25 @@ def validate_profile(settings: Dict[str, Any]) -> List[str]:
 # ---------------------------------------------------------------------------
 
 def list_profiles() -> Dict[str, ProfileMeta]:
-    """Return metadata for all profiles."""
-    return {name: data["meta"] for name, data in PROFILES.items()}
+    """Return metadata for all profiles, built-in and user-created.
+
+    User profiles were previously omitted here, so a profile created with
+    `mnemosyne profile create` never appeared in `mnemosyne profile list`
+    even within the same process.
+    """
+    _load_user_profiles()
+    out = {name: data["meta"] for name, data in PROFILES.items()}
+    for name, data in USER_PROFILES.items():
+        out.setdefault(name, data["meta"])
+    return out
 
 
 def get_profile(name: str) -> Optional[Dict[str, Any]]:
     """Get a profile's settings by name. Returns None if not found."""
-    data = PROFILES.get(name) or USER_PROFILES.get(name)
+    data = PROFILES.get(name)
+    if data is None:
+        _load_user_profiles()
+        data = USER_PROFILES.get(name)
     if data is None:
         return None
     return dict(data["settings"])
@@ -659,16 +671,71 @@ def apply_profile(name: str, config_path=None, dry_run: bool = False) -> Tuple[b
     return True, []
 
 
-# Separate registry for user-created profiles — keeps builtins immutable.
+# In-process cache of user-created profiles. Keeps builtins immutable.
+# The durable copy lives on disk; see _user_profiles_dir.
 USER_PROFILES: Dict[str, Dict[str, Any]] = {}
+
+_USER_PROFILE_SUFFIX = ".json"
+
+
+def _user_profiles_dir(config_path=None) -> Path:
+    """Directory holding user-created profiles, beside config.yaml."""
+    if config_path:
+        base = Path(config_path) if isinstance(config_path, str) else config_path
+    else:
+        from mnemosyne.core.config import _default_config_path
+        base = _default_config_path()
+    return base.parent / "profiles"
+
+
+def _load_user_profiles(config_path=None) -> Dict[str, Dict[str, Any]]:
+    """Read user profiles from disk into USER_PROFILES.
+
+    Profiles used to live only in this module-level dict, which meant
+    `mnemosyne profile create` wrote into a process that then exited. The
+    profile was unreachable even from the very next command, and
+    list_profiles never returned it either. They are now persisted as JSON
+    next to config.yaml and reloaded here.
+    """
+    import json
+
+    directory = _user_profiles_dir(config_path)
+    if not directory.is_dir():
+        return USER_PROFILES
+
+    for path in sorted(directory.glob("*" + _USER_PROFILE_SUFFIX)):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            settings = raw.get("settings") or {}
+            if not isinstance(settings, dict):
+                continue
+            meta_raw = raw.get("meta") or {}
+            USER_PROFILES[path.stem] = {
+                "meta": ProfileMeta(
+                    name=path.stem,
+                    description=meta_raw.get("description", "User-created profile"),
+                    use_case=meta_raw.get("use_case", "Custom"),
+                    ratings=meta_raw.get("ratings") or {},
+                ),
+                "settings": {str(k): str(v) for k, v in settings.items()},
+            }
+        except Exception:
+            logger.warning("Skipping unreadable profile %s", path, exc_info=True)
+    return USER_PROFILES
 
 
 def create_profile(name: str, description: str = "", config_path=None) -> bool:
-    """Save current config as a named profile.
+    """Save current config as a named profile, persisted to disk.
 
-    Reads the current config values and stores them as a new profile
-    in the USER_PROFILES registry (separate from built-in PROFILES).
+    Written to `<config dir>/profiles/<name>.json` so it survives the
+    process. Returns False if the captured settings fail validation.
     """
+    import json
+
+    if not name or "/" in name or "\\" in name or name.startswith("."):
+        logger.error("Invalid profile name: %r", name)
+        return False
+
     config = get_config()
     if config_path:
         from mnemosyne.core.config import MnemosyneConfig
@@ -686,16 +753,37 @@ def create_profile(name: str, description: str = "", config_path=None) -> bool:
         logger.error("Profile '%s' failed validation: %s", name, errors)
         return False
 
-    # Store in USER_PROFILES (separate from built-in PROFILES)
-    USER_PROFILES[name] = {
-        "meta": ProfileMeta(
-            name=name,
-            description=description or "User-created profile",
-            use_case="Custom",
-            ratings={"quality": 10, "speed": 10, "memory": 10, "llm_dependency": 10, "security": 10},
-        ),
-        "settings": settings,
-    }
+    meta = ProfileMeta(
+        name=name,
+        description=description or "User-created profile",
+        use_case="Custom",
+        ratings={"quality": 10, "speed": 10, "memory": 10, "llm_dependency": 10, "security": 10},
+    )
+
+    directory = _user_profiles_dir(config_path)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / (name + _USER_PROFILE_SUFFIX)).write_text(
+            json.dumps(
+                {
+                    "meta": {
+                        "description": meta.description,
+                        "use_case": meta.use_case,
+                        "ratings": meta.ratings,
+                    },
+                    "settings": settings,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        logger.error("Could not write profile '%s' to %s", name, directory, exc_info=True)
+        return False
+
+    USER_PROFILES[name] = {"meta": meta, "settings": settings}
     return True
 
 

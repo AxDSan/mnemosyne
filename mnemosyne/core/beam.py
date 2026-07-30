@@ -982,8 +982,10 @@ def init_beam(db_path: Path = None):
 
     # --- L3 Persona (v3.10.0) ---
     # Always-on persona tier with explicit retention classification.
-    # Tier values: 'permanent' (manual, never evicted), 'long_term' (default,
-    # reinforcement-driven decay), 'working' (transient).
+    # Tier values: 'permanent', 'long_term' (default), 'working'.
+    # Tier controls injection priority only. No eviction or decay is
+    # implemented for this table: the only writes are insert on promote,
+    # delete on demote, and the reinforcement counter bump.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS memoria_persona (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
