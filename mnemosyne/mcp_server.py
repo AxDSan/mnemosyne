@@ -48,39 +48,6 @@ except ImportError:
     TextContent = None
     CallToolResult = None
 
-
-def _assert_supported_mcp() -> None:
-    """Fail with an actionable message on an unsupported mcp major version.
-
-    This server targets the mcp 1.x low-level API, where tool registration
-    is done with the ``@server.list_tools()`` / ``@server.call_tool()``
-    decorators. mcp 2.0 removed those in favour of ``MCPServer`` and also
-    renamed ``Tool.inputSchema`` to ``input_schema``.
-
-    Without this check the failure is an ``AttributeError`` raised from a
-    decorator line, which reads like a bug in Mnemosyne rather than a
-    dependency mismatch. `pyproject.toml` pins ``mcp<2`` so a normal install
-    cannot land here; this guard exists for environments that resolved a
-    newer mcp some other way.
-    """
-    if not _MCP_AVAILABLE or Server is None:
-        return
-    if hasattr(Server("_probe"), "list_tools"):
-        return
-
-    try:
-        import importlib.metadata as _md
-        installed = _md.version("mcp")
-    except Exception:
-        installed = "unknown"
-
-    raise RuntimeError(
-        f"Installed mcp {installed} is not supported. The Mnemosyne MCP server "
-        "targets the mcp 1.x low-level API; mcp 2.0 removed Server.list_tools "
-        "and renamed Tool.inputSchema. Install a supported version with:\n"
-        "    pip install 'mcp>=1.0.0,<2'"
-    )
-
 from mnemosyne.mcp_tools import get_tool_definitions, handle_tool_call
 
 # ---------------------------------------------------------------------------
@@ -123,27 +90,61 @@ def _resolve_sse_auth(host: str) -> Tuple[bool, Optional[str]]:
 # Server Setup
 # ---------------------------------------------------------------------------
 
+def _build_mcp_server() -> Server:
+    """Build an MCP ``Server`` instance wired to the mnemosyne tool handlers.
+
+    Returns a ``mcp.server.lowlevel.server.Server`` with ``on_list_tools`` and
+    ``on_call_tool`` callbacks installed. Used by both the stdio transport
+    (see ``_run_stdio``) and the SSE transport (see ``_build_sse_app``) so the
+    registration logic stays in one place.
+
+    Migrated from ``mcp`` SDK 1.x to 2.x: the 1.x ``@server.list_tools()`` and
+    ``@server.call_tool()`` decorators were removed in 2.0. The 2.x
+    ``mcp.server.lowlevel.server.Server`` accepts the same callbacks as
+    ``on_list_tools``/``on_call_tool`` keyword arguments on the constructor.
+
+    The ``on_call_tool`` signature also changed in 2.x: callbacks now receive
+    ``(ctx, params)`` where ``params`` is a ``CallToolRequestParams`` carrying
+    ``.name`` and ``.arguments``. The handler returns a ``CallToolResult``
+    instead of a raw list of ``TextContent``.
+    """
+    from mcp.types import CallToolResult, ListToolsResult, Tool
+
+    async def _on_list_tools(ctx, params):  # noqa: ARG001 — ctx/params unused
+        raw = get_tool_definitions()
+        # The dict from get_tool_definitions() uses ``inputSchema`` (the wire
+        # field name); ``mcp.types.Tool`` accepts it via Pydantic alias and
+        # normalizes to ``input_schema`` on the model. **t spreads both.
+        # SDK 2.x contract: the callback must return a ListToolsResult
+        # wrapper, not a bare list of Tool objects.
+        return ListToolsResult(tools=[Tool(**t) for t in raw])
+
+    async def _on_call_tool(ctx, params):  # noqa: ARG001 — ctx unused
+        try:
+            result = handle_tool_call(params.name, params.arguments or {})
+            content = [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+            return CallToolResult(content=content)
+        except Exception as e:
+            # SDK 2.x contract: return a CallToolResult with is_error=True so
+            # clients can distinguish implementation failures from successful
+            # calls. Preserves the existing error payload shape for backward
+            # compatibility with any caller already parsing the error content.
+            content = [TextContent(type="text", text=json.dumps({"status": "error", "message": str(e)}, indent=2))]
+            return CallToolResult(content=content, is_error=True)
+
+    return Server(
+        "mnemosyne",
+        on_list_tools=_on_list_tools,
+        on_call_tool=_on_call_tool,
+    )
+
+
 async def _run_stdio() -> None:
     """Run MCP server over stdio transport."""
     if not _MCP_AVAILABLE:
         raise RuntimeError("MCP not installed. Run: pip install mnemosyne-memory[mcp]")
-    _assert_supported_mcp()
 
-    server = Server("mnemosyne")
-
-    @server.list_tools()
-    async def list_tools():
-        from mcp.types import Tool
-        raw = get_tool_definitions()
-        return [Tool(**t) for t in raw]
-
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict) -> list:
-        try:
-            result = handle_tool_call(name, arguments)
-            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
-        except Exception as e:
-            return [TextContent(type="text", text=json.dumps({"status": "error", "message": str(e)}, indent=2))]
+    server = _build_mcp_server()
 
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
@@ -160,7 +161,6 @@ def _build_sse_app(host: str = "127.0.0.1"):
     """
     if not _MCP_AVAILABLE:
         raise RuntimeError("MCP not installed. Run: pip install mnemosyne-memory[mcp]")
-    _assert_supported_mcp()
 
     try:
         from mcp.server.sse import SseServerTransport
@@ -180,21 +180,7 @@ def _build_sse_app(host: str = "127.0.0.1"):
     # /messages/ and Starlette Mount path-prefix matching needs it to
     # agree. Route("/messages") would 404 on every client POST.
     transport = SseServerTransport("/messages/")
-    server = Server("mnemosyne")
-
-    @server.list_tools()
-    async def list_tools():
-        from mcp.types import Tool
-        raw = get_tool_definitions()
-        return [Tool(**t) for t in raw]
-
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict) -> list:
-        try:
-            result = handle_tool_call(name, arguments)
-            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
-        except Exception as e:
-            return [TextContent(type="text", text=json.dumps({"status": "error", "message": str(e)}, indent=2))]
+    server = _build_mcp_server()
 
     async def handle_sse(request):
         async with transport.connect_sse(request.scope, request.receive, request._send) as streams:

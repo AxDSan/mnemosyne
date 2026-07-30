@@ -61,8 +61,10 @@ class TestToolSchemas:
     def test_tool_schemas_are_valid_json(self):
         """Each tool schema must be valid JSON-serializable."""
         for tool in TOOLS:
-            # Schema must be serializable
-            dumped = json.dumps(tool["inputSchema"])
+            # Schema must be serializable. ``mcp`` SDK 2.x renamed the wire
+            # field to ``input_schema`` (was ``inputSchema`` in 1.x); the
+            # schema dict in ``TOOLS`` uses the new key.
+            dumped = json.dumps(tool["input_schema"])
             loaded = json.loads(dumped)
             assert loaded["type"] == "object"
             assert "properties" in loaded
@@ -70,7 +72,7 @@ class TestToolSchemas:
     def test_remember_schema_has_required_fields(self):
         """mnemosyne_remember requires 'content'."""
         remember_tool = next(t for t in TOOLS if t["name"] == "mnemosyne_remember")
-        schema = remember_tool["inputSchema"]
+        schema = remember_tool["input_schema"]
         assert "required" in schema
         assert "content" in schema["required"]
         assert "properties" in schema
@@ -85,7 +87,7 @@ class TestToolSchemas:
     def test_recall_schema_has_required_fields(self):
         """mnemosyne_recall requires 'query'."""
         recall_tool = next(t for t in TOOLS if t["name"] == "mnemosyne_recall")
-        schema = recall_tool["inputSchema"]
+        schema = recall_tool["input_schema"]
         assert "required" in schema
         assert "query" in schema["required"]
         assert "limit" in schema["properties"]
@@ -104,7 +106,7 @@ class TestToolSchemas:
 
     def test_batch_schema_has_operations(self):
         batch_tool = next(t for t in TOOLS if t["name"] == "mnemosyne_batch")
-        schema = batch_tool["inputSchema"]
+        schema = batch_tool["input_schema"]
         assert "operations" in schema["required"]
         assert schema["properties"]["operations"]["type"] == "array"
         assert schema["properties"]["operations"]["maxItems"] == 50
@@ -1004,16 +1006,16 @@ print(json.dumps({"result": result, "after": after}))
         assert "mnemosyne_remember" in names
 
     def test_tool_definitions_convertible_to_tool_pydantic(self):
-        """Tool dict definitions must be compatible with mcp SDK 1.x Tool Pydantic model.
+        """Tool dict definitions must be compatible with the ``mcp`` SDK 2.x Tool Pydantic model.
 
-        The SDK 1.x list_tools handler expects Tool() instances with typed fields.
-        If get_tool_definitions() returns dicts with unexpected keys or missing
-        required fields, Tool(**t) will raise a ValidationError.
+        The SDK 2.x ``Tool`` model exposes ``input_schema`` (snake_case) as
+        its canonical Python field; ``inputSchema`` is still accepted as a
+        Pydantic alias on construction. This test asserts both paths:
+        (a) ``Tool(**t)`` constructs without raising; (b) the constructed
+        ``Tool`` carries the same schema as the source dict regardless of
+        which key the dict used.
         """
-        try:
-            from mcp.types import Tool
-        except ImportError:
-            pytest.skip("mcp SDK not installed")
+        from mcp.types import Tool
 
         tools = get_tool_definitions()
         for t in tools:
@@ -1021,7 +1023,189 @@ print(json.dumps({"result": result, "after": after}))
             assert isinstance(tool, Tool)
             assert tool.name == t["name"]
             assert tool.description == t.get("description")
-            assert tool.inputSchema == t["inputSchema"]
+            # Pydantic normalizes both ``inputSchema`` (1.x alias) and
+            # ``input_schema`` (2.x canonical) to ``tool.input_schema``.
+            expected = t.get("input_schema", t.get("inputSchema"))
+            assert tool.input_schema == expected
+
+        # Keep the legacy-only wire shape covered even though the current
+        # normalizer emits the SDK 2.x canonical key.
+        legacy = dict(tools[0])
+        legacy["inputSchema"] = legacy.pop("input_schema")
+        legacy_tool = Tool(**legacy)
+        assert legacy_tool.input_schema == legacy["inputSchema"]
+
+    def test_mcp_client_request_surface_returns_typed_results(self):
+        """Real SDK client requests exercise list/call registration and dispatch."""
+        from mcp import ClientSession
+        from mcp.shared.memory import create_client_server_memory_streams
+        from mcp.types import CallToolResult, ListToolsResult
+        from mnemosyne.mcp_server import _build_mcp_server
+
+        import asyncio
+        import contextlib
+        from unittest.mock import patch
+
+        async def exercise():
+            server = _build_mcp_server()
+            async with create_client_server_memory_streams() as (client_streams, server_streams):
+                server_task = asyncio.create_task(
+                    server.run(*server_streams, server.create_initialization_options())
+                )
+                try:
+                    async with ClientSession(*client_streams) as client:
+                        await client.initialize()
+                        listed = await client.list_tools()
+                        assert isinstance(listed, ListToolsResult)
+                        assert len(listed.tools) >= 25
+                        with patch(
+                            "mnemosyne.mcp_server.handle_tool_call",
+                            return_value={"status": "ok"},
+                        ) as handle_call:
+                            success = await client.call_tool("mnemosyne_stats", None)
+                        assert isinstance(success, CallToolResult)
+                        assert success.is_error is False
+                        handle_call.assert_called_once_with("mnemosyne_stats", {})
+                finally:
+                    server_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await server_task
+
+        asyncio.run(exercise())
+
+    def test_transport_builders_share_mcp_server(self):
+        """stdio and SSE transport setup both obtain the shared server builder."""
+        from mnemosyne import mcp_server
+
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+
+        async def exercise_stdio():
+            fake_server = type(
+                "FakeServer",
+                (),
+                {
+                    "run": AsyncMock(),
+                    "create_initialization_options": lambda self: object(),
+                },
+            )()
+
+            class _StdioContext:
+                async def __aenter__(self):
+                    return (object(), object())
+
+                async def __aexit__(self, *args):
+                    return False
+
+            with (
+                patch.object(mcp_server, "_build_mcp_server", return_value=fake_server) as build,
+                patch.object(mcp_server, "stdio_server", return_value=_StdioContext()),
+            ):
+                await mcp_server._run_stdio()
+            build.assert_called_once_with()
+            fake_server.run.assert_awaited_once()
+
+        asyncio.run(exercise_stdio())
+
+        with patch.object(mcp_server, "_build_mcp_server", return_value=object()) as build:
+            app = mcp_server._build_sse_app(host="127.0.0.1")
+        build.assert_called_once_with()
+        sse_route = next(route for route in app.routes if getattr(route, "path", None) == "/sse")
+        assert any(cell.cell_contents is build.return_value for cell in (sse_route.endpoint.__closure__ or ()))
+
+    def test_build_mcp_server_list_tools_returns_listtoolsresult(self):
+        """SDK 2.x contract: the tools/list callback must return a ListToolsResult.
+
+        Regression test for the CodeRabbit finding on PR #571 (round 2):
+        ``_on_list_tools`` must wrap the Tool list in ``ListToolsResult(tools=...)``
+        rather than returning a bare list. The SDK 2.x low-level server expects
+        a ``ListToolsResult`` object — a bare list breaks the ``tools/list``
+        response contract for both stdio and SSE transports.
+        """
+        from mcp.types import ListToolsResult, Tool
+        from mnemosyne.mcp_server import _build_mcp_server
+
+        server = _build_mcp_server()
+        entry = server.get_request_handler("tools/list")
+        assert entry is not None
+        assert callable(entry.handler)
+        on_list_tools = entry.handler
+
+        import asyncio
+        result = asyncio.run(on_list_tools(ctx=None, params=None))
+        assert isinstance(result, ListToolsResult), (
+            f"tools/list callback must return ListToolsResult, got {type(result).__name__}"
+        )
+        assert isinstance(result.tools, list)
+        assert all(isinstance(t, Tool) for t in result.tools)
+        assert len(result.tools) >= 25  # matches test_all_tools_present
+
+    def test_build_mcp_server_call_tool_returns_is_error_on_failure(self):
+        """SDK 2.x contract: tools/call must return CallToolResult with is_error=True on failure.
+
+        Regression test for the CodeRabbit finding on PR #571 (round 2):
+        the ``_on_call_tool`` exception path must set ``is_error=True`` so MCP
+        clients can distinguish implementation failures from successful calls.
+        Preserves the existing error payload shape for backward compatibility.
+        """
+        from mcp.types import CallToolResult
+        from mnemosyne.mcp_server import _build_mcp_server
+
+        server = _build_mcp_server()
+        entry = server.get_request_handler("tools/call")
+        assert entry is not None
+        assert callable(entry.handler)
+        on_call_tool = entry.handler
+
+        # Construct a params-shaped object with empty name → handle_tool_call
+        # raises before returning a valid result. This is the path that was
+        # previously returning a successful-looking CallToolResult with error
+        # content instead of a flagged failure.
+        class _Params:
+            name = ""
+            arguments = {}
+
+        import asyncio
+        result = asyncio.run(on_call_tool(ctx=None, params=_Params()))
+        assert isinstance(result, CallToolResult)
+        assert result.is_error is True, (
+            "tools/call failure path must set is_error=True for SDK 2.x contract"
+        )
+        # Error payload preserved for backward compatibility
+        import json as _json
+        assert len(result.content) >= 1
+        payload = _json.loads(result.content[0].text)
+        assert payload.get("status") == "error"
+
+    def test_build_mcp_server_call_tool_success_returns_is_error_false(self):
+        """SDK 2.x contract: successful tools/call must return is_error=False (or unset)."""
+        from mcp.types import CallToolResult
+        from mnemosyne.mcp_server import _build_mcp_server
+
+        server = _build_mcp_server()
+        entry = server.get_request_handler("tools/call")
+        assert entry is not None
+        assert callable(entry.handler)
+        on_call_tool = entry.handler
+
+        # Use a real tool definition and call it through the path. We mock
+        # handle_tool_call to return a minimal valid result so we don't need
+        # the full DB-backed stack here.
+        import asyncio
+        from unittest.mock import patch
+
+        class _Params:
+            name = "mnemosyne_stats"
+            arguments = None
+
+        with patch("mnemosyne.mcp_server.handle_tool_call", return_value={"status": "ok"}) as handle_call:
+            result = asyncio.run(on_call_tool(ctx=None, params=_Params()))
+        handle_call.assert_called_once_with("mnemosyne_stats", {})
+        assert isinstance(result, CallToolResult)
+        assert not result.is_error, (
+            "successful tools/call must have is_error=False (or None)"
+        )
+        assert json.loads(result.content[0].text) == {"status": "ok"}
 
     def test_top_level_cli_forwards_mcp_arguments(self, tmp_path):
         """`mnemosyne mcp ...` must pass subcommand args to the MCP parser."""
@@ -1088,7 +1272,7 @@ class TestImportGuard:
     def test_mcp_server_raises_without_mcp(self):
         """MCP server raises helpful error if mcp not installed."""
         from mnemosyne.mcp_server import _MCP_AVAILABLE, _run_stdio
-        
+
         if _MCP_AVAILABLE:
             # mcp is installed — verify the server function exists and the flag is True
             assert _MCP_AVAILABLE is True

@@ -145,9 +145,10 @@ def test_generated_docs_match_the_code():
 def test_mcp_modules_import(module):
     """Catch an incompatible mcp SDK at test time rather than at first use.
 
-    mcp 2.0 removed Server.list_tools and renamed Tool.inputSchema, and the
-    dependency was unbounded, so a fresh install produced a server that could
-    not start.
+    The SDK 1.x to 2.x migration removed Server.list_tools and renamed
+    Tool.inputSchema. While the dependency was unbounded, a fresh install
+    could resolve an SDK the server could not start against, and nothing
+    failed until a user ran `mnemosyne mcp`.
     """
     __import__(module)
 
