@@ -366,38 +366,91 @@ CONFIG_DESCRIPTIONS = {
     "write_classifier": "Write classifier mode controlling which content is stored.",
 }
 
-# Keys where a module-level constant bypasses MnemosyneConfig, so the value
-# that actually takes effect differs from DEFAULTS in config.py. These are
-# code inconsistencies, not doc bugs; documenting them beats emitting a
-# default the runtime never uses. Every entry is validated in main().
-EFFECTIVE_DEFAULT_NOTES = {
-    "host_llm_n_ctx": (
-        "32000",
-        "`local_llm.py` reads `MNEMOSYNE_HOST_LLM_N_CTX` directly with a `32000` "
-        "fallback, so the `2048` declared in `config.py` never applies.",
-    ),
-    "llm_repo": (
-        "openbmb/MiniCPM5-1B-GGUF",
-        "`local_llm.py` falls back to `DEFAULT_MODEL_REPO` when the env var is unset.",
-    ),
-    "llm_file": (
-        "MiniCPM5-1B-Q4_K_M.gguf",
-        "`local_llm.py` falls back to `DEFAULT_MODEL_FILE` when the env var is unset.",
-    ),
-    "vec_weight": (
-        "0.5",
-        "`_normalize_weights` in `beam.py` reads the env var directly, so "
-        "`config.yaml` alone does not affect recall.",
-    ),
-    "fts_weight": (
-        "0.3",
-        "Read directly from the environment by `_normalize_weights`.",
-    ),
-    "importance_weight": (
-        "0.2",
-        "Read directly from the environment by `_normalize_weights`.",
-    ),
+# Keys whose effective default is set by a module-level constant that reads
+# os.environ directly, bypassing MnemosyneConfig. For these, the value in
+# DEFAULTS is not what the runtime uses.
+#
+# This list is DERIVED, not maintained by hand: _scan_effective_defaults()
+# below finds every `os.environ.get("MNEMOSYNE_...", "literal")` in the
+# package and compares it against DEFAULTS. Hand-maintaining it was how the
+# rest of this file rotted, and there are currently ~20 real divergences,
+# which is far too many to track manually.
+#
+# Only prose lives here, keyed by config key, and only where the plain
+# "module reads it directly" note is not explanation enough.
+EFFECTIVE_DEFAULT_PROSE = {
+    "vec_weight": "This is why setting recall weights in `config.yaml` alone has no effect.",
+    "fts_weight": "This is why setting recall weights in `config.yaml` alone has no effect.",
+    "importance_weight": "This is why setting recall weights in `config.yaml` alone has no effect.",
+    "llm_enabled": "Note the direction: `config.py` declares this off while the module defaults it on.",
 }
+
+
+def _scan_effective_defaults(env_map: dict, defaults: dict) -> dict:
+    """Find keys whose runtime default differs from the declared one.
+
+    Returns {config_key: (effective_value, source_file)}.
+
+    Matches module-level `os.environ.get("MNEMOSYNE_X", "literal")`. Values
+    that differ only in spelling (`true` vs `1`, `0.7` vs `0.70`, an empty
+    declared default) are not divergences and are filtered out.
+    """
+    import glob
+    import re
+
+    pattern = re.compile(
+        r'os\.environ\.get\(\s*["\'](MNEMOSYNE_[A-Z0-9_]+)["\']\s*,\s*'
+        r'(?:"([^"]*)"|\'([^\']*)\')\s*\)'
+    )
+    env_to_key = {v: k for k, v in env_map.items()}
+
+    found = {}
+    root = os.path.join(REPO_ROOT, "mnemosyne")
+    for path in glob.glob(os.path.join(root, "**", "*.py"), recursive=True):
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            continue
+        for m in pattern.finditer(text):
+            envvar = m.group(1)
+            value = m.group(2) if m.group(2) is not None else m.group(3)
+            key = env_to_key.get(envvar)
+            if key is None or key in found:
+                continue
+            found[key] = (value, os.path.relpath(path, REPO_ROOT))
+
+    def _same(declared, effective: str) -> bool:
+        if declared is None:
+            return False
+        if isinstance(declared, bool):
+            return effective.strip().lower() in (
+                ("true", "1", "yes", "on") if declared else ("false", "0", "no", "off")
+            )
+        d = str(declared).strip()
+        e = effective.strip()
+        if d == e:
+            return True
+        try:
+            return float(d) == float(e)
+        except (TypeError, ValueError):
+            return False
+
+    out = {}
+    for key, (value, src) in found.items():
+        declared = defaults.get(key)
+        # An empty declared default means "unset", which the module fallback
+        # fills in. That is the documented design, not a contradiction.
+        if declared in ("", None):
+            continue
+        # An empty module fallback is also "unset": the module reads the env
+        # var, gets nothing, and applies its own logic downstream. There is
+        # no competing default to report.
+        if value.strip() == "":
+            continue
+        if not _same(declared, value):
+            out[key] = (value, src)
+    return out
 
 # Env vars read directly via os.environ, bypassing MnemosyneConfig. These
 # are NOT in ENV_VAR_MAP, so they cannot be set in config.yaml and are
@@ -536,7 +589,8 @@ def _render_tool_list(tools) -> list:
     return lines
 
 
-def _render_config(env_map, defaults, restart, version: str) -> str:
+def _render_config(env_map, defaults, restart, version: str, effective=None) -> str:
+    effective = effective or {}
     lines = [
         "---",
         'title: "Configuration"',
@@ -576,11 +630,8 @@ def _render_config(env_map, defaults, restart, version: str) -> str:
     ]
     for key in sorted(env_map):
         declared = _fmt_default(defaults.get(key))
-        if key in EFFECTIVE_DEFAULT_NOTES:
-            effective = EFFECTIVE_DEFAULT_NOTES[key][0]
-            shown = f"`{effective}` [^{key}]"
-            if declared not in (f"`{effective}`",):
-                shown = f"`{effective}` [^{key}] (declared {declared})"
+        if key in effective:
+            shown = f"`{effective[key][0]}` [^{key}] (declared {declared})"
         else:
             shown = declared
         lines.append("| `{}` | `{}` | {} | {} | {} |".format(
@@ -591,17 +642,30 @@ def _render_config(env_map, defaults, restart, version: str) -> str:
             CONFIG_DESCRIPTIONS.get(key, ""),
         ))
 
-    lines += [
-        "",
-        "### Keys whose effective default bypasses `config.py`",
-        "",
-        "For these keys a module-level constant reads the environment variable "
-        "directly, so the value in `DEFAULTS` is not what the runtime uses. "
-        "Treat the environment variable as authoritative.",
-        "",
-    ]
-    for key in sorted(EFFECTIVE_DEFAULT_NOTES):
-        lines.append(f"[^{key}]: `{key}` -- {EFFECTIVE_DEFAULT_NOTES[key][1]}")
+    if effective:
+        lines += [
+            "",
+            f"### Keys whose effective default bypasses `config.py` ({len(effective)})",
+            "",
+            "For these keys a module-level constant reads the environment variable "
+            "directly with its own fallback, so the value in `DEFAULTS` is not what "
+            "the runtime uses and a `config.yaml` entry alone does not reach the "
+            "module. Treat the environment variable as authoritative.",
+            "",
+            "This list is derived by scanning the package for "
+            "`os.environ.get(\"MNEMOSYNE_...\", default)` and diffing against "
+            "`DEFAULTS`, so it cannot fall out of date.",
+            "",
+        ]
+        for key in sorted(effective):
+            value, src = effective[key]
+            prose = EFFECTIVE_DEFAULT_PROSE.get(key, "")
+            tail = f" {prose}" if prose else ""
+            lines.append(
+                f"[^{key}]: `{key}` -- effective default `{value}`, set in "
+                f"`{src}`, not the `{_fmt_default(defaults.get(key))}` declared in "
+                f"`config.py`.{tail}"
+            )
 
     lines += [
         "",
@@ -724,9 +788,9 @@ def _validate_descriptions(env_map) -> None:
         print("Add or remove entries in CONFIG_DESCRIPTIONS in scripts/generate-docs.py.")
         sys.exit(1)
 
-    stale_notes = sorted(set(EFFECTIVE_DEFAULT_NOTES) - actual)
+    stale_notes = sorted(set(EFFECTIVE_DEFAULT_PROSE) - actual)
     if stale_notes:
-        print("FATAL: EFFECTIVE_DEFAULT_NOTES references keys that no longer exist:")
+        print("FATAL: EFFECTIVE_DEFAULT_PROSE references keys that no longer exist:")
         for k in stale_notes:
             print(f"  {k}")
         sys.exit(1)
@@ -739,14 +803,16 @@ def main() -> None:
     tools = _collect_tools()
     env_map, defaults, restart = _collect_config()
     _validate_descriptions(env_map)
+    effective = _scan_effective_defaults(env_map, defaults)
 
     mcp_count = sum(1 for t in tools if t["mcp"])
     schema_mdx = _render_tool_schema(tools, version)
-    config_mdx = _render_config(env_map, defaults, restart, version)
+    config_mdx = _render_config(env_map, defaults, restart, version, effective)
 
     if check_only:
         print(f"v{version} | {len(tools)} tools ({mcp_count} over MCP) | "
-              f"{len(env_map)} config keys | {len(ENV_ONLY_DESCRIPTIONS)} env-only")
+              f"{len(env_map)} config keys | {len(ENV_ONLY_DESCRIPTIONS)} env-only | "
+              f"{len(effective)} effective-default divergences")
         return
 
     canonical = os.path.join(REPO_ROOT, "docs", "api")

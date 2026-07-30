@@ -69,16 +69,17 @@ def main() -> None:
     tools = gen._collect_tools()
     env_map, defaults, restart = gen._collect_config()
     gen._validate_descriptions(env_map)
+    effective = gen._scan_effective_defaults(env_map, defaults)
 
     expected = {
         os.path.join("docs", "api", "tool-schema.mdx"): gen._render_tool_schema(tools, version),
         os.path.join("docs", "api", "configuration.mdx"): gen._render_config(
-            env_map, defaults, restart, version),
+            env_map, defaults, restart, version, effective),
     }
 
     mcp_count = sum(1 for t in tools if t["mcp"])
     print(f"Code reports: v{version}, {len(tools)} tools ({mcp_count} over MCP), "
-          f"{len(env_map)} config keys")
+          f"{len(env_map)} config keys, {len(effective)} effective-default divergences")
     print("Checking canonical docs/api/ against generated output...")
 
     drift = []

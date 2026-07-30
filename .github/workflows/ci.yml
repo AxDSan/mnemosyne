@@ -17,10 +17,17 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Generate docs from code
-        run: python3 scripts/generate-docs.py 2>&1
+      # No pip install on purpose: the generator parses the source with ast
+      # rather than importing mnemosyne, so this job stays dependency-free.
+      # If that ever changes, this job needs the package installed.
+      - name: Report the surface the code declares
+        run: python3 scripts/generate-docs.py --check 2>&1
 
-      - name: Verify docs match generated
+      # Verifies the committed docs/api/*.mdx against freshly generated
+      # output, in-process. The previous implementation resolved a sibling
+      # repo that is never checked out here and exited 0, so this gate
+      # passed unconditionally and checked nothing.
+      - name: Verify generated docs are up to date
         run: python3 scripts/verify-docs.py 2>&1
 
   lint:
