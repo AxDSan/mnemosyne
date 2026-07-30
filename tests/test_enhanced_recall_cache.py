@@ -367,6 +367,34 @@ def test_private_enhanced_cache_key_weight_fallback_honors_yaml_over_env(
         MnemosyneConfig.reset_instance()
 
 
+def test_enhanced_recall_skips_env_intent_adjustment_when_disabled(enhanced, monkeypatch):
+    """An explicit use_intent=False wins over the process-level intent flag."""
+    memory, calls = enhanced
+    monkeypatch.setenv("MNEMOSYNE_QUERY_INTENT", "1")
+    monkeypatch.setattr(beam_module, "classify_intent", lambda query: object())
+    adjust_calls = []
+
+    def record_adjustment(*args, **kwargs):
+        adjust_calls.append((args, kwargs))
+        return (0.0, 1.0, 0.0)
+
+    monkeypatch.setattr(beam_module, "adjust_weights", record_adjustment)
+
+    results = memory.recall_enhanced(
+        "explicitly disabled query intent",
+        use_weibull=False,
+        use_mmr=False,
+        use_intent=False,
+        use_synonyms=False,
+    )
+
+    assert results
+    assert adjust_calls == []
+    assert calls[0][2]["_resolved_weights"].as_tuple() == (
+        beam_module._resolve_recall_weights(None, None, None).as_tuple()
+    )
+
+
 def test_enhanced_recall_reloaded_weight_snapshot_misses_cache_and_changes_key(
     enhanced, monkeypatch, tmp_path: Path
 ):

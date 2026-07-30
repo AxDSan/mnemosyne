@@ -6988,6 +6988,7 @@ class BeamMemory:
 
         if (not intent_adjusted_weights
                 and all(weight is None for weight in raw_weights)
+                and use_intent
                 and os.environ.get("MNEMOSYNE_QUERY_INTENT", "0") == "1"
                 and classify_intent is not None and adjust_weights is not None):
             try:
