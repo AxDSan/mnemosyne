@@ -1,9 +1,9 @@
 ---
 title: "MCP Tool Schema"
 version: 3.15.1
-tool_count: 37
+tool_count: 36
 mcp_tool_count: 28
-plugin_only_tool_count: 9
+plugin_only_tool_count: 8
 generated_at: "auto"
 ---
 
@@ -13,7 +13,7 @@ generated_at: "auto"
 > Source: `mnemosyne/tool_schemas.py` and `mnemosyne/mcp_tools.py`.
 > Regenerate with `python3 scripts/generate-docs.py`.
 
-Mnemosyne declares **37 tools**. Of those, **28 are callable over MCP** (stdio and SSE), and **9 are implemented only in the Hermes provider** and are not reachable through the MCP server.
+Mnemosyne declares **36 tools**. Of those, **28 are callable over MCP** (stdio and SSE), and **8 are implemented only in the Hermes provider** and are not reachable through the MCP server.
 
 The split is real and worth respecting: calling a plugin-only tool over MCP raises `Unknown tool`. The counts above are derived from `mnemosyne/mcp_tools.py::_TOOL_HANDLERS`, so they cannot drift from the code.
 
@@ -317,20 +317,11 @@ Attest, update, or invalidate a memory the caller did not necessarily author. Su
 
 ---
 
-## Hermes plugin only, NOT available over MCP (9)
+## Hermes plugin only, NOT available over MCP (8)
 
 These schemas exist in `mnemosyne/tool_schemas.py` and are implemented by the Hermes provider adapters under `hermes_memory_provider/`. They have no entry in `_TOOL_HANDLERS`, so an MCP client that calls them gets an error.
 
-### 1. `mnemosyne_forget_canonical`
-
-Retire a CANONICAL self-fact slot for the current profile. Stamps valid_until on the current row, preserving it as history. Returns whether a current row was retired. Nothing is deleted. Use this to remove a canonical fact (e.g. a stale preference or identity).
-
-| Parameter | Type | Required | Default |
-|-----------|------|----------|---------|
-| `category` | `string` | yes | *(none)* |
-| `name` | `string` | yes | *(none)* |
-
-### 2. `mnemosyne_persona_demote`
+### 1. `mnemosyne_persona_demote`
 
 Move a persona fact back to memoria_preferences (acting as a tombstone). Use when a previously-promoted rule no longer applies or was a one-off. Returns the demoted persona id and the new preference record location.
 
@@ -339,7 +330,7 @@ Move a persona fact back to memoria_preferences (acting as a tombstone). Use whe
 | `persona_id` | `integer` | yes | *(none)* |
 | `reason` | `string` | no | *(unset)* |
 
-### 3. `mnemosyne_persona_list`
+### 2. `mnemosyne_persona_list`
 
 List L3 persona facts, optionally filtered by tier and/or topic. Returns personas ordered by tier (permanent first), then by reinforcement count descending (most-used first).
 
@@ -348,7 +339,7 @@ List L3 persona facts, optionally filtered by tier and/or topic. Returns persona
 | `tier` | `enum[permanent, long_term, working]` | no | *(none)* |
 | `topic` | `string` | no | *(none)* |
 
-### 4. `mnemosyne_persona_promote`
+### 3. `mnemosyne_persona_promote`
 
 Promote a working or episodic memory into the L3 persona tier. Persona facts are always auto-injected into the system prompt regardless of semantic relevance. Tier values: 'permanent' (never evicted, requires explicit demotion), 'long_term' (default; reinforcement-driven decay), 'working' (transient). Returns the new persona id.
 
@@ -358,7 +349,7 @@ Promote a working or episodic memory into the L3 persona tier. Persona facts are
 | `tier` | `enum[permanent, long_term, working]` | no | `long_term` |
 | `reason` | `string` | no | *(unset)* |
 
-### 5. `mnemosyne_persona_reinforce`
+### 4. `mnemosyne_persona_reinforce`
 
 Bump the reinforcement_count and last_reinforced_at on a persona fact. Use when the persona rule was just applied -- signals 'this rule is in active use' to the decay logic.
 
@@ -366,25 +357,25 @@ Bump the reinforcement_count and last_reinforced_at on a persona fact. Use when 
 |-----------|------|----------|---------|
 | `persona_id` | `integer` | yes | *(none)* |
 
-### 6. `mnemosyne_sync_pull`
+### 5. `mnemosyne_sync_pull`
 
 Pull remote memory changes from the configured Mnemosyne sync server. Applies incoming events locally with timestamp + importance conflict resolution.
 
 *No parameters.*
 
-### 7. `mnemosyne_sync_push`
+### 6. `mnemosyne_sync_push`
 
 Push local memory changes to a remote Mnemosyne sync server. Only events created since the last sync are sent. Requires a configured remote sync server (configured via config.yaml or MNEMOSYNE_SYNC_REMOTE env var).
 
 *No parameters.*
 
-### 8. `mnemosyne_sync_status`
+### 7. `mnemosyne_sync_status`
 
 Show Mnemosyne sync status: device ID, last cursor, event count, remote URL, and encryption state.
 
 *No parameters.*
 
-### 9. `mnemosyne_triple_end`
+### 8. `mnemosyne_triple_end`
 
 Expire a fact in the knowledge graph WITHOUT replacing it (e.g. a relationship that simply ended). Closes all open triples for subject+predicate, or only the one matching object when given. Use mnemosyne_triple_add instead when a new value replaces the old.
 

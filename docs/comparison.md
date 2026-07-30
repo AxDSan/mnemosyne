@@ -116,8 +116,8 @@ Additional: **TripleStore** — temporal knowledge graph with `valid_from`/`vali
 
 ### MCP (Model Context Protocol)
 
-Mnemosyne provides an MCP server with **28 tools** and **2 transports**. A further 9
-tool schemas are implemented only in the Hermes provider, for 37 declared in total.
+Mnemosyne provides an MCP server with **28 tools** and **2 transports**. A further 8
+tool schemas are implemented only in the Hermes provider, for 36 advertised in total.
 See the [generated tool schema reference](api/tool-schema.mdx) for the full list,
 which is derived from the code and cannot drift.
 

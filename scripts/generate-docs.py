@@ -118,8 +118,9 @@ def _collect_tools() -> list:
     if not handlers:
         sys.exit("FATAL: could not parse _TOOL_HANDLERS from mnemosyne/mcp_tools.py")
 
-    tools, seen = [], set()
-    for node in _parse("mnemosyne/tool_schemas.py").body:
+    # Every module-level *_SCHEMA dict, keyed by its variable name.
+    by_var, tree = {}, _parse("mnemosyne/tool_schemas.py")
+    for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
         tgt = node.targets[0]
@@ -129,7 +130,37 @@ def _collect_tools() -> list:
             schema = ast.literal_eval(node.value)
         except (ValueError, TypeError, SyntaxError):
             continue
-        if not isinstance(schema, dict) or "name" not in schema:
+        if isinstance(schema, dict) and "name" in schema:
+            by_var[tgt.id] = schema
+
+    # ALL_TOOL_SCHEMAS is the advertised surface: mcp_tools.TOOLS is built
+    # from it, so a schema that is defined but absent from this list is not
+    # exposed over MCP at all. Documenting definitions rather than exports
+    # would overstate the tool count.
+    exported_vars = []
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        tgt = node.target if isinstance(node, ast.AnnAssign) else node.targets[0]
+        if isinstance(tgt, ast.Name) and tgt.id == "ALL_TOOL_SCHEMAS":
+            value = node.value
+            if isinstance(value, (ast.List, ast.Tuple)):
+                exported_vars = [e.id for e in value.elts if isinstance(e, ast.Name)]
+
+    if not exported_vars:
+        sys.exit("FATAL: could not parse ALL_TOOL_SCHEMAS from mnemosyne/tool_schemas.py")
+
+    orphans = sorted(
+        by_var[v]["name"] for v in by_var if v not in set(exported_vars)
+    )
+    if orphans:
+        print("  note: schemas defined but absent from ALL_TOOL_SCHEMAS, "
+              "so not advertised over MCP: " + ", ".join(orphans))
+
+    tools, seen = [], set()
+    for var in exported_vars:
+        schema = by_var.get(var)
+        if schema is None:
             continue
         name = schema["name"]
         if name in seen:
@@ -147,7 +178,7 @@ def _collect_tools() -> list:
         })
 
     if not tools:
-        sys.exit("FATAL: no *_SCHEMA dicts parsed from mnemosyne/tool_schemas.py")
+        sys.exit("FATAL: ALL_TOOL_SCHEMAS resolved to no schemas")
     tools.sort(key=lambda t: (not t["mcp"], t["name"]))
     return tools
 

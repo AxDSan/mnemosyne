@@ -595,10 +595,14 @@ mnemosyne mcp --bank project_a
 
 ### MCP Tools
 
-Mnemosyne declares 37 tool schemas in `mnemosyne/tool_schemas.py`. **28 of them are
-callable over MCP**, dispatched by `_TOOL_HANDLERS` in `mnemosyne/mcp_tools.py`. The
-remaining 9 are implemented only in the Hermes provider and raise `Unknown tool` if
+Mnemosyne advertises 36 tools via `ALL_TOOL_SCHEMAS` in `mnemosyne/tool_schemas.py`.
+**28 of them are callable over MCP**, dispatched by `_TOOL_HANDLERS` in `mnemosyne/mcp_tools.py`. The
+remaining 8 are implemented only in the Hermes provider and raise `Unknown tool` if
 called over MCP.
+
+Note that `mnemosyne_forget_canonical` is defined in `tool_schemas.py` but is **not
+in `ALL_TOOL_SCHEMAS`**, so it is not advertised over MCP at all. It is reachable
+only through the Hermes provider.
 
 The complete, per-parameter list is generated from the code on every build. Do not
 maintain a copy here:

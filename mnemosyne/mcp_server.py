@@ -48,6 +48,39 @@ except ImportError:
     TextContent = None
     CallToolResult = None
 
+
+def _assert_supported_mcp() -> None:
+    """Fail with an actionable message on an unsupported mcp major version.
+
+    This server targets the mcp 1.x low-level API, where tool registration
+    is done with the ``@server.list_tools()`` / ``@server.call_tool()``
+    decorators. mcp 2.0 removed those in favour of ``MCPServer`` and also
+    renamed ``Tool.inputSchema`` to ``input_schema``.
+
+    Without this check the failure is an ``AttributeError`` raised from a
+    decorator line, which reads like a bug in Mnemosyne rather than a
+    dependency mismatch. `pyproject.toml` pins ``mcp<2`` so a normal install
+    cannot land here; this guard exists for environments that resolved a
+    newer mcp some other way.
+    """
+    if not _MCP_AVAILABLE or Server is None:
+        return
+    if hasattr(Server("_probe"), "list_tools"):
+        return
+
+    try:
+        import importlib.metadata as _md
+        installed = _md.version("mcp")
+    except Exception:
+        installed = "unknown"
+
+    raise RuntimeError(
+        f"Installed mcp {installed} is not supported. The Mnemosyne MCP server "
+        "targets the mcp 1.x low-level API; mcp 2.0 removed Server.list_tools "
+        "and renamed Tool.inputSchema. Install a supported version with:\n"
+        "    pip install 'mcp>=1.0.0,<2'"
+    )
+
 from mnemosyne.mcp_tools import get_tool_definitions, handle_tool_call
 
 # ---------------------------------------------------------------------------
@@ -94,6 +127,7 @@ async def _run_stdio() -> None:
     """Run MCP server over stdio transport."""
     if not _MCP_AVAILABLE:
         raise RuntimeError("MCP not installed. Run: pip install mnemosyne-memory[mcp]")
+    _assert_supported_mcp()
 
     server = Server("mnemosyne")
 
@@ -126,6 +160,7 @@ def _build_sse_app(host: str = "127.0.0.1"):
     """
     if not _MCP_AVAILABLE:
         raise RuntimeError("MCP not installed. Run: pip install mnemosyne-memory[mcp]")
+    _assert_supported_mcp()
 
     try:
         from mcp.server.sse import SseServerTransport
