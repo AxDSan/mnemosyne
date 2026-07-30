@@ -198,6 +198,37 @@ def cmd_check(args: argparse.Namespace) -> int:
     else:
         _ok(f"PyPI currently has {published}; releasing {version}")
 
+    # release.yml runs `python -m build` AFTER the tag exists. A build failure
+    # there leaves a tag with no release and nothing on PyPI, and the tag
+    # cannot simply be re-pushed. Cheap to check now, expensive to discover
+    # later. Skipped when `build` is not installed rather than failing on it.
+    if getattr(args, "skip_build", False):
+        _warn("skipped the package build check (--skip-build)")
+    else:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            r = subprocess.run([sys.executable, "-m", "build", "--outdir", td],
+                               cwd=REPO, capture_output=True, text=True)
+            combined = (r.stderr or "") + (r.stdout or "")
+            if r.returncode != 0 and "No module named build" in combined:
+                # Probe the interpreter that would actually run it, not the one
+                # importing this script; they are often different.
+                _warn(f"`{os.path.basename(sys.executable)} -m build` is unavailable, "
+                      "so the package build release.yml runs was not pre-flighted. "
+                      "pip install build")
+            elif r.returncode != 0:
+                _bad("python -m build FAILED; release.yml would fail after tagging")
+                tail = [ln for ln in combined.strip().splitlines() if ln.strip()][-1:]
+                print("        " + (tail[0] if tail else "(no output)"))
+                problems += 1
+            else:
+                names = sorted(os.listdir(td))
+                if any(version in n for n in names):
+                    _ok(f"package builds: {', '.join(names)}")
+                else:
+                    _bad(f"package built but artifacts are not {version}: {names}")
+                    problems += 1
+
     dirty = _git("status", "--porcelain")
     tracked = [ln for ln in dirty.splitlines() if not ln.startswith("??")]
     if tracked:
@@ -424,6 +455,9 @@ def main() -> int:
         p = sub.add_parser(name, help=helptext)
         p.add_argument("version", nargs="?" if name == "check" else None,
                        help="MAJOR.MINOR.PATCH")
+        if name in ("check", "tag"):
+            p.add_argument("--skip-build", action="store_true",
+                           help="skip the python -m build pre-flight (slow)")
         p.set_defaults(func=fn)
     args = ap.parse_args()
     return args.func(args)
