@@ -28,7 +28,7 @@ This path defaults to `~/.hermes/` because Hermes persists that directory across
 | Variable | Default | Description |
 |---|---|---|
 | `MNEMOSYNE_WM_MAX_ITEMS` | `10000` | Maximum **unconsolidated** items in working memory before eviction |
-| `MNEMOSYNE_WM_TTL_HOURS` | `24` | TTL in hours for **unconsolidated** working memory entries |
+| `MNEMOSYNE_WM_TTL_HOURS` | `168` | TTL in hours for **unconsolidated** working memory entries |
 
 Consolidated rows (those stamped `consolidated_at` by `sleep()`) are exempt from both limits. They remain queryable through `recall()` until explicitly removed via `forget()`. This is by design — the E3 additive memory contract guarantees that consolidated content persists.
 
@@ -120,9 +120,9 @@ MNEMOSYNE_EMBEDDING_DIM=768
 
 | Variable | Default | Description |
 |---|---|---|
-| `MNEMOSYNE_LLM_ENABLED` | `true` | Enable LLM summarization during sleep cycle |
+| `MNEMOSYNE_LLM_ENABLED` | `false` | Enable LLM summarization during sleep cycle |
 | `MNEMOSYNE_LLM_N_CTX` | `2048` | Context window size for the local model |
-| `MNEMOSYNE_LLM_MAX_TOKENS` | `2048` | Maximum output tokens per summary |
+| `MNEMOSYNE_LLM_MAX_TOKENS` | `512` | Maximum output tokens per summary |
 | `MNEMOSYNE_LLM_N_THREADS` | `4` | CPU threads for local inference |
 | `MNEMOSYNE_LLM_REPO` | `openbmb/MiniCPM5-1B-GGUF` | HuggingFace repo for GGUF model |
 | `MNEMOSYNE_LLM_FILE` | `MiniCPM5-1B-Q4_K_M.gguf` | GGUF filename |
@@ -256,16 +256,27 @@ These environment variables configure the Mnemosyne Sync subsystem.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MNEMOSYNE_SYNC_API_KEY` | *(none)* | API key for authenticating sync requests |
-| `MNEMOSYNE_SYNC_JWT` | *(none)* | JWT token for JWT-based sync auth |
-| `MNEMOSYNE_SYNC_KEY` | *(none)* | Base64-encoded 32-byte encryption key for client-side payload encryption |
-| `MNEMOSYNE_SYNC_KEY_SOURCE` | `env` | Where to read the encryption key: `env`, `keyring`, `prompt`, `file` |
-| `MNEMOSYNE_SYNC_KEY_FILE` | *(none)* | Path to a file containing the base64-encoded encryption key |
-| `MNEMOSYNE_SYNC_PASSPHRASE` | *(none)* | Passphrase for key derivation (PBKDF2/Argon2id) |
-| `MNEMOSYNE_SYNC_SERVER_PORT` | `8765` | Default port for `mnemosyne sync serve` |
-| `MNEMOSYNE_SYNC_INSECURE` | `false` | Allow plain HTTP connections (dev only) |
+| `MNEMOSYNE_SYNC_REMOTE` | *(none)* | Remote sync server URL. Requires a restart. |
+| `MNEMOSYNE_SYNC_HOST` | `127.0.0.1` | Bind address for `mnemosyne sync-serve`. Requires a restart. |
+| `MNEMOSYNE_SYNC_PORT` | `8765` | Bind port for `mnemosyne sync-serve`. Requires a restart. |
+| `MNEMOSYNE_SYNC_KEY` | *(none)* | Passphrase used to derive the client-side encryption key. |
+| `MNEMOSYNE_SYNC_ENCRYPT` | `false` | Encrypt sync payloads client-side. |
+| `MNEMOSYNE_SYNC_ROLES` | `user` | Conversation roles synced into memory. Defaults to user turns only. |
+| `MNEMOSYNE_SYNC_TOKEN` | *(none)* | Bearer token presented to the sync server. Env-only, read by the Hermes sync adapter. |
+| `MNEMOSYNE_SYNC_MODE` | *(none)* | Sync mode selector. Env-only, read by the Hermes sync adapter. |
+| `MNEMOSYNE_SYNC_KEY_SOURCE` | *(none)* | Where the passphrase comes from: `keyring` or `prompt`. Env-only, Hermes adapter. |
 
-See [docs/sync.md](sync.md) for full usage and [docs/security.md](security.md) for the security model.
+The first six are `config.yaml` keys and can be set as `sync_remote`, `sync_host`,
+`sync_port`, `sync_key`, `sync_encrypt`, and `sync_roles`. The last three are read
+directly from the environment by `hermes_memory_provider/sync_adapter.py` and are
+**not** settable in `config.yaml`.
+
+Server-side authentication is configured on the command line, not by environment
+variable: `mnemosyne sync-serve --api-key` / `--api-key-file` for bearer auth, or
+`--jwt-secret` / `--jwt-secret-file` for JWT. See
+[the generated configuration reference](api/configuration.mdx) for the complete
+key list, and [docs/sync.md](sync.md) for usage and
+[docs/security.md](security.md) for the security model.
 
 ## Example Configuration
 

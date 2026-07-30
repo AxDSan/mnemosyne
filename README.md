@@ -4,10 +4,10 @@
 
 # Mnemosyne
 
-*Zero-dependency AI memory that works everywhere. SQLite-backed. Sub-millisecond.*
+*Zero-cloud AI memory that works everywhere. SQLite-backed. One pure-Python dependency.*
 
-[![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://python.org)
-[![PyPI](https://img.shields.io/pypi/v/mnemosyne-memory.svg?v=3.11.1)](https://pypi.org/project/mnemosyne-memory/)
+[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
+[![PyPI](https://img.shields.io/pypi/v/mnemosyne-memory.svg)](https://pypi.org/project/mnemosyne-memory/)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/mnemosyne-oss/mnemosyne/actions/workflows/ci.yml/badge.svg)](https://github.com/mnemosyne-oss/mnemosyne/actions/workflows/ci.yml)
 [![BEAM](https://img.shields.io/badge/BEAM-ICLR%202026-purple.svg)](https://beam-benchmark.github.io/)
@@ -26,7 +26,7 @@
 - [Works With Everything](#works-with-everything)
 - [Quick Start](#quick-start)
   - [Add to your agent](#add-to-your-agent)
-- [Benchmark](#benchmark)
+- [Benchmarks](#benchmarks)
 - [CLI Usage](#cli-usage)
 - [Python API](#python-api)
   - [BEAM Direct Access](#advanced-beam-direct-access)
@@ -35,7 +35,7 @@
 - [Security & Privacy Model](#security--privacy-model)
 - [Configuration](#configuration)
   - [Environment Variables](#environment-variables)
-- [Hermes Plugin (23 tools)](#hermes-plugin-23-tools)
+- [Hermes Plugin](#hermes-plugin)
 - [Mnemosyne Sync](#mnemosyne-sync)
 - [Contributing](#contributing)
 - [Sponsors](#sponsors)
@@ -109,9 +109,11 @@ results = recall("user preferences")
 
 ## Benchmarks
 
-Mnemosyne holds top-tier scores on the two major memory benchmarks, **LongMemEval** (ICLR 2025) and **BEAM** (ICLR 2026), both in one SQLite file, zero cloud dependencies.
+Mnemosyne scores competitively on the two major memory benchmarks, **LongMemEval** (ICLR 2025) and **BEAM** (ICLR 2026), both in one SQLite file with no cloud dependency.
 
-### LongMemEval (retrieval)
+> **Read the version labels.** These are point-in-time results, not a claim about the current build. The BEAM numbers were measured on **v3.0.0 (May 2026)** and predate polyphonic recall, enhanced recall, SHMR, and the persona tier. They have not been re-run since. Re-running BEAM and LongMemEval on the current tree is tracked as an open task.
+
+### LongMemEval (retrieval), measured April 2026
 
 | System | Score | Notes |
 |--------|-------|-------|
@@ -120,15 +122,21 @@ Mnemosyne holds top-tier scores on the two major memory benchmarks, **LongMemEva
 | Backboard | 93.4% | Independent assessment |
 | Hindsight | 91.4% | Vectorize.io |
 
-### BEAM (end-to-end QA)
+Note that Mnemosyne's row is Recall@All@5 while Mempalace's is Recall@5; the metrics are not identical and the ordering should not be read as a strict ranking.
 
-| Scale | Mnemosyne v3 | Honcho | Hindsight | LIGHT | RAG |
-|-------|-------------|--------|-----------|-------|-----|
+### BEAM (end-to-end QA), measured on v3.0.0
+
+| Scale | Mnemosyne v3.0.0 | Honcho | Hindsight | LIGHT | RAG |
+|-------|------------------|--------|-----------|-------|-----|
 | **100K** | **65.2%** | 63.0% | 73.4% | 35.8% | 32.3% |
 
 Per-ability (100K): IE 91.5% · MR 87.5% · TR 75.0% · ABS 100.0% · CR 50.0% · KU 50.0% · EO 25.0% · IF 62.5% · PF 54.5% · SUM 55.6%
 
+**Judge caveat:** Mnemosyne's run used Llama 3.3 70B with a DeepSeek V4 Flash judge, while Hindsight's published 73.4% used Llama-4-Maverick. Scores produced under different judges are not directly comparable, so the 65.2% and 73.4% figures in the same row should be read with that in mind. Hindsight leads on this benchmark as published. See [beam-benchmark.md](docs/beam-benchmark.md) for the full methodology.
+
 ### BEAM retrieval (pure recall)
+
+This measures raw retrieval in isolation, with no answer synthesis, so it is a different quantity from the end-to-end QA scores above and is not comparable to them.
 
 | Scale | Recall@10 | Latency | Storage | Messages |
 |-------|-----------|---------|---------|----------|
@@ -137,7 +145,7 @@ Per-ability (100K): IE 91.5% · MR 87.5% · TR 75.0% · ABS 100.0% · CR 50.0% �
 | 1M | 20% | 493ms | 4.8 MB | 2,000 |
 | **10M** | **20%** | **35ms** | **7.2 MB** | **20,000** |
 
-Recall holds flat across all scales. **100% abstention accuracy**, never hallucinates on unknowns. Episodic compression delivers 9.4x storage savings.
+The notable property is that recall holds flat as the corpus grows by two orders of magnitude, and that storage grows sub-linearly: episodic compression delivers 9.4x savings. Abstention accuracy is 100%, meaning the system declines rather than inventing an answer when the corpus does not contain one. The absolute 20% Recall@10 is low, and the flatness rather than the level is the result worth citing.
 
 Full reports: [docs/beam-benchmark.md](docs/beam-benchmark.md)
 
@@ -294,10 +302,10 @@ results = beam.recall("editor preferences", top_k=5)
 | **Local-first by default** | ✅ | No data ever leaves your machine unless you enable sync |
 | **No telemetry** | ✅ | Zero tracking, zero analytics, zero cloud dependency |
 | **Optional sync** | ✅ | Bidirectional delta sync between desktop and VPS |
-| **Client-side encryption (sync)** | ✅ | XChaCha20-Poly1305 authenticated encryption. Key never leaves your machine. |
+| **Client-side encryption (sync)** | ✅ | Authenticated encryption via Fernet (AES-128-CBC) or PyNaCl SecretBox (XSalsa20-Poly1305). Key never leaves your machine. |
 | **BYOK / data-at-rest** | ✅ | Via OS keychain, env vars, or passphrase-derived keys |
 | **Self-hostable** | ✅ | Docker, bare metal, Fly.io -- you control the infrastructure |
-| **TLS enforcement** | ✅ | HTTPS required in production. Dev `--insecure` flag isolated. |
+| **TLS enforcement** | ✅ | HTTPS in production; point `SSL_CERT_FILE` at a private CA for self-signed dev certs. |
 
 When client-side encryption is enabled, the remote sync server sees **only metadata** (event IDs, timestamps, operation types, device IDs). Memory content, importance scores, source fields, and vector embeddings are all encrypted before transmission. The server cannot read your memories.
 
@@ -414,24 +422,24 @@ Bidirectional, delta-based memory sync between Mnemosyne instances. Designed for
 **Key features:**
 - Delta/change-based protocol -- only transfers changes since last sync
 - Bidirectional, push-only, or pull-only modes
-- Optional client-side payload encryption (XChaCha20-Poly1305)
+- Optional client-side payload encryption (Fernet, or PyNaCl SecretBox XSalsa20-Poly1305)
 - API key and JWT authentication
 - Timeline + importance conflict resolution
 - Append-only event log for auditability
 
 ```bash
 # Start a sync server on your VPS
-mnemosyne sync serve --port 8765 --api-key "your-secret-key"
+mnemosyne sync-serve --port 8765 --api-key "your-secret-key"
 
 # On your local machine, sync bidirectionally
 mnemosyne sync --remote https://my-vps:8765
 
 # With client-side encryption
-export MNEMOSYNE_SYNC_KEY=$(mnemosyne sync generate-key)
+export MNEMOSYNE_SYNC_KEY=$(mnemosyne sync-generate-key)
 mnemosyne sync --remote https://my-vps:8765 --encrypt
 
 # Check sync status
-mnemosyne sync status --remote https://my-vps:8765
+mnemosyne sync-status --remote https://my-vps:8765
 ```
 
 **When encryption is enabled**, the remote server sees only metadata (event IDs, timestamps, operation types). Memory content is encrypted before leaving your machine and can only be decrypted with your key.

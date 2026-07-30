@@ -12,6 +12,7 @@ Mnemosyne runs everywhere. Pick your platform:
 | [Pi](pi.md) | Pi extension + skill | `pi install npm:@mnemosyne-oss/pi-mnemosyne` |
 | [Hermes Agent](hermes-mcp.md) | MCP + Plugin | `~/.hermes/config.yaml` |
 | [Zero](zero.md) | Plugin (tools + hooks) | `.zero/plugins/mnemosyne/` |
+| [OpenClaw](openclaw.md) | Native plugin | `pip install mnemosyne-memory[openclaw]` |
 
 ## Quick Start (any MCP client)
 

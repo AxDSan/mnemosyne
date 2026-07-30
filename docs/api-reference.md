@@ -1,4 +1,4 @@
-# API Reference — Mnemosyne v3.11.0
+# API Reference — Mnemosyne v3.15.1
 
 ## Quick Start
 
@@ -130,7 +130,7 @@ results = mem.recall(
     channel_id: str = None,               # Filter by channel/group
     temporal_weight: float = 0.0,         # 0.0–1.0, boosts memories near query_time
     query_time = None,                    # datetime or ISO string for temporal calculation
-    temporal_halflife: float = None,      # Hours for decay (default: 24)
+    temporal_halflife: float = None,      # Hours for decay (default: 168)
     vec_weight: float = None,             # Override vector scoring weight
     fts_weight: float = None,             # Override FTS scoring weight
     importance_weight: float = None       # Override importance weight
@@ -595,7 +595,17 @@ mnemosyne mcp --bank project_a
 
 ### MCP Tools
 
-These are the standalone MCP server tools from `mnemosyne.mcp_tools`. The Hermes plugin exposes a larger tool surface and uses `mnemosyne_stats` rather than the MCP-only `mnemosyne_get_stats` name.
+Mnemosyne declares 37 tool schemas in `mnemosyne/tool_schemas.py`. **28 of them are
+callable over MCP**, dispatched by `_TOOL_HANDLERS` in `mnemosyne/mcp_tools.py`. The
+remaining 9 are implemented only in the Hermes provider and raise `Unknown tool` if
+called over MCP.
+
+The complete, per-parameter list is generated from the code on every build. Do not
+maintain a copy here:
+
+**[Generated MCP tool schema reference](api/tool-schema.mdx)**
+
+A frequently used subset, for orientation:
 
 | Tool | Description |
 |---|---|
@@ -604,7 +614,10 @@ These are the standalone MCP server tools from `mnemosyne.mcp_tools`. The Hermes
 | `mnemosyne_sleep` | Run consolidation |
 | `mnemosyne_scratchpad_read` | Read scratchpad |
 | `mnemosyne_scratchpad_write` | Write to scratchpad |
-| `mnemosyne_get_stats` | Get memory statistics |
+| `mnemosyne_stats` | Get memory statistics |
+
+There is no `mnemosyne_get_stats`. The tool is `mnemosyne_stats` on both the MCP
+server and the Hermes plugin.
 
 ---
 

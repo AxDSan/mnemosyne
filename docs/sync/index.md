@@ -6,8 +6,8 @@ Everything you need to sync your memories between machines, with or without encr
 
 - **[Tutorial](tutorial.md)** — 10-minute step-by-step setup. VPS + local. Encrypted and plaintext.
 - **[Troubleshooting](troubleshooting.md)** — Common issues, error messages, and fixes.
-- **[Sync Protocol](sync.md)** — Full protocol reference, CLI reference, and architecture.
-- **[Security & Privacy Model](security.md)** — Threat model, encryption internals, BYOK comparison.
+- **[Sync Protocol](../sync.md)** — Full protocol reference, CLI reference, and architecture.
+- **[Security & Privacy Model](../security.md)** — Threat model, encryption internals, BYOK comparison.
 
 ## What is Mnemosyne Sync?
 
@@ -65,4 +65,4 @@ What the server sees:
 - **Without encryption:** memory content, importance, sources, metadata
 - **With encryption:** only event IDs, timestamps, operation types, device IDs
 
-Read the [Security & Privacy Model](security.md) for the full threat model and BYOK comparison.
+Read the [Security & Privacy Model](../security.md) for the full threat model and BYOK comparison.

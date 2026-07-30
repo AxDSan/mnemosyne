@@ -25,7 +25,7 @@ hermes config set memory.provider mnemosyne
 hermes memory setup
 ```
 
-This gives you **23 tools** — remember, recall, forget, stats, knowledge graph ops, multi-agent shared surface, scratchpad, export/import, and more. All native Hermes commands.
+This gives you the **20 tools** declared in `plugin.yaml` (remember, recall, forget, stats, knowledge graph ops, scratchpad, export/import, sync), plus the persona and canonical tools the provider implements beyond that declaration. All native Hermes commands. See the [generated tool schema reference](../api/tool-schema.mdx) for the full surface.
 
 ## Usage
 

@@ -1,6 +1,6 @@
 # Mnemosyne Sync
 
-**Last updated:** June 2026 &middot; Mnemosyne v3.6.0
+**Last updated:** June 2026 &middot; Mnemosyne v3.15.1
 
 > **Bidirectional memory sync between local and remote Mnemosyne instances.**
 > Delta-based, event-sourced, with optional client-side encryption.
@@ -119,7 +119,7 @@ Each exchange is idempotent &mdash; events carry unique `event_id`s and are dedu
 
 ```bash
 # On your VPS / remote machine
-mnemosyne sync serve --port 8765 --api-key "your-secret-api-key"
+mnemosyne sync-serve --port 8765 --api-key "your-secret-api-key"
 ```
 
 This starts a sync server listening on port 8765.
@@ -130,10 +130,10 @@ This starts a sync server listening on port 8765.
 
 ```bash
 # On your local machine
-export MNEMOSYNE_SYNC_API_KEY="your-secret-api-key"
+export MNEMOSYNE_SYNC_TOKEN="your-secret-api-key"
 
 # Test the connection
-mnemosyne sync status --remote https://my-vps.example.com:8765
+mnemosyne sync-status --remote https://my-vps.example.com:8765
 ```
 
 ### 3. Run a Sync
@@ -153,7 +153,7 @@ mnemosyne sync --remote https://my-vps.example.com:8765 --mode push
 
 ```bash
 # Generate an encryption key
-mnemosyne sync generate-key > mnemosyne-sync.key
+mnemosyne sync-generate-key > mnemosyne-sync.key
 
 # Sync with encryption
 MNEMOSYNE_SYNC_KEY=$(cat mnemosyne-sync.key) \
@@ -177,7 +177,6 @@ Options:
   --encrypt              Enable client-side payload encryption
   --prompt-key           Prompt for encryption key interactively
   --api-key TEXT         API key for remote authentication
-  --insecure             Skip TLS certificate verification (NOT for production)
   --interval SECONDS     Continuous sync interval (0 = one-shot)  [default: 0]
   --help                 Show this message and exit
 
@@ -197,10 +196,10 @@ Security Notice:
   ╚════════════════════════════════════════════════════════╝
 ```
 
-### `mnemosyne sync serve`
+### `mnemosyne sync-serve`
 
 ```
-Usage: mnemosyne sync serve [OPTIONS]
+Usage: mnemosyne sync-serve [OPTIONS]
 
 Start a sync server for remote Mnemosyne instances.
 
@@ -214,10 +213,10 @@ Options:
   --help                  Show this message and exit
 ```
 
-### `mnemosyne sync status`
+### `mnemosyne sync-status`
 
 ```
-Usage: mnemosyne sync status [OPTIONS]
+Usage: mnemosyne sync-status [OPTIONS]
 
 Show sync status with a remote instance.
 
@@ -242,17 +241,17 @@ Example output:
   Pending:     12 local events to push
 ```
 
-### `mnemosyne sync generate-key`
+### `mnemosyne sync-generate-key`
 
 ```
-Usage: mnemosyne sync generate-key
+Usage: mnemosyne sync-generate-key
 
 Generate a random 32-byte key for client-side encryption.
 
 Outputs a base64-encoded key suitable for MNEMOSYNE_SYNC_KEY.
 
 Example:
-  export MNEMOSYNE_SYNC_KEY=$(mnemosyne sync generate-key)
+  export MNEMOSYNE_SYNC_KEY=$(mnemosyne sync-generate-key)
 ```
 
 ---
@@ -338,7 +337,7 @@ When the same memory is modified on both sides before a sync:
 2. **If timestamps equal** &mdash; The event with higher `importance` wins
 3. **If timestamps and importance equal** &mdash; The event from the device with the lexicographically higher `device_id` wins (deterministic tiebreaker)
 
-This is intentionally simple for v1. Conflicts are logged and visible in `mnemosyne sync status`.
+This is intentionally simple for v1. Conflicts are logged and visible in `mnemosyne sync-status`.
 
 ### Future: Version Chain Resolution
 
@@ -354,10 +353,10 @@ The simplest authentication method. Passed as `Authorization: Bearer <key>` head
 
 ```bash
 # Server side
-mnemosyne sync serve --api-key "sk-mnemo-abc123"
+mnemosyne sync-serve --api-key "sk-mnemo-abc123"
 
 # Client side
-export MNEMOSYNE_SYNC_API_KEY="sk-mnemo-abc123"
+export MNEMOSYNE_SYNC_TOKEN="sk-mnemo-abc123"
 mnemosyne sync --remote https://my-vps:8765
 ```
 
@@ -367,7 +366,7 @@ For multi-user setups or integration with existing auth systems.
 
 ```bash
 # Server side
-mnemosyne sync serve --jwt-secret "your-jwt-secret"
+mnemosyne sync-serve --jwt-secret "your-jwt-secret"
 
 # Client side
 MNEMOSYNE_SYNC_JWT="<token>" mnemosyne sync --remote https://my-vps:8765
@@ -383,7 +382,7 @@ See [docs/security.md](security.md#encryption-in-mnemosyne-sync) for the full en
 
 ```bash
 # Generate a key
-mnemosyne sync generate-key
+mnemosyne sync-generate-key
 
 # Sync with encryption
 export MNEMOSYNE_SYNC_KEY="<base64-key>"
@@ -430,7 +429,7 @@ services:
       - MNEMOSYNE_SYNC_KEY_FILE=/run/secrets/sync.key
     command: >
       sh -c "pip install -q mnemosyne-memory[sync] &&
-             mnemosyne sync serve --port 8765 --api-key $(cat /run/secrets/sync.key)"
+             mnemosyne sync-serve --port 8765 --api-key $(cat /run/secrets/sync.key)"
 
 volumes:
   mnemosyne-data:
@@ -491,7 +490,7 @@ app = "mnemosyne-sync"
 ```bash
 # Deploy
 fly launch --from fly.toml
-fly secrets set MNEMOSYNE_SYNC_API_KEY="sk-mnemo-..."
+fly secrets set MNEMOSYNE_SYNC_TOKEN="sk-mnemo-..."
 fly deploy
 ```
 
@@ -504,7 +503,7 @@ If you don't want to expose the sync port publicly:
 ssh -L 8765:localhost:8765 user@your-vps
 
 # On your VPS
-mnemosyne sync serve --port 8765 --host 127.0.0.1 --api-key "..."
+mnemosyne sync-serve --port 8765 --host 127.0.0.1 --api-key "..."
 
 # On your local machine (tunnel active)
 mnemosyne sync --remote http://localhost:8765
@@ -527,7 +526,7 @@ The complete security model is documented in [docs/security.md](security.md). Ke
 
 | Concern | Solution |
 |---------|----------|
-| Data in transit | TLS encryption (HTTPS). `--insecure` flag for dev only. |
+| Data in transit | TLS encryption (HTTPS). For self-signed dev certs set `SSL_CERT_FILE`. |
 | Data at rest on remote | Same as local &mdash; file permissions, disk encryption. |
 | Payload confidentiality | Optional client-side encryption (Fernet/XSalsa20-Poly1305) |
 | Authentication | API key or JWT on all endpoints |
@@ -553,7 +552,7 @@ The complete security model is documented in [docs/security.md](security.md). Ke
 
 - Version chain conflict resolution using TripleStore's existing `valid_from/valid_until/superseded_by`
 - Agent-assisted merge proposal (via Hermes plugin)
-- `mnemosyne sync status` with detailed conflict reporting
+- `mnemosyne sync-status` with detailed conflict reporting
 - Per-bank sync isolation
 
 ### Phase 4 (Future)
@@ -585,7 +584,7 @@ The sync layer is the foundation for a future hosted service. The architecture w
 
 Mnemosyne Cloud will follow a **Bring Your Own Key** model, going one step further than Zep's data-at-rest BYOK:
 
-1. **You generate your key locally** (`mnemosyne sync generate-key`). It never touches Cloud servers.
+1. **You generate your key locally** (`mnemosyne sync-generate-key`). It never touches Cloud servers.
 2. **Your client encrypts payloads** before they leave your machine.
 3. **Cloud stores opaque ciphertext** plus routing metadata. A Cloud breach exposes metadata (event counts, timestamps, device IDs) but never memory content.
 4. **Only your devices decrypt.** Cloud cannot read, train on, or sell your memories because it mathematically cannot decrypt them.

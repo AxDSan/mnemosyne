@@ -1,91 +1,133 @@
 #!/usr/bin/env python3
-"""Verify that generated docs match the provider code.
-
-Snapshots generated output and diffs against committed state.
-Exits non-zero if generated content differs.
+"""Verify that generated docs match the code they are generated from.
 
 Usage:
-    python3 scripts/verify-docs.py [--fix]
+    python3 scripts/verify-docs.py          # fail on drift
+    python3 scripts/verify-docs.py --fix    # rewrite the files, then pass
+
+WHY THIS CHECKS THE CANONICAL FILES
+-----------------------------------
+The previous implementation resolved `../mnemosyne-docs/src` and called
+`sys.exit(0)` when that directory was absent. On the CI runner the sibling
+repo is never checked out, so the docs-check job passed unconditionally and
+verified nothing. Meanwhile the canonical `docs/api/*.mdx` in THIS repo,
+the files the gate exists to protect, were never examined at all.
+
+This version compares the generator's output against the committed
+`docs/api/*.mdx` in-process, with no git and no sibling required, so the
+gate does real work in CI. The sibling repo is still checked when present,
+but it can only add findings, never mask them.
 """
+from __future__ import annotations
 
 import argparse
+import difflib
+import importlib.util
 import os
-import subprocess
 import sys
 
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-def main():
-    parser = argparse.ArgumentParser(description="Verify generated docs match code")
-    parser.add_argument("--fix", action="store_true", help="Auto-fix by running generator")
-    args = parser.parse_args()
 
-    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    docs = os.path.join(os.path.dirname(repo), "mnemosyne-docs", "src")
-    generator = os.path.join(repo, "scripts", "generate-docs.py")
+def _load_generator():
+    path = os.path.join(REPO, "scripts", "generate-docs.py")
+    if not os.path.isfile(path):
+        sys.exit(f"ERROR: generator not found at {path}")
+    spec = importlib.util.spec_from_file_location("_gendocs", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
-    if not os.path.isfile(generator):
-        print("ERROR: generator not found at", generator)
-        sys.exit(1)
 
-    if not os.path.isdir(docs):
-        print("WARNING: docs sibling dir not found at", docs)
-        print("SKIP: website docs not checked out in this environment (CI runner ok)")
-        sys.exit(0)
+def _diff(label: str, expected: str, actual: str) -> bool:
+    """True when they differ. Prints a bounded unified diff."""
+    if expected == actual:
+        return False
+    print(f"  DRIFT: {label}")
+    lines = list(difflib.unified_diff(
+        actual.splitlines(keepends=True),
+        expected.splitlines(keepends=True),
+        fromfile=f"{label} (committed)",
+        tofile=f"{label} (generated)",
+        n=1,
+    ))
+    for line in lines[:40]:
+        sys.stdout.write("    " + line if line.endswith("\n") else "    " + line + "\n")
+    if len(lines) > 40:
+        print(f"    ... {len(lines) - 40} more diff lines")
+    return True
 
-    # Run the generator (idempotent - no-op if already up to date)
-    print("Running generator...")
-    result = subprocess.run(
-        [sys.executable, generator],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        print("ERROR: generator failed:")
-        print(result.stderr)
-        sys.exit(1)
 
-    # Check if git sees changes in generated files against HEAD
-    print("Checking for drift against committed state...")
-    generated_paths = [
-        "app/(docs)/api/tool-schema/page.mdx",
-        "app/(docs)/getting-started/configuration/page.mdx",
-    ]
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Verify generated docs match code")
+    ap.add_argument("--fix", action="store_true", help="Rewrite the generated files")
+    args = ap.parse_args()
 
-    # Use git diff HEAD for each generated path
-    has_drift = False
-    for rel_path in generated_paths:
-        abs_path = os.path.join(docs, rel_path)
-        if not os.path.isfile(abs_path):
-            print("  SKIP (not found):", rel_path)
+    gen = _load_generator()
+
+    version = gen._version()
+    tools = gen._collect_tools()
+    env_map, defaults, restart = gen._collect_config()
+    gen._validate_descriptions(env_map)
+
+    expected = {
+        os.path.join("docs", "api", "tool-schema.mdx"): gen._render_tool_schema(tools, version),
+        os.path.join("docs", "api", "configuration.mdx"): gen._render_config(
+            env_map, defaults, restart, version),
+    }
+
+    mcp_count = sum(1 for t in tools if t["mcp"])
+    print(f"Code reports: v{version}, {len(tools)} tools ({mcp_count} over MCP), "
+          f"{len(env_map)} config keys")
+    print("Checking canonical docs/api/ against generated output...")
+
+    drift = []
+    for rel, want in expected.items():
+        abs_path = os.path.join(REPO, rel)
+        have = ""
+        if os.path.isfile(abs_path):
+            with open(abs_path, encoding="utf-8") as f:
+                have = f.read()
+        else:
+            print(f"  MISSING: {rel}")
+            drift.append(rel)
             continue
-        r = subprocess.run(
-            ["git", "diff", "HEAD", "--exit-code", "--", abs_path],
-            capture_output=True, text=True,
-            cwd=docs,
-        )
-        if r.returncode != 0:
-            print("  DRIFT:", rel_path)
-            has_drift = True
+        if _diff(rel, want, have):
+            drift.append(rel)
 
-    if has_drift:
+    if drift and args.fix:
+        for rel, want in expected.items():
+            abs_path = os.path.join(REPO, rel)
+            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+            with open(abs_path, "w", encoding="utf-8") as f:
+                f.write(want)
         print("")
-        print("FAIL: Generated docs differ from committed state.")
-        print("Run: python3 scripts/generate-docs.py")
-        # Show the diff summary
-        r = subprocess.run(
-            ["git", "diff", "HEAD", "--stat", "--", "src/"],
-            capture_output=True, text=True,
-            cwd=docs,
-        )
-        if r.stdout.strip():
-            print(r.stdout)
-        if args.fix:
-            print("Auto-fix completed. Review and commit the changes.")
-            sys.exit(0)
-        sys.exit(1)
-    else:
-        print("")
-        print("OK: All generated docs match committed state.")
+        print("Rewrote: " + ", ".join(sorted(drift)))
+        print("OK (--fix). Review and commit.")
         sys.exit(0)
+
+    # Sibling docs repo: informational only, and only when present.
+    sibling = os.path.normpath(os.path.join(REPO, "..", "mnemosyne-docs"))
+    if os.path.isdir(sibling):
+        sib_tool = os.path.join(sibling, "content", "api", "tool-schema.mdx")
+        if os.path.isfile(sib_tool):
+            with open(sib_tool, encoding="utf-8") as f:
+                if f.read() != expected[os.path.join("docs", "api", "tool-schema.mdx")]:
+                    print("  DRIFT (sibling): content/api/tool-schema.mdx")
+                    drift.append("sibling:content/api/tool-schema.mdx")
+        else:
+            print("  note: sibling present but content/api/tool-schema.mdx missing")
+    else:
+        print("  note: ../mnemosyne-docs not checked out, skipping sibling check")
+
+    print("")
+    if drift:
+        print("FAIL: generated docs are out of date.")
+        print("Run: python3 scripts/generate-docs.py")
+        sys.exit(1)
+
+    print("OK: generated docs match the code.")
+    sys.exit(0)
 
 
 if __name__ == "__main__":

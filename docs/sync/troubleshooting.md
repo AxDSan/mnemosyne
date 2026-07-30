@@ -36,9 +36,9 @@ HTTP 401 on /sync/pull: {"error": "Unauthorized"}
 
 **Fix:**
 
-1. Verify the env var is set: `echo $MNEMOSYNE_SYNC_API_KEY`
+1. Verify the env var is set: `echo $MNEMOSYNE_SYNC_TOKEN`
 2. Match the key exactly to the server's: `mnemosyne sync-serve --api-key "***`
-3. Check for trailing whitespace: `echo $MNEMOSYNE_SYNC_API_KEY | wc -c`
+3. Check for trailing whitespace: `echo $MNEMOSYNE_SYNC_TOKEN | wc -c`
 4. Ensure the Authorization header is sent: add `--api-key "***` if env var is missing
 
 ### JWT issues
@@ -70,17 +70,17 @@ SSLCertVerificationError: certificate verify failed
 **Fix:**
 
 1. **Production:** Use a real certificate. Caddy provisions Let's Encrypt automatically. For Nginx, use certbot.
-2. **Development only:** Use `--insecure` flag (never in production):
-
-```bash
-mnemosyne sync --remote https://192.168.1.50:8765 --insecure
-```
-
-3. **Self-signed certs:** Export the CA cert and set `SSL_CERT_FILE`:
+2. **Self-signed or private CA:** Export the CA certificate and point `SSL_CERT_FILE` at it. This is the supported way to trust a non-public certificate, and it applies to both the sync client and the embedding API client.
 
 ```bash
 export SSL_CERT_FILE=/path/to/ca-cert.pem
+# requests-based paths also honour REQUESTS_CA_BUNDLE
+export REQUESTS_CA_BUNDLE=/path/to/ca-cert.pem
+
+mnemosyne sync --db-path /path/to/surface.db --remote https://192.168.1.50:8765
 ```
+
+3. **Plain HTTP on a trusted network:** use an `http://` remote URL rather than `https://`. There is no flag that disables certificate verification on an HTTPS connection; if you were looking for `--insecure`, it does not exist.
 
 ---
 

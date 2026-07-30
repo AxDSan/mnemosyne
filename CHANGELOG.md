@@ -259,8 +259,6 @@ layered memory roadmap
   an empty config.yaml before init so the auto-seed doesn't override test
   env vars with defaults.
 
-## [Unreleased]
-
 ## [3.11.0] — 2026-06-30
 
 ### Added

@@ -1,116 +1,216 @@
 ---
 title: "Configuration"
-version: 3.12.0
+version: 3.15.1
+config_key_count: 106
+env_only_count: 42
 generated_at: "auto"
 ---
 
 # Configuration
 
-Mnemosyne is configured entirely through environment variables. No config files, no YAML, no JSON.
+<!-- GENERATED FILE. Do not edit by hand.
+     Source: mnemosyne/core/config.py (ENV_VAR_MAP, DEFAULTS, REQUIRES_RESTART)
+     Regenerate: python3 scripts/generate-docs.py -->
+
+Mnemosyne reads configuration from a YAML file and from environment variables.
+Precedence is **`config.yaml` > environment variable > built-in default**.
+
+`config.yaml` lives at `$MNEMOSYNE_DATA_DIR/config.yaml`, falling back to
+`$HERMES_HOME/mnemosyne/config.yaml` and then `~/.hermes/mnemosyne/config.yaml`.
+Nested YAML works, and leaf keys resolve too, so `memory.mnemosyne.wm_max_items`
+and `wm_max_items` are equivalent.
+
+Keys marked **restart** are read once at startup. Changing them at runtime warns
+and does not take effect until the process restarts.
+
+There are **106 configuration keys**. A further
+**42 environment variables** are read directly from the
+environment and are **not** settable in `config.yaml`; they are listed separately below.
 
 ---
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MNEMOSYNE_DATA_DIR` | `~/.hermes/mnemosyne/data` | Directory for database, logs, models, and stats |
-| `MNEMOSYNE_HOME` | `~/.hermes/mnemosyne` | Override home directory for all Mnemosyne data |
-| `MNEMOSYNE_SHARED_DB_PATH` | `data/shared/mnemosyne.db` | SQLite path for shared surface memory DB |
-| `MNEMOSYNE_BLOB_DIR` | *(required)* | Directory for blob storage (content sanitizer output) |
-| `MNEMOSYNE_AUTO_MIGRATE` | `1` | Auto-migrate DB schema on startup (set to 0 to disable) |
-| `MNEMOSYNE_WM_MAX_ITEMS` | `10000` | Maximum items in working memory before eviction |
-| `MNEMOSYNE_WM_TTL_HOURS` | `24` | Hours before working memory entries expire |
-| `MNEMOSYNE_EP_LIMIT` | `50000` | Max episodic memories returned per recall |
-| `MNEMOSYNE_SP_MAX` | `1000` | Maximum scratchpad entries |
-| `MNEMOSYNE_RECENCY_HALFLIFE` | `168` | Recency decay halflife in hours (default: 1 week) |
-| `MNEMOSYNE_TEMPORAL_HALFLIFE_HOURS` | `24` | Temporal voice halflife for time-weighted recall scoring |
-| `MNEMOSYNE_SLEEP_BATCH` | `5000` | Batch size for sleep consolidation |
-| `MNEMOSYNE_AUTO_SLEEP_ENABLED` | `false` | Enable automatic sleep consolidation (Hermes provider, default off) |
-| `MNEMOSYNE_SESSION_END_TIMEOUT` | `15` | Max seconds for session-end sleep (Hermes provider) |
-| `MNEMOSYNE_AUTO_SLEEP_TIMEOUT` | `5` | Max seconds for auto-sleep cycle |
-| `MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT` | `2` | Max seconds to drain LLM queue on shutdown |
-| `MNEMOSYNE_SLEEP_PROMPT` | *(required)* | Custom prompt for sleep LLM consolidation |
-| `MNEMOSYNE_TIER2_DAYS` | `30` | Days before memories enter Tier 2 (compressed) |
-| `MNEMOSYNE_TIER3_DAYS` | `180` | Days before memories enter Tier 3 (summary only) |
-| `MNEMOSYNE_TIER1_WEIGHT` | `1.0` | Scoring weight for Tier 1 (fresh) memories |
-| `MNEMOSYNE_TIER2_WEIGHT` | `0.5` | Scoring weight for Tier 2 (compressed) memories |
-| `MNEMOSYNE_TIER3_WEIGHT` | `0.25` | Scoring weight for Tier 3 (summary) memories |
-| `MNEMOSYNE_DEGRADE_BATCH` | `100` | Batch size for tiered degradation pass |
-| `MNEMOSYNE_SMART_COMPRESS` | `true` | Use LLM for smart tiered compression instead of truncation |
-| `MNEMOSYNE_TIER3_MAX_CHARS` | `300` | Max character length for Tier 3 summaries |
-| `MNEMOSYNE_STATED_WEIGHT` | `1.0` | Veracity weight for stated (user-asserted) memories |
-| `MNEMOSYNE_INFERRED_WEIGHT` | `0.7` | Veracity weight for inferred (LLM-extracted) memories |
-| `MNEMOSYNE_TOOL_WEIGHT` | `0.5` | Veracity weight for tool-returned memories |
-| `MNEMOSYNE_IMPORTED_WEIGHT` | `0.6` | Veracity weight for externally imported memories |
-| `MNEMOSYNE_UNKNOWN_WEIGHT` | `0.8` | Veracity weight for memories with unknown source |
-| `MNEMOSYNE_VEC_TYPE` | `int8` | Vector storage format (int8, float32, float16, binary) |
-| `MNEMOSYNE_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | fastembed model for vector embeddings |
-| `MNEMOSYNE_EMBEDDING_DIM` | `384` | Override embedding vector dimension |
-| `MNEMOSYNE_EMBEDDING_API_KEY` | *(required)* | API key for cloud embedding provider |
-| `MNEMOSYNE_EMBEDDING_API_URL` | `https://openrouter.ai/api/v1` | API endpoint for cloud embeddings |
-| `MNEMOSYNE_NO_EMBEDDINGS` | `false` | Disable dense vector retrieval entirely |
-| `MNEMOSYNE_EMBEDDINGS_VIA_API` | `false` | Force cloud API mode for embeddings |
-| `MNEMOSYNE_EMBEDDING_FALLBACK_MODEL` | *(required)* | Local fastembed model for API fallback (v3.6.0) |
-| `MNEMOSYNE_VEC_WEIGHT` | `0.5` | Vector similarity weight in hybrid ranking |
-| `MNEMOSYNE_FTS_WEIGHT` | `0.3` | Full-text search weight in hybrid ranking |
-| `MNEMOSYNE_IMPORTANCE_WEIGHT` | `0.2` | Importance score weight in hybrid ranking |
-| `MNEMOSYNE_LLM_ENABLED` | `true` | Enable LLM summarization during sleep consolidation |
-| `MNEMOSYNE_LLM_BASE_URL` | *(required)* | OpenAI-compatible API base URL for remote LLM |
-| `MNEMOSYNE_LLM_API_KEY` | *(required)* | API key for remote LLM endpoint |
-| `MNEMOSYNE_LLM_MODEL` | *(required)* | Model identifier for remote LLM calls |
-| `MNEMOSYNE_LLM_MAX_TOKENS` | `2048` | Max output tokens per LLM summary |
-| `MNEMOSYNE_LLM_N_CTX` | `2048` | Context window size for local LLM |
-| `MNEMOSYNE_LLM_N_THREADS` | `4` | CPU threads for local LLM inference |
-| `MNEMOSYNE_LLM_REPO` | `openbmb/MiniCPM5-1B-GGUF` | HuggingFace repo for GGUF model |
-| `MNEMOSYNE_LLM_FILE` | `MiniCPM5-1B-Q4_K_M.gguf` | GGUF filename for local LLM |
-| `MNEMOSYNE_LLM_FALLBACK_BASE_URL` | *(required)* | Fallback API URL when primary remote LLM fails |
-| `MNEMOSYNE_LLM_FALLBACK_API_KEY` | *(required)* | API key for fallback LLM endpoint |
-| `MNEMOSYNE_LLM_FALLBACK_MODELS` | *(required)* | Comma-separated fallback model names to try |
-| `MNEMOSYNE_FORCE_LOCAL` | `false` | Skip remote LLM and use local model directly |
-| `MNEMOSYNE_LLM_CONFLICT_DETECTION` | `false` | Enable LLM-based conflict detection during sleep |
-| `MNEMOSYNE_CONFLICT_LLM_BASE_URL` | *(required)* | API base URL for conflict detection LLM |
-| `MNEMOSYNE_CONFLICT_LLM_API_KEY` | *(required)* | API key for conflict detection LLM |
-| `MNEMOSYNE_CONFLICT_LLM_MODEL` | *(required)* | Model for conflict detection LLM calls |
-| `MNEMOSYNE_HOST_LLM_ENABLED` | `false` | Route consolidation through host-provided LLM adapter |
-| `MNEMOSYNE_HOST_LLM_MODEL` | *(required)* | Model override for host LLM adapter |
-| `MNEMOSYNE_HOST_LLM_PROVIDER` | *(required)* | Provider override for host LLM adapter (e.g. openai-codex) |
-| `MNEMOSYNE_HOST_LLM_N_CTX` | `32000` | Context window budget when using host LLM adapter |
-| `MNEMOSYNE_EXTRACTION_MODEL` | `google/gemini-2.5-flash` | Model for entity/fact extraction via OpenRouter |
-| `MNEMOSYNE_EXTRACTION_PROMPT` | *(required)* | Custom prompt for entity/fact extraction |
-| `MNEMOSYNE_BEAM_OPTIMIZATIONS` | `false` | Enable BEAM benchmark optimizations (feature flag) |
-| `MNEMOSYNE_ENHANCED_RECALL` | `0` | Enable enhanced recall pipeline (fact+graph+episodic fusion) |
-| `MNEMOSYNE_FACT_RECALL_ENABLED` | `0` | Enable fact-based recall (backward compat alias) |
-| `MNEMOSYNE_POLYPHONIC_RECALL` | `0` | Enable polyphonic recall engine (multi-voice fusion) |
-| `MNEMOSYNE_PROACTIVE_LINKING` | `0` | Enable proactive cross-memory linking on insertion |
-| `MNEMOSYNE_GRAPH_BONUS` | `1` | A/B toggle: graph traversal bonus in recall scoring |
-| `MNEMOSYNE_FACT_BONUS` | `1` | A/B toggle: fact match bonus in recall scoring |
-| `MNEMOSYNE_BINARY_BONUS` | `1` | A/B toggle: binary vector bonus in recall scoring |
-| `MNEMOSYNE_LENIENT_FACT_MATCH` | `false` | Use substring instead of exact match for fact recall |
-| `MNEMOSYNE_VERACITY_MULTIPLIER` | `1` | A/B toggle: apply veracity multiplier to recall scores |
-| `MNEMOSYNE_CROSS_TIER_DEDUP` | `1` | A/B toggle: cross-tier deduplication in BEAM recall |
-| `MNEMOSYNE_VOICE_VECTOR` | `1` | A/B toggle: polyphonic vector voice (Phase 3d) |
-| `MNEMOSYNE_VOICE_GRAPH` | `1` | A/B toggle: polyphonic graph voice (Phase 3b) |
-| `MNEMOSYNE_VOICE_FACT` | `1` | A/B toggle: polyphonic fact voice (Phase 3a) |
-| `MNEMOSYNE_VOICE_TEMPORAL` | `1` | A/B toggle: polyphonic temporal voice (Phase 3c) |
-| `MNEMOSYNE_BEAM_MODE` | `false` | Enable BEAM mode (polyphonic recall engine extension) |
-| `MNEMOSYNE_USE_CAVEMAN` | `false` | Use caveman/AAAK encoding fallback for consolidation |
-| `MNEMOSYNE_SYNC_ROLES` | `user` | Conversation roles to sync into memory; default user-only to avoid assistant transcript noise |
-| `MNEMOSYNE_SKIP_CONTEXTS` | `cron,flush,subagent,background,skill_loop` | Comma-separated context names to skip |
-| `MNEMOSYNE_SYNC_TURN_USER_LIMIT` | `500` | Max chars of user content synced per turn (0=no limit) |
-| `MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT` | `800` | Max chars of assistant content synced per turn (0=no limit) |
-| `MNEMOSYNE_PREFETCH_CONTENT_CHARS` | `0` | Truncate prefetched content to N chars (0=no truncation) |
-| `MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS` | `user,owner,assistant,agent,system,profile,identity,default` | Comma/space-separated local owner/system words that should not by themselves make canonical facts relevant |
-| `MNEMOSYNE_RECALL_EXTRA_STOPWORDS` | *(required)* | Comma/space-separated extra lexical stopwords for local recall corpora |
-| `MNEMOSYNE_PREFETCH_PROFILE` | `general` | Prefetch profile name (general, coding, etc.) |
-| `MNEMOSYNE_MCP_TOKEN` | *(required)* | Bearer token for MCP server auth (required for remote deployment) |
-| `MNEMOSYNE_MCP_BANK` | `default` | Default MCP bank name for tool operations |
-| `MNEMOSYNE_AUTHOR_ID` | *(required)* | Identifier for the author/agent creating memories |
-| `MNEMOSYNE_AUTHOR_TYPE` | *(required)* | Type of author (user, assistant, system, etc.) |
-| `MNEMOSYNE_CHANNEL_ID` | *(required)* | Channel/session identifier for memory scoping |
-| `MNEMOSYNE_DEFAULT_OWNER` | `default` | Default owner for canonical facts and shared memory |
-| `MNEMOSYNE_SHMR_BATCH_SIZE` | `50` | Max memories per SHMR reorganization batch |
-| `MNEMOSYNE_SHMR_MAX_ITERATIONS` | `3` | Max SHMR clustering iterations per batch |
-| `MNEMOSYNE_SHMR_SIMILARITY_THRESHOLD` | `0.70` | Cosine similarity threshold for memory clustering |
-| `MNEMOSYNE_SHMR_HARMONY_THRESHOLD` | `0.60` | Harmony threshold for cluster merging |
-| `MNEMOSYNE_SHMR_MODEL` | *(required)* | LLM model for SHMR summarization (empty = use default) |
-| `MNEMOSYNE_SHMR_MIN_CLUSTER_SIZE` | `2` | Minimum memories to form a SHMR cluster |
-| `MNEMOSYNE_SHMR_TEMPERATURE` | `0.2` | LLM temperature for SHMR summarization |
+## Configuration keys (106)
+
+| Config key | Environment variable | Default | Restart | Description |
+|------------|----------------------|---------|---------|-------------|
+| `auto_migrate` | `MNEMOSYNE_AUTO_MIGRATE` | `true` | no | Run packaged migrations automatically on database open. |
+| `auto_sleep_enabled` | `MNEMOSYNE_AUTO_SLEEP_ENABLED` | `true` | no | Run consolidation automatically on a background daemon. |
+| `backup_dir` | `MNEMOSYNE_BACKUP_DIR` | *(unset)* | **yes** | Directory for `mnemosyne backups` snapshots. |
+| `blob_dir` | `MNEMOSYNE_BLOB_DIR` | *(unset)* | **yes** | Directory for content-addressed blob storage. |
+| `conflict_llm_api_key` | `MNEMOSYNE_CONFLICT_LLM_API_KEY` | *(unset)* | no | API key for the conflict detection endpoint. |
+| `conflict_llm_base_url` | `MNEMOSYNE_CONFLICT_LLM_BASE_URL` | *(unset)* | no | Base URL for the conflict detection endpoint. |
+| `conflict_llm_model` | `MNEMOSYNE_CONFLICT_LLM_MODEL` | *(unset)* | no | Model for conflict detection calls. |
+| `cross_session` | `MNEMOSYNE_CROSS_SESSION` | `false` | no | Allow recall to return memories from other sessions. |
+| `data_dir` | `MNEMOSYNE_DATA_DIR` | *(unset)* | **yes** | Root directory for all Mnemosyne data. Overrides the `$HERMES_HOME` default. |
+| `db_path` | `MNEMOSYNE_DB_PATH` | *(unset)* | **yes** | Explicit path to the primary SQLite database file. |
+| `default_owner` | `MNEMOSYNE_DEFAULT_OWNER` | *(unset)* | **yes** | Default owner ID for canonical facts and shared memory. |
+| `default_scope` | `MNEMOSYNE_DEFAULT_SCOPE` | `session` | no | Default scope for new memories: `session` or `global`. |
+| `degrade_batch` | `MNEMOSYNE_DEGRADE_BATCH` | `100` | no | Rows degraded per maintenance pass. |
+| `embedding_api_key` | `MNEMOSYNE_EMBEDDING_API_KEY` | *(unset)* | no | API key for a remote embedding provider. Falls back to `OPENAI_API_KEY`. |
+| `embedding_api_url` | `MNEMOSYNE_EMBEDDING_API_URL` | *(unset)* | **yes** | Base URL of an OpenAI-compatible embedding endpoint. |
+| `embedding_dim` | `MNEMOSYNE_EMBEDDING_DIM` | `384` | **yes** | Override the embedding dimension. Must match the dimension stored in the existing vec tables. |
+| `embedding_model` | `MNEMOSYNE_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | **yes** | Embedding model name. Local fastembed model, or an API model when routed to a provider. |
+| `embeddings_off` | `MNEMOSYNE_EMBEDDINGS_OFF` | `false` | no | Alias for `no_embeddings`. |
+| `embeddings_via_api` | `MNEMOSYNE_EMBEDDINGS_VIA_API` | `false` | no | Force API mode for embeddings instead of inferring it from the model name. |
+| `enhanced_recall` | `MNEMOSYNE_ENHANCED_RECALL` | `false` | no | Enable the enhanced recall pipeline with fact, graph, and episodic fusion. |
+| `ep_limit` | `MNEMOSYNE_EP_LIMIT` | `50000` | no | Maximum rows retained in `episodic_memory`. |
+| `fact_recall_enabled` | `MNEMOSYNE_FACT_RECALL_ENABLED` | `true` | no | Enable structured fact matching during recall. |
+| `fastembed_cache_dir` | `MNEMOSYNE_FASTEMBED_CACHE_DIR` | *(unset)* | **yes** | Cache directory for downloaded fastembed ONNX models. |
+| `force_local` | `MNEMOSYNE_FORCE_LOCAL` | `false` | no | Skip the remote chain and use the local GGUF model directly. |
+| `fts_weight` | `MNEMOSYNE_FTS_WEIGHT` | `0.3` [^fts_weight] | no | FTS5 rank weight in hybrid ranking. |
+| `home` | `MNEMOSYNE_HOME` | *(unset)* | **yes** | Base Hermes home directory used to derive default paths. |
+| `host_llm_enabled` | `MNEMOSYNE_HOST_LLM_ENABLED` | `false` | no | Route LLM work through a host-registered backend. See `core/llm_backends.py`. |
+| `host_llm_model` | `MNEMOSYNE_HOST_LLM_MODEL` | *(unset)* | no | Model override passed to the host backend. |
+| `host_llm_n_ctx` | `MNEMOSYNE_HOST_LLM_N_CTX` | `32000` [^host_llm_n_ctx] (declared `2048`) | no | Context budget assumed for the host backend. |
+| `host_llm_provider` | `MNEMOSYNE_HOST_LLM_PROVIDER` | *(unset)* | no | Provider override passed to the host backend. |
+| `ignore_patterns` | `MNEMOSYNE_IGNORE_PATTERNS` | *(unset)* | no | Comma separated regexes; matching content is never stored. |
+| `importance_weight` | `MNEMOSYNE_IMPORTANCE_WEIGHT` | `0.2` [^importance_weight] | no | Importance weight in hybrid ranking. |
+| `lenient_fact_match` | `MNEMOSYNE_LENIENT_FACT_MATCH` | `false` | no | Match facts by substring instead of exact equality. |
+| `llm_api_key` | `MNEMOSYNE_LLM_API_KEY` | *(unset)* | no | API key for the remote chat endpoint. |
+| `llm_base_url` | `MNEMOSYNE_LLM_BASE_URL` | *(unset)* | no | Base URL of an OpenAI-compatible chat endpoint. |
+| `llm_conflict_detection` | `MNEMOSYNE_LLM_CONFLICT_DETECTION` | `false` | no | Enable LLM-based contradiction detection during sleep. |
+| `llm_enabled` | `MNEMOSYNE_LLM_ENABLED` | `false` | no | Enable LLM summarization during sleep consolidation. |
+| `llm_fallback_api_key` | `MNEMOSYNE_LLM_FALLBACK_API_KEY` | *(unset)* | no | API key for the fallback chat endpoint. |
+| `llm_fallback_base_url` | `MNEMOSYNE_LLM_FALLBACK_BASE_URL` | *(unset)* | no | Base URL for the fallback chat endpoint. |
+| `llm_fallback_models` | `MNEMOSYNE_LLM_FALLBACK_MODELS` | *(unset)* | no | Comma separated models to try if the primary fails. |
+| `llm_file` | `MNEMOSYNE_LLM_FILE` | `MiniCPM5-1B-Q4_K_M.gguf` [^llm_file] (declared *(unset)*) | **yes** | GGUF filename within the repo. |
+| `llm_max_tokens` | `MNEMOSYNE_LLM_MAX_TOKENS` | `512` | no | Maximum output tokens per LLM summary. |
+| `llm_model` | `MNEMOSYNE_LLM_MODEL` | *(unset)* | no | Model identifier for remote chat calls. |
+| `llm_n_ctx` | `MNEMOSYNE_LLM_N_CTX` | `2048` | no | Context window for local GGUF inference. |
+| `llm_n_threads` | `MNEMOSYNE_LLM_N_THREADS` | `4` | no | CPU threads for local GGUF inference. |
+| `llm_repo` | `MNEMOSYNE_LLM_REPO` | `openbmb/MiniCPM5-1B-GGUF` [^llm_repo] (declared *(unset)*) | **yes** | Hugging Face repo holding the local GGUF model. |
+| `llm_timeout` | `MNEMOSYNE_LLM_TIMEOUT` | `60` | no | Per-request timeout in seconds for LLM calls. |
+| `no_embeddings` | `MNEMOSYNE_NO_EMBEDDINGS` | `false` | no | Disable dense retrieval entirely. Recall degrades to lexical FTS5. |
+| `persona_daily_sync_hour` | `MNEMOSYNE_PERSONA_DAILY_SYNC_HOUR` | `3` | no | Local hour at which the daily persona sync runs. |
+| `persona_enabled` | `MNEMOSYNE_PERSONA_ENABLED` | `true` | no | Inject L3 persona facts into the system prompt. |
+| `persona_interval` | `MNEMOSYNE_PERSONA_INTERVAL` | `10` | no | Turns between persona refreshes. |
+| `persona_token_cap` | `MNEMOSYNE_PERSONA_TOKEN_CAP` | `500` | no | Token budget for injected persona facts. |
+| `polyphonic_recall` | `MNEMOSYNE_POLYPHONIC_RECALL` | `false` | no | Enable the polyphonic multi-voice recall engine with RRF fusion. |
+| `prefetch_content_chars` | `MNEMOSYNE_PREFETCH_CONTENT_CHARS` | `2000` | no | Truncate prefetched memory content to this many characters. `0` disables truncation. |
+| `proactive_linking` | `MNEMOSYNE_PROACTIVE_LINKING` | `true` | no | Create cross-memory graph edges on insertion. |
+| `query_intent` | `MNEMOSYNE_QUERY_INTENT` | `true` | no | Classify query intent and adjust scoring weights accordingly. |
+| `recall_diagnostics` | `MNEMOSYNE_RECALL_DIAGNOSTICS` | `false` | no | Collect per-stage recall diagnostics. See `explain=True`. |
+| `recall_extra_stopwords` | `MNEMOSYNE_RECALL_EXTRA_STOPWORDS` | *(unset)* | no | Extra comma or space separated stopwords for lexical recall. |
+| `recency_halflife` | `MNEMOSYNE_RECENCY_HALFLIFE` | `168` | no | Hours until the recency decay factor halves. |
+| `reflect_disabled_for_cron` | `MNEMOSYNE_REFLECT_DISABLED_FOR_CRON` | `true` | no | Skip reflection when running in a cron context. |
+| `reflect_max_calls_per_session` | `MNEMOSYNE_REFLECT_MAX_CALLS_PER_SESSION` | `3` | no | Maximum reflection passes per session. |
+| `shared_db_path` | `MNEMOSYNE_SHARED_DB_PATH` | *(unset)* | **yes** | Path to the shared cross-agent surface database. |
+| `shmr_batch_size` | `MNEMOSYNE_SHMR_BATCH_SIZE` | `50` | no | Memories per SHMR harmonization batch. |
+| `shmr_harmony_threshold` | `MNEMOSYNE_SHMR_HARMONY_THRESHOLD` | `0.5` | no | Harmony score required to merge a cluster into a belief. |
+| `shmr_max_iterations` | `MNEMOSYNE_SHMR_MAX_ITERATIONS` | `10` | no | Maximum clustering iterations per SHMR batch. |
+| `shmr_min_cluster_size` | `MNEMOSYNE_SHMR_MIN_CLUSTER_SIZE` | `3` | no | Minimum memories required to form a cluster. |
+| `shmr_model` | `MNEMOSYNE_SHMR_MODEL` | *(unset)* | no | LLM model for SHMR summarization. Empty uses the default chain. |
+| `shmr_similarity_threshold` | `MNEMOSYNE_SHMR_SIMILARITY_THRESHOLD` | `0.7` | no | Cosine similarity required to cluster two memories. |
+| `shmr_temperature` | `MNEMOSYNE_SHMR_TEMPERATURE` | `0.3` | no | Sampling temperature for SHMR summarization. |
+| `skip_contexts` | `MNEMOSYNE_SKIP_CONTEXTS` | `cron,flush,subagent,background,skill_loop` | no | Comma separated host context names that should not write memories. |
+| `skip_embeddings` | `MNEMOSYNE_SKIP_EMBEDDINGS` | `false` | no | Alias for `no_embeddings`. |
+| `sleep_batch` | `MNEMOSYNE_SLEEP_BATCH` | `5000` | no | Working memory rows processed per sleep cycle. |
+| `sleep_model_refresh_auto_apply` | `MNEMOSYNE_SLEEP_MODEL_REFRESH_AUTO_APPLY` | `true` | no | Apply high-confidence proposals without review. |
+| `sleep_model_refresh_auto_apply_min_confidence` | `MNEMOSYNE_SLEEP_MODEL_REFRESH_AUTO_APPLY_MIN_CONFIDENCE` | `0.7` | no | Minimum confidence to auto-apply a proposal. |
+| `sleep_model_refresh_categories` | `MNEMOSYNE_SLEEP_MODEL_REFRESH_CATEGORIES` | `user,workflow,project` | no | Comma separated canonical categories eligible for refresh. |
+| `sleep_model_refresh_conflict_min_confidence` | `MNEMOSYNE_SLEEP_MODEL_REFRESH_CONFLICT_MIN_CONFIDENCE` | `0.8` | no | Minimum confidence to auto-apply a proposal that contradicts a current fact. |
+| `sleep_model_refresh_conflict_min_evidence` | `MNEMOSYNE_SLEEP_MODEL_REFRESH_CONFLICT_MIN_EVIDENCE` | `5` | no | Minimum supporting memories for a contradicting change. |
+| `sleep_model_refresh_enabled` | `MNEMOSYNE_SLEEP_MODEL_REFRESH_ENABLED` | `true` | no | Let sleep propose updates to canonical facts. |
+| `sleep_model_refresh_max_tokens` | `MNEMOSYNE_SLEEP_MODEL_REFRESH_MAX_TOKENS` | `1024` | no | Token budget for a refresh proposal. |
+| `sleep_model_refresh_min_evidence` | `MNEMOSYNE_SLEEP_MODEL_REFRESH_MIN_EVIDENCE` | `3` | no | Minimum supporting memories before proposing a change. |
+| `sleep_model_refresh_temperature` | `MNEMOSYNE_SLEEP_MODEL_REFRESH_TEMPERATURE` | `0.3` | no | Sampling temperature for refresh proposals. |
+| `sleep_prompt` | `MNEMOSYNE_SLEEP_PROMPT` | *(unset)* | no | Override the consolidation summarization prompt. |
+| `smart_compress` | `MNEMOSYNE_SMART_COMPRESS` | `true` | no | Use LLM summarization rather than truncation when degrading a tier. |
+| `sp_max` | `MNEMOSYNE_SP_MAX` | `1000` | no | Maximum scratchpad entries retained. |
+| `sync_encrypt` | `MNEMOSYNE_SYNC_ENCRYPT` | `false` | no | Encrypt sync payloads client-side with XChaCha20-Poly1305. |
+| `sync_host` | `MNEMOSYNE_SYNC_HOST` | `127.0.0.1` | **yes** | Bind address for `mnemosyne sync-serve`. |
+| `sync_key` | `MNEMOSYNE_SYNC_KEY` | *(unset)* | no | Passphrase used to derive the client-side encryption key. |
+| `sync_port` | `MNEMOSYNE_SYNC_PORT` | `8765` | **yes** | Bind port for `mnemosyne sync-serve`. |
+| `sync_remote` | `MNEMOSYNE_SYNC_REMOTE` | *(unset)* | **yes** | Remote sync server URL. |
+| `sync_roles` | `MNEMOSYNE_SYNC_ROLES` | `user` | no | Conversation roles synced into memory. Defaults to user turns only. |
+| `sync_turn_assistant_limit` | `MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT` | `10` | no | Maximum assistant turns captured per sync pass. |
+| `sync_turn_user_limit` | `MNEMOSYNE_SYNC_TURN_USER_LIMIT` | `10` | no | Maximum user turns captured per sync pass. |
+| `temporal_halflife_hours` | `MNEMOSYNE_TEMPORAL_HALFLIFE_HOURS` | `168` | no | Hours until the temporal recall boost decays by half. |
+| `tier1_weight` | `MNEMOSYNE_TIER1_WEIGHT` | `1.0` | no | Recall score multiplier for tier 1 (fresh) episodic memories. |
+| `tier2_days` | `MNEMOSYNE_TIER2_DAYS` | `30` | no | Age in days at which an episodic memory degrades to tier 2. |
+| `tier2_weight` | `MNEMOSYNE_TIER2_WEIGHT` | `0.5` | no | Recall score multiplier for tier 2 memories. |
+| `tier3_days` | `MNEMOSYNE_TIER3_DAYS` | `180` | no | Age in days at which an episodic memory degrades to tier 3. |
+| `tier3_max_chars` | `MNEMOSYNE_TIER3_MAX_CHARS` | `300` | no | Character budget for tier 3 compressed content. |
+| `tier3_weight` | `MNEMOSYNE_TIER3_WEIGHT` | `0.25` | no | Recall score multiplier for tier 3 memories. |
+| `vec_type` | `MNEMOSYNE_VEC_TYPE` | `int8` | **yes** | sqlite-vec element type: `int8`, `float32`, or `bit`. |
+| `vec_weight` | `MNEMOSYNE_VEC_WEIGHT` | `0.5` [^vec_weight] | no | Vector similarity weight in hybrid ranking. Normalized with the next two to sum to 1.0. |
+| `wm_bump_cap_hours` | `MNEMOSYNE_WM_BUMP_CAP_HOURS` | `24` | no | Maximum window in which a recall can refresh a row's recency. |
+| `wm_max_items` | `MNEMOSYNE_WM_MAX_ITEMS` | `10000` | no | Maximum rows retained in `working_memory` before eviction. |
+| `wm_pinned_ids` | `MNEMOSYNE_WM_PINNED_IDS` | *(unset)* | no | Comma separated memory IDs that are never evicted. |
+| `wm_ttl_hours` | `MNEMOSYNE_WM_TTL_HOURS` | `168` | no | Age at which a working memory row becomes eligible for consolidation or trim. |
+| `write_classifier` | `MNEMOSYNE_WRITE_CLASSIFIER` | *(unset)* | no | Write classifier mode controlling which content is stored. |
+
+### Keys whose effective default bypasses `config.py`
+
+For these keys a module-level constant reads the environment variable directly, so the value in `DEFAULTS` is not what the runtime uses. Treat the environment variable as authoritative.
+
+[^fts_weight]: `fts_weight` -- Read directly from the environment by `_normalize_weights`.
+[^host_llm_n_ctx]: `host_llm_n_ctx` -- `local_llm.py` reads `MNEMOSYNE_HOST_LLM_N_CTX` directly with a `32000` fallback, so the `2048` declared in `config.py` never applies.
+[^importance_weight]: `importance_weight` -- Read directly from the environment by `_normalize_weights`.
+[^llm_file]: `llm_file` -- `local_llm.py` falls back to `DEFAULT_MODEL_FILE` when the env var is unset.
+[^llm_repo]: `llm_repo` -- `local_llm.py` falls back to `DEFAULT_MODEL_REPO` when the env var is unset.
+[^vec_weight]: `vec_weight` -- `_normalize_weights` in `beam.py` reads the env var directly, so `config.yaml` alone does not affect recall.
+
+---
+
+## Environment-only variables (42)
+
+These are read with `os.environ` at their point of use and bypass
+`MnemosyneConfig` entirely. They cannot be set in `config.yaml`.
+
+| Environment variable | Description |
+|----------------------|-------------|
+| `MNEMOSYNE_AUTHOR_ID` | Identifier recorded as the author of new memories. |
+| `MNEMOSYNE_AUTHOR_TYPE` | Author kind: user, assistant, system. |
+| `MNEMOSYNE_AUTO_SLEEP_TIMEOUT` | Seconds the Hermes provider waits for a background sleep to finish. |
+| `MNEMOSYNE_BANK` | Default memory bank for CLI operations. |
+| `MNEMOSYNE_BEAM_MODE` | Enable BEAM mode extensions in the polyphonic engine. |
+| `MNEMOSYNE_BEAM_OPTIMIZATIONS` | Enable BEAM benchmark optimizations. |
+| `MNEMOSYNE_BINARY_BONUS` | A/B toggle for the binary vector bonus in episodic scoring. |
+| `MNEMOSYNE_BUSY_TIMEOUT_MS` | SQLite `busy_timeout` in milliseconds. |
+| `MNEMOSYNE_CHANNEL_ID` | Channel or session identifier for memory scoping. |
+| `MNEMOSYNE_CONTEXT_INCLUDE_CONSOLIDATED` | Include already-consolidated rows in assembled context. |
+| `MNEMOSYNE_CROSS_TIER_DEDUP` | A/B toggle for deduplication across working and episodic results. |
+| `MNEMOSYNE_EMBEDDING_DOC_PREFIX` | Prefix prepended to documents before embedding. Applied verbatim. |
+| `MNEMOSYNE_EMBEDDING_QUERY_PREFIX` | Prefix prepended to queries before embedding. Applied verbatim. |
+| `MNEMOSYNE_EMBEDDING_THREADS` | Thread count for local ONNX embedding inference. |
+| `MNEMOSYNE_EXTRACTION_MODEL` | Model used by the cloud extraction client. |
+| `MNEMOSYNE_EXTRACTION_PROMPT` | Override the fact extraction prompt. |
+| `MNEMOSYNE_FACT_BONUS` | A/B toggle for the fact match bonus in episodic scoring. |
+| `MNEMOSYNE_GRAPH_BONUS` | A/B toggle for the graph traversal bonus in episodic scoring. |
+| `MNEMOSYNE_HOST_LLM_TIMEOUT` | Timeout in seconds for host LLM backend calls. |
+| `MNEMOSYNE_IMPORTED_WEIGHT` | Veracity multiplier for imported memories. |
+| `MNEMOSYNE_INFERRED_WEIGHT` | Veracity multiplier for inferred memories. |
+| `MNEMOSYNE_MCP_BANK` | Memory bank used by the MCP server. |
+| `MNEMOSYNE_MCP_TOKEN` | Bearer token for MCP SSE auth. Required for any non-loopback bind. |
+| `MNEMOSYNE_PERSONA_FILE` | Path to an external persona facts file. |
+| `MNEMOSYNE_PREFETCH_MODEL_SLOT_LIMIT` | Maximum canonical slots prefetched per turn. |
+| `MNEMOSYNE_PREFETCH_MODEL_SLOT_MIN_OVERLAP` | Minimum token overlap for a canonical slot to count as relevant. |
+| `MNEMOSYNE_PREFETCH_PROFILE` | Prefetch profile name, for example `general` or `coding`. |
+| `MNEMOSYNE_SESSION_END_TIMEOUT` | Seconds allowed for end-of-session memory writes. |
+| `MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT` | Seconds allowed to drain pending writes on shutdown. |
+| `MNEMOSYNE_STATED_WEIGHT` | Veracity multiplier for directly stated memories. |
+| `MNEMOSYNE_SYNC_KEY_SOURCE` | Where the sync passphrase comes from: `keyring` or `prompt`. |
+| `MNEMOSYNE_SYNC_MODE` | Sync mode selector used by the Hermes sync adapter. |
+| `MNEMOSYNE_SYNC_TOKEN` | Bearer token presented to the sync server. |
+| `MNEMOSYNE_SYNC_TURN_SLOW_THRESHOLD` | Milliseconds after which a turn sync is logged as slow. |
+| `MNEMOSYNE_TOOL_WEIGHT` | Veracity multiplier for tool-produced memories. |
+| `MNEMOSYNE_UNKNOWN_WEIGHT` | Veracity multiplier for memories of unknown provenance. |
+| `MNEMOSYNE_USE_CAVEMAN` | Use the AAAK keyword compression fallback for consolidation. |
+| `MNEMOSYNE_VERACITY_MULTIPLIER` | A/B toggle for applying veracity multipliers at all. |
+| `MNEMOSYNE_VOICE_FACT` | Set to `0` to disable the polyphonic fact voice. |
+| `MNEMOSYNE_VOICE_GRAPH` | Set to `0` to disable the polyphonic graph voice. |
+| `MNEMOSYNE_VOICE_TEMPORAL` | Set to `0` to disable the polyphonic temporal voice. |
+| `MNEMOSYNE_VOICE_VECTOR` | Set to `0` to disable the polyphonic vector voice. |
+
+---
+
+## Recall scoring weights
+
+`vec_weight`, `fts_weight`, and `importance_weight` are normalized to sum to 1.0
+at query time. They are the highest-leverage tuning knobs in the system.
+
+Note a real caveat: `_normalize_weights` in `mnemosyne/core/beam.py` reads these
+three from the environment directly rather than through `MnemosyneConfig`, so
+setting them in `config.yaml` alone does not affect recall. Set the environment
+variables. This is tracked as a known inconsistency.

@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- Python 3.9 or later
+- Python 3.10 or later
 - (Optional) Hermes Agent Framework for plugin integration
 
 ## Installation

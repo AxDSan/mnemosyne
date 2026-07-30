@@ -4,341 +4,746 @@ Auto-generate docs/api/ files from live code.
 
 Usage:
     python3 scripts/generate-docs.py
+    python3 scripts/generate-docs.py --check      # report drift, write nothing
 
 Writes canonical copies to docs/api/ inside the mnemosyne repo.
-Also writes to the website sibling repo (../mnemosyne-docs/src/) if present.
-All website writes are optional — canonical copies are always written.
+Also writes to the docs sibling repo (../mnemosyne-docs) if present.
+All sibling writes are optional; canonical copies are always written.
+
+DESIGN: PARSE, DO NOT IMPORT
+----------------------------
+Everything factual is read out of the source tree with `ast`, never by
+importing mnemosyne. Two reasons, both load-bearing:
+
+  1. The CI `docs-check` job runs a bare python3 with NO pip install
+     (see .github/workflows/ci.yml). `import mnemosyne` would fail on
+     PyYAML, so an import-based generator could only ever work locally.
+  2. Importing pulls in sqlite, config singletons, and optionally
+     fastembed. Docs generation must not depend on a working runtime.
+
+WHAT IS DERIVED VS WHAT IS AUTHORED
+-----------------------------------
+Derived from code (cannot drift):
+  - the tool list, names, descriptions, and parameters  <- mnemosyne/tool_schemas.py
+  - which tools are reachable over MCP                  <- mnemosyne/mcp_tools.py::_TOOL_HANDLERS
+  - the config key list, env var names, and defaults    <- mnemosyne/core/config.py
+  - which keys need a restart                           <- config.py::REQUIRES_RESTART
+  - the version                                         <- mnemosyne/__init__.py
+
+Authored here (editorial prose only):
+  - CONFIG_DESCRIPTIONS, one line per config key.
+
+The split matters. Before this rewrite the generator hardcoded the tool
+list and the config defaults as literals "verified against v3.6.0", while
+reading the version dynamically. The result was docs stamped with a
+current version carrying a two-year-old payload: 25 tools when the code
+had 37, and roughly a dozen wrong defaults. Facts now come from the code
+and only prose is hand-held, and DESCRIPTION drift is a hard error below.
 """
 from __future__ import annotations
 
-import json
+import ast
 import os
 import sys
 
-# ---------------------------------------------------------------
-# Tool schema definitions (25 real tools — verified against
-# hermes_memory_provider/__init__.py::ALL_TOOL_SCHEMAS and
-# mnemosyne/mcp_tools.py::_TOOL_HANDLERS, v3.6.0)
-# ---------------------------------------------------------------
-ALL_TOOL_SCHEMAS = [
-    {"name": "mnemosyne_remember", "description": "Store a durable memory", "params": {"content": "string", "importance": "float=0.5", "source": "string=user", "scope": "string=session", "valid_until": "string=", "extract_entities": "bool=false", "extract": "bool=false", "metadata": "dict={}", "veracity": "string=unknown"}},
-    {"name": "mnemosyne_recall", "description": "Search memories by vector+FTS hybrid ranking", "params": {"query": "string", "limit": "int=5", "temporal_weight": "float=0.0", "query_time": "string=", "temporal_halflife": "float=24", "vec_weight": "float=null", "fts_weight": "float=null", "importance_weight": "float=null"}},
-    {"name": "mnemosyne_forget", "description": "Permanently delete a memory by ID", "params": {"memory_id": "string"}},
-    {"name": "mnemosyne_get", "description": "Retrieve a single memory by ID (no search)", "params": {"memory_id": "string"}},
-    {"name": "mnemosyne_update", "description": "Update content or importance of an existing memory", "params": {"memory_id": "string", "content": "string=", "importance": "float="}},
-    {"name": "mnemosyne_validate", "description": "Attest, update, or invalidate a memory (collaborative ownership)", "params": {"memory_id": "string", "action": "enum[attest,update,invalidate,delete]", "validator": "string=", "new_content": "string=", "note": "string=", "bank": "enum[private,surface]=private"}},
-    {"name": "mnemosyne_invalidate", "description": "Mark a memory as expired/superseded", "params": {"memory_id": "string", "replacement_id": "string="}},
-    {"name": "mnemosyne_import", "description": "Import memories from JSON file or provider (Hindsight, Mem0)", "params": {"input_path": "string=", "provider": "string=", "api_key": "string=", "user_id": "string=", "agent_id": "string=", "base_url": "string=", "dry_run": "bool=false", "channel_id": "string=", "force": "bool=false"}},
-    {"name": "mnemosyne_export", "description": "Export all memories to a JSON file", "params": {"output_path": "string"}},
-    {"name": "mnemosyne_diagnose", "description": "PII-safe diagnostics: deps, DB state, vector readiness, vec_working coverage", "params": {"repair_vec_working": "bool=false", "dry_run": "bool=false"}},
-    {"name": "mnemosyne_stats", "description": "Memory statistics: working count, episodic count, BEAM tiers", "params": {}},
-    {"name": "mnemosyne_sleep", "description": "Run consolidation cycle (compress old working memories)", "params": {"all_sessions": "bool=false", "dry_run": "bool=false"}},
-    {"name": "mnemosyne_triple_add", "description": "Add a fact triple to the knowledge graph", "params": {"subject": "string", "predicate": "string", "object": "string", "valid_from": "string="}},
-    {"name": "mnemosyne_triple_query", "description": "Query the temporal knowledge graph", "params": {"subject": "string=", "predicate": "string=", "object": "string="}},
-    {"name": "mnemosyne_graph_link", "description": "Declare a semantic edge between two memories", "params": {"source_id": "string", "target_id": "string", "relationship": "string", "weight": "float=0.5"}},
-    {"name": "mnemosyne_graph_query", "description": "Multi-hop BFS traversal from a seed memory", "params": {"seed_memory_id": "string", "max_hops": "int=2", "edge_type": "string=", "min_weight": "float=0.0"}},
-    {"name": "mnemosyne_shared_remember", "description": "Store compact cross-agent surface memory", "params": {"content": "string", "kind": "string=meta", "importance": "float=0.8", "veracity": "string=unknown", "metadata": "dict"}},
-    {"name": "mnemosyne_shared_recall", "description": "Search only the shared surface DB", "params": {"query": "string", "limit": "int=5"}},
-    {"name": "mnemosyne_shared_forget", "description": "Delete one working shared-surface memory by ID", "params": {"memory_id": "string"}},
-    {"name": "mnemosyne_shared_stats", "description": "Return shared surface DB path and counts", "params": {}},
-    {"name": "mnemosyne_scratchpad_write", "description": "Write a temporary note to the scratchpad", "params": {"content": "string"}},
-    {"name": "mnemosyne_scratchpad_read", "description": "Read the scratchpad entries", "params": {}},
-    {"name": "mnemosyne_scratchpad_clear", "description": "Clear all scratchpad entries", "params": {}},
-    {"name": "mnemosyne_remember_canonical", "description": "Store an owner-scoped canonical fact (single source of truth)", "params": {"content": "string", "importance": "float=0.5", "veracity": "string=unknown", "source": "string=user", "valid_until": "string="}},
-    {"name": "mnemosyne_recall_canonical", "description": "Recall canonical facts by slot, category, or substring", "params": {"slot": "string=", "category": "string=", "substring": "string=", "limit": "int=5", "include_history": "bool=false"}},
-]
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# NOTE: 25 MCP tools with real handler implementations in mcp_tools.py.
-# mnemosyne_end was removed — it had no handler, no schema in the provider,
-# and would raise ValueError("Unknown tool") if called.
-# mnemosyne_triple_end exists in Hermes provider schemas but has no MCP handler;
-# it is NOT included here since it would fail at MCP runtime.
 
 # ---------------------------------------------------------------
-# Config schema (env vars — verified against actual os.environ.get
-# calls in beam.py, the hermes_memory_provider, and integrations, v3.6.0)
+# AST extraction helpers
 # ---------------------------------------------------------------
-CONFIG_ENTRIES = [
-    # ── Storage & Paths ──
-    {"key": "MNEMOSYNE_DATA_DIR", "env": "MNEMOSYNE_DATA_DIR", "default": "~/.hermes/mnemosyne/data", "desc": "Directory for database, logs, models, and stats"},
-    {"key": "MNEMOSYNE_HOME", "env": "MNEMOSYNE_HOME", "default": "~/.hermes/mnemosyne", "desc": "Override home directory for all Mnemosyne data"},
-    {"key": "MNEMOSYNE_SHARED_DB_PATH", "env": "MNEMOSYNE_SHARED_DB_PATH", "default": "data/shared/mnemosyne.db", "desc": "SQLite path for shared surface memory DB"},
-    {"key": "MNEMOSYNE_BLOB_DIR", "env": "MNEMOSYNE_BLOB_DIR", "default": "", "desc": "Directory for blob storage (content sanitizer output)"},
-    {"key": "MNEMOSYNE_AUTO_MIGRATE", "env": "MNEMOSYNE_AUTO_MIGRATE", "default": "1", "desc": "Auto-migrate DB schema on startup (set to 0 to disable)"},
+def _parse(rel_path: str) -> ast.Module:
+    with open(os.path.join(REPO_ROOT, rel_path), encoding="utf-8") as f:
+        return ast.parse(f.read(), filename=rel_path)
 
-    # ── Working Memory ──
-    {"key": "MNEMOSYNE_WM_MAX_ITEMS", "env": "MNEMOSYNE_WM_MAX_ITEMS", "default": "10000", "desc": "Maximum items in working memory before eviction"},
-    {"key": "MNEMOSYNE_WM_TTL_HOURS", "env": "MNEMOSYNE_WM_TTL_HOURS", "default": "24", "desc": "Hours before working memory entries expire"},
 
-    # ── Episodic & Recall ──
-    {"key": "MNEMOSYNE_EP_LIMIT", "env": "MNEMOSYNE_EP_LIMIT", "default": "50000", "desc": "Max episodic memories returned per recall"},
-    {"key": "MNEMOSYNE_SP_MAX", "env": "MNEMOSYNE_SP_MAX", "default": "1000", "desc": "Maximum scratchpad entries"},
-    {"key": "MNEMOSYNE_RECENCY_HALFLIFE", "env": "MNEMOSYNE_RECENCY_HALFLIFE", "default": "168", "desc": "Recency decay halflife in hours (default: 1 week)"},
-    {"key": "MNEMOSYNE_TEMPORAL_HALFLIFE_HOURS", "env": "MNEMOSYNE_TEMPORAL_HALFLIFE_HOURS", "default": "24", "desc": "Temporal voice halflife for time-weighted recall scoring"},
+def _module_literal(rel_path: str, names: set) -> dict:
+    """Return {name: python_value} for module-level literal assignments."""
+    out = {}
+    for node in _parse(rel_path).body:
+        if isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        elif isinstance(node, ast.Assign):
+            targets = node.targets
+        else:
+            continue
+        for tgt in targets:
+            if isinstance(tgt, ast.Name) and tgt.id in names and node.value is not None:
+                try:
+                    out[tgt.id] = ast.literal_eval(node.value)
+                except (ValueError, TypeError, SyntaxError):
+                    pass
+    return out
 
-    # ── Sleep & Consolidation ──
-    {"key": "MNEMOSYNE_SLEEP_BATCH", "env": "MNEMOSYNE_SLEEP_BATCH", "default": "5000", "desc": "Batch size for sleep consolidation"},
-    {"key": "MNEMOSYNE_AUTO_SLEEP_ENABLED", "env": "MNEMOSYNE_AUTO_SLEEP_ENABLED", "default": "false", "desc": "Enable automatic sleep consolidation (Hermes provider, default off)"},
-    {"key": "MNEMOSYNE_SESSION_END_TIMEOUT", "env": "MNEMOSYNE_SESSION_END_TIMEOUT", "default": "15", "desc": "Max seconds for session-end sleep (Hermes provider)"},
-    {"key": "MNEMOSYNE_AUTO_SLEEP_TIMEOUT", "env": "MNEMOSYNE_AUTO_SLEEP_TIMEOUT", "default": "5", "desc": "Max seconds for auto-sleep cycle"},
-    {"key": "MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT", "env": "MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT", "default": "2", "desc": "Max seconds to drain LLM queue on shutdown"},
-    {"key": "MNEMOSYNE_SLEEP_PROMPT", "env": "MNEMOSYNE_SLEEP_PROMPT", "default": "", "desc": "Custom prompt for sleep LLM consolidation"},
 
-    # ── Tiered Degradation (BEAM) ──
-    {"key": "MNEMOSYNE_TIER2_DAYS", "env": "MNEMOSYNE_TIER2_DAYS", "default": "30", "desc": "Days before memories enter Tier 2 (compressed)"},
-    {"key": "MNEMOSYNE_TIER3_DAYS", "env": "MNEMOSYNE_TIER3_DAYS", "default": "180", "desc": "Days before memories enter Tier 3 (summary only)"},
-    {"key": "MNEMOSYNE_TIER1_WEIGHT", "env": "MNEMOSYNE_TIER1_WEIGHT", "default": "1.0", "desc": "Scoring weight for Tier 1 (fresh) memories"},
-    {"key": "MNEMOSYNE_TIER2_WEIGHT", "env": "MNEMOSYNE_TIER2_WEIGHT", "default": "0.5", "desc": "Scoring weight for Tier 2 (compressed) memories"},
-    {"key": "MNEMOSYNE_TIER3_WEIGHT", "env": "MNEMOSYNE_TIER3_WEIGHT", "default": "0.25", "desc": "Scoring weight for Tier 3 (summary) memories"},
-    {"key": "MNEMOSYNE_DEGRADE_BATCH", "env": "MNEMOSYNE_DEGRADE_BATCH", "default": "100", "desc": "Batch size for tiered degradation pass"},
-    {"key": "MNEMOSYNE_SMART_COMPRESS", "env": "MNEMOSYNE_SMART_COMPRESS", "default": "true", "desc": "Use LLM for smart tiered compression instead of truncation"},
-    {"key": "MNEMOSYNE_TIER3_MAX_CHARS", "env": "MNEMOSYNE_TIER3_MAX_CHARS", "default": "300", "desc": "Max character length for Tier 3 summaries"},
+def _dict_keys_of_assignment(rel_path: str, var_name: str) -> list:
+    """
+    String keys of a module-level dict whose VALUES are not literals.
 
-    # ── Veracity Weights ──
-    {"key": "MNEMOSYNE_STATED_WEIGHT", "env": "MNEMOSYNE_STATED_WEIGHT", "default": "1.0", "desc": "Veracity weight for stated (user-asserted) memories"},
-    {"key": "MNEMOSYNE_INFERRED_WEIGHT", "env": "MNEMOSYNE_INFERRED_WEIGHT", "default": "0.7", "desc": "Veracity weight for inferred (LLM-extracted) memories"},
-    {"key": "MNEMOSYNE_TOOL_WEIGHT", "env": "MNEMOSYNE_TOOL_WEIGHT", "default": "0.5", "desc": "Veracity weight for tool-returned memories"},
-    {"key": "MNEMOSYNE_IMPORTED_WEIGHT", "env": "MNEMOSYNE_IMPORTED_WEIGHT", "default": "0.6", "desc": "Veracity weight for externally imported memories"},
-    {"key": "MNEMOSYNE_UNKNOWN_WEIGHT", "env": "MNEMOSYNE_UNKNOWN_WEIGHT", "default": "0.8", "desc": "Veracity weight for memories with unknown source"},
+    _TOOL_HANDLERS maps tool names to function objects, so literal_eval
+    cannot touch it. We only need the keys.
+    """
+    for node in _parse(rel_path).body:
+        if isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        elif isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        else:
+            continue
+        for tgt in targets:
+            if isinstance(tgt, ast.Name) and tgt.id == var_name and isinstance(value, ast.Dict):
+                return [k.value for k in value.keys
+                        if isinstance(k, ast.Constant) and isinstance(k.value, str)]
+    return []
 
-    # ── Vector & Embeddings ──
-    {"key": "MNEMOSYNE_VEC_TYPE", "env": "MNEMOSYNE_VEC_TYPE", "default": "int8", "desc": "Vector storage format (int8, float32, float16, binary)"},
-    {"key": "MNEMOSYNE_EMBEDDING_MODEL", "env": "MNEMOSYNE_EMBEDDING_MODEL", "default": "BAAI/bge-small-en-v1.5", "desc": "fastembed model for vector embeddings"},
-    {"key": "MNEMOSYNE_EMBEDDING_DIM", "env": "MNEMOSYNE_EMBEDDING_DIM", "default": "384", "desc": "Override embedding vector dimension"},
-    {"key": "MNEMOSYNE_EMBEDDING_API_KEY", "env": "MNEMOSYNE_EMBEDDING_API_KEY", "default": "", "desc": "API key for cloud embedding provider"},
-    {"key": "MNEMOSYNE_EMBEDDING_API_URL", "env": "MNEMOSYNE_EMBEDDING_API_URL", "default": "https://openrouter.ai/api/v1", "desc": "API endpoint for cloud embeddings"},
-    {"key": "MNEMOSYNE_NO_EMBEDDINGS", "env": "MNEMOSYNE_NO_EMBEDDINGS", "default": "false", "desc": "Disable dense vector retrieval entirely"},
-    {"key": "MNEMOSYNE_EMBEDDINGS_VIA_API", "env": "MNEMOSYNE_EMBEDDINGS_VIA_API", "default": "false", "desc": "Force cloud API mode for embeddings"},
-    {"key": "MNEMOSYNE_EMBEDDING_FALLBACK_MODEL", "env": "MNEMOSYNE_EMBEDDING_FALLBACK_MODEL", "default": "", "desc": "Local fastembed model for API fallback (v3.6.0)"},
 
-    # ── Hybrid Scoring ──
-    {"key": "MNEMOSYNE_VEC_WEIGHT", "env": "MNEMOSYNE_VEC_WEIGHT", "default": "0.5", "desc": "Vector similarity weight in hybrid ranking"},
-    {"key": "MNEMOSYNE_FTS_WEIGHT", "env": "MNEMOSYNE_FTS_WEIGHT", "default": "0.3", "desc": "Full-text search weight in hybrid ranking"},
-    {"key": "MNEMOSYNE_IMPORTANCE_WEIGHT", "env": "MNEMOSYNE_IMPORTANCE_WEIGHT", "default": "0.2", "desc": "Importance score weight in hybrid ranking"},
-
-    # ── LLM Backends ──
-    {"key": "MNEMOSYNE_LLM_ENABLED", "env": "MNEMOSYNE_LLM_ENABLED", "default": "true", "desc": "Enable LLM summarization during sleep consolidation"},
-    {"key": "MNEMOSYNE_LLM_BASE_URL", "env": "MNEMOSYNE_LLM_BASE_URL", "default": "", "desc": "OpenAI-compatible API base URL for remote LLM"},
-    {"key": "MNEMOSYNE_LLM_API_KEY", "env": "MNEMOSYNE_LLM_API_KEY", "default": "", "desc": "API key for remote LLM endpoint"},
-    {"key": "MNEMOSYNE_LLM_MODEL", "env": "MNEMOSYNE_LLM_MODEL", "default": "", "desc": "Model identifier for remote LLM calls"},
-    {"key": "MNEMOSYNE_LLM_MAX_TOKENS", "env": "MNEMOSYNE_LLM_MAX_TOKENS", "default": "2048", "desc": "Max output tokens per LLM summary"},
-    {"key": "MNEMOSYNE_LLM_N_CTX", "env": "MNEMOSYNE_LLM_N_CTX", "default": "2048", "desc": "Context window size for local LLM"},
-    {"key": "MNEMOSYNE_LLM_N_THREADS", "env": "MNEMOSYNE_LLM_N_THREADS", "default": "4", "desc": "CPU threads for local LLM inference"},
-    {"key": "MNEMOSYNE_LLM_REPO", "env": "MNEMOSYNE_LLM_REPO", "default": "openbmb/MiniCPM5-1B-GGUF", "desc": "HuggingFace repo for GGUF model"},
-    {"key": "MNEMOSYNE_LLM_FILE", "env": "MNEMOSYNE_LLM_FILE", "default": "MiniCPM5-1B-Q4_K_M.gguf", "desc": "GGUF filename for local LLM"},
-    {"key": "MNEMOSYNE_LLM_FALLBACK_BASE_URL", "env": "MNEMOSYNE_LLM_FALLBACK_BASE_URL", "default": "", "desc": "Fallback API URL when primary remote LLM fails"},
-    {"key": "MNEMOSYNE_LLM_FALLBACK_API_KEY", "env": "MNEMOSYNE_LLM_FALLBACK_API_KEY", "default": "", "desc": "API key for fallback LLM endpoint"},
-    {"key": "MNEMOSYNE_LLM_FALLBACK_MODELS", "env": "MNEMOSYNE_LLM_FALLBACK_MODELS", "default": "", "desc": "Comma-separated fallback model names to try"},
-    {"key": "MNEMOSYNE_FORCE_LOCAL", "env": "MNEMOSYNE_FORCE_LOCAL", "default": "false", "desc": "Skip remote LLM and use local model directly"},
-    {"key": "MNEMOSYNE_LLM_CONFLICT_DETECTION", "env": "MNEMOSYNE_LLM_CONFLICT_DETECTION", "default": "false", "desc": "Enable LLM-based conflict detection during sleep"},
-    {"key": "MNEMOSYNE_CONFLICT_LLM_BASE_URL", "env": "MNEMOSYNE_CONFLICT_LLM_BASE_URL", "default": "", "desc": "API base URL for conflict detection LLM"},
-    {"key": "MNEMOSYNE_CONFLICT_LLM_API_KEY", "env": "MNEMOSYNE_CONFLICT_LLM_API_KEY", "default": "", "desc": "API key for conflict detection LLM"},
-    {"key": "MNEMOSYNE_CONFLICT_LLM_MODEL", "env": "MNEMOSYNE_CONFLICT_LLM_MODEL", "default": "", "desc": "Model for conflict detection LLM calls"},
-    {"key": "MNEMOSYNE_HOST_LLM_ENABLED", "env": "MNEMOSYNE_HOST_LLM_ENABLED", "default": "false", "desc": "Route consolidation through host-provided LLM adapter"},
-    {"key": "MNEMOSYNE_HOST_LLM_MODEL", "env": "MNEMOSYNE_HOST_LLM_MODEL", "default": "", "desc": "Model override for host LLM adapter"},
-    {"key": "MNEMOSYNE_HOST_LLM_PROVIDER", "env": "MNEMOSYNE_HOST_LLM_PROVIDER", "default": "", "desc": "Provider override for host LLM adapter (e.g. openai-codex)"},
-    {"key": "MNEMOSYNE_HOST_LLM_N_CTX", "env": "MNEMOSYNE_HOST_LLM_N_CTX", "default": "32000", "desc": "Context window budget when using host LLM adapter"},
-    {"key": "MNEMOSYNE_EXTRACTION_MODEL", "env": "MNEMOSYNE_EXTRACTION_MODEL", "default": "google/gemini-2.5-flash", "desc": "Model for entity/fact extraction via OpenRouter"},
-    {"key": "MNEMOSYNE_EXTRACTION_PROMPT", "env": "MNEMOSYNE_EXTRACTION_PROMPT", "default": "", "desc": "Custom prompt for entity/fact extraction"},
-
-    # ── Feature Flags & A/B Toggles ──
-    {"key": "MNEMOSYNE_BEAM_OPTIMIZATIONS", "env": "MNEMOSYNE_BEAM_OPTIMIZATIONS", "default": "false", "desc": "Enable BEAM benchmark optimizations (feature flag)"},
-    {"key": "MNEMOSYNE_ENHANCED_RECALL", "env": "MNEMOSYNE_ENHANCED_RECALL", "default": "0", "desc": "Enable enhanced recall pipeline (fact+graph+episodic fusion)"},
-    {"key": "MNEMOSYNE_FACT_RECALL_ENABLED", "env": "MNEMOSYNE_FACT_RECALL_ENABLED", "default": "0", "desc": "Enable fact-based recall (backward compat alias)"},
-    {"key": "MNEMOSYNE_POLYPHONIC_RECALL", "env": "MNEMOSYNE_POLYPHONIC_RECALL", "default": "0", "desc": "Enable polyphonic recall engine (multi-voice fusion)"},
-    {"key": "MNEMOSYNE_PROACTIVE_LINKING", "env": "MNEMOSYNE_PROACTIVE_LINKING", "default": "0", "desc": "Enable proactive cross-memory linking on insertion"},
-    {"key": "MNEMOSYNE_GRAPH_BONUS", "env": "MNEMOSYNE_GRAPH_BONUS", "default": "1", "desc": "A/B toggle: graph traversal bonus in recall scoring"},
-    {"key": "MNEMOSYNE_FACT_BONUS", "env": "MNEMOSYNE_FACT_BONUS", "default": "1", "desc": "A/B toggle: fact match bonus in recall scoring"},
-    {"key": "MNEMOSYNE_BINARY_BONUS", "env": "MNEMOSYNE_BINARY_BONUS", "default": "1", "desc": "A/B toggle: binary vector bonus in recall scoring"},
-    {"key": "MNEMOSYNE_LENIENT_FACT_MATCH", "env": "MNEMOSYNE_LENIENT_FACT_MATCH", "default": "false", "desc": "Use substring instead of exact match for fact recall"},
-    {"key": "MNEMOSYNE_VERACITY_MULTIPLIER", "env": "MNEMOSYNE_VERACITY_MULTIPLIER", "default": "1", "desc": "A/B toggle: apply veracity multiplier to recall scores"},
-    {"key": "MNEMOSYNE_CROSS_TIER_DEDUP", "env": "MNEMOSYNE_CROSS_TIER_DEDUP", "default": "1", "desc": "A/B toggle: cross-tier deduplication in BEAM recall"},
-    {"key": "MNEMOSYNE_VOICE_VECTOR", "env": "MNEMOSYNE_VOICE_VECTOR", "default": "1", "desc": "A/B toggle: polyphonic vector voice (Phase 3d)"},
-    {"key": "MNEMOSYNE_VOICE_GRAPH", "env": "MNEMOSYNE_VOICE_GRAPH", "default": "1", "desc": "A/B toggle: polyphonic graph voice (Phase 3b)"},
-    {"key": "MNEMOSYNE_VOICE_FACT", "env": "MNEMOSYNE_VOICE_FACT", "default": "1", "desc": "A/B toggle: polyphonic fact voice (Phase 3a)"},
-    {"key": "MNEMOSYNE_VOICE_TEMPORAL", "env": "MNEMOSYNE_VOICE_TEMPORAL", "default": "1", "desc": "A/B toggle: polyphonic temporal voice (Phase 3c)"},
-    {"key": "MNEMOSYNE_BEAM_MODE", "env": "MNEMOSYNE_BEAM_MODE", "default": "false", "desc": "Enable BEAM mode (polyphonic recall engine extension)"},
-    {"key": "MNEMOSYNE_USE_CAVEMAN", "env": "MNEMOSYNE_USE_CAVEMAN", "default": "false", "desc": "Use caveman/AAAK encoding fallback for consolidation"},
-
-    # ── Hermes Provider ──
-    {"key": "MNEMOSYNE_SYNC_ROLES", "env": "MNEMOSYNE_SYNC_ROLES", "default": "user", "desc": "Conversation roles to sync into memory; default user-only to avoid assistant transcript noise"},
-    {"key": "MNEMOSYNE_SKIP_CONTEXTS", "env": "MNEMOSYNE_SKIP_CONTEXTS", "default": "cron,flush,subagent,background,skill_loop", "desc": "Comma-separated context names to skip"},
-    {"key": "MNEMOSYNE_SYNC_TURN_USER_LIMIT", "env": "MNEMOSYNE_SYNC_TURN_USER_LIMIT", "default": "500", "desc": "Max chars of user content synced per turn (0=no limit)"},
-    {"key": "MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT", "env": "MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT", "default": "800", "desc": "Max chars of assistant content synced per turn (0=no limit)"},
-    {"key": "MNEMOSYNE_PREFETCH_CONTENT_CHARS", "env": "MNEMOSYNE_PREFETCH_CONTENT_CHARS", "default": "0", "desc": "Truncate prefetched content to N chars (0=no truncation)"},
-    {"key": "MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS", "env": "MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS", "default": "user,owner,assistant,agent,system,profile,identity,default", "desc": "Comma/space-separated local owner/system words that should not by themselves make canonical facts relevant"},
-    {"key": "MNEMOSYNE_RECALL_EXTRA_STOPWORDS", "env": "MNEMOSYNE_RECALL_EXTRA_STOPWORDS", "default": "", "desc": "Comma/space-separated extra lexical stopwords for local recall corpora"},
-    {"key": "MNEMOSYNE_PREFETCH_PROFILE", "env": "MNEMOSYNE_PREFETCH_PROFILE", "default": "general", "desc": "Prefetch profile name (general, coding, etc.)"},
-
-    # ── MCP & Identity ──
-    {"key": "MNEMOSYNE_MCP_TOKEN", "env": "MNEMOSYNE_MCP_TOKEN", "default": "", "desc": "Bearer token for MCP server auth (required for remote deployment)"},
-    {"key": "MNEMOSYNE_MCP_BANK", "env": "MNEMOSYNE_MCP_BANK", "default": "default", "desc": "Default MCP bank name for tool operations"},
-    {"key": "MNEMOSYNE_AUTHOR_ID", "env": "MNEMOSYNE_AUTHOR_ID", "default": "", "desc": "Identifier for the author/agent creating memories"},
-    {"key": "MNEMOSYNE_AUTHOR_TYPE", "env": "MNEMOSYNE_AUTHOR_TYPE", "default": "", "desc": "Type of author (user, assistant, system, etc.)"},
-    {"key": "MNEMOSYNE_CHANNEL_ID", "env": "MNEMOSYNE_CHANNEL_ID", "default": "", "desc": "Channel/session identifier for memory scoping"},
-    {"key": "MNEMOSYNE_DEFAULT_OWNER", "env": "MNEMOSYNE_DEFAULT_OWNER", "default": "default", "desc": "Default owner for canonical facts and shared memory"},
-
-    # ── SHMR (Semantic Hierarchical Memory Reorganization) ──
-    {"key": "MNEMOSYNE_SHMR_BATCH_SIZE", "env": "MNEMOSYNE_SHMR_BATCH_SIZE", "default": "50", "desc": "Max memories per SHMR reorganization batch"},
-    {"key": "MNEMOSYNE_SHMR_MAX_ITERATIONS", "env": "MNEMOSYNE_SHMR_MAX_ITERATIONS", "default": "3", "desc": "Max SHMR clustering iterations per batch"},
-    {"key": "MNEMOSYNE_SHMR_SIMILARITY_THRESHOLD", "env": "MNEMOSYNE_SHMR_SIMILARITY_THRESHOLD", "default": "0.70", "desc": "Cosine similarity threshold for memory clustering"},
-    {"key": "MNEMOSYNE_SHMR_HARMONY_THRESHOLD", "env": "MNEMOSYNE_SHMR_HARMONY_THRESHOLD", "default": "0.60", "desc": "Harmony threshold for cluster merging"},
-    {"key": "MNEMOSYNE_SHMR_MODEL", "env": "MNEMOSYNE_SHMR_MODEL", "default": "", "desc": "LLM model for SHMR summarization (empty = use default)"},
-    {"key": "MNEMOSYNE_SHMR_MIN_CLUSTER_SIZE", "env": "MNEMOSYNE_SHMR_MIN_CLUSTER_SIZE", "default": "2", "desc": "Minimum memories to form a SHMR cluster"},
-    {"key": "MNEMOSYNE_SHMR_TEMPERATURE", "env": "MNEMOSYNE_SHMR_TEMPERATURE", "default": "0.2", "desc": "LLM temperature for SHMR summarization"},
-]
-
-# ---------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------
 def _version() -> str:
-    import re
-    init_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "mnemosyne", "__init__.py")
-    if os.path.exists(init_path):
-        with open(init_path) as f:
-            m = re.search(r"__version__\s*=\s*['\"]([^'\"]+)['\"]", f.read())
-            if m:
-                return m.group(1)
-    return "3.4.0"  # fallback
+    v = _module_literal("mnemosyne/__init__.py", {"__version__"}).get("__version__")
+    if not v:
+        sys.exit("FATAL: could not read __version__ from mnemosyne/__init__.py")
+    return v
 
-def _write_tool_schema_mdx(tools, version):
+
+# ---------------------------------------------------------------
+# Tool schemas, derived
+# ---------------------------------------------------------------
+def _collect_tools() -> list:
+    """
+    Every *_SCHEMA dict in tool_schemas.py, annotated with MCP reachability.
+
+    Returns a list of dicts: name, description, params (ordered),
+    required (set), mcp (bool).
+    """
+    handlers = set(_dict_keys_of_assignment("mnemosyne/mcp_tools.py", "_TOOL_HANDLERS"))
+    if not handlers:
+        sys.exit("FATAL: could not parse _TOOL_HANDLERS from mnemosyne/mcp_tools.py")
+
+    tools, seen = [], set()
+    for node in _parse("mnemosyne/tool_schemas.py").body:
+        if not isinstance(node, ast.Assign):
+            continue
+        tgt = node.targets[0]
+        if not (isinstance(tgt, ast.Name) and tgt.id.endswith("_SCHEMA")):
+            continue
+        try:
+            schema = ast.literal_eval(node.value)
+        except (ValueError, TypeError, SyntaxError):
+            continue
+        if not isinstance(schema, dict) or "name" not in schema:
+            continue
+        name = schema["name"]
+        if name in seen:
+            continue
+        seen.add(name)
+
+        params = schema.get("parameters") or {}
+        props = params.get("properties") or {}
+        tools.append({
+            "name": name,
+            "description": (schema.get("description") or "").strip(),
+            "props": props,
+            "required": set(params.get("required") or []),
+            "mcp": name in handlers,
+        })
+
+    if not tools:
+        sys.exit("FATAL: no *_SCHEMA dicts parsed from mnemosyne/tool_schemas.py")
+    tools.sort(key=lambda t: (not t["mcp"], t["name"]))
+    return tools
+
+
+def _type_of(spec: dict) -> str:
+    """Render a JSON Schema property as a short type string."""
+    if not isinstance(spec, dict):
+        return "any"
+    if "enum" in spec:
+        return "enum[" + ", ".join(str(v) for v in spec["enum"]) + "]"
+    t = spec.get("type")
+    if isinstance(t, list):
+        return " | ".join(str(x) for x in t)
+    if t == "array":
+        item = spec.get("items") or {}
+        inner = _type_of(item) if item else "any"
+        return f"array<{inner}>"
+    if t:
+        return str(t)
+    if "anyOf" in spec:
+        return " | ".join(_type_of(s) for s in spec["anyOf"])
+    return "any"
+
+
+# ---------------------------------------------------------------
+# Config, derived
+# ---------------------------------------------------------------
+def _collect_config() -> tuple:
+    got = _module_literal(
+        "mnemosyne/core/config.py",
+        {"ENV_VAR_MAP", "DEFAULTS", "REQUIRES_RESTART"},
+    )
+    env_map = got.get("ENV_VAR_MAP")
+    defaults = got.get("DEFAULTS")
+    restart = got.get("REQUIRES_RESTART")
+    if not env_map or not defaults or restart is None:
+        sys.exit("FATAL: could not parse ENV_VAR_MAP / DEFAULTS / REQUIRES_RESTART "
+                 "from mnemosyne/core/config.py")
+    return env_map, defaults, set(restart)
+
+
+# Editorial prose, one line per config key. Keys and defaults come from
+# code; only these sentences are hand-written. A key here that no longer
+# exists in ENV_VAR_MAP, or an ENV_VAR_MAP key missing here, is a hard
+# error in main() so this table cannot silently rot.
+CONFIG_DESCRIPTIONS = {
+    # Paths
+    "data_dir": "Root directory for all Mnemosyne data. Overrides the `$HERMES_HOME` default.",
+    "home": "Base Hermes home directory used to derive default paths.",
+    "db_path": "Explicit path to the primary SQLite database file.",
+    "backup_dir": "Directory for `mnemosyne backups` snapshots.",
+    "blob_dir": "Directory for content-addressed blob storage.",
+    "shared_db_path": "Path to the shared cross-agent surface database.",
+
+    # Embeddings
+    "embedding_model": "Embedding model name. Local fastembed model, or an API model when routed to a provider.",
+    "embedding_dim": "Override the embedding dimension. Must match the dimension stored in the existing vec tables.",
+    "embedding_api_key": "API key for a remote embedding provider. Falls back to `OPENAI_API_KEY`.",
+    "embedding_api_url": "Base URL of an OpenAI-compatible embedding endpoint.",
+    "embeddings_via_api": "Force API mode for embeddings instead of inferring it from the model name.",
+    "no_embeddings": "Disable dense retrieval entirely. Recall degrades to lexical FTS5.",
+    "skip_embeddings": "Alias for `no_embeddings`.",
+    "embeddings_off": "Alias for `no_embeddings`.",
+    "fastembed_cache_dir": "Cache directory for downloaded fastembed ONNX models.",
+
+    # Vectors
+    "vec_type": "sqlite-vec element type: `int8`, `float32`, or `bit`.",
+
+    # Hybrid scoring
+    "vec_weight": "Vector similarity weight in hybrid ranking. Normalized with the next two to sum to 1.0.",
+    "fts_weight": "FTS5 rank weight in hybrid ranking.",
+    "importance_weight": "Importance weight in hybrid ranking.",
+    "temporal_halflife_hours": "Hours until the temporal recall boost decays by half.",
+    "recency_halflife": "Hours until the recency decay factor halves.",
+    "recall_extra_stopwords": "Extra comma or space separated stopwords for lexical recall.",
+    "cross_session": "Allow recall to return memories from other sessions.",
+
+    # Recall engines
+    "polyphonic_recall": "Enable the polyphonic multi-voice recall engine with RRF fusion.",
+    "query_intent": "Classify query intent and adjust scoring weights accordingly.",
+    "fact_recall_enabled": "Enable structured fact matching during recall.",
+    "enhanced_recall": "Enable the enhanced recall pipeline with fact, graph, and episodic fusion.",
+    "proactive_linking": "Create cross-memory graph edges on insertion.",
+    "lenient_fact_match": "Match facts by substring instead of exact equality.",
+    "recall_diagnostics": "Collect per-stage recall diagnostics. See `explain=True`.",
+
+    # Working memory
+    "wm_max_items": "Maximum rows retained in `working_memory` before eviction.",
+    "wm_ttl_hours": "Age at which a working memory row becomes eligible for consolidation or trim.",
+    "wm_bump_cap_hours": "Maximum window in which a recall can refresh a row's recency.",
+    "wm_pinned_ids": "Comma separated memory IDs that are never evicted.",
+
+    # Episodic and consolidation
+    "ep_limit": "Maximum rows retained in `episodic_memory`.",
+    "sleep_batch": "Working memory rows processed per sleep cycle.",
+    "sp_max": "Maximum scratchpad entries retained.",
+
+    # Tier degradation
+    "tier2_days": "Age in days at which an episodic memory degrades to tier 2.",
+    "tier3_days": "Age in days at which an episodic memory degrades to tier 3.",
+    "tier1_weight": "Recall score multiplier for tier 1 (fresh) episodic memories.",
+    "tier2_weight": "Recall score multiplier for tier 2 memories.",
+    "tier3_weight": "Recall score multiplier for tier 3 memories.",
+    "smart_compress": "Use LLM summarization rather than truncation when degrading a tier.",
+    "tier3_max_chars": "Character budget for tier 3 compressed content.",
+    "degrade_batch": "Rows degraded per maintenance pass.",
+
+    # LLM
+    "llm_enabled": "Enable LLM summarization during sleep consolidation.",
+    "llm_max_tokens": "Maximum output tokens per LLM summary.",
+    "llm_n_threads": "CPU threads for local GGUF inference.",
+    "llm_n_ctx": "Context window for local GGUF inference.",
+    "llm_repo": "Hugging Face repo holding the local GGUF model.",
+    "llm_file": "GGUF filename within the repo.",
+    "llm_base_url": "Base URL of an OpenAI-compatible chat endpoint.",
+    "llm_api_key": "API key for the remote chat endpoint.",
+    "llm_model": "Model identifier for remote chat calls.",
+    "llm_timeout": "Per-request timeout in seconds for LLM calls.",
+    "llm_fallback_models": "Comma separated models to try if the primary fails.",
+    "llm_fallback_base_url": "Base URL for the fallback chat endpoint.",
+    "llm_fallback_api_key": "API key for the fallback chat endpoint.",
+    "force_local": "Skip the remote chain and use the local GGUF model directly.",
+    "sleep_prompt": "Override the consolidation summarization prompt.",
+    "host_llm_enabled": "Route LLM work through a host-registered backend. See `core/llm_backends.py`.",
+    "host_llm_provider": "Provider override passed to the host backend.",
+    "host_llm_model": "Model override passed to the host backend.",
+    "host_llm_n_ctx": "Context budget assumed for the host backend.",
+
+    # Conflict detection
+    "llm_conflict_detection": "Enable LLM-based contradiction detection during sleep.",
+    "conflict_llm_base_url": "Base URL for the conflict detection endpoint.",
+    "conflict_llm_api_key": "API key for the conflict detection endpoint.",
+    "conflict_llm_model": "Model for conflict detection calls.",
+
+    # Sync
+    "sync_remote": "Remote sync server URL.",
+    "sync_host": "Bind address for `mnemosyne sync-serve`.",
+    "sync_port": "Bind port for `mnemosyne sync-serve`.",
+    "sync_key": "Passphrase used to derive the client-side encryption key.",
+    "sync_encrypt": "Encrypt sync payloads client-side with XChaCha20-Poly1305.",
+    "sync_roles": "Conversation roles synced into memory. Defaults to user turns only.",
+
+    # Auto sleep and reflection
+    "auto_sleep_enabled": "Run consolidation automatically on a background daemon.",
+    "reflect_disabled_for_cron": "Skip reflection when running in a cron context.",
+    "reflect_max_calls_per_session": "Maximum reflection passes per session.",
+    "skip_contexts": "Comma separated host context names that should not write memories.",
+
+    # Prefetch and turn limits
+    "prefetch_content_chars": "Truncate prefetched memory content to this many characters. `0` disables truncation.",
+    "sync_turn_user_limit": "Maximum user turns captured per sync pass.",
+    "sync_turn_assistant_limit": "Maximum assistant turns captured per sync pass.",
+
+    # Persona (L3)
+    "persona_enabled": "Inject L3 persona facts into the system prompt.",
+    "persona_token_cap": "Token budget for injected persona facts.",
+    "persona_interval": "Turns between persona refreshes.",
+    "persona_daily_sync_hour": "Local hour at which the daily persona sync runs.",
+
+    # Sleep-time model refresh
+    "sleep_model_refresh_enabled": "Let sleep propose updates to canonical facts.",
+    "sleep_model_refresh_auto_apply": "Apply high-confidence proposals without review.",
+    "sleep_model_refresh_categories": "Comma separated canonical categories eligible for refresh.",
+    "sleep_model_refresh_max_tokens": "Token budget for a refresh proposal.",
+    "sleep_model_refresh_temperature": "Sampling temperature for refresh proposals.",
+    "sleep_model_refresh_auto_apply_min_confidence": "Minimum confidence to auto-apply a proposal.",
+    "sleep_model_refresh_min_evidence": "Minimum supporting memories before proposing a change.",
+    "sleep_model_refresh_conflict_min_confidence": "Minimum confidence to auto-apply a proposal that contradicts a current fact.",
+    "sleep_model_refresh_conflict_min_evidence": "Minimum supporting memories for a contradicting change.",
+
+    # SHMR
+    "shmr_batch_size": "Memories per SHMR harmonization batch.",
+    "shmr_max_iterations": "Maximum clustering iterations per SHMR batch.",
+    "shmr_similarity_threshold": "Cosine similarity required to cluster two memories.",
+    "shmr_harmony_threshold": "Harmony score required to merge a cluster into a belief.",
+    "shmr_model": "LLM model for SHMR summarization. Empty uses the default chain.",
+    "shmr_min_cluster_size": "Minimum memories required to form a cluster.",
+    "shmr_temperature": "Sampling temperature for SHMR summarization.",
+
+    # Misc
+    "auto_migrate": "Run packaged migrations automatically on database open.",
+    "default_scope": "Default scope for new memories: `session` or `global`.",
+    "default_owner": "Default owner ID for canonical facts and shared memory.",
+    "ignore_patterns": "Comma separated regexes; matching content is never stored.",
+    "write_classifier": "Write classifier mode controlling which content is stored.",
+}
+
+# Keys where a module-level constant bypasses MnemosyneConfig, so the value
+# that actually takes effect differs from DEFAULTS in config.py. These are
+# code inconsistencies, not doc bugs; documenting them beats emitting a
+# default the runtime never uses. Every entry is validated in main().
+EFFECTIVE_DEFAULT_NOTES = {
+    "host_llm_n_ctx": (
+        "32000",
+        "`local_llm.py` reads `MNEMOSYNE_HOST_LLM_N_CTX` directly with a `32000` "
+        "fallback, so the `2048` declared in `config.py` never applies.",
+    ),
+    "llm_repo": (
+        "openbmb/MiniCPM5-1B-GGUF",
+        "`local_llm.py` falls back to `DEFAULT_MODEL_REPO` when the env var is unset.",
+    ),
+    "llm_file": (
+        "MiniCPM5-1B-Q4_K_M.gguf",
+        "`local_llm.py` falls back to `DEFAULT_MODEL_FILE` when the env var is unset.",
+    ),
+    "vec_weight": (
+        "0.5",
+        "`_normalize_weights` in `beam.py` reads the env var directly, so "
+        "`config.yaml` alone does not affect recall.",
+    ),
+    "fts_weight": (
+        "0.3",
+        "Read directly from the environment by `_normalize_weights`.",
+    ),
+    "importance_weight": (
+        "0.2",
+        "Read directly from the environment by `_normalize_weights`.",
+    ),
+}
+
+# Env vars read directly via os.environ, bypassing MnemosyneConfig. These
+# are NOT in ENV_VAR_MAP, so they cannot be set in config.yaml and are
+# env-only. Documented separately and honestly.
+ENV_ONLY_DESCRIPTIONS = {
+    "MNEMOSYNE_AUTHOR_ID": "Identifier recorded as the author of new memories.",
+    "MNEMOSYNE_AUTHOR_TYPE": "Author kind: user, assistant, system.",
+    "MNEMOSYNE_AUTO_SLEEP_TIMEOUT": "Seconds the Hermes provider waits for a background sleep to finish.",
+    "MNEMOSYNE_BANK": "Default memory bank for CLI operations.",
+    "MNEMOSYNE_BEAM_MODE": "Enable BEAM mode extensions in the polyphonic engine.",
+    "MNEMOSYNE_BEAM_OPTIMIZATIONS": "Enable BEAM benchmark optimizations.",
+    "MNEMOSYNE_BINARY_BONUS": "A/B toggle for the binary vector bonus in episodic scoring.",
+    "MNEMOSYNE_BUSY_TIMEOUT_MS": "SQLite `busy_timeout` in milliseconds.",
+    "MNEMOSYNE_CHANNEL_ID": "Channel or session identifier for memory scoping.",
+    "MNEMOSYNE_CONTEXT_INCLUDE_CONSOLIDATED": "Include already-consolidated rows in assembled context.",
+    "MNEMOSYNE_CROSS_TIER_DEDUP": "A/B toggle for deduplication across working and episodic results.",
+    "MNEMOSYNE_EMBEDDING_DOC_PREFIX": "Prefix prepended to documents before embedding. Applied verbatim.",
+    "MNEMOSYNE_EMBEDDING_QUERY_PREFIX": "Prefix prepended to queries before embedding. Applied verbatim.",
+    "MNEMOSYNE_EMBEDDING_THREADS": "Thread count for local ONNX embedding inference.",
+    "MNEMOSYNE_EXTRACTION_MODEL": "Model used by the cloud extraction client.",
+    "MNEMOSYNE_EXTRACTION_PROMPT": "Override the fact extraction prompt.",
+    "MNEMOSYNE_FACT_BONUS": "A/B toggle for the fact match bonus in episodic scoring.",
+    "MNEMOSYNE_GRAPH_BONUS": "A/B toggle for the graph traversal bonus in episodic scoring.",
+    "MNEMOSYNE_HOST_LLM_TIMEOUT": "Timeout in seconds for host LLM backend calls.",
+    "MNEMOSYNE_IMPORTED_WEIGHT": "Veracity multiplier for imported memories.",
+    "MNEMOSYNE_INFERRED_WEIGHT": "Veracity multiplier for inferred memories.",
+    "MNEMOSYNE_MCP_BANK": "Memory bank used by the MCP server.",
+    "MNEMOSYNE_MCP_TOKEN": "Bearer token for MCP SSE auth. Required for any non-loopback bind.",
+    "MNEMOSYNE_PERSONA_FILE": "Path to an external persona facts file.",
+    "MNEMOSYNE_PREFETCH_MODEL_SLOT_LIMIT": "Maximum canonical slots prefetched per turn.",
+    "MNEMOSYNE_PREFETCH_MODEL_SLOT_MIN_OVERLAP": "Minimum token overlap for a canonical slot to count as relevant.",
+    "MNEMOSYNE_PREFETCH_PROFILE": "Prefetch profile name, for example `general` or `coding`.",
+    "MNEMOSYNE_SESSION_END_TIMEOUT": "Seconds allowed for end-of-session memory writes.",
+    "MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT": "Seconds allowed to drain pending writes on shutdown.",
+    "MNEMOSYNE_STATED_WEIGHT": "Veracity multiplier for directly stated memories.",
+    "MNEMOSYNE_SYNC_KEY_SOURCE": "Where the sync passphrase comes from: `keyring` or `prompt`.",
+    "MNEMOSYNE_SYNC_MODE": "Sync mode selector used by the Hermes sync adapter.",
+    "MNEMOSYNE_SYNC_TOKEN": "Bearer token presented to the sync server.",
+    "MNEMOSYNE_SYNC_TURN_SLOW_THRESHOLD": "Milliseconds after which a turn sync is logged as slow.",
+    "MNEMOSYNE_TOOL_WEIGHT": "Veracity multiplier for tool-produced memories.",
+    "MNEMOSYNE_UNKNOWN_WEIGHT": "Veracity multiplier for memories of unknown provenance.",
+    "MNEMOSYNE_USE_CAVEMAN": "Use the AAAK keyword compression fallback for consolidation.",
+    "MNEMOSYNE_VERACITY_MULTIPLIER": "A/B toggle for applying veracity multipliers at all.",
+    "MNEMOSYNE_VOICE_FACT": "Set to `0` to disable the polyphonic fact voice.",
+    "MNEMOSYNE_VOICE_GRAPH": "Set to `0` to disable the polyphonic graph voice.",
+    "MNEMOSYNE_VOICE_TEMPORAL": "Set to `0` to disable the polyphonic temporal voice.",
+    "MNEMOSYNE_VOICE_VECTOR": "Set to `0` to disable the polyphonic vector voice.",
+}
+
+
+# ---------------------------------------------------------------
+# Renderers
+# ---------------------------------------------------------------
+def _fmt_default(value) -> str:
+    if value is None:
+        return "*(none)*"
+    if isinstance(value, bool):
+        return "`true`" if value else "`false`"
+    if value == "":
+        return "*(unset)*"
+    return "`{}`".format(value)
+
+
+def _render_tool_schema(tools, version: str) -> str:
+    mcp = [t for t in tools if t["mcp"]]
+    plugin_only = [t for t in tools if not t["mcp"]]
+
     lines = [
         "---",
-        f'title: "MCP Tool Schema"',
+        'title: "MCP Tool Schema"',
         f"version: {version}",
-        "tool_count: {}".format(len(tools)),
+        f"tool_count: {len(tools)}",
+        f"mcp_tool_count: {len(mcp)}",
+        f"plugin_only_tool_count: {len(plugin_only)}",
         'generated_at: "auto"',
         "---",
         "",
         f"# MCP Tool Schema (v{version})",
         "",
-        f"Mnemosyne exposes **{len(tools)} MCP tools** for memory management, retrieval, and diagnostics.",
+        "<!-- GENERATED FILE. Do not edit by hand.",
+        "     Source: mnemosyne/tool_schemas.py + mnemosyne/mcp_tools.py",
+        "     Regenerate: python3 scripts/generate-docs.py -->",
+        "",
+        f"Mnemosyne declares **{len(tools)} tools**. Of those, **{len(mcp)} are callable over MCP** "
+        f"(stdio and SSE), and **{len(plugin_only)} are implemented only in the Hermes provider** "
+        "and are not reachable through the MCP server.",
+        "",
+        "The split is real and worth respecting: calling a plugin-only tool over MCP raises "
+        "`Unknown tool`. The counts above are derived from "
+        "`mnemosyne/mcp_tools.py::_TOOL_HANDLERS`, so they cannot drift from the code.",
         "",
         "---",
+        "",
+        f"## Tools available over MCP ({len(mcp)})",
         "",
     ]
+    lines += _render_tool_list(mcp)
+
+    if plugin_only:
+        lines += [
+            "---",
+            "",
+            f"## Hermes plugin only, NOT available over MCP ({len(plugin_only)})",
+            "",
+            "These schemas exist in `mnemosyne/tool_schemas.py` and are implemented by the "
+            "Hermes provider adapters under `hermes_memory_provider/`. They have no entry in "
+            "`_TOOL_HANDLERS`, so an MCP client that calls them gets an error.",
+            "",
+        ]
+        lines += _render_tool_list(plugin_only)
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_tool_list(tools) -> list:
+    lines = []
     for i, t in enumerate(tools, 1):
-        params = t.get("params", {})
         lines.append(f"### {i}. `{t['name']}`")
-        lines.append(t['description'])
         lines.append("")
-        if params:
-            lines.append("| Parameter | Type | Required |")
-            lines.append("|-----------|------|----------|")
-            for pname, pdef in params.items():
-                ptype, required = pdef, "yes"
-                if "=" in pdef:
-                    ptype, default = pdef.split("=", 1)
-                    required = "no (default: {})".format(default)
-                lines.append("| `{}` | `{}` | {} |".format(pname, ptype, required))
+        if t["description"]:
+            lines.append(t["description"])
+            lines.append("")
+        if t["props"]:
+            lines.append("| Parameter | Type | Required | Default |")
+            lines.append("|-----------|------|----------|---------|")
+            for pname, spec in t["props"].items():
+                spec = spec if isinstance(spec, dict) else {}
+                required = "yes" if pname in t["required"] else "no"
+                default = _fmt_default(spec["default"]) if "default" in spec else "*(none)*"
+                lines.append("| `{}` | `{}` | {} | {} |".format(
+                    pname, _type_of(spec), required, default))
             lines.append("")
         else:
-            lines.append("*No parameters*")
+            lines.append("*No parameters.*")
             lines.append("")
-    return "\n".join(lines)
+    return lines
 
-def _write_config_mdx(entries, version):
+
+def _render_config(env_map, defaults, restart, version: str) -> str:
     lines = [
         "---",
-        f'title: "Configuration"',
+        'title: "Configuration"',
         f"version: {version}",
+        f"config_key_count: {len(env_map)}",
+        f"env_only_count: {len(ENV_ONLY_DESCRIPTIONS)}",
         'generated_at: "auto"',
         "---",
         "",
         "# Configuration",
         "",
-        "Mnemosyne is configured entirely through environment variables. No config files, no YAML, no JSON.",
+        "<!-- GENERATED FILE. Do not edit by hand.",
+        "     Source: mnemosyne/core/config.py (ENV_VAR_MAP, DEFAULTS, REQUIRES_RESTART)",
+        "     Regenerate: python3 scripts/generate-docs.py -->",
+        "",
+        "Mnemosyne reads configuration from a YAML file and from environment variables.",
+        "Precedence is **`config.yaml` > environment variable > built-in default**.",
+        "",
+        "`config.yaml` lives at `$MNEMOSYNE_DATA_DIR/config.yaml`, falling back to",
+        "`$HERMES_HOME/mnemosyne/config.yaml` and then `~/.hermes/mnemosyne/config.yaml`.",
+        "Nested YAML works, and leaf keys resolve too, so `memory.mnemosyne.wm_max_items`",
+        "and `wm_max_items` are equivalent.",
+        "",
+        "Keys marked **restart** are read once at startup. Changing them at runtime warns",
+        "and does not take effect until the process restarts.",
+        "",
+        f"There are **{len(env_map)} configuration keys**. A further",
+        f"**{len(ENV_ONLY_DESCRIPTIONS)} environment variables** are read directly from the",
+        "environment and are **not** settable in `config.yaml`; they are listed separately below.",
         "",
         "---",
         "",
-        "| Variable | Default | Description |",
-        "|----------|---------|-------------|",
+        f"## Configuration keys ({len(env_map)})",
+        "",
+        "| Config key | Environment variable | Default | Restart | Description |",
+        "|------------|----------------------|---------|---------|-------------|",
     ]
-    for e in entries:
-        default = e.get("default", "")
-        if default:
-            default = "`{}`".format(default)
+    for key in sorted(env_map):
+        declared = _fmt_default(defaults.get(key))
+        if key in EFFECTIVE_DEFAULT_NOTES:
+            effective = EFFECTIVE_DEFAULT_NOTES[key][0]
+            shown = f"`{effective}` [^{key}]"
+            if declared not in (f"`{effective}`",):
+                shown = f"`{effective}` [^{key}] (declared {declared})"
         else:
-            default = "*(required)*"
-        lines.append("| `{}` | {} | {} |".format(e["key"], default, e["desc"]))
-    return "\n".join(lines)
+            shown = declared
+        lines.append("| `{}` | `{}` | {} | {} | {} |".format(
+            key,
+            env_map[key],
+            shown,
+            "**yes**" if key in restart else "no",
+            CONFIG_DESCRIPTIONS.get(key, ""),
+        ))
 
-def _inject_config_table(page_path, table_html):
-    """Inject a generated config table into an existing page.mdx (for website only)."""
-    if not os.path.exists(page_path):
-        print("  ⚠️  config page not found at {} — skipping injection".format(page_path))
-        return
-    with open(page_path, 'r') as f:
+    lines += [
+        "",
+        "### Keys whose effective default bypasses `config.py`",
+        "",
+        "For these keys a module-level constant reads the environment variable "
+        "directly, so the value in `DEFAULTS` is not what the runtime uses. "
+        "Treat the environment variable as authoritative.",
+        "",
+    ]
+    for key in sorted(EFFECTIVE_DEFAULT_NOTES):
+        lines.append(f"[^{key}]: `{key}` -- {EFFECTIVE_DEFAULT_NOTES[key][1]}")
+
+    lines += [
+        "",
+        "---",
+        "",
+        f"## Environment-only variables ({len(ENV_ONLY_DESCRIPTIONS)})",
+        "",
+        "These are read with `os.environ` at their point of use and bypass",
+        "`MnemosyneConfig` entirely. They cannot be set in `config.yaml`.",
+        "",
+        "| Environment variable | Description |",
+        "|----------------------|-------------|",
+    ]
+    for name in sorted(ENV_ONLY_DESCRIPTIONS):
+        lines.append("| `{}` | {} |".format(name, ENV_ONLY_DESCRIPTIONS[name]))
+
+    lines += [
+        "",
+        "---",
+        "",
+        "## Recall scoring weights",
+        "",
+        "`vec_weight`, `fts_weight`, and `importance_weight` are normalized to sum to 1.0",
+        "at query time. They are the highest-leverage tuning knobs in the system.",
+        "",
+        "Note a real caveat: `_normalize_weights` in `mnemosyne/core/beam.py` reads these",
+        "three from the environment directly rather than through `MnemosyneConfig`, so",
+        "setting them in `config.yaml` alone does not affect recall. Set the environment",
+        "variables. This is tracked as a known inconsistency.",
+        "",
+    ]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_config_table_block(env_map, defaults, restart) -> str:
+    """A standalone markdown table for injection into a hand-written page."""
+    rows = [
+        "| Config key | Environment variable | Default | Restart | Description |",
+        "|------------|----------------------|---------|---------|-------------|",
+    ]
+    for key in sorted(env_map):
+        rows.append("| `{}` | `{}` | {} | {} | {} |".format(
+            key,
+            env_map[key],
+            _fmt_default(defaults.get(key)),
+            "**yes**" if key in restart else "no",
+            CONFIG_DESCRIPTIONS.get(key, ""),
+        ))
+    return "\n".join(rows)
+
+
+START_MARKER = "{/* GENERATED_CONFIG_TABLE */}"
+END_MARKER = "{/* /GENERATED_CONFIG_TABLE */}"
+
+
+def _inject_config_table(page_path: str, table_md: str) -> bool:
+    """
+    Replace the generated block IN PLACE, preserving its position.
+
+    The previous implementation stripped the markers and appended the block
+    to the end of the file, which pushed a headerless table below the page's
+    closing section. Position is now preserved, and the emitted block is a
+    complete table with a header row.
+    """
+    if not os.path.isfile(page_path):
+        print(f"  skip: config page not found at {page_path}")
+        return False
+
+    with open(page_path, encoding="utf-8") as f:
         content = f.read()
-    start_marker = "{/* GENERATED_CONFIG_TABLE */}"
-    end_marker = "{/* /GENERATED_CONFIG_TABLE */}"
-    new_block = start_marker + "\n" + table_html + "\n" + end_marker
 
-    # Strip ALL existing GENERATED_CONFIG_TABLE blocks (handle duplicates, handle HTML and MDX comment markers)
-    for start_v, end_v in [
+    block = f"{START_MARKER}\n{table_md}\n{END_MARKER}"
+
+    replaced = False
+    for start_v, end_v in (
         ("<!-- GENERATED_CONFIG_TABLE -->", "<!-- /GENERATED_CONFIG_TABLE -->"),
-        ("{/* GENERATED_CONFIG_TABLE */}", "{/* /GENERATED_CONFIG_TABLE */}"),
-    ]:
+        (START_MARKER, END_MARKER),
+    ):
         while start_v in content and end_v in content:
-            start_idx = content.index(start_v)
-            end_idx = content.index(end_v, start_idx) + len(end_v)
-            content = content[:start_idx] + content[end_idx:].lstrip('\n')
+            i = content.index(start_v)
+            j = content.index(end_v, i) + len(end_v)
+            content = content[:i] + (block if not replaced else "") + content[j:]
+            replaced = True
 
-    # Insert a single clean block
-    content = content.rstrip() + "\n\n" + new_block + "\n"
-    with open(page_path, 'w') as f:
+    if not replaced:
+        print(f"  skip: no GENERATED_CONFIG_TABLE markers in {page_path}")
+        return False
+
+    with open(page_path, "w", encoding="utf-8") as f:
         f.write(content)
+    return True
+
 
 # ---------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------
-def main():
-    version = _version()
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    repo_root = os.path.dirname(script_dir)
+def _validate_descriptions(env_map) -> None:
+    """Prose must cover exactly the keys the code declares."""
+    documented = set(CONFIG_DESCRIPTIONS)
+    actual = set(env_map)
+    missing = sorted(actual - documented)
+    extra = sorted(documented - actual)
+    if missing or extra:
+        print("FATAL: CONFIG_DESCRIPTIONS is out of sync with config.py::ENV_VAR_MAP")
+        for k in missing:
+            print(f"  missing description for new key: {k}")
+        for k in extra:
+            print(f"  description for removed key:     {k}")
+        print("")
+        print("Add or remove entries in CONFIG_DESCRIPTIONS in scripts/generate-docs.py.")
+        sys.exit(1)
 
-    # Canonical copies: always write to docs/api/ inside the mnemosyne repo
-    canonical = os.path.join(repo_root, "docs", "api")
+    stale_notes = sorted(set(EFFECTIVE_DEFAULT_NOTES) - actual)
+    if stale_notes:
+        print("FATAL: EFFECTIVE_DEFAULT_NOTES references keys that no longer exist:")
+        for k in stale_notes:
+            print(f"  {k}")
+        sys.exit(1)
+
+
+def main() -> None:
+    check_only = "--check" in sys.argv
+
+    version = _version()
+    tools = _collect_tools()
+    env_map, defaults, restart = _collect_config()
+    _validate_descriptions(env_map)
+
+    mcp_count = sum(1 for t in tools if t["mcp"])
+    schema_mdx = _render_tool_schema(tools, version)
+    config_mdx = _render_config(env_map, defaults, restart, version)
+
+    if check_only:
+        print(f"v{version} | {len(tools)} tools ({mcp_count} over MCP) | "
+              f"{len(env_map)} config keys | {len(ENV_ONLY_DESCRIPTIONS)} env-only")
+        return
+
+    canonical = os.path.join(REPO_ROOT, "docs", "api")
     os.makedirs(canonical, exist_ok=True)
 
-    # Tool schema
-    schema_mdx = _write_tool_schema_mdx(ALL_TOOL_SCHEMAS, version)
-    with open(os.path.join(canonical, "tool-schema.mdx"), "w") as f:
+    with open(os.path.join(canonical, "tool-schema.mdx"), "w", encoding="utf-8") as f:
         f.write(schema_mdx)
-    print("✓ tool-schema.mdx ({} tools) → docs/api/".format(len(ALL_TOOL_SCHEMAS)))
+    print(f"wrote docs/api/tool-schema.mdx  ({len(tools)} tools, {mcp_count} over MCP)")
 
-    # Config
-    config_mdx = _write_config_mdx(CONFIG_ENTRIES, version)
-    with open(os.path.join(canonical, "configuration.mdx"), "w") as f:
+    with open(os.path.join(canonical, "configuration.mdx"), "w", encoding="utf-8") as f:
         f.write(config_mdx)
-    print("✓ configuration.mdx ({} keys) → docs/api/".format(len(CONFIG_ENTRIES)))
+    print(f"wrote docs/api/configuration.mdx ({len(env_map)} config keys, "
+          f"{len(ENV_ONLY_DESCRIPTIONS)} env-only)")
 
-    # Website sibling repo (optional — gracefully skip if missing)
-    docs_sibling = os.path.normpath(os.path.join(repo_root, "..", "mnemosyne-docs", "src"))
-    
-    if os.path.isdir(docs_sibling):
-        # Tool schema
-        www_tool = os.path.join(docs_sibling, "app/(docs)", "api", "tool-schema", "page.mdx")
-        os.makedirs(os.path.dirname(www_tool), exist_ok=True)
-        with open(www_tool, "w") as f:
-            f.write(schema_mdx)
-        print("✓ tool-schema page → website sibling")
-
-        # Config table injection
-        www_config = os.path.join(docs_sibling, "app/(docs)", "getting-started", "configuration", "page.mdx")
-        if os.path.isfile(www_config):
-            _inject_config_table(www_config, "\n".join(
-                "| `{}` | {} | {} |".format(e["key"], e.get("default", ""), e["desc"])
-                for e in CONFIG_ENTRIES
-            ))
-            print("✓ config table → website sibling")
-        else:
-            print("⚠️  website config page not found — skip")
+    # Docs sibling repo. content/ is the source of truth; the src/app route
+    # re-exports it, so only content/ is written here.
+    sibling = os.path.normpath(os.path.join(REPO_ROOT, "..", "mnemosyne-docs"))
+    if not os.path.isdir(sibling):
+        print("skip: ../mnemosyne-docs not checked out (CI runner ok)")
     else:
-        print("⚠️  website sibling not found — skip (CI runner ok)")
+        tool_page = os.path.join(sibling, "content", "api", "tool-schema.mdx")
+        if os.path.isdir(os.path.dirname(tool_page)):
+            with open(tool_page, "w", encoding="utf-8") as f:
+                f.write(schema_mdx)
+            print("wrote ../mnemosyne-docs/content/api/tool-schema.mdx")
+
+        table = _render_config_table_block(env_map, defaults, restart)
+        for rel in (
+            os.path.join("content", "getting-started", "configuration.mdx"),
+            os.path.join("src", "app", "(docs)", "getting-started", "configuration", "page.mdx"),
+        ):
+            path = os.path.join(sibling, rel)
+            if _inject_config_table(path, table):
+                print(f"injected config table -> ../mnemosyne-docs/{rel}")
 
     print("")
-    print("Done. Canonical docs written to docs/api/")
+    print("Done.")
+
 
 if __name__ == "__main__":
     main()

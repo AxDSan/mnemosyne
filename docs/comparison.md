@@ -1,6 +1,6 @@
 # Mnemosyne vs Hindsight Self-Hosted
 
-**Last updated:** 2026-06-30 · Mnemosyne v3.11.0
+**Last updated:** 2026-07-30 · Mnemosyne v3.15.1
 
 This is an honest, technical comparison between Mnemosyne and Hindsight self-hosted (local Docker, not the managed Cloud product). Every claim below is grounded in source code — no fabricated benchmarks or aspirational APIs.
 
@@ -47,7 +47,7 @@ Three SQLite tables:
 
 | Tier | Purpose | Behavior |
 |---|---|---|
-| **Working memory** | Hot, recent context | Auto-injected into prompts via `pre_llm_call` hook. TTL-based eviction (default 24h). Max 10,000 items. FTS5 indexed. |
+| **Working memory** | Hot, recent context | Auto-injected into prompts via `pre_llm_call` hook. TTL-based eviction (default 168h / 7 days). Max 10,000 items. FTS5 indexed. |
 | **Episodic memory** | Long-term consolidated storage | Populated by `sleep()` consolidation. Hybrid vector + FTS5 search. |
 | **Scratchpad** | Temporary agent workspace | Not searchable, not consolidated. Cleared explicitly. Max 1,000 items. |
 
@@ -116,7 +116,12 @@ Additional: **TripleStore** — temporal knowledge graph with `valid_from`/`vali
 
 ### MCP (Model Context Protocol)
 
-Mnemosyne provides an MCP server with **6 tools** and **2 transports**:
+Mnemosyne provides an MCP server with **28 tools** and **2 transports**. A further 9
+tool schemas are implemented only in the Hermes provider, for 37 declared in total.
+See the [generated tool schema reference](api/tool-schema.mdx) for the full list,
+which is derived from the code and cannot drift.
+
+A representative subset:
 
 | Tool | Description |
 |---|---|
@@ -125,7 +130,9 @@ Mnemosyne provides an MCP server with **6 tools** and **2 transports**:
 | `mnemosyne_sleep` | Run consolidation cycle |
 | `mnemosyne_scratchpad_read` | Read agent scratchpad |
 | `mnemosyne_scratchpad_write` | Write to scratchpad |
-| `mnemosyne_get_stats` | Get memory statistics |
+| `mnemosyne_stats` | Get memory statistics |
+| `mnemosyne_batch` | Apply multiple mutations atomically |
+| `mnemosyne_hygiene_audit` | Score stored memories for noise |
 
 ```
 mnemosyne mcp                          # stdio transport (Claude Desktop, etc.)
@@ -135,9 +142,13 @@ mnemosyne mcp --bank project_a            # scoped to a specific bank
 
 ### Hermes Agent Integration
 
-`plugin.yaml` registers **15 tools** and **3 hooks**:
+`plugin.yaml` registers **20 tools** and **3 hooks**:
 
-**Tools:** `mnemosyne_remember`, `mnemosyne_recall`, `mnemosyne_stats`, `mnemosyne_triple_add`, `mnemosyne_triple_query`, `mnemosyne_sleep`, `mnemosyne_scratchpad_write`, `mnemosyne_scratchpad_read`, `mnemosyne_scratchpad_clear`, `mnemosyne_invalidate`, `mnemosyne_export`, `mnemosyne_update`, `mnemosyne_forget`, `mnemosyne_import`, `mnemosyne_diagnose`
+**Tools:** `mnemosyne_remember`, `mnemosyne_recall`, `mnemosyne_stats`, `mnemosyne_triple_add`, `mnemosyne_triple_query`, `mnemosyne_sleep`, `mnemosyne_scratchpad_write`, `mnemosyne_scratchpad_read`, `mnemosyne_scratchpad_clear`, `mnemosyne_invalidate`, `mnemosyne_export`, `mnemosyne_import`, `mnemosyne_update`, `mnemosyne_forget`, `mnemosyne_diagnose`, `mnemosyne_graph_query`, `mnemosyne_graph_link`, `mnemosyne_sync_push`, `mnemosyne_sync_pull`, `mnemosyne_sync_status`
+
+Note that the provider implements more tools than `plugin.yaml` advertises, including
+the persona tools and `mnemosyne_forget_canonical`. `provides_tools` is a declaration
+for Hermes, not an inventory of the provider.
 
 **Hooks:** `pre_llm_call` (context injection), `on_session_start` (session init), `post_tool_call` (memory capture)
 
@@ -149,7 +160,7 @@ Custom HTTP API on port 8888. Native `openclaw-hindsight` plugin exists for Open
 |---|---|---|
 | **Hermes** | Native (in-process, no serialization) | HTTP client |
 | **OpenClaw** | Planned (adapter not yet built) | Native plugin exists |
-| **MCP** | 6 tools, stdio + SSE | Custom HTTP API |
+| **MCP** | 28 tools, stdio + SSE | Custom HTTP API |
 | **Cross-machine** | Export/import JSON only | Any agent with HTTP access to port 8888 |
 
 ---

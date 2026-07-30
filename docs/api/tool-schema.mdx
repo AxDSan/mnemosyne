@@ -1,236 +1,396 @@
 ---
 title: "MCP Tool Schema"
-version: 3.12.0
-tool_count: 25
+version: 3.15.1
+tool_count: 37
+mcp_tool_count: 28
+plugin_only_tool_count: 9
 generated_at: "auto"
 ---
 
-# MCP Tool Schema (v3.12.0)
+# MCP Tool Schema (v3.15.1)
 
-Mnemosyne exposes **25 MCP tools** for memory management, retrieval, and diagnostics.
+<!-- GENERATED FILE. Do not edit by hand.
+     Source: mnemosyne/tool_schemas.py + mnemosyne/mcp_tools.py
+     Regenerate: python3 scripts/generate-docs.py -->
+
+Mnemosyne declares **37 tools**. Of those, **28 are callable over MCP** (stdio and SSE), and **9 are implemented only in the Hermes provider** and are not reachable through the MCP server.
+
+The split is real and worth respecting: calling a plugin-only tool over MCP raises `Unknown tool`. The counts above are derived from `mnemosyne/mcp_tools.py::_TOOL_HANDLERS`, so they cannot drift from the code.
 
 ---
 
-### 1. `mnemosyne_remember`
-Store a durable memory
+## Tools available over MCP (28)
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| `content` | `string` | yes |
-| `importance` | `float` | no (default: 0.5) |
-| `source` | `string` | no (default: user) |
-| `scope` | `string` | no (default: session) |
-| `valid_until` | `string` | no (default: ) |
-| `extract_entities` | `bool` | no (default: false) |
-| `extract` | `bool` | no (default: false) |
-| `metadata` | `dict` | no (default: {}) |
-| `veracity` | `string` | no (default: unknown) |
+### 1. `mnemosyne_batch`
 
-### 2. `mnemosyne_recall`
-Search memories by vector+FTS hybrid ranking
+Apply multiple Mnemosyne memory mutations atomically in one tool call. Supported v1 actions: remember, update, forget, invalidate. All operations are validated before mutation; on failure the whole batch rolls back. Destructive actions require exact memory IDs. Recall/search/canonical/persona/shared-surface operations are not included in v1.
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| `query` | `string` | yes |
-| `limit` | `int` | no (default: 5) |
-| `temporal_weight` | `float` | no (default: 0.0) |
-| `query_time` | `string` | no (default: ) |
-| `temporal_halflife` | `float` | no (default: 24) |
-| `vec_weight` | `float` | no (default: null) |
-| `fts_weight` | `float` | no (default: null) |
-| `importance_weight` | `float` | no (default: null) |
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `operations` | `array<object>` | yes | *(none)* |
+| `dry_run` | `boolean` | no | `false` |
+| `bank` | `string` | no | *(none)* |
+| `author_id` | `string` | no | *(none)* |
+| `author_type` | `string` | no | *(none)* |
+| `channel_id` | `string` | no | *(none)* |
 
-### 3. `mnemosyne_forget`
-Permanently delete a memory by ID
+### 2. `mnemosyne_diagnose`
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| `memory_id` | `string` | yes |
+Run PII-safe diagnostics on Mnemosyne installation. Checks dependencies, database state, vector search readiness, and optional vec_working migration coverage. Never includes memory content or API keys.
 
-### 4. `mnemosyne_get`
-Retrieve a single memory by ID (no search)
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `repair_vec_working` | `boolean` | no | `false` |
+| `dry_run` | `boolean` | no | `false` |
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| `memory_id` | `string` | yes |
+### 3. `mnemosyne_export`
 
-### 5. `mnemosyne_update`
-Update content or importance of an existing memory
+Export all Mnemosyne memories to a JSON file for backup or migration.
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| `memory_id` | `string` | yes |
-| `content` | `string` | no (default: ) |
-| `importance` | `float` | no (default: ) |
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `output_path` | `string` | yes | *(none)* |
 
-### 6. `mnemosyne_validate`
-Attest, update, or invalidate a memory (collaborative ownership)
+### 4. `mnemosyne_forget`
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| `memory_id` | `string` | yes |
-| `action` | `enum[attest,update,invalidate,delete]` | yes |
-| `validator` | `string` | no (default: ) |
-| `new_content` | `string` | no (default: ) |
-| `note` | `string` | no (default: ) |
-| `bank` | `enum[private,surface]` | no (default: private) |
+Permanently delete a memory by ID.
 
-### 7. `mnemosyne_invalidate`
-Mark a memory as expired/superseded
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `memory_id` | `string` | yes | *(none)* |
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| `memory_id` | `string` | yes |
-| `replacement_id` | `string` | no (default: ) |
+### 5. `mnemosyne_get`
 
-### 8. `mnemosyne_import`
-Import memories from JSON file or provider (Hindsight, Mem0)
+Retrieve a single memory by its primary key. Pure read, no side effects. No semantic search. Returns the exact memory with the given ID or None. Use this when you already know the memory ID from a previous recall response.
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| `input_path` | `string` | no (default: ) |
-| `provider` | `string` | no (default: ) |
-| `api_key` | `string` | no (default: ) |
-| `user_id` | `string` | no (default: ) |
-| `agent_id` | `string` | no (default: ) |
-| `base_url` | `string` | no (default: ) |
-| `dry_run` | `bool` | no (default: false) |
-| `channel_id` | `string` | no (default: ) |
-| `force` | `bool` | no (default: false) |
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `memory_id` | `string` | yes | *(none)* |
 
-### 9. `mnemosyne_export`
-Export all memories to a JSON file
+### 6. `mnemosyne_graph_link`
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| `output_path` | `string` | yes |
+Declare a semantic edge between two memories in the graph. Use this to explicitly link related memories so graph traversal finds them.
 
-### 10. `mnemosyne_diagnose`
-PII-safe diagnostics: deps, DB state, vector readiness, vec_working coverage
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `source_id` | `string` | yes | *(none)* |
+| `target_id` | `string` | yes | *(none)* |
+| `relationship` | `string` | yes | *(none)* |
+| `weight` | `number` | no | `0.5` |
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| `repair_vec_working` | `bool` | no (default: false) |
-| `dry_run` | `bool` | no (default: false) |
+### 7. `mnemosyne_graph_query`
 
-### 11. `mnemosyne_stats`
-Memory statistics: working count, episodic count, BEAM tiers
+Traverse the memory graph to find memories related to a seed memory. Uses multi-hop BFS through graph_edges with optional edge_type and min_weight filtering.
 
-*No parameters*
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `seed_memory_id` | `string` | yes | *(none)* |
+| `max_hops` | `integer` | no | `2` |
+| `edge_type` | `string` | no | *(unset)* |
+| `min_weight` | `number` | no | `0.0` |
 
-### 12. `mnemosyne_sleep`
-Run consolidation cycle (compress old working memories)
+### 8. `mnemosyne_hygiene_audit`
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| `all_sessions` | `bool` | no (default: false) |
-| `dry_run` | `bool` | no (default: false) |
+Audit the memory database for noise: terminal spam, command output, heartbeats, stack traces, secrets. Returns ranked candidates sorted by noise score. Dry-run only — does not modify the database. Use mnemosyne_hygiene_clean to act on the results.
 
-### 13. `mnemosyne_triple_add`
-Add a fact triple to the knowledge graph
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `limit` | `integer` | no | `200` |
+| `offset` | `integer` | no | `0` |
+| `scan_all` | `boolean` | no | `false` |
+| `batch_size` | `integer` | no | `1000` |
+| `min_score` | `number` | no | `0.3` |
+| `tables` | `array<enum[working_memory, memories, episodic_memory, scratchpad]>` | no | *(none)* |
+| `bank` | `string` | no | *(none)* |
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| `subject` | `string` | yes |
-| `predicate` | `string` | yes |
-| `object` | `string` | yes |
-| `valid_from` | `string` | no (default: ) |
+### 9. `mnemosyne_hygiene_clean`
 
-### 14. `mnemosyne_triple_query`
-Query the temporal knowledge graph
+Clean noise candidates identified by mnemosyne_hygiene_audit. Actions: 'delete' (hard delete), 'archive' (decay importance to 0 + flag metadata, reversible), 'flag' (mark for review, no change). Requires confirm=true for any modification. Writes a full audit log to the hygiene_audit_log table.
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| `subject` | `string` | no (default: ) |
-| `predicate` | `string` | no (default: ) |
-| `object` | `string` | no (default: ) |
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `candidates_json` | `string` | yes | *(none)* |
+| `action` | `enum[delete, archive, flag, keep]` | no | `keep` |
+| `confirm` | `boolean` | no | `false` |
+| `bank` | `string` | no | *(none)* |
 
-### 15. `mnemosyne_graph_link`
-Declare a semantic edge between two memories
+### 10. `mnemosyne_import`
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| `source_id` | `string` | yes |
-| `target_id` | `string` | yes |
-| `relationship` | `string` | yes |
-| `weight` | `float` | no (default: 0.5) |
+Import Mnemosyne memories from a JSON file or another memory provider (Hindsight, Mem0). Idempotent by default.
 
-### 16. `mnemosyne_graph_query`
-Multi-hop BFS traversal from a seed memory
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `input_path` | `string` | no | *(none)* |
+| `provider` | `string` | no | *(none)* |
+| `api_key` | `string` | no | *(none)* |
+| `user_id` | `string` | no | *(none)* |
+| `agent_id` | `string` | no | *(none)* |
+| `base_url` | `string` | no | *(none)* |
+| `dry_run` | `boolean` | no | `false` |
+| `channel_id` | `string` | no | *(none)* |
+| `force` | `boolean` | no | `false` |
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| `seed_memory_id` | `string` | yes |
-| `max_hops` | `int` | no (default: 2) |
-| `edge_type` | `string` | no (default: ) |
-| `min_weight` | `float` | no (default: 0.0) |
+### 11. `mnemosyne_invalidate`
 
-### 17. `mnemosyne_shared_remember`
-Store compact cross-agent surface memory
+Mark a memory as expired or superseded. Provide memory_id from recall results. Optionally provide replacement_id to chain old to new.
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| `content` | `string` | yes |
-| `kind` | `string` | no (default: meta) |
-| `importance` | `float` | no (default: 0.8) |
-| `veracity` | `string` | no (default: unknown) |
-| `metadata` | `dict` | yes |
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `memory_id` | `string` | yes | *(none)* |
+| `replacement_id` | `string` | no | *(unset)* |
 
-### 18. `mnemosyne_shared_recall`
-Search only the shared surface DB
+### 12. `mnemosyne_recall`
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| `query` | `string` | yes |
-| `limit` | `int` | no (default: 5) |
+Search Mnemosyne for relevant memories. Uses hybrid ranking: by default 50% vector similarity + 30% FTS5 text rank + 20% importance + optional temporal boost. Tune the per-query weights via vec_weight, fts_weight, importance_weight (omit to use environment defaults). Returns ranked results.
+
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `query` | `string` | yes | *(none)* |
+| `limit` | `integer` | no | `5` |
+| `temporal_weight` | `number` | no | `0.0` |
+| `query_time` | `string` | no | *(none)* |
+| `temporal_halflife` | `number` | no | `24` |
+| `vec_weight` | `number` | no | *(none)* |
+| `fts_weight` | `number` | no | *(none)* |
+| `importance_weight` | `number` | no | *(none)* |
+| `explain` | `boolean` | no | `false` |
+
+### 13. `mnemosyne_recall_canonical`
+
+Read CANONICAL self-facts for the current profile. With category+name: return the single authoritative value for that slot. With category only: list that category's slots. With query: substring-search the profile's canonical values. With nothing: list all canonical slots. Set include_history=true to also return superseded versions of a slot.
+
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `category` | `string` | no | *(unset)* |
+| `name` | `string` | no | *(unset)* |
+| `query` | `string` | no | *(unset)* |
+| `include_history` | `boolean` | no | `false` |
+| `limit` | `integer` | no | `10` |
+
+### 14. `mnemosyne_remember`
+
+Store a durable memory in Mnemosyne. Use for ANY fact, preference, identity, insight, or context that should persist across sessions. Higher importance (0.0-1.0) surfaces the memory more often. Use scope='global' for user-level facts; scope='session' for conversation-specific context. Use valid_until (ISO date YYYY-MM-DD) for time-bound facts. Use extract_entities=True to extract named entities for fuzzy recall (e.g. 'Abdias' and 'Abdias J.' will match). Use extract=True to also pull subject-predicate-object fact triples via LLM for fact-aware recall. Use veracity to tag confidence: 'stated' for direct user assertions, 'tool' for deterministic tool output, 'inferred' for derived guesses; 'unknown' (default) gets no recall boost.
+
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `content` | `string` | yes | *(none)* |
+| `importance` | `number` | no | `0.5` |
+| `source` | `string` | no | `user` |
+| `scope` | `string` | no | `session` |
+| `valid_until` | `string` | no | *(unset)* |
+| `extract_entities` | `boolean` | no | `false` |
+| `extract` | `boolean` | no | `false` |
+| `metadata` | `object` | no | `{}` |
+| `veracity` | `string` | no | `unknown` |
+
+### 15. `mnemosyne_remember_canonical`
+
+Store a CANONICAL (single-source-of-truth) self-fact for the current profile. Each (category, name) slot holds exactly one current value: restating the same body is a no-op, and a new body supersedes the old one (kept as history). Use for stable identity cards — name, voice, stable preferences, relationships — that must not contradict themselves over time. Scoped privately to this profile. For relational facts use mnemosyne_triple_add; for episodic recall use mnemosyne_remember.
+
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `category` | `string` | yes | *(none)* |
+| `name` | `string` | yes | *(none)* |
+| `body` | `string` | yes | *(none)* |
+| `source` | `string` | no | *(unset)* |
+| `confidence` | `number` | no | `1.0` |
+
+### 16. `mnemosyne_scratchpad_clear`
+
+Clear all entries from the Mnemosyne scratchpad.
+
+*No parameters.*
+
+### 17. `mnemosyne_scratchpad_read`
+
+Read the Mnemosyne scratchpad entries.
+
+*No parameters.*
+
+### 18. `mnemosyne_scratchpad_write`
+
+Write a temporary note to the Mnemosyne scratchpad.
+
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `content` | `string` | yes | *(none)* |
 
 ### 19. `mnemosyne_shared_forget`
-Delete one working shared-surface memory by ID
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| `memory_id` | `string` | yes |
+Delete one working shared-surface memory by exact ID.
 
-### 20. `mnemosyne_shared_stats`
-Return shared surface DB path and counts
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `memory_id` | `string` | yes | *(none)* |
 
-*No parameters*
+### 20. `mnemosyne_shared_recall`
 
-### 21. `mnemosyne_scratchpad_write`
-Write a temporary note to the scratchpad
+Search only the shared Mnemosyne surface DB.
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| `content` | `string` | yes |
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `query` | `string` | yes | *(none)* |
+| `limit` | `integer` | no | `5` |
 
-### 22. `mnemosyne_scratchpad_read`
-Read the scratchpad entries
+### 21. `mnemosyne_shared_remember`
 
-*No parameters*
+Store compact cross-agent surface memory in a dedicated shared Mnemosyne DB. Use only for stable user/system/workflow metadata or general preferences. Normal mnemosyne_remember writes stay private.
 
-### 23. `mnemosyne_scratchpad_clear`
-Clear all scratchpad entries
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `content` | `string` | yes | *(none)* |
+| `kind` | `string` | no | `meta` |
+| `importance` | `number` | no | `0.8` |
+| `veracity` | `string` | no | `unknown` |
+| `metadata` | `object` | no | `{}` |
 
-*No parameters*
+### 22. `mnemosyne_shared_stats`
 
-### 24. `mnemosyne_remember_canonical`
-Store an owner-scoped canonical fact (single source of truth)
+Return shared surface DB path and counts.
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| `content` | `string` | yes |
-| `importance` | `float` | no (default: 0.5) |
-| `veracity` | `string` | no (default: unknown) |
-| `source` | `string` | no (default: user) |
-| `valid_until` | `string` | no (default: ) |
+*No parameters.*
 
-### 25. `mnemosyne_recall_canonical`
-Recall canonical facts by slot, category, or substring
+### 23. `mnemosyne_sleep`
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| `slot` | `string` | no (default: ) |
-| `category` | `string` | no (default: ) |
-| `substring` | `string` | no (default: ) |
-| `limit` | `int` | no (default: 5) |
-| `include_history` | `bool` | no (default: false) |
+Run the Mnemosyne consolidation cycle. Compresses old working memories into episodic summaries. Call after long sessions or when memory feels stale. Set all_sessions=true to consolidate eligible old working memories across inactive sessions.
+
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `all_sessions` | `boolean` | no | `false` |
+| `dry_run` | `boolean` | no | `false` |
+| `force` | `boolean` | no | `false` |
+
+### 24. `mnemosyne_stats`
+
+Return Mnemosyne memory statistics: working count, episodic count, BEAM tiers.
+
+*No parameters.*
+
+### 25. `mnemosyne_triple_add`
+
+Add a temporal fact triple (subject, predicate, object) to the knowledge graph. Example: ('user', 'prefers', 'neovim'). Use for structured relationships. By default a new triple supersedes any prior fact with the same subject+predicate; set supersede=false for multi-valued facts that should coexist (e.g. ('user','speaks','English') and ('user','speaks','Spanish')).
+
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `subject` | `string` | yes | *(none)* |
+| `predicate` | `string` | yes | *(none)* |
+| `object` | `string` | yes | *(none)* |
+| `valid_from` | `string` | no | *(unset)* |
+| `valid_until` | `string` | no | *(unset)* |
+| `source` | `string` | no | *(unset)* |
+| `confidence` | `number` | no | `1.0` |
+| `supersede` | `boolean` | no | `true` |
+
+### 26. `mnemosyne_triple_query`
+
+Query the temporal knowledge graph for facts matching subject/predicate/object patterns. Subject match is case-insensitive. Pass as_of to query facts valid on a past date.
+
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `subject` | `string` | no | *(unset)* |
+| `predicate` | `string` | no | *(unset)* |
+| `object` | `string` | no | *(unset)* |
+| `as_of` | `string` | no | *(unset)* |
+
+### 27. `mnemosyne_update`
+
+Update the content or importance of an existing memory by ID.
+
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `memory_id` | `string` | yes | *(none)* |
+| `content` | `string` | no | *(none)* |
+| `importance` | `number` | no | *(none)* |
+
+### 28. `mnemosyne_validate`
+
+Attest, update, or invalidate a memory the caller did not necessarily author. Supports collaborative ownership: any agent can validate any memory in either the private bank or the shared surface. The original author is preserved; validator + validated_at are updated to record the most recent attester. A 3-entry ring buffer keeps lightweight history. Actions: 'attest' (confirm correctness), 'update' (replace content), 'invalidate' (mark superseded), 'delete' (remove).
+
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `memory_id` | `string` | yes | *(none)* |
+| `action` | `enum[attest, update, invalidate, delete]` | yes | *(none)* |
+| `validator` | `string` | no | *(unset)* |
+| `new_content` | `string` | no | *(unset)* |
+| `note` | `string` | no | *(unset)* |
+| `bank` | `enum[private, surface]` | no | `private` |
+
+---
+
+## Hermes plugin only, NOT available over MCP (9)
+
+These schemas exist in `mnemosyne/tool_schemas.py` and are implemented by the Hermes provider adapters under `hermes_memory_provider/`. They have no entry in `_TOOL_HANDLERS`, so an MCP client that calls them gets an error.
+
+### 1. `mnemosyne_forget_canonical`
+
+Retire a CANONICAL self-fact slot for the current profile. Stamps valid_until on the current row, preserving it as history. Returns whether a current row was retired. Nothing is deleted. Use this to remove a canonical fact (e.g. a stale preference or identity).
+
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `category` | `string` | yes | *(none)* |
+| `name` | `string` | yes | *(none)* |
+
+### 2. `mnemosyne_persona_demote`
+
+Move a persona fact back to memoria_preferences (acting as a tombstone). Use when a previously-promoted rule no longer applies or was a one-off. Returns the demoted persona id and the new preference record location.
+
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `persona_id` | `integer` | yes | *(none)* |
+| `reason` | `string` | no | *(unset)* |
+
+### 3. `mnemosyne_persona_list`
+
+List L3 persona facts, optionally filtered by tier and/or topic. Returns personas ordered by tier (permanent first), then by reinforcement count descending (most-used first).
+
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `tier` | `enum[permanent, long_term, working]` | no | *(none)* |
+| `topic` | `string` | no | *(none)* |
+
+### 4. `mnemosyne_persona_promote`
+
+Promote a working or episodic memory into the L3 persona tier. Persona facts are always auto-injected into the system prompt regardless of semantic relevance. Tier values: 'permanent' (never evicted, requires explicit demotion), 'long_term' (default; reinforcement-driven decay), 'working' (transient). Returns the new persona id.
+
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `memory_id` | `string` | yes | *(none)* |
+| `tier` | `enum[permanent, long_term, working]` | no | `long_term` |
+| `reason` | `string` | no | *(unset)* |
+
+### 5. `mnemosyne_persona_reinforce`
+
+Bump the reinforcement_count and last_reinforced_at on a persona fact. Use when the persona rule was just applied -- signals 'this rule is in active use' to the decay logic.
+
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `persona_id` | `integer` | yes | *(none)* |
+
+### 6. `mnemosyne_sync_pull`
+
+Pull remote memory changes from the configured Mnemosyne sync server. Applies incoming events locally with timestamp + importance conflict resolution.
+
+*No parameters.*
+
+### 7. `mnemosyne_sync_push`
+
+Push local memory changes to a remote Mnemosyne sync server. Only events created since the last sync are sent. Requires a configured remote sync server (configured via config.yaml or MNEMOSYNE_SYNC_REMOTE env var).
+
+*No parameters.*
+
+### 8. `mnemosyne_sync_status`
+
+Show Mnemosyne sync status: device ID, last cursor, event count, remote URL, and encryption state.
+
+*No parameters.*
+
+### 9. `mnemosyne_triple_end`
+
+Expire a fact in the knowledge graph WITHOUT replacing it (e.g. a relationship that simply ended). Closes all open triples for subject+predicate, or only the one matching object when given. Use mnemosyne_triple_add instead when a new value replaces the old.
+
+| Parameter | Type | Required | Default |
+|-----------|------|----------|---------|
+| `subject` | `string` | yes | *(none)* |
+| `predicate` | `string` | yes | *(none)* |
+| `object` | `string` | no | *(unset)* |
+| `valid_until` | `string` | no | *(unset)* |
