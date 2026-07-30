@@ -446,9 +446,9 @@ def _render_tool_schema(tools, version: str) -> str:
         "",
         f"# MCP Tool Schema (v{version})",
         "",
-        "<!-- GENERATED FILE. Do not edit by hand.",
-        "     Source: mnemosyne/tool_schemas.py + mnemosyne/mcp_tools.py",
-        "     Regenerate: python3 scripts/generate-docs.py -->",
+        "> **Generated file. Do not edit by hand.**",
+        "> Source: `mnemosyne/tool_schemas.py` and `mnemosyne/mcp_tools.py`.",
+        "> Regenerate with `python3 scripts/generate-docs.py`.",
         "",
         f"Mnemosyne declares **{len(tools)} tools**. Of those, **{len(mcp)} are callable over MCP** "
         f"(stdio and SSE), and **{len(plugin_only)} are implemented only in the Hermes provider** "
@@ -517,9 +517,9 @@ def _render_config(env_map, defaults, restart, version: str) -> str:
         "",
         "# Configuration",
         "",
-        "<!-- GENERATED FILE. Do not edit by hand.",
-        "     Source: mnemosyne/core/config.py (ENV_VAR_MAP, DEFAULTS, REQUIRES_RESTART)",
-        "     Regenerate: python3 scripts/generate-docs.py -->",
+        "> **Generated file. Do not edit by hand.**",
+        "> Source: `mnemosyne/core/config.py` (`ENV_VAR_MAP`, `DEFAULTS`, `REQUIRES_RESTART`).",
+        "> Regenerate with `python3 scripts/generate-docs.py`.",
         "",
         "Mnemosyne reads configuration from a YAML file and from environment variables.",
         "Precedence is **`config.yaml` > environment variable > built-in default**.",
@@ -644,7 +644,12 @@ def _inject_config_table(page_path: str, table_md: str) -> bool:
 
     block = f"{START_MARKER}\n{table_md}\n{END_MARKER}"
 
-    replaced = False
+    # Strip every existing block first, in both marker dialects, then insert
+    # one clean block at the position the first one occupied. Doing this in a
+    # single pass matters: the replacement text itself contains the markers,
+    # so a naive replace-in-a-while-loop re-matches its own output and deletes
+    # the block it just wrote.
+    insert_at = None
     for start_v, end_v in (
         ("<!-- GENERATED_CONFIG_TABLE -->", "<!-- /GENERATED_CONFIG_TABLE -->"),
         (START_MARKER, END_MARKER),
@@ -652,8 +657,13 @@ def _inject_config_table(page_path: str, table_md: str) -> bool:
         while start_v in content and end_v in content:
             i = content.index(start_v)
             j = content.index(end_v, i) + len(end_v)
-            content = content[:i] + (block if not replaced else "") + content[j:]
-            replaced = True
+            if insert_at is None or i < insert_at:
+                insert_at = i
+            content = content[:i] + content[j:]
+
+    replaced = insert_at is not None
+    if replaced:
+        content = content[:insert_at] + block + content[insert_at:]
 
     if not replaced:
         print(f"  skip: no GENERATED_CONFIG_TABLE markers in {page_path}")
