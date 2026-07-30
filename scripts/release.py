@@ -378,7 +378,8 @@ Full changelog: <https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v{versi
     _write(os.path.join(outdir, f"{slug}-discord.md"), discord + "\n")
 
     print(f"Drafts written to dist-announce/ for {version}:\n")
-    print(f"  {slug}.mdx          blog post, move to mnemosyne-website/content/blog/")
+    print(f"  {slug}.mdx          blog post -> mnemosyne-website/content/blog/")
+    print(f"                          verified to build; renders one page per locale (7)")
     print(f"  {slug}-x.txt        X post ({len(x_post)} chars)")
     print(f"  {slug}-discord.md   Discord announcement")
     print()
