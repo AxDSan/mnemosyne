@@ -485,6 +485,39 @@ def test_enhanced_nonfinite_yaml_weight_uses_finite_cache_material_and_score(
     assert math.isfinite(results[0]["score"])
 
 
+def test_enhanced_cache_key_uses_effective_finite_temporal_halflife(enhanced):
+    """Invalid temporal inputs use the same safe default in recall and cache."""
+    memory, calls = enhanced
+    common = dict(
+        original_query="nonfinite temporal cache key",
+        expanded_query="nonfinite temporal cache key",
+        top_k=3,
+        runtime=SimpleNamespace(cross_session=False),
+        use_weibull=False,
+        use_mmr=False,
+        use_intent=False,
+        use_synonyms=False,
+        use_associative=False,
+        associative_depth=1,
+        mmr_lambda=0.7,
+        weights=(0.5, 0.3, 0.2),
+    )
+
+    def key_for(temporal_halflife: float) -> str:
+        return memory._enhanced_recall_cache_key(
+            **common,
+            recall_kwargs={"temporal_halflife": temporal_halflife},
+        )
+
+    default_key = key_for(24.0)
+    for invalid in (float("inf"), float("-inf"), float("nan"), 0.0):
+        assert key_for(invalid) == default_key
+        _call(memory, f"invalid temporal sentinel {invalid!r}", temporal_halflife=invalid)
+        assert calls[-1][2]["temporal_halflife"] == 24.0
+
+    assert key_for(48.0) != default_key
+
+
 @pytest.mark.parametrize(
     "huge_weight", [10 ** 10_000, -(10 ** 10_000)], ids=["positive", "negative"]
 )

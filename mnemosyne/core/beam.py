@@ -1593,6 +1593,20 @@ def _temporal_boost(memory_timestamp_str: str, query_time: datetime,
     return math.exp(-hours_delta / halflife_hours)
 
 
+def _resolve_temporal_halflife(value: Any) -> float:
+    """Return the finite, positive temporal half-life used by recall."""
+    raw_value = (
+        os.environ.get("MNEMOSYNE_TEMPORAL_HALFLIFE_HOURS", "24")
+        if value is None
+        else value
+    )
+    try:
+        resolved = float(raw_value)
+    except (TypeError, ValueError, OverflowError):
+        return 24.0
+    return resolved if math.isfinite(resolved) and resolved > 0 else 24.0
+
+
 def _vec_available(conn: sqlite3.Connection) -> bool:
     return _vec_table_available(conn, "vec_episodes")
 
@@ -5697,10 +5711,7 @@ class BeamMemory:
 
         # ---- Temporal scoring setup ----
         parsed_query_time = _parse_query_time(query_time)
-        if temporal_halflife is not None:
-            th_halflife = temporal_halflife
-        else:
-            th_halflife = float(os.environ.get("MNEMOSYNE_TEMPORAL_HALFLIFE_HOURS", "24"))
+        th_halflife = _resolve_temporal_halflife(temporal_halflife)
 
         # [C4] Recall path diagnostics -- lazy import to avoid module-
         # load coupling. Counters are recorded AFTER the per-row
@@ -6843,9 +6854,10 @@ class BeamMemory:
         else:
             resolved_weights = weights
 
-        temporal_halflife = recall_kwargs.get("temporal_halflife")
-        if temporal_halflife is None:
-            temporal_halflife = float(os.environ.get("MNEMOSYNE_TEMPORAL_HALFLIFE_HOURS", "24"))
+        temporal_halflife = _resolve_temporal_halflife(recall_kwargs.get("temporal_halflife"))
+        effective_recall_kwargs = dict(recall_kwargs)
+        if "temporal_halflife" in effective_recall_kwargs:
+            effective_recall_kwargs["temporal_halflife"] = temporal_halflife
 
         db_namespace = str(self.db_path.resolve())
         payload = {
@@ -6857,7 +6869,7 @@ class BeamMemory:
                 "cross_session": bool(runtime.cross_session),
             },
             "top_k": top_k,
-            "recall_kwargs": canonicalize(recall_kwargs),
+            "recall_kwargs": canonicalize(effective_recall_kwargs),
             "resolved": {
                 "weights": resolved_weights,
                 "temporal_halflife": temporal_halflife,
@@ -6943,6 +6955,8 @@ class BeamMemory:
 
         original_query = query
         expanded_query = query
+        if "temporal_halflife" in kwargs:
+            kwargs["temporal_halflife"] = _resolve_temporal_halflife(kwargs["temporal_halflife"])
         raw_weights = (
             kwargs.get("vec_weight"),
             kwargs.get("fts_weight"),
