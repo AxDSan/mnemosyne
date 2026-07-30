@@ -1,5 +1,37 @@
 # Releasing Mnemosyne
 
+> **Use `scripts/release.py`.** A release touches three repositories and
+> several places that will not tell you when they are wrong. Doing it by
+> hand is how `__version__` reached 3.15.1 with no tag, `CHANGELOG` grew a
+> dated `[3.15.0]` heading for a version that never shipped, the docs hero
+> read 3.14.0, and the marketing site's release card read 3.15.0. Four
+> surfaces, three answers.
+>
+> ```bash
+> python3 scripts/release.py check 3.16.0      # what is not ready
+> python3 scripts/release.py prepare 3.16.0    # bump everything, all repos
+> python3 scripts/release.py announce 3.16.0   # blog, X, Discord drafts
+> python3 scripts/release.py tag 3.16.0        # re-check, print the tag commands
+> ```
+
+## What a release touches
+
+| Repository | What changes | Updated by |
+|---|---|---|
+| `mnemosyne` | `mnemosyne/__init__.py` `__version__` | `prepare` |
+| | `CHANGELOG.md`, `[Unreleased]` promoted to a dated section | `prepare` |
+| | `hermes_memory_provider/plugin.yaml` `version` | `prepare` |
+| | `docs/api/*.mdx` regenerated so they carry the new version | `prepare` |
+| `mnemosyne-docs` | `version.txt`, which drives the landing hero | `prepare` |
+| | `content/api/tool-schema.mdx` | `prepare`, via the docs generator |
+| `mnemosyne-website` | `public/llms.txt` "Latest stable" | `prepare` |
+| | `src/data/changelog.json` release card | automatic, `sync:changelog` on each build |
+| | `content/blog/<release>.mdx` | drafted by `announce`, written by you |
+| X / Discord | announcement posts | drafted by `announce`, posted by you |
+
+The sibling repositories must be checked out beside this one. `check` warns
+when they are not, rather than silently skipping them.
+
 ## Versioning Policy
 
 Mnemosyne follows **strict SemVer** (MAJOR.MINOR.PATCH).

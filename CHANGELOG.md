@@ -7,6 +7,8 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
+## [3.15.1] - 2026-07-30
+
 ### Fixed
 
 - **MEMORIA instruction extraction inverted "whenever X" into "never X" (#507).** The instruction pattern was not word-boundary anchored, so `never` matched inside `whenever` and the extractor stored the opposite of what the user said — on a production bank, "Good - whenever needed we can use it." was recorded as the instruction "never needed we can use it". All five locale patterns (en/de/ru/it/es) are now anchored with a leading `\b`. Genuine instructions are unaffected, including those preceded by another word or punctuation ("Note: never push to main", "wherever you go, always run the tests"). Reported by @Axmr1 from a 61-row production audit; original diagnosis and fix approach from @Sanjays2402 (#508) and @Souptik96 (#549).
@@ -15,6 +17,10 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 - **Catastrophic regex backtracking in version-string extraction (#544).** The pattern used by `extract_and_store_facts` could be driven into exponential backtracking by Title-Case input, hanging every `remember()` and import on attacker- or user-supplied content. The separator is now `\s+`, which makes each whitespace-delimited word consumable exactly one way. Behavioral equivalence was verified across a 200,000-string fuzz with zero differences.
 
 ## [3.15.0] - 2026-07-20
+
+> Never published to PyPI. No `v3.15.0` tag was cut, so this section
+> documents work that first reached users in 3.15.1. Kept for history
+> rather than folded, so the individual changes stay attributable.
 
 ### Fixed
 
