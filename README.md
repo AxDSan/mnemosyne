@@ -17,6 +17,17 @@
 
 </div>
 
+<div align="center">
+<sub>
+
+Compute and tooling for benchmarks and CI provided by
+<a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=mnemosyne">Atlas Cloud</a>
+&nbsp;·&nbsp;
+<a href="https://mnemosyne.site/partners">Partner with Mnemosyne</a>
+
+</sub>
+</div>
+
 **Mnemosyne** is a universal, Hermes-first memory layer that works with any agent framework (Claude Code, Cursor, Codex, OpenWebUI, OpenClaw, or your own custom agent). One `pip install`, one SQLite database. No external services required.
 
 ---

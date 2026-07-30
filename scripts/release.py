@@ -351,9 +351,20 @@ def cmd_announce(args: argparse.Namespace) -> int:
 
     bullets = "\n".join(f"- {i}" for i in items) or "- (fill in the headline changes)"
 
+    # The website has no mdx-components.tsx, so plain markdown elements get
+    # no styling at all: a post written with `##` and `-` renders as bare
+    # unstyled HTML. Every existing post hand-writes JSX with Tailwind
+    # classes, so the scaffold has to as well. This was learned the hard way.
+    P = 'className="font-serif-alt text-lg leading-relaxed text-charcoal mb-6"'
+    H2 = 'className="font-serif text-2xl lg:text-3xl text-charcoal mt-12 mb-4"'
+    UL = 'className="font-serif-alt text-lg leading-relaxed text-charcoal mb-6 ml-6 list-disc"'
+
+    li = "\n".join(f'  <li className="mb-2">{i}</li>' for i in items) or \
+         '  <li className="mb-2">TODO the headline changes</li>'
+
     blog = f"""---
 title: "Mnemosyne {version}"
-excerpt: "TODO one or two sentences. What changed and why a user should care."
+excerpt: "TODO one or two sentences. What changed and why a reader should care."
 date: "{today}"
 readTime: "4 min read"
 category: "Release"
@@ -362,27 +373,41 @@ featured: false
 image: "/hero-demo.jpg"
 ---
 
-<p className="font-serif-alt text-lg leading-relaxed text-charcoal mb-6">
+<p {P}>
   TODO: open with the one thing that matters most in this release.
 </p>
 
-## What changed
+<h2 {H2}>
+  What changed
+</h2>
 
-{bullets}
+<ul {UL}>
+{li}
+</ul>
 
-## Upgrading
+<h2 {H2}>
+  Upgrading
+</h2>
+
+<p {P}>
+  Run
+  <code className="text-accent-terracotta bg-cream-dark px-1 rounded">pip install --upgrade 'mnemosyne-memory[embeddings]'</code>.
+  TODO note any migration or config change, or say there is none.
+</p>
 
 <CodeBlock code={{`pip install --upgrade 'mnemosyne-memory[embeddings]'`}} language="bash" />
 
-Full notes: https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v{version}
+<p {P}>
+  Full notes on the
+  <a href="https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v{version}" className="text-accent-terracotta underline underline-offset-2 hover:text-charcoal">v{version} release page</a>.
+</p>
 """
 
     # X has a 280 character budget, so build the shortest honest version and
-    # let the caller expand it. Two items, trimmed, no install line: the link
-    # carries that. A draft that already fits is likelier to get posted than
-    # one the author has to cut down first.
+    # let the author expand it. Two items, trimmed. A draft that already fits
+    # is likelier to get posted than one that must be cut down first.
     def _short(s: str, n: int = 78) -> str:
-        return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+        return s if len(s) <= n else s[: n - 1].rstrip() + "\u2026"
 
     x_lines = "\n".join(f"- {_short(i)}" for i in items[:2])
     x_post = f"""Mnemosyne {version} is out.
