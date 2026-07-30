@@ -3830,14 +3830,18 @@ def register(ctx):
         handler_fn=mnemosyne_command,
     )
 
-    # Also register tools and hooks from hermes_plugin (sibling directory).
-    # This way a single symlink to hermes_memory_provider/ gives us the
-    # full Mnemosyne experience: CLI + tools + hooks.
+    # Legacy fallback: register a vendored hermes_plugin sibling's hooks if
+    # present. Removed from this repo in v3.0 (commit 0ee4d80); normally a
+    # debug-level no-op (issue #578). Only the expected missing-module error is
+    # swallowed; a real registration failure must propagate, not be hidden.
     try:
         _repo_root = str(Path(__file__).resolve().parent.parent)
         if _repo_root not in sys.path:
             sys.path.insert(0, _repo_root)
         from hermes_plugin import register as _plugin_register
+    except ImportError as exc:
+        logger.debug(
+            "hermes_plugin sibling not importable (expected since v3.0): %s", exc
+        )
+    else:
         _plugin_register(ctx)
-    except Exception:
-        pass  # Graceful degradation — CLI still works without plugin tools
