@@ -56,6 +56,46 @@ def test_en_whenever_does_not_yield_never_instruction(content):
     assert matches == [], f"inverted instruction extracted from {content!r}: {matches}"
 
 
+@pytest.mark.parametrize("locale", LOCALES)
+def test_no_locale_pattern_contains_a_literal_backslash_escape(locale):
+    """Guard (#560): a doubled escape makes the pattern match a literal backslash.
+
+    The ``ru`` instruction pattern was written with ``\\\\s+`` / ``[^.,;!?\\\\n]``
+    inside a raw string, so it required a literal backslash in the text and
+    Russian extraction was silently dead. Several ``es`` patterns had the same
+    doubled ``\\\\n``, which truncated captures at the first letter ``n``.
+    """
+    for key, value in BeamMemory.MULTILINGUAL_PATTERNS[locale].items():
+        if not isinstance(value, str):
+            continue
+        assert not re.search(r"\\\\[sndbwSNDBW]", value), (
+            f"{locale}/{key} contains a literal backslash escape; "
+            f"the pattern cannot match ordinary text"
+        )
+
+
+def test_ru_instruction_extracts_a_russian_directive():
+    """#560: Russian instruction extraction must actually match."""
+    matches = re.findall(
+        _runtime_instruction_re("ru"),
+        "всегда запускай тесты перед пушем в main",
+        re.IGNORECASE,
+    )
+    assert matches, "ru instruction pattern matched nothing"
+    assert any("запускай тесты" in m for m in matches), matches
+
+
+def test_es_instruction_capture_is_not_truncated_at_the_letter_n():
+    """#560: the doubled ``\\\\n`` in the es character class ended captures early."""
+    matches = re.findall(
+        _runtime_instruction_re("es"),
+        "siempre ejecuta las pruebas antes de subir a main",
+        re.IGNORECASE,
+    )
+    assert matches, "es instruction pattern matched nothing"
+    assert any("antes de subir" in m for m in matches), matches
+
+
 def test_de_nie_does_not_match_inside_knie():
     """German 'nie' must not match inside unrelated words such as 'Knie'."""
     matches = re.findall(
