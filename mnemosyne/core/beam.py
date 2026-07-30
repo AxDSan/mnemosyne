@@ -3484,6 +3484,8 @@ class BeamMemory:
                   trust_tier,
                   existing_id, self.session_id))
             self.conn.commit()
+            # Cache failures must not turn a committed dedup update into a retry.
+            self._invalidate_query_cache_after_remember_commit()
             # Run the same entity/fact extraction the new-row path runs, so
             # backfill calls -- `mem.remember(same_content, extract=True)` on
             # an already-existing row -- actually populate the triples and
@@ -3507,10 +3509,6 @@ class BeamMemory:
             self._emit_event("MEMORY_UPDATED", existing_id, content=content,
                              source=source, importance=importance, metadata=metadata)
 
-            # Invalidate enhanced recall cache on memory update
-            if hasattr(self, "_query_cache") and self._query_cache is not None:
-                self._query_cache.invalidate()
-
             return existing_id
 
         memory_id = memory_id or _generate_id(content)
@@ -3525,7 +3523,11 @@ class BeamMemory:
               json.dumps(metadata or {}), valid_until, scope,
               self.author_id, self.author_type, self.channel_id, veracity, memory_type, trust_tier))
         self.conn.commit()
-        self._trim_working_memory()
+        try:
+            self._trim_working_memory()
+        finally:
+            # Cache failures must not turn a committed new-memory write into a retry.
+            self._invalidate_query_cache_after_remember_commit()
 
         # --- Embedding storage for vector recall ---
         # remember_batch() already does this; remember() was missing it,
@@ -3585,10 +3587,6 @@ class BeamMemory:
 
         self._emit_event("MEMORY_ADDED", memory_id, content=content,
                          source=source, importance=importance, metadata=metadata)
-
-        # Invalidate enhanced recall cache on new memory
-        if hasattr(self, "_query_cache") and self._query_cache is not None:
-            self._query_cache.invalidate()
 
         return memory_id
 
@@ -4182,6 +4180,17 @@ class BeamMemory:
             cache.invalidate()
         finally:
             cache.close()
+
+    def _invalidate_query_cache_after_remember_commit(self) -> None:
+        """Best-effort cache invalidation after ``remember()`` has committed."""
+        try:
+            self._invalidate_query_cache()
+        except Exception as exc:
+            logger.warning(
+                "remember: query-cache invalidation failed after commit (%s): %s",
+                type(exc).__name__,
+                exc,
+            )
 
     def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
         """
