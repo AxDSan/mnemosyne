@@ -24,9 +24,12 @@ Three invariants this module exists to hold:
 2. **Application-layer integrity.** No schema-level foreign keys (issue #503:
    ``PRAGMA foreign_keys=ON`` broke 22 tests that intentionally create orphan
    rows). ``add_moments`` validates; ``mnemosyne doctor`` reports.
-3. **No bytes.** Nothing here accepts, stores, or returns media bytes. The
-   byte path is ``core/content_sanitizer.py`` (write) and ``core/resolvers.py``
-   (read); this module only ever holds a reference to them.
+3. **No bytes in the database.** The tables hold references and text. The byte
+   path is ``core/content_sanitizer.py`` (write) and ``core/resolvers.py``
+   (read); nothing here writes bytes into a column.
+
+:func:`remember_media` at the bottom of this module is the ingest entry point
+that ties the store to the provider seam.
 
 See ``docs/rfc/0003-media-moments.md`` for the design and the corrections
 this module implements.
@@ -35,6 +38,7 @@ this module implements.
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1096,3 +1100,578 @@ class MediaStore:
             "SELECT 1 FROM working_memory WHERE id = ?", (memory_id,)
         ).fetchone()
         return row is not None
+
+
+# ---------------------------------------------------------------------------
+# Ingest
+# ---------------------------------------------------------------------------
+#
+# ``remember_media`` is a free function taking ``beam`` rather than a method,
+# following ``_extract_and_store_entities`` (``beam.py:1561``). ``beam.py`` is
+# already ~8,000 lines; this keeps its growth to a short delegating method and
+# makes the flow unit-testable against a stub.
+
+#: Refuse to read more than this into memory for a describe call. A four-gigabyte
+#: video is not something to base64 into a JSON body, and the failure should be a
+#: clean "unavailable" rather than an OOM.
+MAX_FETCH_BYTES = 20 * 1024 * 1024
+
+#: A reference longer than this is not a reference. Chiefly a guard against a
+#: caller routing an inline payload here after `data:` conversion has already
+#: run -- ``ref_value`` and ``metadata`` are uncapped TEXT columns that
+#: ``sanitize_content`` never inspects.
+MAX_REF_LENGTH = 8192
+
+_EXTENSION_MODALITY: Dict[str, str] = {
+    ".png": "image", ".jpg": "image", ".jpeg": "image", ".gif": "image",
+    ".webp": "image", ".bmp": "image", ".tiff": "image", ".heic": "image",
+    ".svg": "image",
+    ".mp4": "video", ".mov": "video", ".webm": "video", ".mkv": "video",
+    ".avi": "video", ".m4v": "video",
+    ".mp3": "audio", ".wav": "audio", ".flac": "audio", ".ogg": "audio",
+    ".m4a": "audio", ".aac": "audio", ".opus": "audio",
+    ".pdf": "document", ".docx": "document", ".pptx": "document",
+    ".epub": "document", ".txt": "document", ".md": "document",
+}
+
+
+@dataclass(frozen=True)
+class MediaIngestResult:
+    """Outcome of :func:`remember_media`.
+
+    A bare ``str`` return would discard the thing the caller most needs: the
+    degradation ladder produces a *status*, and ``unavailable`` is a success.
+    """
+
+    asset_id: str
+    #: The always-written reference memory. Present even when no provider ran.
+    anchor_memory_id: Optional[str] = None
+    #: One of media.UNDERSTANDING_STATUSES.
+    status: str = "pending"
+    moment_ids: List[str] = field(default_factory=list)
+    #: Memory rows created for moments, in the same order.
+    memory_ids: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+    @property
+    def described(self) -> bool:
+        return self.status in {"ok", "partial"}
+
+
+def normalize_media_input(
+    ref: str,
+    ref_kind: Optional[str] = None,
+    mime: Optional[str] = None,
+) -> Tuple[str, str, Optional[str], Optional[str]]:
+    """Resolve caller input to ``(ref_kind, ref_value, mime, content_hash)``.
+
+    **A ``data:`` URI is converted here, at the door, before anything is
+    stored.** This is not a tidiness preference. ``sanitize_content`` only ever
+    inspects ``content`` (``beam.py:3251``, ``:3523``, ``memory.py:358``) --
+    ``metadata_json`` is never sanitized, and neither is ``media_assets.
+    ref_value``. A ``data:`` URI arriving as a *reference* would therefore write
+    megabytes of base64 into two uncapped TEXT columns, with no size cap and no
+    entropy check: exactly the outcome those branches exist to prevent, reached
+    by a path that does not watch for it. Converting on entry means the bytes go
+    to the blob store and only a short ``blob://`` reference is ever persisted.
+    """
+    if not ref or not str(ref).strip():
+        raise ValueError("ref must be a non-empty string")
+    ref = str(ref).strip()
+
+    from mnemosyne.core import content_sanitizer
+
+    if content_sanitizer._is_data_uri(ref):
+        parsed = content_sanitizer._parse_data_uri(ref)
+        if parsed is None:
+            raise ValueError("ref looks like a data: URI but could not be parsed")
+        data_mime, raw = parsed
+        digest = content_sanitizer._store_blob(raw)
+        return ("blob", f"blob://sha256/{digest}", mime or data_mime, digest)
+
+    if len(ref) > MAX_REF_LENGTH:
+        raise ValueError(
+            f"ref is {len(ref)} characters, over the {MAX_REF_LENGTH} limit; "
+            "inline payloads must arrive as a data: URI so they can be "
+            "converted to a blob reference rather than stored as text"
+        )
+
+    if ref_kind:
+        kind = str(ref_kind).strip().lower()
+    elif ref.startswith("blob://"):
+        kind = "blob"
+    elif ref.startswith(("http://", "https://")):
+        kind = "youtube" if _is_youtube(ref) else "url"
+    elif len(ref) == 64 and all(c in "0123456789abcdefABCDEF" for c in ref):
+        kind = "sha256"
+    else:
+        kind = "file"
+
+    kind, value = normalize_ref(kind, ref)
+
+    content_hash = None
+    if kind == "sha256":
+        content_hash = value
+    elif kind == "blob":
+        match = re.match(r"^blob://sha256/([0-9a-f]{64})$", value)
+        if match:
+            content_hash = match.group(1)
+
+    return (kind, value, mime, content_hash)
+
+
+def _is_youtube(ref: str) -> bool:
+    host = (urlsplit(ref).netloc or "").lower()
+    return host.endswith(("youtube.com", "youtu.be")) or host.endswith(".youtube.com")
+
+
+def infer_modality(
+    ref_kind: str,
+    ref_value: str,
+    mime: Optional[str] = None,
+) -> str:
+    """Explicit mime wins, then the file extension, then ``document``.
+
+    ``document`` is the fallback rather than ``image`` because it is the least
+    committal: a document moment is a page or a character range, which degrades
+    to ``whole`` harmlessly, whereas guessing ``image`` invites a vision call on
+    something that is not one.
+    """
+    if mime:
+        top = str(mime).split("/", 1)[0].strip().lower()
+        if top in {"image", "video", "audio"}:
+            return top
+        if top == "application" or top == "text":
+            return "document"
+
+    if ref_kind == "youtube":
+        return "video"
+
+    suffix = Path(urlsplit(ref_value).path or ref_value).suffix.lower()
+    return _EXTENSION_MODALITY.get(suffix, "document")
+
+
+def _short_ref(ref_kind: str, ref_value: str, limit: int = 120) -> str:
+    """A human-readable stub for the anchor row's generated content.
+
+    The full reference lives in ``media_assets.ref_value``; the memory row gets
+    something a person would recognize in a recall result.
+    """
+    if ref_kind in {"blob", "sha256"}:
+        return ref_value[-12:]
+    name = Path(urlsplit(ref_value).path or ref_value).name
+    return (name or ref_value)[:limit]
+
+
+def _make_fetch(ref_kind: str, ref_value: str):
+    """Build the lazy byte-reader handed to the provider.
+
+    It is only ever *called* for content the provider cannot fetch itself, and
+    it is wired from the ``core/resolvers.py`` registry so a host that registers
+    an S3 or archive resolver gets remote media for free. A plain local path has
+    no registered scheme, so it is read directly -- reading a file the user
+    explicitly named is the operation they asked for, and it is still gated
+    behind ``modality_enabled``.
+    """
+    def _fetch() -> Optional[bytes]:
+        try:
+            if ref_kind == "file":
+                path = Path(ref_value)
+                if not path.is_file():
+                    return None
+                if path.stat().st_size > MAX_FETCH_BYTES:
+                    logger.info("media: %s exceeds the fetch cap; skipping", ref_kind)
+                    return None
+                return path.read_bytes()
+
+            from mnemosyne.core.resolvers import resolve_open
+
+            stream = resolve_open(ref_value)
+            if stream is None:
+                return None
+            with stream:
+                raw = stream.read(MAX_FETCH_BYTES + 1)
+            if raw is not None and len(raw) > MAX_FETCH_BYTES:
+                return None
+            return raw
+        except Exception:
+            logger.info("media: fetch failed", exc_info=True)
+            return None
+
+    return _fetch
+
+
+def remember_media(
+    beam,
+    *,
+    ref: str,
+    ref_kind: Optional[str] = None,
+    modality: Optional[str] = None,
+    mime: Optional[str] = None,
+    title: Optional[str] = None,
+    source: str = "media",
+    hint: Optional[str] = None,
+    max_moments: Optional[int] = None,
+    importance: float = 0.5,
+    scope: str = "session",
+    captured_at: Optional[str] = None,
+    captured_at_precision: str = "unknown",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> MediaIngestResult:
+    """Register a piece of media and, if a provider is configured, describe it.
+
+    Synchronous by design. RFC 0003 §5.1: ``core/`` has no access lock --
+    ``_beam_access_lock`` lives only in the Hermes provider -- so a background
+    thread here would run unserialized against SQLite, which is the shape of the
+    WAL-checkpoint crash in #498/#520.
+
+    The order of operations is the design, and each step is placed where it is
+    for a stated reason:
+
+    1. Normalize the reference. ``data:`` becomes ``blob://`` here, before
+       storage (see :func:`normalize_media_input`).
+    2. Infer the modality.
+    3. Upsert the asset as ``pending`` **and commit**, so a process killed
+       mid-ingest leaves a retryable state rather than one nothing can be in.
+    4. Write the anchor memory row **before the provider gate**, so rung 4 of
+       the degradation ladder gives the user strictly more than they had. With
+       no provider configured this function still succeeds and still leaves
+       something recallable.
+    5. Ask the provider, if and only if the operator has opted in.
+    6. Per moment: **the moment row first**, then the memory row, then the bind.
+       A crash between them leaves a recoverable unbound moment that ``doctor``
+       counts; the reverse order leaks a memory row nothing can trace back.
+    7. Set the final status in a ``finally``, so a constraint error mid-loop
+       cannot strand the asset at ``pending``.
+
+    Two rules keep the reference out of ``content``: ``ref`` is always a
+    parameter and never content, and the anchor row's text is *generated*
+    (``"Referenced image: photo.png"``), with the full reference living only in
+    ``media_assets.ref_value``.
+    """
+    store = getattr(beam, "media", None)
+    if store is None:
+        store = MediaStore(db_path=getattr(beam, "db_path", None),
+                           conn=getattr(beam, "conn", None))
+
+    ref_kind_norm, ref_value, mime_norm, content_hash = normalize_media_input(
+        ref, ref_kind, mime
+    )
+    modality_norm = (str(modality).strip().lower() if modality
+                     else infer_modality(ref_kind_norm, ref_value, mime_norm))
+    if modality_norm not in MODALITIES:
+        raise ValueError(
+            f"unknown modality {modality!r}; expected one of {sorted(MODALITIES)}"
+        )
+
+    upsert = store.upsert_asset(
+        ref_kind=ref_kind_norm,
+        ref_value=ref_value,
+        modality=modality_norm,
+        content_hash=content_hash,
+        mime=mime_norm,
+        title=title,
+        source=source,
+        session_id=getattr(beam, "session_id", None),
+        scope=scope,
+        captured_at=captured_at,
+        captured_at_precision=captured_at_precision,
+        understanding_status="pending",
+        metadata=metadata,
+    )
+    asset_id = upsert.asset_id
+
+    warnings: List[str] = []
+    moment_ids: List[str] = []
+    memory_ids: List[str] = []
+    status = "unavailable"
+
+    try:
+        anchor_memory_id = _ensure_anchor_memory(
+            beam, store, asset_id, ref_kind_norm, ref_value, modality_norm,
+            title=title, source=source, importance=importance, scope=scope,
+        )
+
+        result = _describe(
+            asset_id, ref_kind_norm, ref_value, modality_norm, mime_norm,
+            content_hash, hint, max_moments,
+        )
+        if result is None:
+            return MediaIngestResult(
+                asset_id=asset_id, anchor_memory_id=anchor_memory_id,
+                status="unavailable", warnings=warnings,
+            )
+
+        warnings.extend(result.warnings or [])
+        if result.refused:
+            status = "refused"
+            return MediaIngestResult(
+                asset_id=asset_id, anchor_memory_id=anchor_memory_id,
+                status=status, warnings=warnings,
+            )
+
+        drafts, skipped = _to_drafts(result, modality_norm)
+        if skipped:
+            warnings.append(f"{skipped} provider moment(s) dropped as unwritable")
+
+        if not drafts:
+            status = "partial" if result.summary else "unavailable"
+            return MediaIngestResult(
+                asset_id=asset_id, anchor_memory_id=anchor_memory_id,
+                status=status, warnings=warnings,
+            )
+
+        write = store.add_moments(asset_id, drafts)
+        moment_ids = list(write.moment_ids)
+        memory_ids = _bind_moment_memories(
+            beam, store, asset_id, drafts, moment_ids,
+            source=source, importance=importance, scope=scope,
+            provider=result.provider, model=result.model,
+        )
+        status = "partial" if skipped else "ok"
+
+        return MediaIngestResult(
+            asset_id=asset_id, anchor_memory_id=anchor_memory_id,
+            status=status, moment_ids=moment_ids, memory_ids=memory_ids,
+            warnings=warnings,
+        )
+    finally:
+        # A constraint error mid-loop must not strand the asset at 'pending' --
+        # nothing retries that state, and doctor would not flag it either.
+        try:
+            store.set_understanding_status(asset_id, status)
+        except Exception:
+            logger.info("media: could not finalize status for %s", asset_id, exc_info=True)
+
+
+def _ensure_anchor_memory(
+    beam, store: MediaStore, asset_id: str, ref_kind: str, ref_value: str,
+    modality: str, *, title: Optional[str], source: str, importance: float,
+    scope: str,
+) -> Optional[str]:
+    """Write (or reuse) the reference memory for an asset.
+
+    Reused on re-ingest so a repeat does not accumulate anchor rows -- the
+    asset upsert is idempotent and this has to be too. The recorded id is
+    re-validated rather than trusted: consolidation may have taken the row.
+    """
+    asset = store.get_asset(asset_id) or {}
+    try:
+        meta = json.loads(asset.get("metadata") or "{}")
+    except Exception:
+        meta = {}
+    existing = meta.get("anchor_memory_id") if isinstance(meta, dict) else None
+    if existing and store._memory_exists(existing):
+        return existing
+
+    content = f"Referenced {modality}: {title or _short_ref(ref_kind, ref_value)}"
+    memory_id = _remember_text(
+        beam, content, source=source, importance=importance, scope=scope,
+        metadata={"media": {"asset_id": asset_id, "modality": modality,
+                            "ref_kind": ref_kind, "role": "anchor"}},
+    )
+    if memory_id and isinstance(meta, dict):
+        meta["anchor_memory_id"] = memory_id
+        try:
+            store.conn.execute(
+                "UPDATE media_assets SET metadata = ? WHERE asset_id = ?",
+                (json.dumps(meta, default=str), asset_id),
+            )
+            store.conn.commit()
+        except Exception:
+            logger.info("media: could not record anchor id", exc_info=True)
+    return memory_id
+
+
+def _remember_text(
+    beam, content: str, *, source: str, importance: float, scope: str,
+    metadata: Dict[str, Any],
+) -> Optional[str]:
+    """Write one memory row for media.
+
+    ``memory_type="artifact"`` because ``classify_memory`` would label a caption
+    an "observation" (RFC 0003 §3.3 cost 3), and ``dedupe=False`` because
+    ``_find_duplicate`` matches on ``(session_id, content)`` -- two identical
+    captions from *different* assets would otherwise collapse into one row and
+    the second moment would bind to the wrong asset, silently. It also avoids
+    the ``COALESCE`` retype at ``beam.py:3301`` converting a user's
+    conversational note into an artifact on a content collision.
+
+    ``BeamMemory.remember`` is called directly rather than the ``core/memory.py``
+    facade: ``should_remember`` can veto a write outright, which would leave a
+    moment row bound to nothing.
+    """
+    try:
+        return beam.remember(
+            content,
+            source=source,
+            importance=importance,
+            metadata=metadata,
+            scope=scope,
+            memory_type="artifact",
+            dedupe=False,
+        )
+    except Exception:
+        logger.info("media: memory write failed", exc_info=True)
+        return None
+
+
+def _describe(
+    asset_id: str, ref_kind: str, ref_value: str, modality: str,
+    mime: Optional[str], content_hash: Optional[str],
+    hint: Optional[str], max_moments: Optional[int],
+):
+    """Ask the provider seam. Returns a DescribeResult or None.
+
+    Never raises: ``call_modality_describe`` already returns None when the
+    operator has not opted in, when nothing serves the modality, and when the
+    backend fails. The import is local so ``core/media.py`` stays usable with no
+    provider machinery loaded at all.
+    """
+    try:
+        from mnemosyne.core.modality_backends import (
+            DescribeRequest, call_modality_describe,
+        )
+    except Exception:
+        return None
+
+    try:
+        cap = max_moments
+        if cap is None:
+            from mnemosyne.core import config as _config
+            cap = _config.get_int("modality_max_moments", 12)
+        request = DescribeRequest(
+            modality=modality,
+            uri=ref_value,
+            mime=mime,
+            content_hash=content_hash,
+            hint=hint,
+            max_moments=int(cap),
+            fetch=_make_fetch(ref_kind, ref_value),
+        )
+        return call_modality_describe(request)
+    except Exception:
+        logger.info("media: describe failed for %s", asset_id, exc_info=True)
+        return None
+
+
+def _to_drafts(result, modality: str) -> Tuple[List[MomentDraft], int]:
+    """Map provider output onto storage drafts, dropping what cannot be written.
+
+    A provider's span guesses are validated here rather than trusted. Anything
+    that fails is dropped and counted -- one bad moment must not cost the batch,
+    since ``add_moments`` is deliberately all-or-nothing.
+    """
+    drafts: List[MomentDraft] = []
+    seen = set()
+    skipped = 0
+
+    described = list(getattr(result, "moments", None) or [])
+    if not described and getattr(result, "summary", None):
+        described = [_summary_moment(result.summary)]
+
+    for ordinal, item in enumerate(described):
+        span_kind = _span_kind_for(item, modality)
+        draft = MomentDraft(
+            kind=_moment_kind_for(item, modality),
+            text=str(getattr(item, "text", "") or "").strip(),
+            span_kind=span_kind,
+            t_start_ms=getattr(item, "t_start_ms", None) if span_kind == "time" else None,
+            t_end_ms=getattr(item, "t_end_ms", None) if span_kind == "time" else None,
+            page_start=getattr(item, "page_start", None) if span_kind == "page" else None,
+            page_end=getattr(item, "page_end", None) if span_kind == "page" else None,
+            char_start=getattr(item, "char_start", None) if span_kind == "char" else None,
+            char_end=getattr(item, "char_end", None) if span_kind == "char" else None,
+            bbox=getattr(item, "bbox", None) if span_kind == "box" else None,
+            speaker=getattr(item, "speaker", None) if span_kind == "time" else None,
+            confidence=float(getattr(item, "confidence", 1.0) or 1.0),
+            ordinal=ordinal,
+            provider=getattr(result, "provider", None),
+            provider_model=getattr(result, "model", None),
+        )
+        if not draft.text or draft.kind not in MOMENT_KINDS:
+            skipped += 1
+            continue
+        try:
+            validate_span(draft.span_kind, draft.span_values(), draft.speaker)
+        except (ValueError, TypeError):
+            skipped += 1
+            continue
+
+        key = (draft.kind, draft.span_key())
+        if key in seen:
+            # Providers repeat themselves. The unique index would collapse these
+            # anyway; dropping here keeps add_moments' strict batch check honest.
+            skipped += 1
+            continue
+        seen.add(key)
+        drafts.append(draft)
+
+    return drafts, skipped
+
+
+def _summary_moment(summary: str):
+    from mnemosyne.core.modality_backends import DescribedMoment
+    return DescribedMoment(kind="summary", text=str(summary))
+
+
+def _moment_kind_for(item, modality: str) -> str:
+    kind = str(getattr(item, "kind", "") or "").strip().lower()
+    if kind in MOMENT_KINDS:
+        return kind
+    return {"audio": "transcript", "video": "shot", "document": "page"}.get(
+        modality, "caption"
+    )
+
+
+def _span_kind_for(item, modality: str) -> str:
+    """Pick the span kind from what the provider actually populated.
+
+    Order matters: a provider that returns both a timestamp and a bbox gets the
+    timestamp, because the time axis is the one a user queries. Everything that
+    populates nothing is ``whole``, which is always writable.
+    """
+    if getattr(item, "t_start_ms", None) is not None:
+        return "time"
+    if getattr(item, "page_start", None) is not None:
+        return "page"
+    if getattr(item, "char_start", None) is not None and getattr(item, "char_end", None) is not None:
+        return "char"
+    if getattr(item, "bbox", None) is not None:
+        return "box"
+    return "whole"
+
+
+def _bind_moment_memories(
+    beam, store: MediaStore, asset_id: str, drafts: List[MomentDraft],
+    moment_ids: List[str], *, source: str, importance: float, scope: str,
+    provider: Optional[str], model: Optional[str],
+) -> List[str]:
+    """Write a memory row per *newly unbound* moment and bind it.
+
+    Only unbound moments get a row: on a repeat ingest the moments already exist
+    and are already bound, and writing a second memory row for each would
+    reintroduce the duplication the unique index exists to prevent.
+    """
+    bound: List[str] = []
+    existing = {m["moment_id"]: m for m in store.get_moments(asset_id)}
+
+    for draft, moment_id in zip(drafts, moment_ids):
+        row = existing.get(moment_id)
+        if row is not None and row.get("memory_id"):
+            bound.append(row["memory_id"])
+            continue
+        memory_id = _remember_text(
+            beam, draft.text, source=source, importance=importance, scope=scope,
+            metadata={"media": {
+                "asset_id": asset_id, "moment_id": moment_id,
+                "kind": draft.kind, "span_kind": draft.span_kind,
+                "provider": provider, "provider_model": model,
+            }},
+        )
+        if memory_id is None:
+            continue
+        store.bind_moment_memory(moment_id, memory_id)
+        bound.append(memory_id)
+
+    return bound
