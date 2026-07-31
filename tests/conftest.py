@@ -69,6 +69,15 @@ def _close_cached_connections():
     except Exception:
         pass
 
+    # Same reasoning for the content-resolver registry. Note this clears only
+    # explicit registrations: the built-in blob resolver survives, so tests
+    # that read blobs still work after the reset.
+    try:
+        from mnemosyne.core import resolvers as _resolvers_mod
+        _resolvers_mod.clear_content_resolvers()
+    except Exception:
+        pass
+
 
 @pytest.fixture(autouse=True)
 def _reset_thread_local_connections():
