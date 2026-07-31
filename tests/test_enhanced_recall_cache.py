@@ -443,41 +443,54 @@ def test_enhanced_recall_reloaded_weight_snapshot_misses_cache_and_changes_key(
 def test_enhanced_recall_reload_boundary_uses_one_complete_weight_generation(
     enhanced, monkeypatch, tmp_path: Path
 ):
-    """Enhanced cache-key and base recall share one non-hybrid config snapshot."""
+    """A reload at the snapshot boundary reaches cache and recall as one generation."""
     memory, calls = enhanced
     data_dir = tmp_path / "config"
     data_dir.mkdir()
     config_path = data_dir / "config.yaml"
-    old_generation = (1.0, 0.0, 0.0)
     new_generation = (0.0, 1.0, 0.0)
     config_path.write_text("vec_weight: 1\nfts_weight: 0\nimportance_weight: 0\n")
     monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
     MnemosyneConfig.reset_instance()
     config = get_config()
     original_maybe_reload = config._maybe_reload
+    original_resolver = beam_module._resolve_recall_weights
     reads = 0
+    weight_resolution_reads = []
+    in_weight_resolution = False
     observed_key_weights = []
     original_key = memory._enhanced_recall_cache_key
 
-    def reload_before_second_legacy_read():
+    def reload_at_snapshot_boundary():
         nonlocal reads
         reads += 1
-        if reads == 2:
+        original_maybe_reload()
+        if in_weight_resolution:
             config_path.write_text("vec_weight: 0\nfts_weight: 1\nimportance_weight: 0\n")
             config.reload()
-        else:
-            original_maybe_reload()
+
+    def capture_resolver(*args, **kwargs):
+        nonlocal in_weight_resolution
+        start_reads = reads
+        in_weight_resolution = True
+        try:
+            return original_resolver(*args, **kwargs)
+        finally:
+            in_weight_resolution = False
+            weight_resolution_reads.append(reads - start_reads)
 
     def capture_key(*args, **kwargs):
         observed_key_weights.append(kwargs["weights"])
         return original_key(*args, **kwargs)
 
-    monkeypatch.setattr(config, "_maybe_reload", reload_before_second_legacy_read)
+    monkeypatch.setattr(config, "_maybe_reload", reload_at_snapshot_boundary)
+    monkeypatch.setattr(beam_module, "_resolve_recall_weights", capture_resolver)
     monkeypatch.setattr(memory, "_enhanced_recall_cache_key", capture_key)
     _call(memory, "atomic enhanced snapshot")
 
     base_weights = calls[0][2]["_resolved_weights"].as_tuple()
-    assert base_weights in {old_generation, new_generation}
+    assert weight_resolution_reads == [1]
+    assert base_weights == new_generation
     assert observed_key_weights == [base_weights]
 
 

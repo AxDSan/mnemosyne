@@ -284,10 +284,11 @@ class TestRecallConfigurableWeights:
         assert all(math.isfinite(weight) for weight in weights.values())
         assert all(math.isfinite(result["score"]) for result in payload["results"])
 
-    def test_multi_key_weight_snapshot_never_mixes_yaml_generations(self, temp_db, monkeypatch):
-        """A reload between legacy single-key reads cannot create a hybrid triplet."""
+    def test_multi_key_weight_snapshot_uses_one_generation_at_reload_boundary(
+        self, temp_db, monkeypatch
+    ):
+        """A reload at the snapshot boundary yields one complete new generation."""
         config_path = temp_db.parent / "config.yaml"
-        old_generation = (1.0, 0.0, 0.0)
         new_generation = (0.0, 1.0, 0.0)
         config_path.write_text("vec_weight: 1\nfts_weight: 0\nimportance_weight: 0\n")
         monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(temp_db.parent))
@@ -296,19 +297,18 @@ class TestRecallConfigurableWeights:
         original_maybe_reload = config._maybe_reload
         reads = 0
 
-        def reload_before_second_legacy_read():
+        def reload_at_snapshot_boundary():
             nonlocal reads
             reads += 1
-            if reads == 2:
-                config_path.write_text("vec_weight: 0\nfts_weight: 1\nimportance_weight: 0\n")
-                config.reload()
-            else:
-                original_maybe_reload()
+            original_maybe_reload()
+            config_path.write_text("vec_weight: 0\nfts_weight: 1\nimportance_weight: 0\n")
+            config.reload()
 
-        monkeypatch.setattr(config, "_maybe_reload", reload_before_second_legacy_read)
+        monkeypatch.setattr(config, "_maybe_reload", reload_at_snapshot_boundary)
         snapshot = beam_module._resolve_recall_weights(None, None, None).as_tuple()
 
-        assert snapshot in {old_generation, new_generation}
+        assert reads == 1
+        assert snapshot == new_generation
 
     def test_config_multi_key_read_uses_one_yaml_generation(self, temp_db, monkeypatch):
         """The generic config API performs one reload check for a multi-key read."""
