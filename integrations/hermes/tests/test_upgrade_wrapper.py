@@ -40,6 +40,7 @@ def test_upgrade_reregisters_with_existing_wrapper_mode_and_interpreter(
     monkeypatch.setattr(upgrade, "check_available_version", lambda method: "0.5.1")
     monkeypatch.setattr(upgrade, "run_upgrade_command", lambda method, capture: (0, ""))
     monkeypatch.setattr(install, "plugin_state", lambda **kwargs: state)
+    monkeypatch.setattr(install, "profile_links_enabled", lambda **kwargs: True)
     monkeypatch.setattr(
         install,
         "run_install",
@@ -53,8 +54,32 @@ def test_upgrade_reregisters_with_existing_wrapper_mode_and_interpreter(
             "hermes_home_path": str(tmp_path),
             "mode": expected_mode,
             "python": expected_python,
+            "link_profiles": True,
         }
     ]
+
+
+def test_upgrade_preserves_root_only_profile_link_preference(monkeypatch, tmp_path):
+    state = install.PluginState(
+        status="installed",
+        installed=True,
+        target=tmp_path / "plugins" / "mnemosyne",
+        message="installed",
+        mode="wrapper",
+        wrapper_python=Path("/selected/venv/bin/python"),
+    )
+    calls = []
+    monkeypatch.setattr(upgrade, "detect_install_method", lambda: "pip")
+    monkeypatch.setattr(upgrade, "get_current_version", lambda: "0.5.0")
+    monkeypatch.setattr(upgrade, "get_current_core_version", lambda: "3.11.1")
+    monkeypatch.setattr(upgrade, "check_available_version", lambda method: "0.5.1")
+    monkeypatch.setattr(upgrade, "run_upgrade_command", lambda method, capture: (0, ""))
+    monkeypatch.setattr(install, "plugin_state", lambda **kwargs: state)
+    monkeypatch.setattr(install, "profile_links_enabled", lambda **kwargs: False)
+    monkeypatch.setattr(install, "run_install", lambda **kwargs: calls.append(kwargs) or 0)
+
+    assert upgrade.upgrade_command(SimpleNamespace(hermes_home=str(tmp_path))) == 0
+    assert calls[0]["link_profiles"] is False
 
 
 def test_upgrade_stops_before_package_upgrade_for_invalid_wrapper(monkeypatch, tmp_path, capsys):

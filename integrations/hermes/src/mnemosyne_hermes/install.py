@@ -725,6 +725,33 @@ def _link_all_profiles(
     return linked
 
 
+def profile_links_enabled(*, hermes_home_path: str | Path | None = None) -> bool:
+    """Return whether opted-in profiles currently link to this home's plugin.
+
+    Upgrade uses the observed state to preserve a prior root-only installation
+    without persisting separate installer configuration. Missing links mean the
+    safer root-only behavior; when no child profiles exist the distinction has
+    no effect.
+    """
+    target = plugin_target_dir(hermes_home_path)
+    if not (target.is_symlink() or target.exists()):
+        return False
+    try:
+        expected = target.resolve()
+    except OSError:
+        return False
+    for profile_home in _iter_mnemosyne_profiles(hermes_home_path):
+        profile_target = profile_home / "plugins" / PLUGIN_NAME
+        if not profile_target.is_symlink():
+            continue
+        try:
+            if profile_target.resolve() == expected:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _verify_links(*, hermes_home_path: str | Path | None = None) -> bool:
     """Print PASS/FAIL for each home that should have a resolvable plugin link.
 
@@ -1284,7 +1311,7 @@ def _parser() -> argparse.ArgumentParser:
         dest="link_profiles",
         action="store_false",
         default=True,
-        help="Install only at --hermes-home; do not link opted-in child profiles.",
+        help="Install only at the selected Hermes home; do not link opted-in child profiles.",
     )
     subparsers.add_parser(
         "uninstall",

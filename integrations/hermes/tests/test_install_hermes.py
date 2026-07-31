@@ -70,6 +70,41 @@ def test_wrapper_install_root_only_does_not_link_opted_in_child_profile(tmp_path
     assert not (child / "plugins" / "mnemosyne").exists()
 
 
+def test_root_only_install_does_not_remove_existing_child_profile_link(tmp_path):
+    _skip_on_windows()
+    child = _make_profile(tmp_path, "child", "mnemosyne")
+    install_plugin(hermes_home_path=tmp_path)
+    child_link = child / "plugins" / "mnemosyne"
+
+    install_plugin(
+        hermes_home_path=tmp_path,
+        mode="wrapper",
+        python=sys.executable,
+        force=True,
+        link_profiles=False,
+    )
+
+    assert child_link.is_symlink()
+
+
+def test_profile_links_enabled_reflects_existing_root_profile_links(tmp_path):
+    _skip_on_windows()
+    _make_profile(tmp_path, "child", "mnemosyne")
+
+    install_plugin(hermes_home_path=tmp_path)
+
+    assert install_mod.profile_links_enabled(hermes_home_path=tmp_path) is True
+
+
+def test_profile_links_enabled_is_false_for_root_only_install(tmp_path):
+    _skip_on_windows()
+    _make_profile(tmp_path, "child", "mnemosyne")
+
+    install_plugin(hermes_home_path=tmp_path, link_profiles=False)
+
+    assert install_mod.profile_links_enabled(hermes_home_path=tmp_path) is False
+
+
 def test_rerun_is_idempotent(tmp_path):
     _skip_on_windows()
     profile_a = _make_profile(tmp_path, "alice", "mnemosyne")

@@ -116,7 +116,7 @@ def upgrade_command(args=None) -> int:
     """
     dry_run = getattr(args, "dry_run", False) if args else False
     hermes_home_path = getattr(args, "hermes_home", None) if args else None
-    from mnemosyne_hermes.install import plugin_state
+    from mnemosyne_hermes.install import plugin_state, profile_links_enabled
 
     existing_plugin = plugin_state(hermes_home_path=hermes_home_path)
     if existing_plugin.status == "invalid_wrapper":
@@ -126,6 +126,7 @@ def upgrade_command(args=None) -> int:
         return 1
     install_mode = "wrapper" if existing_plugin.mode == "wrapper" else "symlink"
     wrapper_python = existing_plugin.wrapper_python if install_mode == "wrapper" else None
+    link_profiles = profile_links_enabled(hermes_home_path=hermes_home_path)
 
     method = detect_install_method()
     current_ver = get_current_version()
@@ -189,6 +190,7 @@ def upgrade_command(args=None) -> int:
             hermes_home_path=hermes_home_path,
             mode=install_mode,
             python=wrapper_python,
+            link_profiles=link_profiles,
         )
         if result_code != 0:
             print("  ⚠ Re-registration had issues (see output above).")
