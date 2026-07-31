@@ -87,11 +87,11 @@ def test_root_only_install_does_not_remove_existing_child_profile_link(tmp_path)
     assert child_link.is_symlink()
 
 
-def test_profile_links_enabled_reflects_existing_root_profile_links(tmp_path):
+def test_profile_links_preference_preserves_default_when_profiles_are_added_later(tmp_path):
     _skip_on_windows()
-    _make_profile(tmp_path, "child", "mnemosyne")
 
     install_plugin(hermes_home_path=tmp_path)
+    _make_profile(tmp_path, "child", "mnemosyne")
 
     assert install_mod.profile_links_enabled(hermes_home_path=tmp_path) is True
 

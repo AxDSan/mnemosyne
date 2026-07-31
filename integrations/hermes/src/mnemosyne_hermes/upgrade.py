@@ -119,14 +119,17 @@ def upgrade_command(args=None) -> int:
     from mnemosyne_hermes.install import plugin_state, profile_links_enabled
 
     existing_plugin = plugin_state(hermes_home_path=hermes_home_path)
+    link_profiles = profile_links_enabled(hermes_home_path=hermes_home_path)
+    install_command = "mnemosyne-hermes install --force"
+    if not link_profiles:
+        install_command += " --no-profile-links"
     if existing_plugin.status == "invalid_wrapper":
         print("⚠ Cannot safely upgrade an invalid Mnemosyne wrapper.")
         print(f"  {existing_plugin.message}")
-        print("  Repair it with: mnemosyne-hermes install --force --mode wrapper")
+        print(f"  Repair it with: {install_command} --mode wrapper")
         return 1
     install_mode = "wrapper" if existing_plugin.mode == "wrapper" else "symlink"
     wrapper_python = existing_plugin.wrapper_python if install_mode == "wrapper" else None
-    link_profiles = profile_links_enabled(hermes_home_path=hermes_home_path)
 
     method = detect_install_method()
     current_ver = get_current_version()
@@ -143,7 +146,7 @@ def upgrade_command(args=None) -> int:
         print("    uv tool upgrade mnemosyne-hermes")
         print("    pip install --upgrade mnemosyne-hermes[all]")
         print("\n  After upgrading, re-register the plugin:")
-        print("    mnemosyne-hermes install --force")
+        print(f"    {install_command}")
         return 1
 
     # Check available version (best-effort)
@@ -160,7 +163,7 @@ def upgrade_command(args=None) -> int:
     if dry_run:
         method_name = {"pipx": "pipx upgrade", "uv-tool": "uv tool upgrade", "pip": "pip install --upgrade"}.get(method, method)
         print(f"\n  Would run: {method_name} mnemosyne-hermes")
-        print("  Would run: mnemosyne-hermes install --force")
+        print(f"  Would run: {install_command}")
         print(f"  Plugin symlink target: {Path(hermes_home_path or '~/.hermes').expanduser() / 'plugins' / 'mnemosyne'}")
         return 0
 
@@ -194,11 +197,11 @@ def upgrade_command(args=None) -> int:
         )
         if result_code != 0:
             print("  ⚠ Re-registration had issues (see output above).")
-            print("  Run manually: mnemosyne-hermes install --force")
+            print(f"  Run manually: {install_command}")
             return 1
     except Exception as e:
         print(f"  ⚠ Could not auto-run install step: {e}")
-        print("  Run manually: mnemosyne-hermes install --force")
+        print(f"  Run manually: {install_command}")
         return 1
 
     print("\n✓ Upgrade complete!")

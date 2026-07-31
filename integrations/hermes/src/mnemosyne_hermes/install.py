@@ -725,14 +725,40 @@ def _link_all_profiles(
     return linked
 
 
-def profile_links_enabled(*, hermes_home_path: str | Path | None = None) -> bool:
-    """Return whether opted-in profiles currently link to this home's plugin.
+def _profile_links_preference_path(hermes_home_path: str | Path | None = None) -> Path:
+    """Return the installer-managed profile-link preference for a Hermes home."""
+    base = Path(hermes_home_path).expanduser() if hermes_home_path else hermes_home()
+    return base / "plugins" / ".mnemosyne-profile-links.json"
 
-    Upgrade uses the observed state to preserve a prior root-only installation
-    without persisting separate installer configuration. Missing links mean the
-    safer root-only behavior; when no child profiles exist the distinction has
-    no effect.
+
+def _write_profile_links_preference(
+    enabled: bool,
+    *,
+    hermes_home_path: str | Path | None = None,
+) -> None:
+    """Persist the selected profile-link behavior for later upgrades."""
+    path = _profile_links_preference_path(hermes_home_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"link_profiles": enabled}) + "\n", encoding="utf-8")
+
+
+def profile_links_enabled(*, hermes_home_path: str | Path | None = None) -> bool:
+    """Return the selected profile-link behavior for a Hermes home.
+
+    New installs persist the explicit selection, which lets upgrades distinguish
+    the default enabled behavior from an explicit root-only installation even
+    when no opted-in child profile exists yet. Existing installs without the
+    preference file retain the legacy observed-link fallback.
     """
+    try:
+        preference = json.loads(
+            _profile_links_preference_path(hermes_home_path).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        preference = None
+    if isinstance(preference, dict) and isinstance(preference.get("link_profiles"), bool):
+        return preference["link_profiles"]
+
     target = plugin_target_dir(hermes_home_path)
     if not (target.is_symlink() or target.exists()):
         return False
@@ -1108,6 +1134,7 @@ def install_plugin(
         os.symlink(str(source), str(target))
         if link_profiles:
             _link_all_profiles(source, hermes_home_path=hermes_home_path, force=force)
+        _write_profile_links_preference(link_profiles, hermes_home_path=hermes_home_path)
         return target
 
     # Validate and fully write the replacement before removing a working wrapper.
@@ -1125,6 +1152,7 @@ def install_plugin(
         shutil.rmtree(staging_parent, ignore_errors=True)
     if link_profiles:
         _link_all_profiles(target, hermes_home_path=hermes_home_path, force=force)
+    _write_profile_links_preference(link_profiles, hermes_home_path=hermes_home_path)
     return target
 
 
@@ -1139,6 +1167,7 @@ def uninstall_plugin(*, hermes_home_path: str | Path | None = None) -> Path:
         target.unlink()
     elif target.exists():
         shutil.rmtree(target)
+    _profile_links_preference_path(hermes_home_path).unlink(missing_ok=True)
     return target
 
 
@@ -1204,6 +1233,14 @@ def cleanup_plugin(
                         actions.append("Reset config: memory.provider from 'mnemosyne' to unset")
         except Exception:
             pass
+
+    preference_path = _profile_links_preference_path(hermes_home_path)
+    if preference_path.exists():
+        if dry_run:
+            actions.append(f"Would remove: {preference_path}")
+        else:
+            preference_path.unlink()
+            actions.append(f"Removed: {preference_path}")
 
     return actions
 
