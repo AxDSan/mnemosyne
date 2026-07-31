@@ -1037,6 +1037,7 @@ def install_plugin(
     mode: str = "symlink",
     python: str | Path | None = None,
     migrate_wrapper_to_symlink: bool = False,
+    link_profiles: bool = True,
 ) -> Path:
     """Install the Mnemosyne provider into Hermes' user plugin directory.
 
@@ -1044,6 +1045,9 @@ def install_plugin(
     creates a real persistent plugin directory containing a tiny shim that
     activates the selected interpreter's site-packages (including editable
     install ``.pth`` files) and imports ``mnemosyne_hermes`` from there.
+    ``link_profiles`` preserves the historical
+    opted-in profile fan-out by default; set it False to install only at the
+    selected Hermes home.
     """
     if mode not in {"symlink", "wrapper"}:
         raise ValueError("mode must be 'symlink' or 'wrapper'")
@@ -1075,7 +1079,8 @@ def install_plugin(
             )
         _prepare_plugin_target(base, target, force=force)
         os.symlink(str(source), str(target))
-        _link_all_profiles(source, hermes_home_path=hermes_home_path, force=force)
+        if link_profiles:
+            _link_all_profiles(source, hermes_home_path=hermes_home_path, force=force)
         return target
 
     # Validate and fully write the replacement before removing a working wrapper.
@@ -1091,7 +1096,8 @@ def install_plugin(
         _replace_plugin_target_with_staged(target, staged)
     finally:
         shutil.rmtree(staging_parent, ignore_errors=True)
-    _link_all_profiles(target, hermes_home_path=hermes_home_path, force=force)
+    if link_profiles:
+        _link_all_profiles(target, hermes_home_path=hermes_home_path, force=force)
     return target
 
 
@@ -1273,6 +1279,13 @@ def _parser() -> argparse.ArgumentParser:
             "wrapper with the default symlink install."
         ),
     )
+    install.add_argument(
+        "--no-profile-links",
+        dest="link_profiles",
+        action="store_false",
+        default=True,
+        help="Install only at --hermes-home; do not link opted-in child profiles.",
+    )
     subparsers.add_parser(
         "uninstall",
         help="Remove Mnemosyne from Hermes' memory provider plugin directory.",
@@ -1310,6 +1323,7 @@ def run_install(
     mode: str = "symlink",
     python: str | Path | None = None,
     migrate_wrapper_to_symlink: bool = False,
+    link_profiles: bool = True,
 ) -> int:
     """Core install logic — check deps, bootstrap Hermes venv if needed, create symlink.
 
@@ -1360,6 +1374,7 @@ def run_install(
         mode=mode,
         python=python,
         migrate_wrapper_to_symlink=migrate_wrapper_to_symlink,
+        link_profiles=link_profiles,
     )
     skill_result = install_bundled_skill(
         hermes_home_path=hermes_home_path,
@@ -1417,6 +1432,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  Hermes Python: {hermes_python or 'not found'}")
                 print(f"  Currently installed: {'yes' if is_installed(hermes_home_path=args.hermes_home) else 'no'}")
                 print(f"  Install mode: {getattr(args, 'mode', 'symlink')}")
+                print(f"  Will link opted-in profiles: {bool(getattr(args, 'link_profiles', True))}")
                 print(f"  Skill target file: {skill.target}")
                 print(f"  Skill state: {skill.status}")
                 print(f"  Skill action: {skill_plan.message}")
@@ -1449,6 +1465,7 @@ def main(argv: list[str] | None = None) -> int:
                 mode=getattr(args, "mode", "symlink"),
                 python=getattr(args, "python", None),
                 migrate_wrapper_to_symlink=getattr(args, "migrate_wrapper_to_symlink", False),
+                link_profiles=getattr(args, "link_profiles", True),
             )
 
         if command == "uninstall":

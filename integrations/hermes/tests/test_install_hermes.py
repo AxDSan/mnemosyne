@@ -54,6 +54,22 @@ def test_only_opted_in_profile_gets_link(tmp_path):
     assert not (profile_b / "plugins" / "mnemosyne").exists()
 
 
+def test_wrapper_install_root_only_does_not_link_opted_in_child_profile(tmp_path):
+    _skip_on_windows()
+    child = _make_profile(tmp_path, "child", "mnemosyne")
+
+    target = install_plugin(
+        hermes_home_path=tmp_path,
+        mode="wrapper",
+        python=sys.executable,
+        link_profiles=False,
+    )
+
+    assert target == tmp_path / "plugins" / "mnemosyne"
+    assert target.is_dir() and not target.is_symlink()
+    assert not (child / "plugins" / "mnemosyne").exists()
+
+
 def test_rerun_is_idempotent(tmp_path):
     _skip_on_windows()
     profile_a = _make_profile(tmp_path, "alice", "mnemosyne")
