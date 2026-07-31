@@ -3461,6 +3461,13 @@ class BeamMemory:
         from mnemosyne.core.canonical import CanonicalStore
         self.canonical = CanonicalStore(db_path=self.db_path, conn=self.conn)
 
+        # Media assets + moment index (RFC 0003 phase 0). Wired exactly like
+        # CanonicalStore above: the store owns its own idempotent DDL, so
+        # existing banks acquire the tables on next open with no migration
+        # module. Zero lines in init_beam, which holds only first-party DDL.
+        from mnemosyne.core.media import MediaStore
+        self.media = MediaStore(db_path=self.db_path, conn=self.conn)
+
         # Phase 3: Episodic graph (shared connection)
         self.episodic_graph = None
         if EpisodicGraph is not None:

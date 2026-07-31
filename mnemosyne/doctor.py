@@ -85,6 +85,11 @@ _DOCTOR_TABLE_COLUMNS: dict[str, frozenset[str]] = {
     "graph_edges": frozenset({"source", "target"}),
     "canonical_facts": frozenset({"owner_id", "category", "name", "valid_until"}),
     "triples": frozenset({"valid_from", "valid_until"}),
+    # Media sidecars (RFC 0003). Only the two reference columns are approved --
+    # `text`, `speaker`, and the span columns are user content and must never
+    # reach a metric.
+    "media_assets": frozenset({"asset_id"}),
+    "media_moments": frozenset({"asset_id", "memory_id"}),
 }
 _DOCTOR_TABLES = tuple(_DOCTOR_TABLE_COLUMNS)
 
@@ -1300,6 +1305,7 @@ class ReferenceContractRegistry:
                 "episodic_memory",
                 "canonical_facts",
                 "triples",
+                "media_moments",
             )
         }
 
@@ -1405,7 +1411,79 @@ class ReferenceContractRegistry:
             findings,
         )
         self._inspect_unverifiable_stores(catalog, metrics)
+        self._inspect_media(catalog, live_union, metrics, findings)
         return AdapterResult(metrics=metrics, findings=findings, repair_candidates=candidates)
+
+    def _inspect_media(
+        self,
+        catalog: _CatalogResult,
+        live_union: str,
+        metrics: dict[str, Any],
+        findings: list[Finding],
+    ) -> None:
+        """Count both media orphan kinds; warn about only one of them.
+
+        A moment whose ``asset_id`` has no asset is real corruption — nothing in
+        RFC 0003 should ever produce it — so it gets a Finding.
+
+        A moment whose ``memory_id`` no longer resolves is the *expected* steady
+        state: consolidation summarizes the memory row away and
+        ``media_moments.text`` stays authoritative, and working memory is
+        trimmed on a cap. Warning about those would make this check cry wolf at
+        every healthy media user after their first ``sleep()``, which trains
+        people to ignore the half of it that catches the real corruption.
+
+        This runs on the read-only doctor connection, so the tables-absent case
+        must take the ``not_configured`` branch and never attempt DDL.
+        """
+        empty = {"status": "not_configured", "asset_orphans": 0, "memory_orphans": 0}
+        if not {"media_moments", "media_assets"}.issubset(catalog.tables):
+            metrics["media_moments"] = empty
+            return
+        columns = _table_columns(self.conn, "media_moments", self.scan_limit)
+        if columns.error_class:
+            metrics["media_moments"] = {"status": STATUS_UNKNOWN, "error_class": columns.error_class}
+            return
+        required = {"asset_id", "memory_id"}
+        if not required.issubset(columns.columns):
+            metrics["media_moments"] = (
+                {"status": STATUS_UNKNOWN, "columns_truncated": True}
+                if columns.truncated else empty
+            )
+            return
+
+        asset_orphans = _bounded_count(
+            self.conn,
+            "SELECT 1 FROM media_moments m WHERE NOT EXISTS "
+            "(SELECT 1 FROM media_assets a WHERE a.asset_id = m.asset_id)",
+            self.scan_limit,
+        )
+        if live_union:
+            memory_orphans = _bounded_count(
+                self.conn,
+                "SELECT 1 FROM media_moments m WHERE m.memory_id IS NOT NULL "
+                f"AND m.memory_id NOT IN ({live_union})",
+                self.scan_limit,
+            )
+            status = "checked"
+        else:
+            memory_orphans = _BoundedCount(value=0)
+            status = "unverifiable_contract"
+
+        metrics["media_moments"] = _with_counts(
+            status, {"asset_orphans": asset_orphans, "memory_orphans": memory_orphans}
+        )
+        if not asset_orphans.error_class and asset_orphans.value:
+            findings.append(Finding(
+                code="references.media_moment_orphan_asset",
+                status=STATUS_WARNING,
+                severity=SEVERITY_WARNING,
+                message=(
+                    "Media moments reference assets that no longer exist. "
+                    "Moments whose memory row is gone are expected after "
+                    "consolidation and are counted without a warning."
+                ),
+            ))
 
     def _inspect_graph(
         self,
