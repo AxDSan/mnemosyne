@@ -199,12 +199,17 @@ def test_evidence_pack_polyphonic_candidate_only_pass_is_telemetry_neutral(tmp_p
         lambda: FakeEngine([PolyphonicResult(memory_id=memory_id, combined_score=0.9, voice_scores={}, metadata={})]),
     )
 
+    reset_recall_diagnostics()
     before = _state(db_path, memory_id)
     beam.recall_with_evidence_pack("Orion polyphonic", top_k=1, candidate_k=2, pack_k=1)
     after = _state(db_path, memory_id)
-    # The public primary call records one use; the wider internal candidate call records none.
+    diagnostics = get_recall_diagnostics()
+    # Only the public primary call mutates either usage state or diagnostics;
+    # the wider candidate pass is telemetry-neutral under the polyphonic path.
     assert after[0] == before[0] + 1
     assert after[1] is not None
+    assert diagnostics["totals"]["calls"] == 1
+    assert all(tier["total_hits"] == 0 for tier in diagnostics["by_tier"].values())
 
 
 def test_vector_only_candidate_is_opt_in(tmp_path: Path, monkeypatch):
@@ -277,3 +282,16 @@ def test_provenance_backfill_keeps_same_ids_separate_by_tier(tmp_path: Path, mon
     packed = beam.recall_with_evidence_pack("q", top_k=1, candidate_k=2, pack_k=1)
     assert packed["primary"][0]["session_id"] == "primary-session"
     assert packed["evidence_pack"][0]["session_id"] == "candidate-session"
+
+
+def test_evidence_pack_excludes_synthetic_candidate_tiers(tmp_path: Path, monkeypatch):
+    beam = BeamMemory(session_id="reader", db_path=tmp_path / "synthetic-tier.db")
+    calls = iter([
+        [],
+        [{"id": "memoria_source_test", "tier": "memoria", "session_id": "reader"}],
+    ])
+    monkeypatch.setattr(beam, "recall", lambda *args, **kwargs: next(calls))
+
+    packed = beam.recall_with_evidence_pack("q", top_k=1, candidate_k=2, pack_k=1)
+
+    assert packed == {"primary": [], "evidence_pack": []}

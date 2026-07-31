@@ -6100,6 +6100,10 @@ class BeamMemory:
         )
         primary_rows = primary.get("results", []) if isinstance(primary, dict) else primary
         candidate_rows = candidates.get("results", []) if isinstance(candidates, dict) else candidates
+        # Only storage-backed tiers can receive a verified source-session backfill.
+        candidate_rows = [
+            row for row in candidate_rows if row.get("tier") in {"working", "episodic"}
+        ]
         # Keep consolidated originals available to normal recall for provenance,
         # but do not let them compete with hot memories in supplemental packs.
         # The candidate rows already passed recall()'s visibility filters.
@@ -6266,9 +6270,10 @@ class BeamMemory:
                 for _v, _t in _voice_tier_map.items():
                     if _vs.get(_v):
                         _tier_kept[_t] += 1
-            for _t, _n in _tier_kept.items():
-                _recall_diag.record_tier_hits(_t, _n)
-            _recall_diag.record_call(truly_empty=(_kept == 0))
+            if _track_recall:
+                for _t, _n in _tier_kept.items():
+                    _recall_diag.record_tier_hits(_t, _n)
+                _recall_diag.record_call(truly_empty=(_kept == 0))
             if explain:
                 return {
                     "query": query,
