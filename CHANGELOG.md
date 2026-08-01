@@ -50,6 +50,16 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
   rotates the agent session through `/new`, `/resume`, `/branch`, undo, or context
   compression, so subsequent writes, reads, and tools use the active session.
 
+## [3.16.0] - 2026-08-01
+
+### Added
+
+- **Streamable HTTP MCP transport.** `mnemosyne mcp --transport streamable-http`
+  serves stateful MCP Streamable HTTP at `/mcp`, alongside the existing stdio
+  and legacy SSE transports. It uses the MCP SDK session manager for session
+  creation, routing, and explicit DELETE termination; network-exposed binds
+  retain the existing `MNEMOSYNE_MCP_TOKEN` bearer-token requirement.
+
 ## [3.15.1] - 2026-07-30
 
 ### Fixed
