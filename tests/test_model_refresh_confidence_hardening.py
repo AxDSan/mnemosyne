@@ -75,6 +75,18 @@ class TestParseNonFiniteConfidence:
                 raw, allowed_categories={"model:user"}
             ) == []
 
+    def test_boolean_confidence_is_rejected(self):
+        """bool subclasses int, so float(true) would read as full
+        confidence; it must degrade like any other non-numeric type."""
+        for literal in ("true", "false"):
+            raw = (
+                '[{"category": "model:user", "name": "style", "body": "b", '
+                f'"confidence": {literal}, "evidence_ids": ["e1", "e2"]}}]'
+            )
+            assert model_refresh.parse_model_update_proposals(
+                raw, allowed_categories={"model:user"}
+            ) == []
+
     def test_valid_confidence_still_parses(self):
         """Control: the non-finite filter must not eat well-formed proposals."""
         raw = (
@@ -94,6 +106,18 @@ class TestStoredConfidenceHardening:
         """NaN in persisted metadata must not bypass the confidence gate."""
         beam = BeamMemory(session_id="hard", db_path=tmp_path / "mnemo.db")
         pid = _store_proposal(beam, _proposal(confidence=float("nan")))
+
+        assert model_refresh.maybe_auto_apply_model_refresh_proposal(
+            beam, pid, owner_id="default"
+        ) is False
+
+        store = CanonicalStore(db_path=beam.db_path, conn=beam.conn)
+        assert store.recall("default", "model:user", "communication_style") is None
+
+    def test_auto_apply_rejects_boolean_stored_confidence(self, tmp_path):
+        """A persisted ``true`` confidence must not gate through as 1.0."""
+        beam = BeamMemory(session_id="hard", db_path=tmp_path / "mnemo.db")
+        pid = _store_proposal(beam, _proposal(confidence=True))
 
         assert model_refresh.maybe_auto_apply_model_refresh_proposal(
             beam, pid, owner_id="default"

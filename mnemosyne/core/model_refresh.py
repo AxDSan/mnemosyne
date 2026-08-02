@@ -87,8 +87,12 @@ def coerce_confidence(value: Any, default: float) -> float:
     degrade to the caller's default instead of raising. NaN in
     particular must never survive as a float: it compares False against
     every threshold, so downstream gates of the form
-    ``confidence < minimum`` silently pass it.
+    ``confidence < minimum`` silently pass it. bool is rejected before
+    the float attempt: it subclasses int, so ``float(True)`` would
+    silently read a JSON ``true`` as full confidence.
     """
+    if isinstance(value, bool):
+        return default
     try:
         value = float(value)
     except (TypeError, ValueError):
