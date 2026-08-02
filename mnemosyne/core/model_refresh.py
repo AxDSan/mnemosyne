@@ -78,7 +78,7 @@ def _coerce_evidence_ids(value: Any) -> List[str]:
 
 
 def coerce_confidence(value: Any, default: float) -> float:
-    """Return value as a finite float, or default.
+    """Return value as a finite float clamped to [0.0, 1.0], or default.
 
     Confidence reaches this module from two unhardened directions: LLM
     JSON (json.loads round-trips NaN and Infinity, so a model can emit
@@ -89,7 +89,10 @@ def coerce_confidence(value: Any, default: float) -> float:
     every threshold, so downstream gates of the form
     ``confidence < minimum`` silently pass it. bool is rejected before
     the float attempt: it subclasses int, so ``float(True)`` would
-    silently read a JSON ``true`` as full confidence.
+    silently read a JSON ``true`` as full confidence. Finite values are
+    clamped to the confidence domain: a persisted ``2.0`` must not
+    outrank every in-range proposal or reach the canonical store
+    unbounded.
     """
     if isinstance(value, bool):
         return default
@@ -97,7 +100,9 @@ def coerce_confidence(value: Any, default: float) -> float:
         value = float(value)
     except (TypeError, ValueError, OverflowError):
         return default
-    return value if math.isfinite(value) else default
+    if not math.isfinite(value):
+        return default
+    return max(0.0, min(1.0, value))
 
 
 def parse_model_update_proposals(
@@ -131,7 +136,6 @@ def parse_model_update_proposals(
         confidence = coerce_confidence(item.get("confidence", 0.0), 0.0)
         if confidence <= 0.0:
             continue
-        confidence = max(0.0, min(1.0, confidence))
         evidence_ids = _coerce_evidence_ids(item.get("evidence_ids") or item.get("evidence") or [])
         if not evidence_ids:
             continue

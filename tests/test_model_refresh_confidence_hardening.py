@@ -139,6 +139,35 @@ class TestStoredConfidenceHardening:
         store = CanonicalStore(db_path=beam.db_path, conn=beam.conn)
         assert store.recall("default", "model:user", "communication_style") is None
 
+    def test_auto_apply_normalizes_overrange_stored_confidence(self, tmp_path):
+        """A persisted finite 2.0 cleared the gate and reached the
+        canonical store unbounded; it must apply at the clamped 1.0."""
+        beam = BeamMemory(session_id="hard", db_path=tmp_path / "mnemo.db")
+        pid = _store_proposal(beam, _proposal(confidence=2.0))
+
+        assert model_refresh.maybe_auto_apply_model_refresh_proposal(
+            beam, pid, owner_id="default"
+        ) is True
+
+        canonical = CanonicalStore(db_path=beam.db_path, conn=beam.conn).recall(
+            "default", "model:user", "communication_style"
+        )
+        assert canonical is not None
+        assert canonical["confidence"] == pytest.approx(1.0)
+
+    def test_auto_apply_rejects_negative_stored_confidence(self, tmp_path):
+        """A persisted negative confidence clamps to 0.0 and must fail
+        the gate rather than persist below the domain floor."""
+        beam = BeamMemory(session_id="hard", db_path=tmp_path / "mnemo.db")
+        pid = _store_proposal(beam, _proposal(confidence=-3.0))
+
+        assert model_refresh.maybe_auto_apply_model_refresh_proposal(
+            beam, pid, owner_id="default"
+        ) is False
+
+        store = CanonicalStore(db_path=beam.db_path, conn=beam.conn)
+        assert store.recall("default", "model:user", "communication_style") is None
+
     def test_apply_survives_legacy_text_confidence(self, tmp_path):
         """A legacy bank's text confidence applies at the 0.5 default
         instead of raising ValueError."""
