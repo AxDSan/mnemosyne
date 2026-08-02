@@ -1262,6 +1262,7 @@ class _BeamConnection(sqlite3.Connection):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._defer_commit = False
+        self._vec_working_count_cache: Optional[Tuple[int, int, int]] = None
 
     def commit(self) -> None:
         if self._defer_commit:
@@ -2888,7 +2889,20 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
     # the candidate neighborhood until enough filtered rows are found or the
     # vector table is exhausted, then return only the requested result count.
     try:
-        total_vectors = int(conn.execute("SELECT COUNT(*) FROM vec_working").fetchone()[0])
+        # COUNT(*) on a vec0 virtual table is a full scan. Cache it across
+        # read-only searches, invalidating on both external commits
+        # (data_version) and writes through this connection (total_changes).
+        count_stamp = (
+            int(conn.execute("PRAGMA data_version").fetchone()[0]),
+            int(conn.total_changes),
+        )
+        cached_count = getattr(conn, "_vec_working_count_cache", None)
+        if cached_count is not None and cached_count[:2] == count_stamp:
+            total_vectors = cached_count[2]
+        else:
+            total_vectors = int(conn.execute("SELECT COUNT(*) FROM vec_working").fetchone()[0])
+            if isinstance(conn, _BeamConnection):
+                conn._vec_working_count_cache = (*count_stamp, total_vectors)
     except Exception:
         return []
     if total_vectors == 0:
@@ -2896,7 +2910,7 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
     scan_k = min(total_vectors, max(k * 25, 500))
     match_expr = {
         "bit": "vec_quantize_binary(?)",
-        "int8": 'vec_quantize_int8(?, "unit")',
+        "int8": "vec_quantize_int8(?, 'unit')",
     }.get(vec_type, "?")
     rows = []
     while True:
