@@ -6,10 +6,18 @@ Entry point at repo root for `hermes plugins install` compatibility.
 import sys
 from pathlib import Path
 
-# Ensure this directory is on path so `hermes_plugin` is discoverable
+# Ensure this directory is on path so `hermes_plugin` is discoverable.
+# Unconditional insert: when the repo is checked out under
+# $HERMES_HOME/plugins/ (the root-repo layout), an ambient sys.path entry for
+# that parent dir can shadow this checkout — making `import mnemosyne`
+# resolve to THIS plugin __init__ (the stub) instead of the mnemosyne core
+# subpackage. hermes_memory_provider's `from mnemosyne.core...` imports then
+# fail with "No module named 'mnemosyne.core'" and the provider silently does
+# not load. Always promoting the real repo root keeps the plugin's own core
+# authoritative regardless of how the process was launched (Hermes runtime,
+# pytest namespace detection, etc.).
 _repo_root = Path(__file__).resolve().parent
-if str(_repo_root) not in sys.path:
-    sys.path.insert(0, str(_repo_root))
+sys.path.insert(0, str(_repo_root))
 
 # Re-export __version__ / __author__ from the inner mnemosyne subpackage so
 # `from mnemosyne import __version__` works in either install layout:
@@ -26,22 +34,39 @@ except ImportError:
     __version__ = "unknown"
     __author__ = "Abdias J"
 
-# Graceful fallback when Hermes framework is not present
-# (e.g. pip-only / standalone installs without hermes_plugin)
+# The Hermes memory provider loader (plugins/memory/__init__.py) loads a
+# provider module and then either:
+#   1. calls mod.register(collector) — the collector's
+#      register_memory_provider(provider) captures the active provider, or
+#   2. instantiates a top-level MemoryProvider subclass.
+# The `register` symbol below is therefore the loader's entry point for this
+# module (the provider implementation lives in hermes_memory_provider/).
+#
+# When hermes_plugin is importable, `register` is hermes_plugin's own
+# registration callable (the legacy plugin path) and must NOT be rebound —
+# see tests/test_init_register_shadowing.py. The loader bridge is only
+# defined in the fallback branch so the two paths can never collide.
 try:
     from hermes_plugin import register
-    __all__ = ["register", "__version__", "__author__"]
 except ImportError:
-    __all__ = ["__version__", "__author__"]
+    def register(ctx):
+        """Memory-provider loader entry point (root-repo layout).
+
+        Delegates to register_memory_provider(), which registers a single
+        MnemosyneMemoryProvider with the loader's collector.
+        """
+        register_memory_provider(ctx)
+
+__all__ = ["register", "__version__", "__author__"]
 
 
 # ---- Memory Provider bridge ----
-# The Hermes memory provider discovery system (plugins/memory/__init__.py)
-# calls load_memory_provider("mnemosyne"), which looks for
-# register_memory_provider or MemoryProvider in this top-level __init__.py.
-# The actual MnemosyneMemoryProvider lives in hermes_memory_provider/__init__.py.
-# This bridge function delegates to it so the memory provider system can
-# discover and load the provider.
+# plugins/memory/__init__.py discovers this directory by text-scanning the
+# top-level __init__.py for `register_memory_provider` or `MemoryProvider`
+# (_is_memory_provider_dir), then drives loading through `register` (above)
+# or a MemoryProvider subclass. This symbol keeps the discovery marker
+# present and exposes the delegation as a stable module-level API even in
+# install layouts where `register` is supplied by hermes_plugin.
 def register_memory_provider(ctx):
     """Bridge to hermes_memory_provider for memory provider discovery."""
     try:
