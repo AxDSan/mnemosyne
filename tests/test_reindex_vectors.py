@@ -56,9 +56,16 @@ def test_reindex_does_not_mask_episodic_binary_vector_write_failure(tmp_path, mo
     beam = _reindex_fixture_beam(tmp_path, episodic=1)
     monkeypatch.setattr(E, "available", lambda: True)
     monkeypatch.setattr(E, "embed", lambda contents: [[0.1] * E.EMBEDDING_DIM for _ in contents])
+    class _Array:
+        def __init__(self, vector):
+            self.vector = vector
+
+        def tolist(self):
+            return self.vector
+
     monkeypatch.setattr(
         "mnemosyne.core.beam.np",
-        type("_Numpy", (), {"asarray": staticmethod(lambda vector: vector)})(),
+        type("_Numpy", (), {"asarray": staticmethod(_Array)})(),
     )
     monkeypatch.setattr("mnemosyne.core.beam._mib", lambda _array: b"vector")
     beam.conn.execute(

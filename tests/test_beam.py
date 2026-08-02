@@ -477,6 +477,7 @@ def test_vec_working_coverage_reports_fallback_only_when_table_unavailable(temp_
 def test_vec_working_repair_reports_backfill_insert_failure(temp_db, monkeypatch):
     """Repair must not claim success while vec_working coverage remains partial."""
     beam = BeamMemory(session_id="vec-working-repair-failure", db_path=temp_db)
+    beam.conn.execute("DROP TABLE IF EXISTS vec_working")
     beam.conn.execute("CREATE TABLE vec_working (rowid INTEGER PRIMARY KEY, embedding TEXT)")
     beam.conn.execute(
         "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
