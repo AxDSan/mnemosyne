@@ -1,10 +1,11 @@
 """Tests for the hermes_plugin fallback in hermes_memory_provider.register().
 
-Covers the three behaviours required by review on #581 (issue #578):
+Covers the four behaviours required by review on #581 (issue #578):
 - absent hermes_plugin sibling -> debug log, no raise;
 - a present-but-broken sibling (missing transitive dependency) -> the
   ModuleNotFoundError propagates instead of being swallowed;
-- a sibling whose register() raises -> that error propagates.
+- a sibling whose register() raises -> that error propagates;
+- a sibling that does not export register() -> plain ImportError propagates.
 """
 import logging
 import sys
@@ -18,9 +19,17 @@ from hermes_memory_provider import register
 
 @pytest.fixture
 def clean_hermes_plugin(monkeypatch):
-    """Ensure no cached hermes_plugin import leaks between tests."""
+    """Ensure no cached hermes_plugin import leaks between tests.
+
+    monkeypatch.delitem restores the pre-test state, but a fake hermes_plugin
+    imported during the test is added to sys.modules by the import machinery
+    itself and is not tracked by monkeypatch. Pop it on teardown too, or it
+    leaks into later consumers that import hermes_plugin (e.g. the autouse
+    fixtures in conftest.py, or other test files).
+    """
     monkeypatch.delitem(sys.modules, "hermes_plugin", raising=False)
     yield
+    sys.modules.pop("hermes_plugin", None)
 
 
 def _install_fake_hermes_plugin(monkeypatch, tmp_path, init_py):
@@ -73,3 +82,20 @@ def test_register_plugin_register_failure_propagates(
     )
     with pytest.raises(RuntimeError, match="plugin registration failed"):
         register(MagicMock())
+
+
+def test_register_sibling_without_register_attr_propagates(
+    clean_hermes_plugin, monkeypatch, tmp_path
+):
+    """A sibling that exists but does not export register() raises a plain
+    ImportError (not ModuleNotFoundError); it must propagate, not be swallowed."""
+    _install_fake_hermes_plugin(
+        monkeypatch,
+        tmp_path,
+        """
+        # intentionally does not define register()
+        """,
+    )
+    with pytest.raises(ImportError) as excinfo:
+        register(MagicMock())
+    assert not isinstance(excinfo.value, ModuleNotFoundError)
