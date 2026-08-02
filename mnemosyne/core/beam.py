@@ -2881,39 +2881,57 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
         emb_arr = emb_arr / query_norm
     emb_json = json.dumps(emb_arr.tolist())
     k = int(k)
+    # sqlite-vec applies its KNN `k` limit before the relational working-memory
+    # filters below. With many thread-scoped rows, asking for only the caller's
+    # final `k` can select rows from other sessions, filter them all out, and
+    # incorrectly trigger the expensive JSON-vector compatibility scan. Widen
+    # the candidate neighborhood until enough filtered rows are found or the
+    # vector table is exhausted, then return only the requested result count.
     try:
-        if vec_type == "bit":
-            rows = conn.execute(f"""
-                SELECT wm.id, vw.distance
-                FROM vec_working vw
-                JOIN working_memory wm ON wm.rowid = vw.rowid
-                WHERE vw.embedding MATCH vec_quantize_binary(?)
-                  AND k={k}
-                  AND {where_sql}
-                ORDER BY vw.distance
-            """, (emb_json, *where_params)).fetchall()
-        elif vec_type == "int8":
-            rows = conn.execute(f"""
-                SELECT wm.id, vw.distance
-                FROM vec_working vw
-                JOIN working_memory wm ON wm.rowid = vw.rowid
-                WHERE vw.embedding MATCH vec_quantize_int8(?, "unit")
-                  AND k={k}
-                  AND {where_sql}
-                ORDER BY vw.distance
-            """, (emb_json, *where_params)).fetchall()
-        else:
-            rows = conn.execute(f"""
-                SELECT wm.id, vw.distance
-                FROM vec_working vw
-                JOIN working_memory wm ON wm.rowid = vw.rowid
-                WHERE vw.embedding MATCH ?
-                  AND k={k}
-                  AND {where_sql}
-                ORDER BY vw.distance
-            """, (emb_json, *where_params)).fetchall()
+        total_vectors = int(conn.execute("SELECT COUNT(*) FROM vec_working").fetchone()[0])
     except Exception:
         return []
+    if total_vectors == 0:
+        return []
+    scan_k = min(total_vectors, max(k * 25, 500))
+    rows = []
+    while True:
+        try:
+            if vec_type == "bit":
+                rows = conn.execute(f"""
+                    SELECT wm.id, vw.distance
+                    FROM vec_working vw
+                    JOIN working_memory wm ON wm.rowid = vw.rowid
+                    WHERE vw.embedding MATCH vec_quantize_binary(?)
+                      AND k={scan_k}
+                      AND {where_sql}
+                    ORDER BY vw.distance
+                """, (emb_json, *where_params)).fetchall()
+            elif vec_type == "int8":
+                rows = conn.execute(f"""
+                    SELECT wm.id, vw.distance
+                    FROM vec_working vw
+                    JOIN working_memory wm ON wm.rowid = vw.rowid
+                    WHERE vw.embedding MATCH vec_quantize_int8(?, "unit")
+                      AND k={scan_k}
+                      AND {where_sql}
+                    ORDER BY vw.distance
+                """, (emb_json, *where_params)).fetchall()
+            else:
+                rows = conn.execute(f"""
+                    SELECT wm.id, vw.distance
+                    FROM vec_working vw
+                    JOIN working_memory wm ON wm.rowid = vw.rowid
+                    WHERE vw.embedding MATCH ?
+                      AND k={scan_k}
+                      AND {where_sql}
+                    ORDER BY vw.distance
+                """, (emb_json, *where_params)).fetchall()
+        except Exception:
+            return []
+        if len(rows) >= k or scan_k >= total_vectors:
+            break
+        scan_k = min(total_vectors, scan_k * 2)
     results = []
     for row in rows:
         distance = float(row["distance"])

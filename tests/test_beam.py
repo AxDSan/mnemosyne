@@ -279,6 +279,50 @@ def test_wm_vec_search_falls_back_when_vec_working_missing_row(temp_db):
     assert results[0]["sim"] == pytest.approx(1.0)
 
 
+def test_wm_vec_search_overfetches_before_applying_session_filter(temp_db):
+    np = pytest.importorskip("numpy")
+    beam = BeamMemory(session_id="target-session", db_path=temp_db)
+    _require_vec_working(beam.conn)
+    now = datetime.now().isoformat()
+    exact = _unit_embedding()
+    target = np.array([0.9, 0.1] + [0.0] * (beam_module.EMBEDDING_DIM - 2), dtype=np.float32)
+
+    rows = [
+        (f"excluded-{i}", f"excluded {i}", "test", now, "other-session", "session", 0.5)
+        for i in range(600)
+    ]
+    rows.append(("global-target", "global target", "test", now, "target-session", "global", 0.5))
+    beam.conn.executemany(
+        """
+        INSERT INTO working_memory
+            (id, content, source, timestamp, session_id, scope, importance)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    for memory_id, *_rest in rows[:-1]:
+        rowid = beam.conn.execute("SELECT rowid FROM working_memory WHERE id = ?", (memory_id,)).fetchone()["rowid"]
+        beam_module._vec_table_insert(beam.conn, "vec_working", rowid, exact)
+    target_rowid = beam.conn.execute(
+        "SELECT rowid FROM working_memory WHERE id = 'global-target'"
+    ).fetchone()["rowid"]
+    beam_module._vec_table_insert(beam.conn, "vec_working", target_rowid, target)
+    beam.conn.commit()
+
+    results = _wm_vec_search(
+        beam.conn,
+        exact,
+        k=5,
+        where_sql=(
+            "(valid_until IS NULL OR valid_until > ?) AND superseded_by IS NULL "
+            "AND (session_id = ? OR scope = 'global')"
+        ),
+        where_params=(now, "target-session"),
+    )
+
+    assert [r["id"] for r in results] == ["global-target"]
+
+
 def test_vec_working_coverage_reports_missing_and_repair_fills_gap(temp_db):
     beam = BeamMemory(session_id="vec-working-coverage", db_path=temp_db)
     _require_vec_working(beam.conn)
