@@ -7,16 +7,6 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
-## [3.16.0] - 2026-08-02
-
-### Fixed
-
-- **sqlite-vec working-memory search could miss valid session-scoped results.**
-  KNN candidates are now overfetched before applying relational session and
-  scope filters. This prevents valid rows outside the initial unfiltered
-  neighborhood from being discarded and avoids incorrectly triggering the
-  slower JSON-vector compatibility scan.
-
 ## [3.15.1] - 2026-07-30
 
 ### Fixed
