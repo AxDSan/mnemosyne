@@ -11,6 +11,8 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from mnemosyne.core.beam import BeamMemory, reindex_vectors, _effective_vec_type
 import mnemosyne.core.embeddings as E
 
@@ -18,6 +20,54 @@ import mnemosyne.core.embeddings as E
 def _ddl(conn, table):
     row = conn.execute("SELECT sql FROM sqlite_master WHERE name = ?", (table,)).fetchone()
     return row[0] if row and row[0] else ""
+
+
+def _reindex_fixture_beam(tmp_path, *, working=0, episodic=0):
+    beam = BeamMemory(session_id="reindex-failure", db_path=str(tmp_path / "m.db"))
+    for index in range(working):
+        beam.conn.execute(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (f"wm-{index}", f"working source {index}", "test", "2026-01-01T00:00:00", "reindex-failure"),
+        )
+    for index in range(episodic):
+        beam.conn.execute(
+            "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, importance) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (f"ep-{index}", f"episodic source {index}", "test", "2026-01-01T00:00:00", "reindex-failure", 0.5),
+        )
+    beam.conn.commit()
+    return beam
+
+
+@pytest.mark.parametrize("batch_response", [None, [[0.1] * 384]])
+def test_reindex_rejects_failed_or_partial_embedding_batches(tmp_path, monkeypatch, batch_response):
+    """A failed or short embedding batch must never yield a reindexed result."""
+    beam = _reindex_fixture_beam(tmp_path, working=2)
+    monkeypatch.setattr(E, "available", lambda: True)
+    monkeypatch.setattr(E, "embed", lambda _contents: batch_response)
+
+    with pytest.raises(RuntimeError, match="working_memory embedding batch"):
+        reindex_vectors(beam.conn)
+
+
+def test_reindex_does_not_mask_episodic_binary_vector_write_failure(tmp_path, monkeypatch):
+    """A binary-vector update failure after a destructive rebuild must fail loudly."""
+    beam = _reindex_fixture_beam(tmp_path, episodic=1)
+    monkeypatch.setattr(E, "available", lambda: True)
+    monkeypatch.setattr(E, "embed", lambda contents: [[0.1] * E.EMBEDDING_DIM for _ in contents])
+    monkeypatch.setattr(
+        "mnemosyne.core.beam.np",
+        type("_Numpy", (), {"asarray": staticmethod(lambda vector: vector)})(),
+    )
+    monkeypatch.setattr("mnemosyne.core.beam._mib", lambda _array: b"vector")
+    beam.conn.execute(
+        "CREATE TRIGGER fail_binary_vector BEFORE UPDATE OF binary_vector ON episodic_memory "
+        "BEGIN SELECT RAISE(ABORT, 'binary vector write failed'); END"
+    )
+
+    with pytest.raises(Exception, match="binary vector write failed"):
+        reindex_vectors(beam.conn)
 
 
 def test_reindex_rebuilds_all_vector_stores_at_active_dim():

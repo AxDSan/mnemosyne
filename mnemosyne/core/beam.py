@@ -2288,7 +2288,8 @@ def _wm_vec_delete(conn: sqlite3.Connection, memory_id: str) -> None:
     conn.execute("DELETE FROM vec_working WHERE rowid = ?", (rowid,))
 
 
-def _store_working_embedding(conn: sqlite3.Connection, memory_id: str, embedding: List[float], *, commit_vec: bool = True) -> None:
+def _store_working_embedding(conn: sqlite3.Connection, memory_id: str, embedding: List[float], *,
+                             commit_vec: bool = True, strict_vec: bool = False) -> None:
     """Store working-memory embedding in fallback and sqlite-vec stores.
 
     ``memory_embeddings`` remains the compatibility/fallback store. When the
@@ -2310,6 +2311,8 @@ def _store_working_embedding(conn: sqlite3.Connection, memory_id: str, embedding
     try:
         _wm_vec_upsert(conn, memory_id, embedding, commit=commit_vec)
     except Exception as exc:
+        if strict_vec:
+            raise
         logger.warning(
             "vec_working upsert failed for '%s' (%s): %s",
             memory_id, type(exc).__name__, exc,
@@ -2320,27 +2323,18 @@ def _backfill_vec_working_from_memory_embeddings(conn: sqlite3.Connection) -> in
     """Idempotently mirror fallback working embeddings into vec_working."""
     if not _wm_vec_available(conn) or np is None:
         return 0
-    try:
-        rows = conn.execute("""
-            SELECT wm.id, wm.rowid, me.embedding_json
-            FROM working_memory wm
-            JOIN memory_embeddings me ON me.memory_id = wm.id
-            LEFT JOIN vec_working vw ON vw.rowid = wm.rowid
-            WHERE vw.rowid IS NULL
-        """).fetchall()
-    except Exception:
-        return 0
+    rows = conn.execute("""
+        SELECT wm.id, wm.rowid, me.embedding_json
+        FROM working_memory wm
+        JOIN memory_embeddings me ON me.memory_id = wm.id
+        LEFT JOIN vec_working vw ON vw.rowid = wm.rowid
+        WHERE vw.rowid IS NULL
+    """).fetchall()
     inserted = 0
     for row in rows:
-        try:
-            embedding = json.loads(row["embedding_json"])
-            _vec_table_insert(conn, "vec_working", int(row["rowid"]), embedding)
-            inserted += 1
-        except Exception as exc:
-            logger.warning(
-                "vec_working backfill skipped '%s' (%s): %s",
-                row["id"], type(exc).__name__, exc,
-            )
+        embedding = json.loads(row["embedding_json"])
+        _vec_table_insert(conn, "vec_working", int(row["rowid"]), embedding)
+        inserted += 1
     return inserted
 
 
@@ -2458,11 +2452,29 @@ def repair_vec_working(conn: sqlite3.Connection, *, dry_run: bool = False) -> Di
     try:
         result["inserted"] = _backfill_vec_working_from_memory_embeddings(conn)
         conn.commit()
-        result["status"] = "repaired"
     except Exception as exc:
         result["status"] = "error"
         result["error"] = f"{type(exc).__name__}: {exc}"
     result["after"] = vec_working_coverage(conn)
+    if result.get("status") != "error":
+        after = result["after"]
+        coverage_error = after.get("error") or after.get("missing_vec_working_rows_error")
+        unresolved = after.get("missing_vec_working_rows")
+        if (
+            after.get("status") != "complete"
+            or after.get("vec_working_available") is not True
+            or coverage_error
+            or unresolved != 0
+        ):
+            result["status"] = "error"
+            if coverage_error:
+                result["error"] = f"vec_working repair coverage unavailable: {coverage_error}"
+            elif unresolved is None:
+                result["error"] = "vec_working repair coverage unavailable"
+            else:
+                result["error"] = f"vec_working repair incomplete: {unresolved} rows unresolved"
+        else:
+            result["status"] = "repaired"
     return result
 
 
@@ -2494,10 +2506,27 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     vec_ok = _vec_available(conn)
 
     def _count(sql: str) -> int:
+        return int(conn.execute(sql).fetchone()[0])
+
+    def _embed_chunk(store: str, chunk) -> Any:
         try:
-            return int(conn.execute(sql).fetchone()[0])
-        except Exception:
-            return 0
+            vectors = _embeddings.embed([row["content"] for row in chunk])
+        except Exception as exc:
+            raise RuntimeError(
+                f"{store} embedding batch failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        if vectors is None:
+            raise RuntimeError(f"{store} embedding batch returned no embeddings")
+        try:
+            vector_count = len(vectors)
+        except TypeError as exc:
+            raise RuntimeError(f"{store} embedding batch returned an invalid result") from exc
+        if vector_count != len(chunk):
+            raise RuntimeError(
+                f"{store} embedding batch returned {vector_count} embeddings "
+                f"for {len(chunk)} source rows"
+            )
+        return vectors
 
     wm_total = _count("SELECT COUNT(*) FROM working_memory "
                       "WHERE content IS NOT NULL AND length(content) > 0")
@@ -2538,11 +2567,11 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     ).fetchall()
     for start in range(0, len(wm_rows), batch_size):
         chunk = wm_rows[start:start + batch_size]
-        vecs = _embeddings.embed([r["content"] for r in chunk])
-        if vecs is None:
-            break
+        vecs = _embed_chunk("working_memory", chunk)
         for r, vec in zip(chunk, vecs):
-            _store_working_embedding(conn, r["id"], np.asarray(vec).tolist(), commit_vec=False)
+            _store_working_embedding(
+                conn, r["id"], np.asarray(vec).tolist(), commit_vec=False, strict_vec=True
+            )
             wm_done += 1
         conn.commit()
         if progress:
@@ -2557,26 +2586,27 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     ).fetchall()
     for start in range(0, len(ep_rows), batch_size):
         chunk = ep_rows[start:start + batch_size]
-        vecs = _embeddings.embed([r["content"] for r in chunk])
-        if vecs is None:
-            break
+        vecs = _embed_chunk("episodic_memory", chunk)
         for r, vec in zip(chunk, vecs):
             arr = np.asarray(vec)
             rowid = int(r["rowid"])
             if vec_ok:
                 _vec_table_insert(conn, "vec_episodes", rowid, arr.tolist(), commit=False)
             if _mib is not None:
-                try:
-                    conn.execute(
-                        "UPDATE episodic_memory SET binary_vector = ? WHERE rowid = ?",
-                        (_mib(arr), rowid),
-                    )
-                except Exception:
-                    pass
+                conn.execute(
+                    "UPDATE episodic_memory SET binary_vector = ? WHERE rowid = ?",
+                    (_mib(arr), rowid),
+                )
             ep_done += 1
         conn.commit()
         if progress:
             progress("episodic_memory", ep_done, ep_total)
+
+    if wm_done != wm_total or ep_done != ep_total:
+        raise RuntimeError(
+            "Reindex incomplete: processed "
+            f"{wm_done}/{wm_total} working and {ep_done}/{ep_total} episodic rows"
+        )
 
     plan["status"] = "reindexed"
     plan["working_memory_reindexed"] = wm_done

@@ -474,6 +474,81 @@ def test_vec_working_coverage_reports_fallback_only_when_table_unavailable(temp_
     assert repair["reason"] == "vec_working unavailable"
 
 
+def test_vec_working_repair_reports_backfill_insert_failure(temp_db, monkeypatch):
+    """Repair must not claim success while vec_working coverage remains partial."""
+    beam = BeamMemory(session_id="vec-working-repair-failure", db_path=temp_db)
+    beam.conn.execute("CREATE TABLE vec_working (rowid INTEGER PRIMARY KEY, embedding TEXT)")
+    beam.conn.execute(
+        "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("unrepaired", "working source", "test", "2026-01-01T00:00:00", "vec-working-repair-failure"),
+    )
+    beam.conn.execute(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+        ("unrepaired", "[0.1, 0.2]", "test"),
+    )
+    beam.conn.commit()
+    monkeypatch.setattr(beam_module, "_wm_vec_available", lambda _conn: True)
+    monkeypatch.setattr(beam_module, "np", object())
+    monkeypatch.setattr(
+        beam_module,
+        "_vec_table_insert",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("vec insert failed")),
+    )
+
+    result = beam_module.repair_vec_working(beam.conn)
+
+    assert result["status"] == "error"
+    assert "vec insert failed" in result["error"]
+    assert result["after"]["missing_vec_working_rows"] == 1
+
+
+def test_vec_working_repair_reports_unavailable_coverage(monkeypatch):
+    """A failed post-repair coverage query must not be reported as repaired."""
+    coverage_results = iter([
+        {"vec_working_available": True, "missing_vec_working_rows": 1},
+        {
+            "vec_working_available": True,
+            "missing_vec_working_rows": 0,
+            "missing_vec_working_rows_error": "OperationalError: vec_working unavailable",
+        },
+    ])
+    monkeypatch.setattr(beam_module, "vec_working_coverage", lambda _conn: next(coverage_results))
+    monkeypatch.setattr(beam_module, "_backfill_vec_working_from_memory_embeddings", lambda _conn: 1)
+
+    class _Connection:
+        def commit(self):
+            pass
+
+    result = beam_module.repair_vec_working(_Connection())
+
+    assert result["status"] == "error"
+    assert "coverage unavailable" in result["error"]
+
+
+def test_vec_working_repair_requires_complete_available_postcheck(monkeypatch):
+    """A post-repair coverage error with a default zero count is not success."""
+    coverage_results = iter([
+        {"vec_working_available": True, "missing_vec_working_rows": 1},
+        {
+            "vec_working_available": False,
+            "missing_vec_working_rows": 0,
+            "status": "error",
+            "error": "vec_working table missing",
+        },
+    ])
+    monkeypatch.setattr(beam_module, "vec_working_coverage", lambda _conn: next(coverage_results))
+    monkeypatch.setattr(beam_module, "_backfill_vec_working_from_memory_embeddings", lambda _conn: 1)
+
+    class _Connection:
+        def commit(self):
+            pass
+
+    result = beam_module.repair_vec_working(_Connection())
+
+    assert result["status"] == "error"
+    assert "coverage unavailable" in result["error"]
+
 
 class TestFactAnnotationMatching:
     def test_strict_fact_match_ignores_stopword_only_matches(self, monkeypatch):

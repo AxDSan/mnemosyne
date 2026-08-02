@@ -285,6 +285,13 @@ def cmd_diagnose(args):
 
         if repair_vec_working:
             print("\n  vec_working repair requested")
+            repair_failed = any(
+                entry.get("check") == "vec_working_repair_status"
+                and str(entry.get("status", "")).upper() == "ERROR"
+                for entry in result.get("entries", [])
+            )
+            if repair_failed and not dry_run:
+                _fail("vec_working repair failed; inspect diagnostics above", exit_code=1)
 
         if fix_mode or (dry_run and not repair_vec_working):
             print("\n--- Auto-fix ---")

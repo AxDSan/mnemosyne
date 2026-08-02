@@ -1,8 +1,9 @@
 import sqlite3
 
-import mnemosyne
+import pytest
 
-from mnemosyne import diagnose
+import mnemosyne
+from mnemosyne import cli, diagnose
 from mnemosyne.core.beam import BeamMemory
 from mnemosyne.core.memory import init_db
 
@@ -149,3 +150,21 @@ def test_diagnose_reports_memory_orphans_without_mutating_rows(tmp_path, monkeyp
     assert _entry(summary, "orphan_memory_id_overlap")["status"] == "1"
     assert _entry(summary, "hygiene_noise_scanned")["status"] == "3"
     assert _entry(summary, "hygiene_noise_candidates")["status"] == "0"
+
+
+def test_cli_diagnose_repair_failure_is_a_process_failure(monkeypatch):
+    monkeypatch.setattr(
+        diagnose,
+        "run_diagnostics",
+        lambda **_kwargs: {
+            "checks_passed": 1,
+            "checks_total": 2,
+            "key_findings": ["vec_working repair error: inserted 0 rows"],
+            "entries": [{"check": "vec_working_repair_status", "status": "error"}],
+        },
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        cli.cmd_diagnose(["--repair-vec-working"])
+
+    assert raised.value.code == 1
