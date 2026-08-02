@@ -125,6 +125,74 @@ def test_register_registers_single_provider_in_root_repo_layout():
     assert "PASS" in result.stdout, result.stdout
 
 
+def test_actual_loader_registers_provider_with_hermes_plugin_importable(tmp_path, monkeypatch):
+    """dplush review round 2: real plugins.memory loader + hermes_plugin importable.
+
+    In a full Hermes deployment the plugin SDK is importable, so the top-level
+    module binds ``_legacy_register`` from it. The memory loader still calls
+    ``mod.register(collector)``; register() must dispatch to the provider
+    bridge for a collector-shaped ctx, otherwise
+    ``load_memory_provider("mnemosyne")`` returns None even though the module
+    executed. The legacy hermes_plugin.register must NOT be invoked by the
+    memory loader.
+    """
+    pytest.importorskip("plugins.memory")
+    import sys as _sys
+
+    from plugins.memory import load_memory_provider
+
+    # Mock hermes_plugin package (the SDK is not installed in CI).
+    mock_pkg = tmp_path / "mock_sdk" / "hermes_plugin"
+    mock_pkg.mkdir(parents=True)
+    (mock_pkg / "__init__.py").write_text(
+        textwrap.dedent("""\
+            calls = []
+            def register(ctx):
+                calls.append(ctx)
+                return "legacy_register_called"
+        """)
+    )
+    mock_parent = str(tmp_path / "mock_sdk")
+
+    _sys.path.insert(0, mock_parent)
+    try:
+        # Drop any shadowed/cached module state from earlier tests in this
+        # process (dev-box artifact — see test_actual_loader_loads_mnemosyne_provider).
+        _cached = _sys.modules.get("mnemosyne")
+        if _cached is not None and not hasattr(_cached, "core"):
+            _sys.modules.pop("mnemosyne", None)
+        _sys.modules.pop("_hermes_user_memory", None)
+        _sys.modules.pop("_hermes_user_memory.mnemosyne", None)
+
+        plugins_dir = tmp_path / "plugins"
+        plugins_dir.mkdir()
+        plugin_dir = plugins_dir / "mnemosyne"
+        plugin_dir.symlink_to(REPO_ROOT, target_is_directory=True)
+
+        # Point the loader at the temp layout via HERMES_HOME (get_hermes_home()
+        # reads this env var).
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        provider = load_memory_provider("mnemosyne")
+
+        assert provider is not None, (
+            "load_memory_provider('mnemosyne') returned None with hermes_plugin "
+            "importable — register() did not dispatch to the provider bridge"
+        )
+        assert type(provider).__name__ == "MnemosyneMemoryProvider", type(provider)
+        assert provider.name == "mnemosyne", provider.name
+
+        import hermes_plugin
+
+        assert len(hermes_plugin.calls) == 0, (
+            "legacy hermes_plugin.register was invoked by the memory loader: "
+            + repr(hermes_plugin.calls)
+        )
+    finally:
+        if mock_parent in _sys.path:
+            _sys.path.remove(mock_parent)
+
+
 def test_actual_loader_loads_mnemosyne_provider(tmp_path, monkeypatch):
     """End-to-end: the real plugins.memory loader returns the provider.
 

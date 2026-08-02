@@ -42,19 +42,38 @@ except ImportError:
 # The `register` symbol below is therefore the loader's entry point for this
 # module (the provider implementation lives in hermes_memory_provider/).
 #
-# When hermes_plugin is importable, `register` is hermes_plugin's own
-# registration callable (the legacy plugin path) and must NOT be rebound —
-# see tests/test_init_register_shadowing.py. The loader bridge is only
-# defined in the fallback branch so the two paths can never collide.
+# When hermes_plugin is importable (a full Hermes deployment), `register` must
+# still dispatch: the memory loader ALWAYS calls mod.register(collector), so
+# if register were simply hermes_plugin's own callable, a memory-provider
+# collector would be routed down the legacy plugin path and would never
+# receive MnemosyneMemoryProvider (review feedback from dplush on #565).
+# Dispatch is therefore driven by the ctx shape — a memory-provider collector
+# is uniquely identifiable by its register_memory_provider method — while any
+# other (legacy plugin) context keeps the hermes_plugin registration path
+# intact. See tests/test_init_register_shadowing.py and
+# tests/test_loader_registers_provider.py.
 try:
-    from hermes_plugin import register
+    from hermes_plugin import register as _legacy_register
 except ImportError:
-    def register(ctx):
-        """Memory-provider loader entry point (root-repo layout).
+    _legacy_register = None
 
-        Delegates to register_memory_provider(), which registers a single
-        MnemosyneMemoryProvider with the loader's collector.
-        """
+
+def register(ctx):
+    """Loader entry point: dispatch between the memory-provider bridge and the
+    legacy hermes_plugin registration path based on the ctx shape.
+
+    - A memory-provider collector (has ``register_memory_provider``) →
+      register exactly one MnemosyneMemoryProvider via the bridge.
+    - Any other ctx (legacy Hermes plugin context) → hermes_plugin.register,
+      when the SDK is importable.
+    """
+    if hasattr(ctx, "register_memory_provider"):
+        register_memory_provider(ctx)
+    elif _legacy_register is not None:
+        return _legacy_register(ctx)
+    else:
+        # No hermes_plugin SDK available: only the memory-loader contract can
+        # apply in this layout, so route through the bridge.
         register_memory_provider(ctx)
 
 __all__ = ["register", "__version__", "__author__"]
