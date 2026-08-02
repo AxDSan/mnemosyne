@@ -2894,39 +2894,22 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
     if total_vectors == 0:
         return []
     scan_k = min(total_vectors, max(k * 25, 500))
+    match_expr = {
+        "bit": "vec_quantize_binary(?)",
+        "int8": 'vec_quantize_int8(?, "unit")',
+    }.get(vec_type, "?")
     rows = []
     while True:
         try:
-            if vec_type == "bit":
-                rows = conn.execute(f"""
-                    SELECT wm.id, vw.distance
-                    FROM vec_working vw
-                    JOIN working_memory wm ON wm.rowid = vw.rowid
-                    WHERE vw.embedding MATCH vec_quantize_binary(?)
-                      AND k={scan_k}
-                      AND {where_sql}
-                    ORDER BY vw.distance
-                """, (emb_json, *where_params)).fetchall()
-            elif vec_type == "int8":
-                rows = conn.execute(f"""
-                    SELECT wm.id, vw.distance
-                    FROM vec_working vw
-                    JOIN working_memory wm ON wm.rowid = vw.rowid
-                    WHERE vw.embedding MATCH vec_quantize_int8(?, "unit")
-                      AND k={scan_k}
-                      AND {where_sql}
-                    ORDER BY vw.distance
-                """, (emb_json, *where_params)).fetchall()
-            else:
-                rows = conn.execute(f"""
-                    SELECT wm.id, vw.distance
-                    FROM vec_working vw
-                    JOIN working_memory wm ON wm.rowid = vw.rowid
-                    WHERE vw.embedding MATCH ?
-                      AND k={scan_k}
-                      AND {where_sql}
-                    ORDER BY vw.distance
-                """, (emb_json, *where_params)).fetchall()
+            rows = conn.execute(f"""
+                SELECT wm.id, vw.distance
+                FROM vec_working vw
+                JOIN working_memory wm ON wm.rowid = vw.rowid
+                WHERE vw.embedding MATCH {match_expr}
+                  AND k = ?
+                  AND {where_sql}
+                ORDER BY vw.distance
+            """, (emb_json, scan_k, *where_params)).fetchall()
         except Exception:
             return []
         if len(rows) >= k or scan_k >= total_vectors:
