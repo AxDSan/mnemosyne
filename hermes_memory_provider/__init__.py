@@ -3832,14 +3832,19 @@ def register(ctx):
 
     # Legacy fallback: register a vendored hermes_plugin sibling's hooks if
     # present. Removed from this repo in v3.0 (commit 0ee4d80); normally a
-    # debug-level no-op (issue #578). Only the expected missing-module error is
-    # swallowed; a real registration failure must propagate, not be hidden.
+    # debug-level no-op (issue #578).
     try:
         _repo_root = str(Path(__file__).resolve().parent.parent)
         if _repo_root not in sys.path:
             sys.path.insert(0, _repo_root)
         from hermes_plugin import register as _plugin_register
-    except ImportError as exc:
+    except ModuleNotFoundError as exc:
+        # Swallow only the expected absent-sibling case. A present-but-broken
+        # sibling raises a different ModuleNotFoundError.name (a missing
+        # transitive dependency) or a plain ImportError; those must propagate,
+        # not be hidden as "expected".
+        if exc.name != "hermes_plugin":
+            raise
         logger.debug(
             "hermes_plugin sibling not importable (expected since v3.0): %s", exc
         )
