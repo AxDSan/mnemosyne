@@ -340,8 +340,8 @@ def test_wm_vec_search_amortizes_vec_working_count_until_database_changes(temp_d
     embedding = _unit_embedding()
     now = datetime.now().isoformat()
 
-    def insert_memory(memory_id):
-        beam.conn.execute(
+    def insert_memory(conn, memory_id):
+        conn.execute(
             """
             INSERT INTO working_memory
                 (id, content, source, timestamp, session_id, scope, importance)
@@ -349,10 +349,10 @@ def test_wm_vec_search_amortizes_vec_working_count_until_database_changes(temp_d
             """,
             (memory_id, memory_id, "test", now, "count-cache", "session", 0.5),
         )
-        rowid = beam.conn.execute("SELECT rowid FROM working_memory WHERE id = ?", (memory_id,)).fetchone()["rowid"]
-        beam_module._vec_table_insert(beam.conn, "vec_working", rowid, embedding)
+        rowid = conn.execute("SELECT rowid FROM working_memory WHERE id = ?", (memory_id,)).fetchone()["rowid"]
+        beam_module._vec_table_insert(conn, "vec_working", rowid, embedding)
 
-    insert_memory("first")
+    insert_memory(beam.conn, "first")
     statements = []
     beam.conn.set_trace_callback(statements.append)
     try:
@@ -368,7 +368,7 @@ def test_wm_vec_search_amortizes_vec_working_count_until_database_changes(temp_d
 
         assert sum("SELECT COUNT(*) FROM vec_working" in sql for sql in statements) == 1
 
-        insert_memory("second")
+        insert_memory(beam.conn, "second")
         results = beam_module._wm_vec_search_sqlite(
             beam.conn,
             embedding,
@@ -378,6 +378,25 @@ def test_wm_vec_search_amortizes_vec_working_count_until_database_changes(temp_d
         )
         assert {r["id"] for r in results} == {"first", "second"}
         assert sum("SELECT COUNT(*) FROM vec_working" in sql for sql in statements) == 2
+
+        external = sqlite3.connect(str(temp_db), factory=beam_module._BeamConnection)
+        external.row_factory = sqlite3.Row
+        try:
+            external.enable_load_extension(True)
+            beam_module.sqlite_vec.load(external)
+            insert_memory(external, "external")
+        finally:
+            external.close()
+
+        results = beam_module._wm_vec_search_sqlite(
+            beam.conn,
+            embedding,
+            k=5,
+            where_sql="session_id = ?",
+            where_params=("count-cache",),
+        )
+        assert {r["id"] for r in results} == {"first", "second", "external"}
+        assert sum("SELECT COUNT(*) FROM vec_working" in sql for sql in statements) == 3
     finally:
         beam.conn.set_trace_callback(None)
 
