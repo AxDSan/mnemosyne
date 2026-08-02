@@ -85,18 +85,22 @@ def test_reindex_does_not_mask_episodic_binary_vector_write_failure(tmp_path, mo
         reindex_vectors(beam.conn)
 
 
-def test_reindex_does_not_mask_working_embedding_write_failure(tmp_path, monkeypatch):
-    """A strict working-vector write failure after a destructive rebuild must fail loudly."""
+def test_reindex_does_not_mask_working_vec_write_failure(tmp_path, monkeypatch):
+    """A strict vec_working write failure during reindex must fail loudly."""
     beam = _reindex_fixture_beam(tmp_path, working=1)
     monkeypatch.setattr(E, "available", lambda: True)
     monkeypatch.setattr(E, "embed", lambda contents: [[0.1] * E.EMBEDDING_DIM for _ in contents])
     monkeypatch.setattr("mnemosyne.core.beam.np", _NumpyStub())
-    beam.conn.execute(
-        "CREATE TRIGGER fail_working_embedding BEFORE INSERT ON memory_embeddings "
-        "BEGIN SELECT RAISE(ABORT, 'working embedding write failed'); END"
-    )
+    monkeypatch.setattr("mnemosyne.core.beam._vec_available", lambda _conn: False)
+    monkeypatch.setattr("mnemosyne.core.beam._wm_vec_available", lambda _conn: True)
 
-    with pytest.raises(sqlite3.IntegrityError, match="working embedding write failed"):
+    def fail_vec_working(_conn, table, _rowid, _embedding, **_kwargs):
+        assert table == "vec_working"
+        raise sqlite3.IntegrityError("vec_working write failed")
+
+    monkeypatch.setattr("mnemosyne.core.beam._vec_table_insert", fail_vec_working)
+
+    with pytest.raises(sqlite3.IntegrityError, match="vec_working write failed"):
         reindex_vectors(beam.conn)
 
 
