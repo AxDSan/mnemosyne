@@ -8,6 +8,7 @@ working. Also checks that --dry-run writes nothing.
 """
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 from pathlib import Path
 
@@ -15,6 +16,20 @@ import pytest
 
 from mnemosyne.core.beam import BeamMemory, reindex_vectors, _effective_vec_type
 import mnemosyne.core.embeddings as E
+
+
+class _Array:
+    def __init__(self, vector):
+        self.vector = vector
+
+    def tolist(self):
+        return self.vector
+
+
+class _NumpyStub:
+    float32 = object()
+    asarray = staticmethod(_Array)
+    array = staticmethod(lambda vector, dtype=None: _Array(vector))
 
 
 def _ddl(conn, table):
@@ -40,7 +55,10 @@ def _reindex_fixture_beam(tmp_path, *, working=0, episodic=0):
     return beam
 
 
-@pytest.mark.parametrize("batch_response", [None, [[0.1] * 384]])
+@pytest.mark.parametrize(
+    "batch_response",
+    [None, [[0.1] * 384], [[0.1] * 384, [0.1] * 384, [0.1] * 384]],
+)
 def test_reindex_rejects_failed_or_partial_embedding_batches(tmp_path, monkeypatch, batch_response):
     """A failed or short embedding batch must never yield a reindexed result."""
     beam = _reindex_fixture_beam(tmp_path, working=2)
@@ -56,24 +74,29 @@ def test_reindex_does_not_mask_episodic_binary_vector_write_failure(tmp_path, mo
     beam = _reindex_fixture_beam(tmp_path, episodic=1)
     monkeypatch.setattr(E, "available", lambda: True)
     monkeypatch.setattr(E, "embed", lambda contents: [[0.1] * E.EMBEDDING_DIM for _ in contents])
-    class _Array:
-        def __init__(self, vector):
-            self.vector = vector
-
-        def tolist(self):
-            return self.vector
-
-    monkeypatch.setattr(
-        "mnemosyne.core.beam.np",
-        type("_Numpy", (), {"asarray": staticmethod(_Array)})(),
-    )
+    monkeypatch.setattr("mnemosyne.core.beam.np", _NumpyStub())
     monkeypatch.setattr("mnemosyne.core.beam._mib", lambda _array: b"vector")
     beam.conn.execute(
         "CREATE TRIGGER fail_binary_vector BEFORE UPDATE OF binary_vector ON episodic_memory "
         "BEGIN SELECT RAISE(ABORT, 'binary vector write failed'); END"
     )
 
-    with pytest.raises(Exception, match="binary vector write failed"):
+    with pytest.raises(sqlite3.IntegrityError, match="binary vector write failed"):
+        reindex_vectors(beam.conn)
+
+
+def test_reindex_does_not_mask_working_embedding_write_failure(tmp_path, monkeypatch):
+    """A strict working-vector write failure after a destructive rebuild must fail loudly."""
+    beam = _reindex_fixture_beam(tmp_path, working=1)
+    monkeypatch.setattr(E, "available", lambda: True)
+    monkeypatch.setattr(E, "embed", lambda contents: [[0.1] * E.EMBEDDING_DIM for _ in contents])
+    monkeypatch.setattr("mnemosyne.core.beam.np", _NumpyStub())
+    beam.conn.execute(
+        "CREATE TRIGGER fail_working_embedding BEFORE INSERT ON memory_embeddings "
+        "BEGIN SELECT RAISE(ABORT, 'working embedding write failed'); END"
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="working embedding write failed"):
         reindex_vectors(beam.conn)
 
 
