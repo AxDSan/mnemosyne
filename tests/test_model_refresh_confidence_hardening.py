@@ -87,6 +87,19 @@ class TestParseNonFiniteConfidence:
                 raw, allowed_categories={"model:user"}
             ) == []
 
+    def test_overrange_integer_confidence_is_rejected(self):
+        """json.loads keeps integer literals as arbitrary-precision ints,
+        so float() raises OverflowError past float range; it must degrade
+        instead of raising."""
+        literal = "1" + "0" * 400
+        raw = (
+            '[{"category": "model:user", "name": "style", "body": "b", '
+            f'"confidence": {literal}, "evidence_ids": ["e1", "e2"]}}]'
+        )
+        assert model_refresh.parse_model_update_proposals(
+            raw, allowed_categories={"model:user"}
+        ) == []
+
     def test_valid_confidence_still_parses(self):
         """Control: the non-finite filter must not eat well-formed proposals."""
         raw = (

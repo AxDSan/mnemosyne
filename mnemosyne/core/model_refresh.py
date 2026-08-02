@@ -95,7 +95,7 @@ def coerce_confidence(value: Any, default: float) -> float:
         return default
     try:
         value = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     return value if math.isfinite(value) else default
 
