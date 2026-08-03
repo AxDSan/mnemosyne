@@ -2461,7 +2461,7 @@ def repair_vec_working(conn: sqlite3.Connection, *, dry_run: bool = False) -> Di
         coverage_error = after.get("error") or after.get("missing_vec_working_rows_error")
         unresolved = after.get("missing_vec_working_rows")
         if (
-            after.get("status") != "complete"
+            after.get("status") not in {"complete", "no_vectors", "empty"}
             or after.get("vec_working_available") is not True
             or coverage_error
             or unresolved != 0

@@ -474,6 +474,28 @@ def test_vec_working_coverage_reports_fallback_only_when_table_unavailable(temp_
     assert repair["reason"] == "vec_working unavailable"
 
 
+@pytest.mark.parametrize("terminal_status", ["no_vectors", "empty"])
+def test_vec_working_repair_accepts_no_work_terminal_states(monkeypatch, terminal_status):
+    """Empty or vectorless stores are healthy no-op repair outcomes."""
+    coverage = {
+        "vec_working_available": True,
+        "missing_vec_working_rows": 0,
+        "status": terminal_status,
+    }
+    monkeypatch.setattr(beam_module, "vec_working_coverage", lambda _conn: coverage)
+    monkeypatch.setattr(beam_module, "_backfill_vec_working_from_memory_embeddings", lambda _conn: 0)
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        result = beam_module.repair_vec_working(conn)
+    finally:
+        conn.close()
+
+    assert result["status"] == "repaired"
+    assert result["inserted"] == 0
+    assert result["after"]["status"] == terminal_status
+
+
 def test_vec_working_repair_reports_backfill_insert_failure(temp_db, monkeypatch):
     """Repair must not claim success while vec_working coverage remains partial."""
     beam = BeamMemory(session_id="vec-working-repair-failure", db_path=temp_db)
