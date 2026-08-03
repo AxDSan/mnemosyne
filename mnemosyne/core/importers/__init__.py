@@ -44,6 +44,7 @@ __all__ = [
     "import_from_mem0",
     "import_from_provider",
     "list_providers",
+    "PROVIDERS",
 ]
 
 from .base import BaseImporter, ImporterResult, import_from_file
