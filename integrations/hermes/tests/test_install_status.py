@@ -7,6 +7,9 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
+
+import mnemosyne_hermes
 from mnemosyne_hermes import install
 
 
@@ -211,6 +214,8 @@ def test_install_plugin_wrapper_creates_persistent_shim(tmp_path):
         "package": "mnemosyne_hermes",
     }
     assert (target / "plugin.yaml").is_file()
+    installed_plugin = yaml.safe_load((target / "plugin.yaml").read_text(encoding="utf-8"))
+    assert installed_plugin["version"] == mnemosyne_hermes.__version__
 
     state = install.plugin_state(hermes_home_path=tmp_path)
     assert state.status == "installed"
