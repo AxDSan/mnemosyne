@@ -88,8 +88,10 @@ version = {attr = "mnemosyne.__version__"}
 # a glance what blocks merge. This `[tool.ruff.lint]` section exists
 # for two reasons:
 #   (1) documents the rule families the project cares about
-#   (2) lets `ruff check` (run with no `--select`) match CI exactly,
-#       which makes `pre-commit` and editor integrations useful.
+#   (2) lets `ruff check` (run with no `--select`) exercise the F/RUF022
+#       subset locally, which is handy for pre-commit and editor integrations.
+#       NOTE: CI narrows this to PR-changed files only and adds a separate
+#       whole-tree E9 fatal gate (syntax errors) that this config does not select.
 #
 # If you add or remove rules here, mirror the change in ci.yml so the
 # two stay in sync.
@@ -100,6 +102,6 @@ version = {attr = "mnemosyne.__version__"}
 # on a broader lint rubric — see `.github/workflows/ci.yml` for the
 # gating rubric and PR history for the discussion (PR #483 followup).
 select = [
-    "F",        # pyflakes (F401 unused imports, F841 dead locals, etc.)
-    "RUF022",   # `__all__` should be defined when a module re-exports symbols
-]  # superset of E9,F63,F7,F82; no need to enable them here
+  "F",        # pyflakes (F401 unused imports, F841 dead locals, F541 unparsed f-strings, etc.)
+  "RUF022",   # checks ordering of existing `__all__` definitions (does NOT require them)
+]  # NOTE: F covers F63, F7, F82 but NOT E9 — the E9 fatal gate lives in ci.yml only
