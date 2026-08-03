@@ -745,7 +745,8 @@ PERSONA_REINFORCE_SCHEMA = {
     "description": (
         "Bump the reinforcement_count and last_reinforced_at on a persona fact. "
         "Use when the persona rule was just applied -- signals 'this rule is in "
-        "active use'. Reinforcement count breaks ties in injection order; it does not feed any decay logic, because none is implemented."
+        "active use'. Reinforcement count breaks ties in mnemosyne_persona_list "
+        "ordering; it does not feed any decay logic, because none is implemented."
     ),
     "parameters": {
         "type": "object",
