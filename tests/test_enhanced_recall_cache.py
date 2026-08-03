@@ -325,6 +325,73 @@ def test_dedup_invalidates_before_enrichment(monkeypatch, tmp_path: Path):
         _close_memory(memory)
 
 
+def test_remember_finally_invalidates_cache_refilled_during_enrichment(monkeypatch, tmp_path: Path):
+    """Post-commit enrichment cannot leave a newly warmed result behind."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    db_path = tmp_path / "memories.db"
+    memory = None
+    try:
+        memory = BeamMemory(session_id="session-a", db_path=db_path)
+        query = "issue 566 post commit enrichment cache refill"
+        baseline = f"{query} baseline"
+        memory.remember(baseline, source="initial", importance=0.1)
+        _call(memory, query, top_k=3)
+        assert memory._query_cache._conn.execute("SELECT COUNT(*) FROM query_cache").fetchone()[0] == 1
+
+        refilled_rows = []
+
+        def refill_during_enrichment(*args):
+            _call(memory, query, top_k=3)
+            refilled_rows.append(
+                memory._query_cache._conn.execute("SELECT COUNT(*) FROM query_cache").fetchone()[0]
+            )
+
+        monkeypatch.setattr(memory, "_ingest_graph_and_veracity", refill_during_enrichment)
+
+        assert memory.remember(baseline, source="updated", importance=1.0)
+        assert refilled_rows == [1]
+        assert memory._query_cache._conn.execute("SELECT COUNT(*) FROM query_cache").fetchone()[0] == 0
+    finally:
+        _close_memory(memory)
+
+
+def test_new_remember_finally_invalidates_cache_refilled_during_enrichment(monkeypatch, tmp_path: Path):
+    """New inserts receive the same final eviction after enrichment refills cache."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    db_path = tmp_path / "memories.db"
+    memory = None
+    try:
+        memory = BeamMemory(session_id="session-a", db_path=db_path)
+        query = "issue 566 new insert enrichment cache refill"
+        memory.remember(f"{query} baseline", source="initial", importance=0.1)
+        _call(memory, query, top_k=3)
+        assert memory._query_cache._conn.execute("SELECT COUNT(*) FROM query_cache").fetchone()[0] == 1
+
+        refilled_rows = []
+
+        def refill_during_enrichment(*args):
+            _call(memory, query, top_k=3)
+            refilled_rows.append(
+                memory._query_cache._conn.execute("SELECT COUNT(*) FROM query_cache").fetchone()[0]
+            )
+
+        monkeypatch.setattr(memory, "_ingest_graph_and_veracity", refill_during_enrichment)
+
+        memory.remember(f"{query} inserted", source="new", importance=1.0)
+        assert refilled_rows == [1]
+        assert memory._query_cache._conn.execute("SELECT COUNT(*) FROM query_cache").fetchone()[0] == 0
+    finally:
+        _close_memory(memory)
+
+
 def test_new_remember_write_survives_post_commit_cache_invalidation_failure(
     monkeypatch, tmp_path: Path, caplog
 ):
