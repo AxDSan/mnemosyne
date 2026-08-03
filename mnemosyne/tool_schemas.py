@@ -663,9 +663,10 @@ PERSONA_PROMOTE_SCHEMA = {
     "description": (
         "Promote a working or episodic memory into the L3 persona tier. "
         "Persona facts are always auto-injected into the system prompt regardless "
-        "of semantic relevance. Tier values: 'permanent' (never evicted, requires "
-        "explicit demotion), 'long_term' (default; reinforcement-driven decay), "
-        "'working' (transient). Returns the new persona id."
+        "of semantic relevance. Tier values: 'permanent', 'long_term' (default), "
+        "'working'. Tier controls injection priority only: no automatic eviction "
+        "or decay is implemented, and a fact leaves the tier only by explicit "
+        "demotion. Returns the new persona id."
     ),
     "parameters": {
         "type": "object",
@@ -678,7 +679,7 @@ PERSONA_PROMOTE_SCHEMA = {
                 "type": "string",
                 "enum": ["permanent", "long_term", "working"],
                 "default": "long_term",
-                "description": "Retention tier for the promoted persona fact.",
+                "description": "Injection-priority tier for the promoted persona fact.",
             },
             "reason": {
                 "type": "string",
