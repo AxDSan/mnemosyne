@@ -8529,7 +8529,15 @@ class BeamMemory:
                         proposal_id = self.remember(
                             model_refresh.proposal_to_memory_content(proposal),
                             source="sleep_model_refresh_proposal",
-                            importance=float(proposal.get("confidence") or 0.5),
+                            # Convert defensively: this runs AFTER the claim
+                            # commit, so a raise here strands this group's
+                            # consolidation_claimed_at and orphans every
+                            # later group's claim. Proposals normally arrive
+                            # sanitized by parse_model_update_proposals, but
+                            # that invariant lives a module away.
+                            importance=model_refresh.coerce_confidence(
+                                proposal.get("confidence"), 0.5
+                            ),
                             metadata=metadata,
                             scope="session",
                             veracity="inferred",
