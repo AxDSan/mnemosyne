@@ -93,20 +93,6 @@ def test_root_only_transition_removes_only_recognized_profile_links(
 
     child_link = child / "plugins" / "mnemosyne"
     foreign_link = foreign_profile / "plugins" / "mnemosyne"
-    if initial_mode == "symlink":
-        previous_source = tmp_path / "previous-mnemosyne-package"
-        previous_source.mkdir()
-        (previous_source / "__init__.py").write_text(
-            "class MnemosyneMemoryProvider:\n    pass\n", encoding="utf-8"
-        )
-        (previous_source / "plugin.yaml").write_text(
-            "name: hermes-mnemosyne\n", encoding="utf-8"
-        )
-        root_link = tmp_path / "plugins" / "mnemosyne"
-        root_link.unlink()
-        os.symlink(str(previous_source), str(root_link))
-        child_link.unlink()
-        os.symlink(str(previous_source), str(child_link))
     foreign_target = tmp_path / "foreign-provider"
     foreign_target.mkdir()
     foreign_link.unlink()
@@ -162,6 +148,131 @@ def test_root_only_cleanup_preserves_link_repointed_after_snapshot(tmp_path, mon
 
     assert child_link.is_symlink()
     assert child_link.resolve() == foreign_target.resolve()
+
+
+def test_root_only_transition_preserves_compatible_foreign_provider_link(tmp_path):
+    _skip_on_windows()
+    child = _make_profile(tmp_path, "child", "mnemosyne")
+    foreign_provider = tmp_path / "foreign-provider"
+    foreign_provider.mkdir()
+    (foreign_provider / "__init__.py").write_text(
+        "class MnemosyneMemoryProvider:\n    pass\n",
+        encoding="utf-8",
+    )
+    (foreign_provider / "plugin.yaml").write_text(
+        "name: hermes-mnemosyne\n",
+        encoding="utf-8",
+    )
+    root_link = tmp_path / "plugins" / "mnemosyne"
+    root_link.parent.mkdir(parents=True)
+    root_link.symlink_to(foreign_provider, target_is_directory=True)
+    child_link = child / "plugins" / "mnemosyne"
+    child_link.parent.mkdir(parents=True)
+    child_link.symlink_to(foreign_provider, target_is_directory=True)
+
+    install_plugin(
+        hermes_home_path=tmp_path,
+        force=True,
+        link_profiles=False,
+    )
+
+    assert child_link.is_symlink()
+    assert child_link.resolve() == foreign_provider.resolve()
+
+
+def test_root_only_cleanup_rename_failure_restores_preference(tmp_path, monkeypatch):
+    _skip_on_windows()
+    child = _make_profile(tmp_path, "child", "mnemosyne")
+    install_plugin(hermes_home_path=tmp_path)
+    child_link = child / "plugins" / "mnemosyne"
+    preference = install_mod._profile_links_preference_path(tmp_path)
+    original_replace = Path.replace
+
+    def deny_profile_quarantine(self, target):
+        if self == child_link:
+            raise PermissionError("profile quarantine denied")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", deny_profile_quarantine)
+
+    with pytest.raises(PermissionError, match="profile quarantine denied"):
+        install_plugin(
+            hermes_home_path=tmp_path,
+            force=True,
+            link_profiles=False,
+        )
+
+    assert child_link.is_symlink()
+    assert install_mod.profile_links_enabled(hermes_home_path=tmp_path) is True
+    assert preference.read_text(encoding="utf-8") == '{"link_profiles": true}\n'
+
+
+def test_root_only_cleanup_failure_restores_effective_legacy_preference(
+    tmp_path, monkeypatch
+):
+    _skip_on_windows()
+    child = _make_profile(tmp_path, "child", "mnemosyne")
+    install_plugin(hermes_home_path=tmp_path)
+    child_link = child / "plugins" / "mnemosyne"
+    preference = install_mod._profile_links_preference_path(tmp_path)
+    preference.unlink()
+    assert install_mod.profile_links_enabled(hermes_home_path=tmp_path) is True
+    original_replace = Path.replace
+
+    def deny_profile_quarantine(self, target):
+        if self == child_link:
+            raise PermissionError("profile quarantine denied")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", deny_profile_quarantine)
+
+    with pytest.raises(PermissionError, match="profile quarantine denied"):
+        install_plugin(
+            hermes_home_path=tmp_path,
+            mode="wrapper",
+            python=sys.executable,
+            force=True,
+            link_profiles=False,
+        )
+
+    assert child_link.is_symlink()
+    assert install_mod.profile_links_enabled(hermes_home_path=tmp_path) is True
+    assert preference.read_text(encoding="utf-8") == '{"link_profiles": true}\n'
+
+
+def test_root_only_cleanup_failure_remains_primary_when_preference_rollback_fails(
+    tmp_path, monkeypatch, capsys
+):
+    _skip_on_windows()
+    child = _make_profile(tmp_path, "child", "mnemosyne")
+    install_plugin(hermes_home_path=tmp_path)
+    child_link = child / "plugins" / "mnemosyne"
+    original_replace = Path.replace
+
+    def deny_profile_quarantine(self, target):
+        if self == child_link:
+            raise PermissionError("profile quarantine denied")
+        return original_replace(self, target)
+
+    def fail_preference_rollback(*args, **kwargs):
+        raise OSError("preference rollback denied")
+
+    monkeypatch.setattr(Path, "replace", deny_profile_quarantine)
+    monkeypatch.setattr(
+        install_mod,
+        "_restore_profile_links_preference",
+        fail_preference_rollback,
+    )
+
+    with pytest.raises(PermissionError, match="profile quarantine denied"):
+        install_plugin(
+            hermes_home_path=tmp_path,
+            force=True,
+            link_profiles=False,
+        )
+
+    assert child_link.is_symlink()
+    assert "Profile-link preference rollback failed" in capsys.readouterr().err
 
 
 def test_profile_link_snapshot_rejects_repoint_during_classification(tmp_path, monkeypatch):

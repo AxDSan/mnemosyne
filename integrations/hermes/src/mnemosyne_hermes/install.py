@@ -301,13 +301,7 @@ def _provider_init_is_mnemosyne(init_file: Path) -> bool:
             )
         ):
             return True
-        return bool(
-            re.search(
-                r"^class\s+MnemosyneMemoryProvider(?:\s*[:(])",
-                source,
-                flags=re.MULTILINE,
-            )
-        )
+        return False
     except Exception:
         return False
 
@@ -987,7 +981,7 @@ def _unlink_profile_links(links: list[_ProfileLinkSnapshot]) -> None:
                 quarantined.replace(target)
                 moved = False
         except OSError:
-            pass
+            raise
         finally:
             if moved and quarantined is not None:
                 try:
@@ -1020,6 +1014,25 @@ def _unlink_all_profiles(
             recognized_targets=recognized_targets,
         )
     )
+
+
+def _unlink_profile_links_or_restore_preference(
+    links: list[_ProfileLinkSnapshot],
+    preference_path: Path,
+    previous_preference: bytes | None,
+) -> None:
+    """Fail root-only cleanup and restore its preference when link removal fails."""
+    try:
+        _unlink_profile_links(links)
+    except OSError:
+        try:
+            _restore_profile_links_preference(preference_path, previous_preference)
+        except OSError:
+            print(
+                f"⚠ Profile-link preference rollback failed; inspect: {preference_path}",
+                file=sys.stderr,
+            )
+        raise
 
 
 def _prepare_plugin_target(
@@ -1333,6 +1346,10 @@ def install_plugin(
         previous_preference = preference_path.read_bytes()
     except FileNotFoundError:
         previous_preference = None
+        if profile_links_enabled(hermes_home_path=hermes_home_path):
+            # Preserve an effective legacy opt-in even if replacing the root
+            # target changes the no-file fallback before cleanup can fail.
+            previous_preference = b'{"link_profiles": true}\n'
 
     if mode == "symlink":
         if migrate_wrapper_to_symlink and _is_wrapper_plugin_target(target):
@@ -1356,7 +1373,11 @@ def install_plugin(
         if link_profiles:
             _link_all_profiles(source, hermes_home_path=hermes_home_path, force=force)
         else:
-            _unlink_profile_links(profile_links_to_unlink)
+            _unlink_profile_links_or_restore_preference(
+                profile_links_to_unlink,
+                preference_path,
+                previous_preference,
+            )
         return target
 
     # Validate and fully write the replacement before removing a working wrapper.
@@ -1388,7 +1409,11 @@ def install_plugin(
     if link_profiles:
         _link_all_profiles(target, hermes_home_path=hermes_home_path, force=force)
     else:
-        _unlink_profile_links(profile_links_to_unlink)
+        _unlink_profile_links_or_restore_preference(
+            profile_links_to_unlink,
+            preference_path,
+            previous_preference,
+        )
     return target
 
 
