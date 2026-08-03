@@ -1455,8 +1455,12 @@ def cmd_profile(args):
         # Captured before the write so the vec_type notice below can tell
         # whether the value actually changed.
         try:
-            from mnemosyne.core.config import get_config as _get_config
-            _prev_vec_type = _get_config().get("vec_type")
+            from mnemosyne.core.config import MnemosyneConfig
+            if config_path_arg:
+                _prev_cfg = MnemosyneConfig(config_path=Path(config_path_arg))
+            else:
+                _prev_cfg = MnemosyneConfig.get_instance()
+            _prev_vec_type = _prev_cfg.get("vec_type")
         except Exception:
             _prev_vec_type = None
 
