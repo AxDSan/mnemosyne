@@ -693,7 +693,10 @@ def test_sidecar_created_after_preflight_is_rejected_before_inode_binding(tmp_pa
     assert journal.read_bytes() == journal_bytes
     assert not backup.exists()
     assert not list(tmp_path.glob(".mnemosyne-repair-*"))
-    assert len(os.listdir("/proc/self/fd")) == fd_before
+    # Other tests and the runner may close inherited descriptors while this
+    # test executes.  The repair path must not leak a new descriptor, but an
+    # exact process-wide count is not stable enough to assert here.
+    assert len(os.listdir("/proc/self/fd")) <= fd_before
 
 
 def test_backup_parent_swap_cannot_redirect_fd_anchored_backup(tmp_path, monkeypatch):
