@@ -292,7 +292,7 @@ def cmd_diagnose(args):
             if fix_result["fixed"]:
                 for item in fix_result["fixed"]:
                     if dry_run:
-                        print(f"  ✅ {item}")
+                        print(f"  ℹ {item}")
                     else:
                         print(f"  ✅ Fixed: {item}")
             if fix_result["failed"]:
