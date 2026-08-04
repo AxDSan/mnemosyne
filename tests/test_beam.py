@@ -526,14 +526,24 @@ def test_vec_working_repair_reports_backfill_insert_failure(temp_db, monkeypatch
     assert result["after"]["missing_vec_working_rows"] == 1
 
 
-def test_vec_working_repair_reports_unavailable_coverage(monkeypatch):
-    """A failed post-repair coverage query must not be reported as repaired."""
+@pytest.mark.parametrize(
+    "coverage_error_key",
+    [
+        "missing_vec_working_rows_error",
+        "memory_embeddings_error",
+        "vec_working_rows_error",
+        "error",
+    ],
+)
+def test_vec_working_repair_reports_unavailable_coverage(monkeypatch, coverage_error_key):
+    """Any post-repair coverage error key must prevent a repaired status."""
     coverage_results = iter([
         {"vec_working_available": True, "missing_vec_working_rows": 1},
         {
             "vec_working_available": True,
             "missing_vec_working_rows": 0,
-            "missing_vec_working_rows_error": "OperationalError: vec_working unavailable",
+            "status": "complete",
+            coverage_error_key: "OperationalError: coverage unavailable",
         },
     ])
     monkeypatch.setattr(beam_module, "vec_working_coverage", lambda _conn: next(coverage_results))
@@ -546,6 +556,7 @@ def test_vec_working_repair_reports_unavailable_coverage(monkeypatch):
     result = beam_module.repair_vec_working(_Connection())
 
     assert result["status"] == "error"
+    assert coverage_error_key in result["error"]
     assert "coverage unavailable" in result["error"]
 
 

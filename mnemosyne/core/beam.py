@@ -2458,17 +2458,24 @@ def repair_vec_working(conn: sqlite3.Connection, *, dry_run: bool = False) -> Di
     result["after"] = vec_working_coverage(conn)
     if result.get("status") != "error":
         after = result["after"]
-        coverage_error = after.get("error") or after.get("missing_vec_working_rows_error")
+        coverage_errors = {
+            key: value
+            for key, value in after.items()
+            if key == "error" or key.endswith("_error")
+        }
         unresolved = after.get("missing_vec_working_rows")
         if (
             after.get("status") not in {"complete", "no_vectors", "empty"}
             or after.get("vec_working_available") is not True
-            or coverage_error
+            or coverage_errors
             or unresolved != 0
         ):
             result["status"] = "error"
-            if coverage_error:
-                result["error"] = f"vec_working repair coverage unavailable: {coverage_error}"
+            if coverage_errors:
+                details = "; ".join(
+                    f"{key}: {value}" for key, value in coverage_errors.items()
+                )
+                result["error"] = f"vec_working repair coverage unavailable: {details}"
             elif unresolved is None:
                 result["error"] = "vec_working repair coverage unavailable"
             else:
@@ -2526,6 +2533,37 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
                 f"{store} embedding batch returned {vector_count} embeddings "
                 f"for {len(chunk)} source rows"
             )
+        for index, vector in enumerate(vectors):
+            if isinstance(vector, (str, bytes)) or getattr(vector, "ndim", 1) != 1:
+                raise RuntimeError(
+                    f"{store} embedding vector {index} must be one-dimensional"
+                )
+            try:
+                values = list(vector)
+            except TypeError as exc:
+                raise RuntimeError(
+                    f"{store} embedding vector {index} is not a convertible numeric vector"
+                ) from exc
+            if len(values) != target_dim:
+                raise RuntimeError(
+                    f"{store} embedding vector {index} has dimension {len(values)}; "
+                    f"expected {target_dim}"
+                )
+            for value in values:
+                if isinstance(value, (list, tuple)) or getattr(value, "ndim", 0) != 0:
+                    raise RuntimeError(
+                        f"{store} embedding vector {index} must be one-dimensional"
+                    )
+                try:
+                    numeric_value = float(value)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise RuntimeError(
+                        f"{store} embedding vector {index} is not a convertible numeric vector"
+                    ) from exc
+                if not math.isfinite(numeric_value):
+                    raise RuntimeError(
+                        f"{store} embedding vector {index} must contain only finite values"
+                    )
         return vectors
 
     wm_total = _count("SELECT COUNT(*) FROM working_memory "
@@ -2547,6 +2585,10 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
 
     if not _embeddings.available():
         raise RuntimeError("Embedding model unavailable; cannot reindex vectors.")
+    if ep_total and not vec_ok and _mib is None:
+        raise RuntimeError(
+            "episodic_memory vector backend unavailable; cannot reindex episodic vectors."
+        )
 
     # 1) Recreate the sqlite-vec tables at the active dimension. vec_facts has no
     #    writer yet but is recreated so its declared dim can't mismatch a query.

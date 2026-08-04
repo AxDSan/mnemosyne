@@ -152,15 +152,19 @@ def test_diagnose_reports_memory_orphans_without_mutating_rows(tmp_path, monkeyp
     assert _entry(summary, "hygiene_noise_candidates")["status"] == "0"
 
 
-def test_cli_diagnose_repair_failure_is_a_process_failure(monkeypatch):
+@pytest.mark.parametrize("repair_status", ["error", "skipped", None])
+def test_cli_diagnose_unsuccessful_repair_is_a_process_failure(monkeypatch, repair_status):
+    entry = {"check": "vec_working_repair_status"}
+    if repair_status is not None:
+        entry["status"] = repair_status
     monkeypatch.setattr(
         diagnose,
         "run_diagnostics",
         lambda **_kwargs: {
             "checks_passed": 1,
             "checks_total": 2,
-            "key_findings": ["vec_working repair error: inserted 0 rows"],
-            "entries": [{"check": "vec_working_repair_status", "status": "error"}],
+            "key_findings": ["vec_working repair did not complete"],
+            "entries": [entry],
         },
     )
 
@@ -168,3 +172,18 @@ def test_cli_diagnose_repair_failure_is_a_process_failure(monkeypatch):
         cli.cmd_diagnose(["--repair-vec-working"])
 
     assert raised.value.code == 1
+
+
+def test_cli_diagnose_skipped_repair_dry_run_does_not_exit(monkeypatch):
+    monkeypatch.setattr(
+        diagnose,
+        "run_diagnostics",
+        lambda **_kwargs: {
+            "checks_passed": 1,
+            "checks_total": 2,
+            "key_findings": ["vec_working repair skipped"],
+            "entries": [{"check": "vec_working_repair_status", "status": "skipped"}],
+        },
+    )
+
+    cli.cmd_diagnose(["--repair-vec-working", "--dry-run"])

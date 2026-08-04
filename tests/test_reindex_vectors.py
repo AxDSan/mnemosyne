@@ -69,6 +69,69 @@ def test_reindex_rejects_failed_or_partial_embedding_batches(tmp_path, monkeypat
         reindex_vectors(beam.conn)
 
 
+@pytest.mark.parametrize(
+    ("invalid_vector", "reason"),
+    [
+        (["not-a-number"] * E.EMBEDDING_DIM, "convertible numeric"),
+        ([[0.1]] * E.EMBEDDING_DIM, "one-dimensional"),
+        ([float("nan")] * E.EMBEDDING_DIM, "finite values"),
+        ([0.1] * (E.EMBEDDING_DIM - 1), "expected"),
+    ],
+)
+def test_reindex_rejects_invalid_individual_embedding_vectors(
+    tmp_path, monkeypatch, invalid_vector, reason
+):
+    """Each vector must be numeric, 1-D, finite, and at the active dimension."""
+    beam = _reindex_fixture_beam(tmp_path, working=1)
+    monkeypatch.setattr(E, "available", lambda: True)
+    monkeypatch.setattr(E, "embed", lambda _contents: [invalid_vector])
+
+    with pytest.raises(
+        RuntimeError, match=rf"working_memory embedding vector 0.*{reason}"
+    ):
+        reindex_vectors(beam.conn)
+
+
+def test_reindex_requires_episodic_vector_backend_before_writes(tmp_path, monkeypatch):
+    """Episodic rows cannot be counted as reindexed without a writable backend."""
+    beam = _reindex_fixture_beam(tmp_path, episodic=1)
+    embed_calls = []
+    monkeypatch.setattr(E, "available", lambda: True)
+    monkeypatch.setattr(E, "embed", lambda contents: embed_calls.append(contents))
+    monkeypatch.setattr("mnemosyne.core.beam._vec_available", lambda _conn: False)
+    monkeypatch.setattr("mnemosyne.core.beam._mib", None)
+
+    with pytest.raises(RuntimeError, match="episodic_memory vector backend unavailable"):
+        reindex_vectors(beam.conn)
+
+    assert embed_calls == []
+
+
+def test_reindex_rejects_invalid_later_episodic_batch(tmp_path, monkeypatch):
+    """A later invalid episodic batch must fail before it is counted as written."""
+    beam = _reindex_fixture_beam(tmp_path, episodic=2)
+    responses = iter([
+        [[0.1] * E.EMBEDDING_DIM],
+        [[float("nan")] * E.EMBEDDING_DIM],
+    ])
+    calls = []
+    monkeypatch.setattr(E, "available", lambda: True)
+
+    def embed(contents):
+        calls.append(contents)
+        return next(responses)
+
+    monkeypatch.setattr(E, "embed", embed)
+    monkeypatch.setattr("mnemosyne.core.beam.np", _NumpyStub())
+    monkeypatch.setattr("mnemosyne.core.beam._vec_available", lambda _conn: False)
+    monkeypatch.setattr("mnemosyne.core.beam._mib", lambda _array: b"vector")
+
+    with pytest.raises(RuntimeError, match="episodic_memory embedding vector 0.*finite values"):
+        reindex_vectors(beam.conn, batch_size=1)
+
+    assert len(calls) == 2
+
+
 def test_reindex_does_not_mask_episodic_binary_vector_write_failure(tmp_path, monkeypatch):
     """A binary-vector update failure after a destructive rebuild must fail loudly."""
     beam = _reindex_fixture_beam(tmp_path, episodic=1)
