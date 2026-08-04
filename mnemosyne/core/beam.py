@@ -5638,30 +5638,13 @@ class BeamMemory:
         query_words = _recall_tokens(query_lower)
 
         # ---- Configurable hybrid scoring setup (Phase 4) ----
-        weight_snapshot = _resolved_weights or _resolve_recall_weights(
-            vec_weight, fts_weight, importance_weight,
+        weight_snapshot = (
+            _resolved_weights
+            if _resolved_weights is not None
+            else _resolve_recall_weights(vec_weight, fts_weight, importance_weight)
         )
         vw, fw, iw = weight_snapshot.as_tuple()
         _explain_trace = None
-        if explain:
-            from mnemosyne.core.recall_diagnostics import RecallExplainTrace
-            _explain_trace = RecallExplainTrace(
-                query=query,
-                top_k=top_k,
-                engine="linear",
-                filters={
-                    "from_date": from_date,
-                    "to_date": to_date,
-                    "source": source,
-                    "topic": topic,
-                    "author_id": author_id,
-                    "author_type": author_type,
-                    "channel_id": channel_id,
-                    "veracity": veracity,
-                    "memory_type": memory_type,
-                },
-                weights={"vec": vw, "fts": fw, "importance": iw, "temporal": temporal_weight},
-            )
 
         # ---- Query intent weight adjustment ----
         # This is deliberately a small opt-in shim, not a new recall mode:
@@ -5687,6 +5670,26 @@ class BeamMemory:
                 vw, fw, iw = _normalize_recall_weight_values(vw, fw, iw).as_tuple()
             except Exception:
                 logger.debug("query intent adjustment failed, using default weights", exc_info=True)
+
+        if explain:
+            from mnemosyne.core.recall_diagnostics import RecallExplainTrace
+            _explain_trace = RecallExplainTrace(
+                query=query,
+                top_k=top_k,
+                engine="linear",
+                filters={
+                    "from_date": from_date,
+                    "to_date": to_date,
+                    "source": source,
+                    "topic": topic,
+                    "author_id": author_id,
+                    "author_type": author_type,
+                    "channel_id": channel_id,
+                    "veracity": veracity,
+                    "memory_type": memory_type,
+                },
+                weights={"vec": vw, "fts": fw, "importance": iw, "temporal": temporal_weight},
+            )
 
         # Query embeddings are used by several recall subpaths. Compute the
         # vector at most once per recall() call, then reuse it for working
@@ -6840,15 +6843,18 @@ class BeamMemory:
             )
             resolved_weights = _resolve_recall_weights(*raw_weights).as_tuple()
             if (all(weight is None for weight in raw_weights)
+                    and use_intent
                     and os.environ.get("MNEMOSYNE_QUERY_INTENT", "0") == "1"
                     and classify_intent is not None and adjust_weights is not None):
                 try:
-                    resolved_weights = adjust_weights(
-                        base_vec=resolved_weights[0],
-                        base_fts=resolved_weights[1],
-                        base_importance=resolved_weights[2],
-                        intent=classify_intent(expanded_query),
-                    )
+                    resolved_weights = _normalize_recall_weight_values(
+                        *adjust_weights(
+                            base_vec=resolved_weights[0],
+                            base_fts=resolved_weights[1],
+                            base_importance=resolved_weights[2],
+                            intent=classify_intent(expanded_query),
+                        )
+                    ).as_tuple()
                 except Exception:
                     logger.debug("query intent adjustment failed while building cache key", exc_info=True)
         else:

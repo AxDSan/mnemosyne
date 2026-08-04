@@ -379,10 +379,19 @@ CONFIG_DESCRIPTIONS = {
 # Only prose lives here, keyed by config key, and only where the plain
 # "module reads it directly" note is not explanation enough.
 EFFECTIVE_DEFAULT_PROSE = {
-    "vec_weight": "This is why setting recall weights in `config.yaml` alone has no effect.",
-    "fts_weight": "This is why setting recall weights in `config.yaml` alone has no effect.",
-    "importance_weight": "This is why setting recall weights in `config.yaml` alone has no effect.",
+    "vec_weight": "Recall weights resolve as `config.yaml > MNEMOSYNE_*_WEIGHT > defaults` at request time.",
+    "fts_weight": "Recall weights resolve as `config.yaml > MNEMOSYNE_*_WEIGHT > defaults` at request time.",
+    "importance_weight": "Recall weights resolve as `config.yaml > MNEMOSYNE_*_WEIGHT > defaults` at request time.",
     "llm_enabled": "Note the direction: `config.py` declares this off while the module defaults it on.",
+}
+
+# These keys are resolved by _resolve_recall_weights() at request time through
+# MnemosyneConfig, so their environment-variable reads are fallback inputs,
+# not module-level configuration bypasses.
+RUNTIME_CONFIG_RESOLVED_KEYS = {
+    "vec_weight",
+    "fts_weight",
+    "importance_weight",
 }
 
 
@@ -416,7 +425,7 @@ def _scan_effective_defaults(env_map: dict, defaults: dict) -> dict:
             envvar = m.group(1)
             value = m.group(2) if m.group(2) is not None else m.group(3)
             key = env_to_key.get(envvar)
-            if key is None or key in found:
+            if key is None or key in found or key in RUNTIME_CONFIG_RESOLVED_KEYS:
                 continue
             found[key] = (value, os.path.relpath(path, REPO_ROOT))
 
@@ -691,10 +700,9 @@ def _render_config(env_map, defaults, restart, version: str, effective=None) -> 
         "`vec_weight`, `fts_weight`, and `importance_weight` are normalized to sum to 1.0",
         "at query time. They are the highest-leverage tuning knobs in the system.",
         "",
-        "Note a real caveat: `_normalize_weights` in `mnemosyne/core/beam.py` reads these",
-        "three from the environment directly rather than through `MnemosyneConfig`, so",
-        "setting them in `config.yaml` alone does not affect recall. Set the environment",
-        "variables. This is tracked as a known inconsistency.",
+        "They resolve at request time as `config.yaml > MNEMOSYNE_*_WEIGHT > defaults`.",
+        "A config reload applies to the next request, and enhanced-recall cache entries",
+        "are isolated by the effective weight snapshot.",
         "",
     ]
     return "\n".join(lines).rstrip() + "\n"

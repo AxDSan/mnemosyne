@@ -1,10 +1,23 @@
 """Regression tests for query-intent recall weighting."""
 
-import os
 import tempfile
 from pathlib import Path
 
 import pytest
+
+from mnemosyne.core.config import MnemosyneConfig
+
+
+@pytest.fixture(autouse=True)
+def isolated_config(monkeypatch, tmp_path: Path):
+    """Keep configuration singleton state and config seeding test-local."""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "config.yaml").write_text("cross_session: false\n")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(config_dir))
+    MnemosyneConfig.reset_instance()
+    yield
+    MnemosyneConfig.reset_instance()
 
 
 def test_query_intent_classification_and_weight_adjustment():
@@ -68,6 +81,25 @@ def test_explicit_recall_weights_override_query_intent(monkeypatch):
         assert results
 
 
+def test_recall_explain_reports_intent_adjusted_weights(monkeypatch):
+    """Explain output must report the weights used by direct recall scoring."""
+    from mnemosyne.core import query_intent
+    from mnemosyne.core.beam import BeamMemory
+
+    monkeypatch.setenv("MNEMOSYNE_QUERY_INTENT", "1")
+    monkeypatch.setattr(query_intent, "classify_intent", lambda query: object())
+    monkeypatch.setattr(query_intent, "adjust_weights", lambda *args, **kwargs: (0.2, 0.7, 0.1))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        beam = BeamMemory(session_id="test", db_path=Path(tmpdir) / "mnemosyne.db")
+        beam.remember("Last week we changed the deployment workflow", importance=0.7)
+        payload = beam.recall("what happened last week", top_k=5, explain=True)
+
+    assert payload["explain"]["weights"] == pytest.approx({
+        "vec": 0.2, "fts": 0.7, "importance": 0.1, "temporal": 0.0,
+    })
+
+
 def test_public_enhanced_recall_keeps_explicit_weights_from_query_intent(monkeypatch):
     """Enhanced intent classification must not rewrite public caller weights."""
     from mnemosyne.core import beam as beam_module
@@ -108,7 +140,6 @@ def test_public_enhanced_recall_keeps_explicit_weights_from_query_intent(monkeyp
 
 def test_public_enhanced_recall_resolves_weight_defaults_and_overrides(monkeypatch):
     from mnemosyne.core import beam as beam_module
-    from mnemosyne.core.config import MnemosyneConfig
     from mnemosyne.core.memory import Mnemosyne
 
     observed_base_weights = []
@@ -131,7 +162,6 @@ def test_public_enhanced_recall_resolves_weight_defaults_and_overrides(monkeypat
         config_dir.mkdir()
         (config_dir / "config.yaml").write_text("cross_session: false\n")
         monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(config_dir))
-        MnemosyneConfig.reset_instance()
         db_path = Path(tmpdir) / "mnemosyne.db"
         memory = Mnemosyne(session_id="test", db_path=db_path)
         try:
@@ -162,4 +192,3 @@ def test_public_enhanced_recall_resolves_weight_defaults_and_overrides(monkeypat
             ]
         finally:
             memory.conn.close()
-            MnemosyneConfig.reset_instance()

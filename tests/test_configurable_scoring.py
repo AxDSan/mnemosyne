@@ -11,7 +11,6 @@ Validates:
 """
 
 import math
-import os
 import sys
 import pytest
 import tempfile
@@ -27,8 +26,15 @@ from mnemosyne.core.beam import (
     _normalize_weights,
     BeamMemory,
     init_beam,
-    _get_connection,
 )
+
+
+@pytest.fixture(autouse=True)
+def reset_config_singleton():
+    """Do not leak a temporary config directory into later test modules."""
+    MnemosyneConfig.reset_instance()
+    yield
+    MnemosyneConfig.reset_instance()
 
 
 # ============================================================================
@@ -185,9 +191,6 @@ class TestRecallConfigurableWeights:
 
         # With high importance weight, the high-importance memory should score higher
         # relative to the low-importance one compared to low importance weight
-        low_iw_scores = {r["content"][:20]: r["score"] for r in results_low_iw}
-        high_iw_scores = {r["content"][:20]: r["score"] for r in results_high_iw}
-
         # The high-importance memory (B) should be present in both
         assert any("B:" in r["content"] for r in results_low_iw)
         assert any("B:" in r["content"] for r in results_high_iw)
@@ -320,16 +323,12 @@ class TestRecallConfigurableWeights:
         original_maybe_reload = config._maybe_reload
         reads = 0
 
-        def reload_before_second_legacy_read():
+        def count_reload_checks():
             nonlocal reads
             reads += 1
-            if reads == 2:
-                config_path.write_text("vec_weight: 0\nfts_weight: 1\nimportance_weight: 0\n")
-                config.reload()
-            else:
-                original_maybe_reload()
+            original_maybe_reload()
 
-        monkeypatch.setattr(config, "_maybe_reload", reload_before_second_legacy_read)
+        monkeypatch.setattr(config, "_maybe_reload", count_reload_checks)
         resolved = config.get_many({
             "vec_weight": 0.5,
             "fts_weight": 0.3,

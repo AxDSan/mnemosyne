@@ -16,6 +16,14 @@ from mnemosyne.core.config import MnemosyneConfig, get_config
 from mnemosyne.core.query_cache import QueryCache
 
 
+@pytest.fixture(autouse=True)
+def reset_config_singleton():
+    """Do not leak a temporary config directory into later test modules."""
+    MnemosyneConfig.reset_instance()
+    yield
+    MnemosyneConfig.reset_instance()
+
+
 @pytest.fixture
 def enhanced(monkeypatch, tmp_path: Path):
     """A deterministic enhanced-recall instance whose base pipeline is observable."""
@@ -362,6 +370,43 @@ def test_private_enhanced_cache_key_weight_fallback_honors_yaml_over_env(
         fallback_key = memory._enhanced_recall_cache_key(**common)
         expected_key = memory._enhanced_recall_cache_key(**common, weights=expected_weights)
 
+        assert fallback_key == expected_key
+    finally:
+        MnemosyneConfig.reset_instance()
+
+
+def test_private_enhanced_cache_key_normalizes_intent_adjustment_fallback(
+    enhanced, monkeypatch, tmp_path: Path
+):
+    """The direct key helper retains scorer-equivalent safe weights."""
+    memory, _ = enhanced
+    data_dir = tmp_path / "config"
+    data_dir.mkdir()
+    (data_dir / "config.yaml").write_text("cross_session: false\n")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("MNEMOSYNE_QUERY_INTENT", "1")
+    monkeypatch.setattr(beam_module, "classify_intent", lambda query: object())
+    monkeypatch.setattr(beam_module, "adjust_weights", lambda **kwargs: (0.0, 0.0, 0.0))
+    MnemosyneConfig.reset_instance()
+    common = dict(
+        original_query="private query",
+        expanded_query="private query",
+        top_k=3,
+        runtime=SimpleNamespace(cross_session=False),
+        use_weibull=False,
+        use_mmr=False,
+        use_intent=True,
+        use_synonyms=False,
+        use_associative=False,
+        associative_depth=1,
+        mmr_lambda=0.7,
+        recall_kwargs={},
+    )
+    try:
+        fallback_key = memory._enhanced_recall_cache_key(**common)
+        expected_key = memory._enhanced_recall_cache_key(
+            **common, weights=(0.5, 0.3, 0.2)
+        )
         assert fallback_key == expected_key
     finally:
         MnemosyneConfig.reset_instance()

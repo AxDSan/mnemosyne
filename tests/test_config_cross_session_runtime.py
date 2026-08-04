@@ -14,9 +14,13 @@ ROOT = Path(__file__).resolve().parents[1]
 HERMES_SRC = ROOT / "integrations" / "hermes" / "src"
 
 
-def _run(script: str, *, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def _run(
+    script: str, *, env: dict[str, str], unset: tuple[str, ...] = ()
+) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment.update(env)
+    for name in unset:
+        environment.pop(name, None)
     environment.pop("PYTHONHOME", None)
     existing_path = environment.get("PYTHONPATH", "")
     environment["PYTHONPATH"] = os.pathsep.join([str(ROOT), str(HERMES_SRC), existing_path])
@@ -155,6 +159,10 @@ finally:
 
     defaults_dir = tmp_path / "defaults"
     defaults_dir.mkdir()
+    # An existing config that omits the weight keys prevents auto-seeding from
+    # materializing their defaults into YAML. The child clears inherited values,
+    # so this case exercises get_many's true default fallback.
+    (defaults_dir / "config.yaml").write_text("cross_session: false\n")
     defaults_result = _run(
         script,
         env={
@@ -162,6 +170,11 @@ finally:
             "MNEMOSYNE_NO_EMBEDDINGS": "1",
             "TEST_DB": str(tmp_path / "defaults.db"),
         },
+        unset=(
+            "MNEMOSYNE_VEC_WEIGHT",
+            "MNEMOSYNE_FTS_WEIGHT",
+            "MNEMOSYNE_IMPORTANCE_WEIGHT",
+        ),
     )
     assert json.loads(defaults_result.stdout) == {
         "fts": 0.3,
