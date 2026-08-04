@@ -30,6 +30,8 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset({
     "generate_agent_instructions",
     "generate_docs_instructions",
     "generate_migration_script",
+    "generate_script",
+    "get_provider_info",
     "import_from_file",
     "import_from_hindsight",
     "import_from_holographic",
