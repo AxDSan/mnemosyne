@@ -153,7 +153,7 @@ def test_diagnose_reports_memory_orphans_without_mutating_rows(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize(
-    "repair_statuses", [["error"], ["skipped"], [None], ["repaired", "error"]]
+    "repair_statuses", [["error"], ["skipped"], [None], ["repaired", "error"], []]
 )
 def test_cli_diagnose_unsuccessful_repair_is_a_process_failure(monkeypatch, repair_statuses):
     entries = []
