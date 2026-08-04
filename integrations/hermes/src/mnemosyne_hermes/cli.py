@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from pathlib import Path
 
 _BANK_HELP = (
@@ -367,13 +366,13 @@ def mnemosyne_command(args):
             base_url = getattr(args, "base_url", None)
 
             def _print_import_result(result):
-                print(f"\nImport complete:")
+                print("\nImport complete:")
                 print(f"  Total found: {result.total}")
                 print(f"  Imported:    {result.imported}")
                 print(f"  Skipped:     {result.skipped}")
                 print(f"  Failed:      {result.failed}")
                 if result.errors:
-                    print(f"  Errors:")
+                    print("  Errors:")
                     for err in result.errors[:10]:
                         print(f"    - {err}")
                     if len(result.errors) > 10:
@@ -492,7 +491,7 @@ def mnemosyne_command(args):
             beam_stats = stats.get("beam", {})
             legacy_stats = stats.get("legacy", {})
             triples_stats = stats.get("triples", {})
-            print(f"Import complete:")
+            print("Import complete:")
             print(f"  Working: +{beam_stats.get('working_memory', {}).get('inserted', 0)}")
             print(f"  Episodic: +{beam_stats.get('episodic_memory', {}).get('inserted', 0)}")
             print(f"  Legacy: +{legacy_stats.get('inserted', 0)}")

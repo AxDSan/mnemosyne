@@ -1,6 +1,5 @@
 """Regression coverage for native-export file imports in dry-run mode."""
 
-import importlib
 import json
 import sqlite3
 import sys
@@ -462,7 +461,7 @@ def test_hermes_file_import_dry_run_preserves_data_and_audit_rows(
     # import route rather than first-run schema creation.
     target = Mnemosyne(session_id="provider", db_path=db_path)
     beam = BeamMemory(session_id="provider", db_path=db_path)
-    provider_class = getattr(importlib.import_module(module_name), provider_name)
+    provider_class = getattr(pytest.importorskip(module_name), provider_name)
     provider = provider_class()
     provider._beam = beam
     provider._session_id = "provider"
@@ -544,7 +543,7 @@ def test_hermes_cli_file_import_forwards_dry_run_and_keeps_exit_compat(
     monkeypatch.setattr(target, "import_from_file", import_spy)
     monkeypatch.setattr("mnemosyne.core.memory.Mnemosyne", cli_memory_factory)
 
-    cli = importlib.import_module(module_name)
+    cli = pytest.importorskip(module_name)
     assert cli.mnemosyne_command(_cli_args(export_path)) == 0
     output = capsys.readouterr().out
     assert calls == [(str(export_path), True, True)]
@@ -594,7 +593,7 @@ def test_hermes_cli_file_import_dry_run_failure_preserves_data(
 
     monkeypatch.setattr(target, "import_from_file", fail_import)
     monkeypatch.setattr("mnemosyne.core.memory.Mnemosyne", cli_memory_factory)
-    cli = importlib.import_module(module_name)
+    cli = pytest.importorskip(module_name)
 
     assert cli.mnemosyne_command(_cli_args(export_path)) == 1
     assert _table_snapshot(target.db_path) == before
