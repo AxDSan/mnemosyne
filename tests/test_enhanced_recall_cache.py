@@ -130,7 +130,8 @@ def test_successful_forget_working_clears_persisted_enhanced_recall_cache(
         assert memory._query_cache.stats()["version"] == cache_version
 
         local_id = memory.remember("issue 553 local-cache forget sentinel", source="test")
-        _call(memory, "issue 553 local-cache forget sentinel", top_k=3)
+        local_warm = _call(memory, "issue 553 local-cache forget sentinel", top_k=3)
+        assert local_id in {result["id"] for result in local_warm}
         local_version = memory._query_cache.stats()["version"]
         assert memory.forget_working(local_id) is True
         assert memory._query_cache.stats()["version"] == local_version + 1
@@ -175,11 +176,16 @@ def test_failed_cross_session_forget_keeps_cache_and_memory(
         }
 
         other = BeamMemory(session_id="session-b", db_path=db_path)
-        _call(other, "issue 553 private forget sentinel", top_k=3)
+        other_warm = _call(other, "issue 553 private forget sentinel", top_k=3)
+        assert memory_id not in {result["id"] for result in other_warm}
         assert other._query_cache is not None
         cache_version = other._query_cache.stats()["version"]
         assert other.forget_working(memory_id) is False
         assert other._query_cache.stats()["version"] == cache_version
+        assert memory_id not in {
+            result["id"]
+            for result in _call(other, "issue 553 private forget sentinel", top_k=3)
+        }
         assert owner.get(memory_id) is not None
         assert memory_id in {
             row["id"] for row in _call(owner, "issue 553 private forget sentinel", top_k=3)
