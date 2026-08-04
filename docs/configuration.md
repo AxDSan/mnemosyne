@@ -57,6 +57,113 @@ If you see `working.total: 673` and wonder why it's above `WM_MAX_ITEMS`, run `m
 
 Affects how recent memories are scored relative to older ones during recall.
 
+## Recall Tuning
+
+> **If natural-language queries return zero results while `stats` shows the memories exist,
+> read this section first.**
+
+### Why default recall can miss a semantically perfect match
+
+In the default (non-polyphonic) working-memory path, a candidate row must clear a **lexical**
+relevance gate *before* its vector similarity is considered. In `BeamMemory._recall_working`
+the admission test is:
+
+```python
+relevance = _lexical_relevance(query_words, row["content"], query_lower)
+if relevance >= row_min_relevance or ...:
+    ...
+    vec_sim = wm_vec_sims.get(row["id"], 0.0)
+    if vec_sim > 0:
+        base_score = base_score * 0.80 + vec_sim * 0.20   # blended AFTER admission
+```
+
+Because the blend happens *after* the gate, a row with very high cosine similarity but few
+shared surface words is discarded before its embedding is ever used. **Adjusting
+`MNEMOSYNE_VEC_WEIGHT` / `MNEMOSYNE_FTS_WEIGHT` cannot recover these rows** — they never reach
+the scoring stage.
+
+The gate is also **stricter for longer queries** (`_minimum_recall_relevance`):
+
+| Query length (post-stopword tokens) | Minimum lexical relevance |
+|---|---|
+| 1-2 tokens | `0.15` |
+| 3 tokens | `0.50` |
+| 4+ tokens | `0.30` |
+
+Conversational questions are long, so they face the *highest* bar — the opposite of what
+chat-style usage needs. Two measured examples (`mnemosyne-memory` 3.15.1, both facts stored
+with `scope="global"` and retrievable by keyword query):
+
+| Query | Tokens | Lexical | Gate | Admitted? |
+|---|---|---|---|---|
+| `"How should I mutate app data safely?"` | 4 | 0.250 | 0.30 | ✗ |
+| `"What content does Ken like?"` | 3 | 0.333 | 0.50 | ✗ |
+
+### Diagnosing it
+
+Pass `explain=True` to `recall()`. A gate cull looks like this — candidates are found, then all
+dropped:
+
+```json
+{"stages": [{"name": "wm_primary", "raw_count": 24,
+             "after_filter_count": 22, "kept_count": 0}]}
+```
+
+`after_filter_count` ≫ `kept_count` means the gate culled, **not** that the data is missing.
+
+### Fixing it
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MNEMOSYNE_POLYPHONIC_RECALL` | `0` (off) | Routes recall through `PolyphonicRecallEngine` (RRF fusion over vector / graph / fact / temporal voices). Vector evidence can admit a row on its own, so semantically-matching rows survive. |
+| `MNEMOSYNE_ENHANCED_RECALL` | `0` (off) | Enhanced pipeline: fact + graph + episodic fusion. |
+| `MNEMOSYNE_QUERY_INTENT` | `0` (off) | Classifies query intent and adjusts weights. |
+| `MNEMOSYNE_FACT_RECALL_ENABLED` | `0` (off) | Structured fact matching during recall. |
+
+```bash
+export MNEMOSYNE_POLYPHONIC_RECALL=1
+```
+
+Measured effect of each flag **in isolation**, same 8 natural-language probes over the same
+62-item corpus (`mnemosyne-memory` 3.15.1):
+
+| Configuration | Probes passed |
+|---|---|
+| baseline (all flags off) | 6/8 |
+| `MNEMOSYNE_ENHANCED_RECALL=1` | 6/8 (no change) |
+| `MNEMOSYNE_QUERY_INTENT=1` | 6/8 (no change) |
+| `MNEMOSYNE_FACT_RECALL_ENABLED=1` | 6/8 (no change) |
+| **`MNEMOSYNE_POLYPHONIC_RECALL=1`** | **7/8** |
+| `MNEMOSYNE_POLYPHONIC_RECALL=1` + question-shaped fact wording | **8/8** |
+
+### Polyphonic recall is a trade-off, not a free win
+
+A wider 40-probe / 10-category evaluation over the same corpus found polyphonic recall is **not
+uniformly better** — it improves phrasing-tolerant recall but admits more superseded rows:
+
+| Category (weight) | Flags off | Polyphonic on |
+|---|---|---|
+| Preference recall (1.0) | 6.7 | **10.0** |
+| Multi-hop synthesis (1.0) | 9.2 | **10.0** |
+| **Temporal supersession (2.0)** | **10.0** | 7.8 |
+| Cross-scope exposure, provider layer (1.5) | **8.0** | 4.0 |
+| Weighted composite | **95.1** | 94.8 |
+
+Widening the candidate set pulls in more *stale* rows next to their corrections, so if your
+workload depends on "what is true **now**", verify supersession behaviour after enabling it.
+
+### Also check `scope` before blaming recall
+
+`remember()` defaults to `scope="session"`, and session-scoped rows are only visible to the same
+`session_id`. Seeding from a script or CLI (which typically uses `session_id="default"`) and then
+querying from an application session returns **zero hits** while `stats` still counts the rows:
+
+```sql
+SELECT scope, session_id, COUNT(*) FROM working_memory GROUP BY scope, session_id;
+```
+
+Use `scope="global"` for durable facts that must be recallable everywhere.
+
 ## Vector Compression & Embedding Model
 
 ```bash
