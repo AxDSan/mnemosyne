@@ -42,6 +42,21 @@ def _fd_target_counts() -> Counter[str]:
     return counts
 
 
+def test_fd_target_counts_ignores_disappearing_descriptors(monkeypatch):
+    """A descriptor vanishing during /proc enumeration does not abort the snapshot."""
+
+    monkeypatch.setattr(os, "listdir", lambda _path: ["3", "4"])
+
+    def readlink(path: str) -> str:
+        if path.endswith("/3"):
+            raise FileNotFoundError(path)
+        return "/tmp/memory.db"
+
+    monkeypatch.setattr(os, "readlink", readlink)
+
+    assert _fd_target_counts() == Counter({"/tmp/memory.db": 1})
+
+
 def _create_db(path: Path, *, with_vector_cache: bool = False) -> None:
     conn = sqlite3.connect(path)
     conn.executescript(
