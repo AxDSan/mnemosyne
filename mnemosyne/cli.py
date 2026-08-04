@@ -1371,6 +1371,11 @@ def cmd_hygiene(args):
         except json.JSONDecodeError as e:
             _fail(f"Invalid JSON in candidates file: {e}")
 
+        # audit --json emits an envelope {"total_scanned": N, "candidates": [...]};
+        # clean expects the candidates array.
+        if isinstance(raw, dict) and "candidates" in raw:
+            raw = raw["candidates"]
+
         candidates = []
         for idx, c in enumerate(raw):
             try:

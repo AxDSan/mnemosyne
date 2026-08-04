@@ -465,6 +465,37 @@ class TestAuditNoise:
 
         assert message in capsys.readouterr().err
 
+    def test_cmd_hygiene_clean_unwraps_audit_envelope(self, temp_db, monkeypatch, capsys):
+        """Regression test for #606: clean must unwrap the audit JSON envelope."""
+        db_path, beam = temp_db
+        _insert_row(beam, "working_memory", "n1", "heartbeat", source="heartbeat")
+        # CLI expects the database at $DATA_DIR/mnemosyne.db
+        cli_db = db_path.parent / "mnemosyne.db"
+        # VACUUM INTO produces a clean, standalone copy (no WAL dependency).
+        sqlite3.connect(str(db_path)).execute("VACUUM INTO ?", (str(cli_db),)).close()
+        monkeypatch.setattr("mnemosyne.cli.DATA_DIR", str(db_path.parent))
+
+        candidates_file = db_path.parent / "audit.json"
+        envelope = {
+            "total_scanned": 1,
+            "candidates": [
+                {
+                    "memory_id": "n1",
+                    "table_name": "working_memory",
+                    "content_preview": "heartbeat",
+                    "noise_score": 0.8,
+                    "noise_reasons": ["trivial_keyword"],
+                    "suggested_action": "delete",
+                }
+            ],
+        }
+        candidates_file.write_text(json.dumps(envelope))
+
+        cmd_hygiene(["clean", "--action", "delete", "--confirm", str(candidates_file)])
+
+        captured = capsys.readouterr()
+        assert "deleted=1" in captured.out
+
     def test_hygiene_status_without_audit_log(self, temp_db):
         db_path, _beam = temp_db
 
