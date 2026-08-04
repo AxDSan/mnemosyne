@@ -70,19 +70,20 @@ def test_reindex_rejects_failed_or_partial_embedding_batches(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize(
-    ("invalid_vector", "reason"),
+    ("invalid_vector_factory", "reason"),
     [
-        (["not-a-number"] * E.EMBEDDING_DIM, "convertible numeric"),
-        ([[0.1]] * E.EMBEDDING_DIM, "one-dimensional"),
-        ([float("nan")] * E.EMBEDDING_DIM, "finite values"),
-        ([0.1] * (E.EMBEDDING_DIM - 1), "expected"),
+        (lambda: ["not-a-number"] * E.EMBEDDING_DIM, "convertible numeric"),
+        (lambda: [[0.1]] * E.EMBEDDING_DIM, "one-dimensional"),
+        (lambda: [float("nan")] * E.EMBEDDING_DIM, "finite values"),
+        (lambda: [0.1] * (E.EMBEDDING_DIM - 1), "expected"),
     ],
 )
 def test_reindex_rejects_invalid_individual_embedding_vectors(
-    tmp_path, monkeypatch, invalid_vector, reason
+    tmp_path, monkeypatch, invalid_vector_factory, reason
 ):
     """Each vector must be numeric, 1-D, finite, and at the active dimension."""
     beam = _reindex_fixture_beam(tmp_path, working=1)
+    invalid_vector = invalid_vector_factory()
     monkeypatch.setattr(E, "available", lambda: True)
     monkeypatch.setattr(E, "embed", lambda _contents: [invalid_vector])
 
