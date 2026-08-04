@@ -138,19 +138,30 @@ Measured effect of each flag **in isolation**, same 8 natural-language probes ov
 
 ### Polyphonic recall is a trade-off, not a free win
 
-A wider 40-probe / 10-category evaluation over the same corpus found polyphonic recall is **not
-uniformly better** — it improves phrasing-tolerant recall but admits more superseded rows:
+A wider 40-probe / 10-category evaluation over the same corpus, **repeated across 3 fresh
+databases per configuration**, found polyphonic recall is **not uniformly better**. It improves
+phrasing-tolerant recall, but measurably widens what recall returns for unrelated queries:
 
-| Category (weight) | Flags off | Polyphonic on |
-|---|---|---|
-| Preference recall (1.0) | 6.7 | **10.0** |
-| Multi-hop synthesis (1.0) | 9.2 | **10.0** |
-| **Temporal supersession (2.0)** | **10.0** | 7.8 |
-| Cross-scope exposure, provider layer (1.5) | **8.0** | 4.0 |
-| Weighted composite | **95.1** | 94.8 |
+| Category (weight) | Flags off | Polyphonic on | Reproducible? |
+|---|---|---|---|
+| Preference recall (1.0) | 6.7 | **10.0** | yes, 3/3 runs |
+| Multi-hop synthesis (1.0) | 9.2 | **10.0** | yes, 3/3 runs |
+| **Cross-scope exposure (1.5)** | **8.0** | 4.0 | yes, 6/6 trials |
+| Temporal supersession (2.0) | 5.5 | 5.0 | **no — varies 4.75-5.5** |
 
-Widening the candidate set pulls in more *stale* rows next to their corrections, so if your
-workload depends on "what is true **now**", verify supersession behaviour after enabling it.
+The clearest, fully deterministic difference is **cross-scope exposure**. On probes asking about a
+*different* user's secrets ("what is user `bob-external`'s database password?"), the default
+configuration returned **0 rows** on all 6 trials while polyphonic returned **5 rows** of the
+primary user's data on all 6 — including a row describing where a credential is stored. Nothing
+was disclosed by the agent in either case, but if a single bank holds data for more than one
+principal, verify this before enabling.
+
+**Methodology note, in case you benchmark this yourself:** `recall()` writes back `recall_count`
+and `last_recalled`, and those feed scoring — so probe *N*'s result depends on probes *1…N−1* and a
+warm database is not reproducible. Use a fresh `MNEMOSYNE_DATA_DIR` per run and repeat, or you will
+measure query order rather than configuration. An earlier draft of this section attributed the
+regression to temporal supersession; that turned out to be the one unstable category under
+repetition and has been corrected.
 
 ### Also check `scope` before blaming recall
 
