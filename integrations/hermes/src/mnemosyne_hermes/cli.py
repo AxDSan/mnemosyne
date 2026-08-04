@@ -482,7 +482,7 @@ def mnemosyne_command(args):
         # File import
         force = getattr(args, "force", False)
         if not input_path:
-            print("Usage: hermes mnemosyne import --input <path> [--force]")
+            print("Usage: hermes mnemosyne import --input <path> [--force] [--dry-run]")
             print("       hermes mnemosyne import --from <provider> --api-key <key> [--dry-run]")
             print("       hermes mnemosyne import --list-providers")
             return 1
