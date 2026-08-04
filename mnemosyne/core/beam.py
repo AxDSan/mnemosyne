@@ -2550,6 +2550,10 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
                     f"expected {target_dim}"
                 )
             for value in values:
+                if isinstance(value, (str, bytes)):
+                    raise RuntimeError(
+                        f"{store} embedding vector {index} is not a convertible numeric vector"
+                    )
                 if isinstance(value, (list, tuple)) or getattr(value, "ndim", 0) != 0:
                     raise RuntimeError(
                         f"{store} embedding vector {index} must be one-dimensional"

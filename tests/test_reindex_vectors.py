@@ -93,6 +93,16 @@ def test_reindex_rejects_invalid_individual_embedding_vectors(
         reindex_vectors(beam.conn)
 
 
+def test_reindex_rejects_numeric_string_embedding_vector(tmp_path, monkeypatch):
+    """Numeric-looking strings must not be persisted as JSON string vectors."""
+    beam = _reindex_fixture_beam(tmp_path, working=1)
+    monkeypatch.setattr(E, "available", lambda: True)
+    monkeypatch.setattr(E, "embed", lambda _contents: [["0.1"] * E.EMBEDDING_DIM])
+
+    with pytest.raises(RuntimeError, match="working_memory embedding vector 0.*convertible numeric"):
+        reindex_vectors(beam.conn)
+
+
 def test_reindex_requires_episodic_vector_backend_before_writes(tmp_path, monkeypatch):
     """Episodic rows cannot be counted as reindexed without a writable backend."""
     beam = _reindex_fixture_beam(tmp_path, episodic=1)
