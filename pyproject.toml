@@ -89,9 +89,14 @@ version = {attr = "mnemosyne.__version__"}
 # for two reasons:
 #   (1) documents the rule families the project cares about
 #   (2) lets `ruff check` (run with no `--select`) exercise the F/RUF022
-#       subset locally, which is handy for pre-commit and editor integrations.
-#       NOTE: CI narrows this to PR-changed files only and adds a separate
-#       whole-tree E9 fatal gate (syntax errors) that this config does not select.
+#       subset locally — but only for files governed by THIS root config.
+#       NOTE: files under integrations/hermes/ are covered by a nested
+#       pyproject.toml with its own broader selection (E,W,F,I,B,C4,UP),
+#       so a bare `ruff check` there will apply that nested config, not
+#       this one. The authoritative CI command is always
+#       `ruff check --select F,RUF022 -- <changed files>` (ci.yml),
+#       which is config-agnostic. CI also adds a separate whole-tree E9
+#       fatal gate (syntax errors) that this config does not select.
 #
 # If you add or remove rules here, mirror the change in ci.yml so the
 # two stay in sync.
