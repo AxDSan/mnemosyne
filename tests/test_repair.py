@@ -736,7 +736,6 @@ def test_sidecar_rejection_detects_duplicate_repair_fd(tmp_path, monkeypatch):
     _insert_memory(db_path, "selected")
     report_path = _write_manifest(db_path, tmp_path)
     journal = db_path.with_name(db_path.name + "-journal")
-    journal.write_bytes(b"sidecar")
     backup = tmp_path / "must-not-exist.sqlite"
     existing_fd = os.open(db_path, os.O_RDONLY)
     leaked_fd = None
@@ -747,6 +746,7 @@ def test_sidecar_rejection_detects_duplicate_repair_fd(tmp_path, monkeypatch):
         result = real_gate(*args, conn=conn, **kwargs)
         if conn is None:
             leaked_fd = os.open(db_path, os.O_RDONLY)
+            journal.write_bytes(b"sidecar")
         return result
 
     monkeypatch.setattr(repair, "_verify_report_gate", leak_fd_after_gate)
