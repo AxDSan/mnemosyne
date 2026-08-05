@@ -5,7 +5,6 @@ Tests for Mnemosyne BEAM architecture
 import pytest
 import tempfile
 import sqlite3
-import os
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -1149,7 +1148,7 @@ class TestExportImport:
 
     def test_beam_import_from_dict_idempotent(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
-        mid = beam.remember("Prefers dark mode", source="preference", importance=0.9)
+        beam.remember("Prefers dark mode", source="preference", importance=0.9)
         data = beam.export_to_dict()
 
         # Import into fresh DB
@@ -1362,7 +1361,7 @@ class TestCrossSessionRecall:
         assert len(results2) > 0, "Cross-session recall should find second global memory"
 
         # Test that session-scoped memory is NOT visible cross-session
-        results3 = beam_b.recall("本轮只测试", top_k=5)
+        beam_b.recall("本轮只测试", top_k=5)
         # This may or may not find it depending on scoring; the key is globals ARE found
 
     def test_fallback_scoring_finds_chinese_substrings(self, temp_db, monkeypatch):
@@ -1570,7 +1569,7 @@ class TestTieredDegradation:
 
     def test_schema_migration_adds_tier_columns(self, temp_db):
         """Wave 1: init_beam() should add tier and degraded_at columns to episodic_memory."""
-        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        BeamMemory(session_id="s1", db_path=temp_db)
         # Just creating a BeamMemory triggers init_beam which runs the migration
 
         conn = sqlite3.connect(temp_db)
@@ -1723,8 +1722,8 @@ class TestTieredDegradation:
         conn.close()
 
         result = beam.degrade_episodic(dry_run=False)
-        # Should degrade at most the resolved batch size (3), not all 5.
-        assert result["tier1_to_tier2"] <= 3
+        # The resolved batch size is exact, not merely an upper bound.
+        assert result["tier1_to_tier2"] == 3
 
     def test_tier_weighting_in_recall(self, temp_db, monkeypatch):
         """Tier 3 memories should score lower than tier 1 in recall."""
@@ -1926,7 +1925,7 @@ class TestVeracity:
 
     def test_schema_adds_veracity_columns(self, temp_db):
         """init_beam should add veracity to working_memory and episodic_memory."""
-        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        BeamMemory(session_id="s1", db_path=temp_db)
 
         conn = sqlite3.connect(temp_db)
         wm_cols = [r[1] for r in conn.execute("PRAGMA table_info(working_memory)").fetchall()]

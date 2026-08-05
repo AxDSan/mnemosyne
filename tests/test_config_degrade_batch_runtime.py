@@ -44,7 +44,7 @@ try:
     old = (datetime.now() - timedelta(days=365)).isoformat()
     memory.conn.executemany(
         "INSERT INTO episodic_memory (id, content, created_at, tier) VALUES (?, ?, ?, 1)",
-        [(f"row-{index}", f"runtime degrade sentinel {index}", old) for index in range(6)],
+        [(f"row-{index}", f"runtime degrade sentinel {index}", old) for index in range(101)],
     )
     memory.conn.commit()
     print(json.dumps(memory.degrade_episodic(dry_run=True), sort_keys=True))
@@ -58,7 +58,7 @@ finally:
     [
         ("degrade_batch: 3\n", "5", 3),
         ("cross_session: false\n", "2", 2),
-        ("cross_session: false\n", None, 6),
+        ("cross_session: false\n", None, 100),
     ],
 )
 def test_degrade_batch_direct_consumer_honors_yaml_env_and_default(
