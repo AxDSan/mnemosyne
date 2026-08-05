@@ -290,7 +290,10 @@ TIER3_DAYS = int(os.environ.get("MNEMOSYNE_TIER3_DAYS", "180"))
 TIER1_WEIGHT = float(os.environ.get("MNEMOSYNE_TIER1_WEIGHT", "1.0"))
 TIER2_WEIGHT = float(os.environ.get("MNEMOSYNE_TIER2_WEIGHT", "0.5"))
 TIER3_WEIGHT = float(os.environ.get("MNEMOSYNE_TIER3_WEIGHT", "0.25"))
-DEGRADE_BATCH_SIZE = int(os.environ.get("MNEMOSYNE_DEGRADE_BATCH", "100"))
+# Kept as the established default for callers that do not configure a value.
+# The actual degradation consumer resolves its value through MnemosyneConfig
+# at the start of each complete operation (see degrade_episodic()).
+DEGRADE_BATCH_SIZE = 100
 SMART_COMPRESS = os.environ.get("MNEMOSYNE_SMART_COMPRESS", "1") not in ("0", "false", "no")
 TIER3_MAX_CHARS = int(os.environ.get("MNEMOSYNE_TIER3_MAX_CHARS", "300"))
 
@@ -8071,6 +8074,12 @@ class BeamMemory:
 
         Returns summary of tier transitions performed.
         """
+        # Resolve once so a config reload cannot make the tier-1 and tier-2
+        # candidate queries use different batch semantics mid-operation.
+        # MnemosyneConfig preserves config.yaml > env > default precedence.
+        from mnemosyne.core.config import get_config
+        degrade_batch_size = get_config().get_int("degrade_batch", DEGRADE_BATCH_SIZE)
+
         cursor = self.conn.cursor()
         now = datetime.now()
         results = {"status": "dry_run" if dry_run else "degraded",
@@ -8087,7 +8096,7 @@ class BeamMemory:
                 SELECT id, rowid, content, importance FROM episodic_memory
                 WHERE tier = 1 AND created_at < ?
                 ORDER BY created_at ASC LIMIT ?
-            """, (tier2_cutoff, DEGRADE_BATCH_SIZE))
+            """, (tier2_cutoff, degrade_batch_size))
             tier1_rows = cursor.fetchall()
         except Exception as exc:
             logger.warning(
@@ -8103,7 +8112,7 @@ class BeamMemory:
                 SELECT id, rowid, content FROM episodic_memory
                 WHERE tier = 2 AND created_at < ?
                 ORDER BY created_at ASC LIMIT ?
-            """, (tier3_cutoff, DEGRADE_BATCH_SIZE // 2))
+            """, (tier3_cutoff, degrade_batch_size // 2))
             tier2_rows = cursor.fetchall()
         except Exception as exc:
             logger.warning(

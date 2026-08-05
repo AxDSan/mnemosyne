@@ -1698,9 +1698,10 @@ class TestTieredDegradation:
         assert tier == 1, "Dry run should not change tier"
 
     def test_degrade_episodic_respects_batch_limit(self, temp_db, monkeypatch):
-        """Degradation should respect DEGRADE_BATCH_SIZE limit."""
+        """Degradation should respect its resolved runtime batch limit."""
         monkeypatch.setattr("mnemosyne.core.beam.TIER2_DAYS", 1)
-        monkeypatch.setattr("mnemosyne.core.beam.DEGRADE_BATCH_SIZE", 3)
+        config = type("Config", (), {"get_int": lambda self, key, default: 3})()
+        monkeypatch.setattr("mnemosyne.core.config.get_config", lambda: config)
 
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         # Consolidate 5 episodic memories first
@@ -1722,7 +1723,7 @@ class TestTieredDegradation:
         conn.close()
 
         result = beam.degrade_episodic(dry_run=False)
-        # Should degrade at most DEGRADE_BATCH_SIZE (3), not all 5
+        # Should degrade at most the resolved batch size (3), not all 5.
         assert result["tier1_to_tier2"] <= 3
 
     def test_tier_weighting_in_recall(self, temp_db, monkeypatch):
