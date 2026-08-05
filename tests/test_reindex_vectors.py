@@ -198,6 +198,7 @@ def test_reindex_real_commits_deferred_working_batches_before_next_embedding(tmp
     monkeypatch.setattr(E, "embed", embed)
     monkeypatch.setattr("mnemosyne.core.beam.np", _NumpyStub())
     monkeypatch.setattr("mnemosyne.core.beam._vec_available", lambda _conn: False)
+    monkeypatch.setattr("mnemosyne.core.beam._wm_vec_available", lambda _conn: False)
     beam.conn._defer_commit = True
 
     result = reindex_vectors(beam.conn, batch_size=1)
