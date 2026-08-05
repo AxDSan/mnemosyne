@@ -1325,7 +1325,8 @@ class TestCrossSessionRecall:
         beam_a = BeamMemory(session_id="hermes_session-A", db_path=temp_db)
         beam_a.remember("用户喜欢直接说结论", source="preference", importance=0.95, scope="global")
         beam_a.remember("用户讨论基金时重视手续费口径", source="preference", importance=0.92, scope="global")
-        beam_a.remember("本轮只测试 mnemosyne 沙盒", source="test", importance=0.80, scope="session")
+        private_content = "private-session-marker-zorblax-482"
+        beam_a.remember(private_content, source="test", importance=0.80, scope="session")
 
         # Backdate all working memories so they are old enough to consolidate
         conn = sqlite3.connect(temp_db)
@@ -1361,8 +1362,8 @@ class TestCrossSessionRecall:
         assert len(results2) > 0, "Cross-session recall should find second global memory"
 
         # Test that session-scoped memory is NOT visible cross-session
-        beam_b.recall("本轮只测试", top_k=5)
-        # This may or may not find it depending on scoring; the key is globals ARE found
+        private_results = beam_b.recall("private-session-marker-zorblax-482", top_k=5)
+        assert private_content not in [result["content"] for result in private_results]
 
     def test_fallback_scoring_finds_chinese_substrings(self, temp_db, monkeypatch):
         """Fallback keyword scoring must handle Chinese where words aren't space-delimited."""
@@ -1699,7 +1700,14 @@ class TestTieredDegradation:
     def test_degrade_episodic_respects_batch_limit(self, temp_db, monkeypatch):
         """Degradation should respect its resolved runtime batch limit."""
         monkeypatch.setattr("mnemosyne.core.beam.TIER2_DAYS", 1)
-        config = type("Config", (), {"get_int": lambda self, key, default: 3})()
+
+        class Config:
+            def get_int(self, key, default):
+                assert key == "degrade_batch"
+                assert default == 100
+                return 3
+
+        config = Config()
         monkeypatch.setattr("mnemosyne.core.config.get_config", lambda: config)
 
         beam = BeamMemory(session_id="s1", db_path=temp_db)
