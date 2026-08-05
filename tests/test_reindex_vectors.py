@@ -178,6 +178,36 @@ def test_reindex_does_not_mask_working_vec_write_failure(tmp_path, monkeypatch):
         reindex_vectors(beam.conn)
 
 
+def test_reindex_real_commits_deferred_working_batches_before_next_embedding(tmp_path, monkeypatch):
+    """Deferred BEAM writes must be committed before the next embedding request."""
+    beam = _reindex_fixture_beam(tmp_path, working=2)
+    observed_transactions = []
+    real_commits = []
+    original_real_commit = type(beam.conn)._real_commit
+
+    def record_real_commit(conn):
+        real_commits.append(conn.in_transaction)
+        return original_real_commit(conn)
+
+    def embed(contents):
+        observed_transactions.append(beam.conn.in_transaction)
+        return [[0.1] * E.EMBEDDING_DIM for _ in contents]
+
+    monkeypatch.setattr(type(beam.conn), "_real_commit", record_real_commit)
+    monkeypatch.setattr(E, "available", lambda: True)
+    monkeypatch.setattr(E, "embed", embed)
+    monkeypatch.setattr("mnemosyne.core.beam.np", _NumpyStub())
+    monkeypatch.setattr("mnemosyne.core.beam._vec_available", lambda _conn: False)
+    beam.conn._defer_commit = True
+
+    result = reindex_vectors(beam.conn, batch_size=1)
+
+    assert result["working_memory_reindexed"] == 2
+    assert observed_transactions == [False, False]
+    assert real_commits == [True, True]
+    assert not beam.conn.in_transaction
+
+
 def test_reindex_rebuilds_all_vector_stores_at_active_dim():
     if not E.available():
         import pytest  # type: ignore

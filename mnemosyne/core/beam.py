@@ -2515,6 +2515,13 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     def _count(sql: str) -> int:
         return int(conn.execute(sql).fetchone()[0])
 
+    def _commit_reindex_writes() -> None:
+        """Commit a rebuild boundary even when BEAM normally defers commits."""
+        if isinstance(conn, _BeamConnection):
+            conn._real_commit()
+        else:
+            conn.commit()
+
     def _embed_chunk(store: str, chunk) -> Any:
         try:
             vectors = _embeddings.embed([row["content"] for row in chunk])
@@ -2602,7 +2609,7 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
             conn.execute(
                 f"CREATE VIRTUAL TABLE {table} USING vec0(embedding {vec_type}[{target_dim}])"
             )
-        conn.commit()
+        _commit_reindex_writes()
 
     # 2) Working memory -> memory_embeddings (+ vec_working), via the shared write
     #    helper so the float-JSON and sqlite-vec stores stay consistent.
@@ -2619,7 +2626,7 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
                 conn, r["id"], np.asarray(vec).tolist(), commit_vec=False, strict_vec=True
             )
             wm_done += 1
-        conn.commit()
+        _commit_reindex_writes()
         if progress:
             progress("working_memory", wm_done, wm_total)
 
@@ -2644,7 +2651,7 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
                     (_mib(arr), rowid),
                 )
             ep_done += 1
-        conn.commit()
+        _commit_reindex_writes()
         if progress:
             progress("episodic_memory", ep_done, ep_total)
 

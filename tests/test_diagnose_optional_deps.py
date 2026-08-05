@@ -38,6 +38,29 @@ def test_diagnose_treats_ctransformers_as_optional(tmp_path, monkeypatch):
     assert ctransformers["status"] not in {"MISSING", "ERROR"}
 
 
+def test_run_diagnostics_counts_lowercase_error_status(tmp_path, monkeypatch):
+    """Summary failures include lowercase statuses emitted by diagnostics."""
+    monkeypatch.setattr(diagnose, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(
+        diagnose,
+        "collect_runtime_diagnostics",
+        lambda: {
+            "checks": [
+                {"category": "test", "check": "lowercase_error", "status": "error", "detail": ""},
+            ]
+        },
+    )
+
+    summary = diagnose.run_diagnostics()
+
+    assert _entry(summary, "lowercase_error")["status"] == "error"
+    assert summary["checks_failed"] == sum(
+        str(entry["status"]).upper() in {"MISSING", "NO", "ERROR"}
+        for entry in summary["entries"]
+    )
+
+
 def test_diagnose_vector_guidance_uses_valid_sleep_actions(tmp_path, monkeypatch):
     monkeypatch.setattr(diagnose, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
