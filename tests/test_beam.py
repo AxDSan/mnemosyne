@@ -1366,7 +1366,7 @@ class TestCrossSessionRecall:
         assert private_content in [result["content"] for result in same_session_private_results]
 
         # Test that session-scoped memory is NOT visible cross-session
-        private_results = beam_b.recall("private-session-marker-zorblax-482", top_k=5)
+        private_results = beam_b.recall(private_content, top_k=5)
         assert private_content not in [result["content"] for result in private_results]
 
     def test_fallback_scoring_finds_chinese_substrings(self, temp_db, monkeypatch):
