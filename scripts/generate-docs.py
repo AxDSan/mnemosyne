@@ -488,6 +488,8 @@ ENV_ONLY_DESCRIPTIONS = {
     "MNEMOSYNE_INFERRED_WEIGHT": "Veracity multiplier for inferred memories.",
     "MNEMOSYNE_LEXICAL_GATE_MIN": "Override the lexical admission gate (float 0.0–1.0, clamped; non-finite/invalid values fall back to the historical query-length thresholds 0.15/0.5/0.3). `0.0` admits purely-vector candidates (recall-first, at a precision cost). Read on every recall call; retrieval stays local (sqlite-vec + JSON/NumPy embeddings, or lexical-only FTS5 when embeddings are unavailable).",
     "MNEMOSYNE_MCP_BANK": "Memory bank used by the MCP server.",
+    "MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES": "Tri-state MCP policy for entity extraction: unset preserves caller behavior (omitted is false); when set, strict 1/true/yes/on or 0/false/no/off overrides the caller; invalid values fail at MCP startup or first use.",
+    "MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES": "Tri-state MCP policy for triple extraction: unset preserves caller behavior (omitted is false); when set, strict 1/true/yes/on or 0/false/no/off overrides the caller; invalid values fail at MCP startup or first use.",
     "MNEMOSYNE_MCP_TOKEN": "Bearer token for network MCP transport auth. Required for any non-loopback bind.",
     "MNEMOSYNE_PERSONA_FILE": "Path to an external persona facts file.",
     "MNEMOSYNE_PREFETCH_MODEL_SLOT_LIMIT": "Maximum canonical slots prefetched per turn.",

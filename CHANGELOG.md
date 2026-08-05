@@ -50,6 +50,10 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
   rotates the agent session through `/new`, `/resume`, `/branch`, undo, or context
   compression, so subsequent writes, reads, and tools use the active session.
 
+### Changed
+
+- MCP remember and batch extraction policies now support strict tri-state server defaults with caller-preserving omission semantics.
+
 ## [3.16.0] - 2026-08-01
 
 ### Added
