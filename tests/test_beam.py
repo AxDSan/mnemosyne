@@ -1361,6 +1361,10 @@ class TestCrossSessionRecall:
         results2 = beam_b.recall("基金讨论时看重什么口径", top_k=5)
         assert len(results2) > 0, "Cross-session recall should find second global memory"
 
+        # Positive control: session-scoped memory remains visible in its own session.
+        same_session_private_results = beam_a.recall(private_content, top_k=5)
+        assert private_content in [result["content"] for result in same_session_private_results]
+
         # Test that session-scoped memory is NOT visible cross-session
         private_results = beam_b.recall("private-session-marker-zorblax-482", top_k=5)
         assert private_content not in [result["content"] for result in private_results]
