@@ -302,7 +302,6 @@ def render_persona_markdown(
     if approx_tokens > token_cap:
         # Truncate by topic sections until under cap
         truncated = lines[:1] + [""]
-        approx = int(len(" ".join(truncated).split()) * 1.3)
         # Iterate topics in priority order (first added = highest importance)
         topic_pri = []
         seen = set()
@@ -323,12 +322,11 @@ def render_persona_markdown(
                 content = item["content"]
                 section.append(f"- {content} [importance: {imp:.2f}]")
             section_text = "\n".join(section)
-            new_approx = approx + int(len(section_text.split()) * 1.3)
+            new_approx = int(len("\n".join(truncated + [section_text]).split()) * 1.3)
             if new_approx > token_cap:
-                break
+                continue
             truncated.append(section_text)
             truncated.append("")
-            approx = new_approx
         out = "\n".join(truncated).rstrip() + "\n"
     return out
 
