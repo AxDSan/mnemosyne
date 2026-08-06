@@ -264,6 +264,7 @@ CONFIG_DESCRIPTIONS = {
     "proactive_linking": "Create cross-memory graph edges on insertion.",
     "lenient_fact_match": "Match facts by substring instead of exact equality.",
     "recall_diagnostics": "Collect per-stage recall diagnostics. See `explain=True`.",
+    "lexical_gate_min": "Override the lexical admission gate (float 0.0–1.0). Defaults to the historical query-length thresholds (0.15/0.5/0.3); `0.0` admits purely-vector candidates (recall-first, at a precision cost). Read on every recall call.",
 
     # Working memory
     "wm_max_items": "Maximum rows retained in `working_memory` before eviction.",

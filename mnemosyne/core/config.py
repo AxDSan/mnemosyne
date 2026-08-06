@@ -93,6 +93,7 @@ ENV_VAR_MAP: Dict[str, str] = {
     "proactive_linking": "MNEMOSYNE_PROACTIVE_LINKING",
     "lenient_fact_match": "MNEMOSYNE_LENIENT_FACT_MATCH",
     "recall_diagnostics": "MNEMOSYNE_RECALL_DIAGNOSTICS",
+    "lexical_gate_min": "MNEMOSYNE_LEXICAL_GATE_MIN",
     # Tiers
     "wm_max_items": "MNEMOSYNE_WM_MAX_ITEMS",
     "wm_ttl_hours": "MNEMOSYNE_WM_TTL_HOURS",

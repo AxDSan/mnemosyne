@@ -5,10 +5,6 @@ query-length-dependent thresholds (0.15 / 0.5 / 0.3). The knob overrides the
 gate entirely (float 0.0-1.0), defaulting to the historical behaviour when
 unset, so existing deployments are unaffected unless they opt in.
 """
-import os
-
-import pytest
-
 from mnemosyne.core.beam import _minimum_recall_relevance
 
 

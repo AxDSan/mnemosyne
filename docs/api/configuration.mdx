@@ -1,7 +1,7 @@
 ---
 title: "Configuration"
 version: 3.15.2
-config_key_count: 106
+config_key_count: 107
 env_only_count: 42
 generated_at: "auto"
 ---
@@ -23,13 +23,13 @@ and `wm_max_items` are equivalent.
 Keys marked **restart** are read once at startup. Changing them at runtime warns
 and does not take effect until the process restarts.
 
-There are **106 configuration keys**. A further
+There are **107 configuration keys**. A further
 **42 environment variables** are read directly from the
 environment and are **not** settable in `config.yaml`; they are listed separately below.
 
 ---
 
-## Configuration keys (106)
+## Configuration keys (107)
 
 | Config key | Environment variable | Default | Restart | Description |
 |------------|----------------------|---------|---------|-------------|
@@ -66,7 +66,7 @@ environment and are **not** settable in `config.yaml`; they are listed separatel
 | `ignore_patterns` | `MNEMOSYNE_IGNORE_PATTERNS` | *(unset)* | no | Comma separated regexes; matching content is never stored. |
 | `importance_weight` | `MNEMOSYNE_IMPORTANCE_WEIGHT` | `0.2` | no | Importance weight in hybrid ranking. |
 | `lenient_fact_match` | `MNEMOSYNE_LENIENT_FACT_MATCH` | `false` | no | Match facts by substring instead of exact equality. |
-| `lexical_gate_min` | `MNEMOSYNE_LEXICAL_GATE_MIN` | *(unset)* | no | Override the lexical admission gate (float 0.0–1.0). Defaults to the historical query-length thresholds (0.15/0.5/0.3). `0.0` admits purely-vector candidates (recall-first, at a precision cost). Read on every recall call. |
+| `lexical_gate_min` | `MNEMOSYNE_LEXICAL_GATE_MIN` | *(none)* | no | Override the lexical admission gate (float 0.0–1.0). Defaults to the historical query-length thresholds (0.15/0.5/0.3); `0.0` admits purely-vector candidates (recall-first, at a precision cost). Read on every recall call. |
 | `llm_api_key` | `MNEMOSYNE_LLM_API_KEY` | *(unset)* | no | API key for the remote chat endpoint. |
 | `llm_base_url` | `MNEMOSYNE_LLM_BASE_URL` | *(unset)* | no | Base URL of an OpenAI-compatible chat endpoint. |
 | `llm_conflict_detection` | `MNEMOSYNE_LLM_CONFLICT_DETECTION` | `false` | no | Enable LLM-based contradiction detection during sleep. |
