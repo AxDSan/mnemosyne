@@ -9,6 +9,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Added
 
+- **CLI version reporting (#642).** `mnemosyne --version` / `mnemosyne version` and `mnemosyne-hermes --version` / `mnemosyne-hermes version` report installed distribution versions without initializing Mnemosyne data. `hermes mnemosyne version` now reports both core and Hermes-provider versions.
 - **Embedding dimension in doctor diagnostics.** `collect_runtime_diagnostics` (surfaced by `mnemosyne doctor`) now reports the resolved `embeddings_dim` alongside `embeddings_model`, so operators can confirm their `MNEMOSYNE_EMBEDDING_DIM` / model-table resolution without inspecting a traceback. Complements the fail-loud unknown-model resolver (#521); the version bump is deferred to that PR to avoid a duplicate bump.
 
 ### Fixed

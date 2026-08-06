@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import hashlib
 import importlib
 import json
@@ -1260,6 +1261,14 @@ def is_installed(*, hermes_home_path: str | Path | None = None) -> bool:
     return plugin_state(hermes_home_path=hermes_home_path).installed
 
 
+def _distribution_version(distribution: str) -> str:
+    """Return an installed distribution version without importing package globals."""
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return "unavailable"
+
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -1270,6 +1279,7 @@ def _parser() -> argparse.ArgumentParser:
         "--hermes-home",
         help="Hermes home directory. Defaults to HERMES_HOME or ~/.hermes.",
     )
+    parser.add_argument("--version", action="store_true", help="Show installed package versions and exit.")
 
     subparsers = parser.add_subparsers(dest="command")
 
@@ -1322,6 +1332,7 @@ def _parser() -> argparse.ArgumentParser:
         "status",
         help="Show whether Mnemosyne is installed for Hermes memory discovery.",
     )
+    subparsers.add_parser("version", help="Show installed package versions.")
     cleanup = subparsers.add_parser(
         "cleanup",
         help="Remove all traces of Mnemosyne from Hermes plugin directory (safe, never touches database).",
@@ -1427,6 +1438,10 @@ def main(argv: list[str] | None = None) -> int:
     """Run the mnemosyne-hermes installer CLI."""
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.version or args.command == "version":
+        print(f"Mnemosyne {_distribution_version('mnemosyne-memory')}")
+        print(f"Mnemosyne Hermes {_distribution_version('mnemosyne-hermes')}")
+        return 0
     command = args.command or "install"
 
     try:

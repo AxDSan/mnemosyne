@@ -9,6 +9,7 @@ All commands use the v2 BEAM architecture (Mnemosyne/BeamMemory).
 import os
 import sys
 import json
+import importlib.metadata
 from pathlib import Path
 from typing import NoReturn
 
@@ -27,6 +28,14 @@ def _default_data_dir() -> str:
 
 
 DATA_DIR = _default_data_dir()
+
+
+def _distribution_version(distribution: str) -> str:
+    """Return an installed distribution version without importing package globals."""
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return "unavailable"
 
 
 def _fail(message: str, exit_code: int = 2) -> NoReturn:
@@ -1673,6 +1682,10 @@ COMMANDS = {
 
 def run_cli():
     """Main CLI entry point."""
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--version", "version"):
+        print(f"Mnemosyne {_distribution_version('mnemosyne-memory')}")
+        return
+
     if len(sys.argv) < 2 or sys.argv[1] in ("--help", "-h", "help"):
         # Keep historical setup behavior for non-doctor CLI entry points while
         # leaving module import and the doctor path free of mkdir side effects.
@@ -1680,6 +1693,7 @@ def run_cli():
         print("Mnemosyne - Local AI Memory System\n")
         print("Usage: mnemosyne <command> [args]\n")
         print("Commands:")
+        print("  version                                Show installed version")
         print("  store <content> [source] [importance]  Store a memory")
         print("  recall <query> [top_k]                 Search memories")
         print("  update <id> <content> [importance]     Update a memory")
