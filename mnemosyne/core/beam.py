@@ -1907,9 +1907,13 @@ def _minimum_recall_relevance(query_tokens: List[str]) -> float:
     env = os.environ.get("MNEMOSYNE_LEXICAL_GATE_MIN")
     if env is not None:
         try:
-            return min(max(float(env), 0.0), 1.0)
+            value = float(env)
         except ValueError:
             pass  # fall through to the default thresholds
+        else:
+            if math.isfinite(value):
+                return min(max(value, 0.0), 1.0)
+            # NaN / +/-inf fall through to the default thresholds
     if len(query_tokens) >= 4:
         return 0.3
     if len(query_tokens) == 3:

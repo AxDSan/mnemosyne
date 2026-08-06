@@ -1,8 +1,8 @@
 ---
 title: "Configuration"
 version: 3.15.2
-config_key_count: 107
-env_only_count: 42
+config_key_count: 106
+env_only_count: 43
 generated_at: "auto"
 ---
 
@@ -23,13 +23,13 @@ and `wm_max_items` are equivalent.
 Keys marked **restart** are read once at startup. Changing them at runtime warns
 and does not take effect until the process restarts.
 
-There are **107 configuration keys**. A further
-**42 environment variables** are read directly from the
+There are **106 configuration keys**. A further
+**43 environment variables** are read directly from the
 environment and are **not** settable in `config.yaml`; they are listed separately below.
 
 ---
 
-## Configuration keys (107)
+## Configuration keys (106)
 
 | Config key | Environment variable | Default | Restart | Description |
 |------------|----------------------|---------|---------|-------------|
@@ -66,7 +66,6 @@ environment and are **not** settable in `config.yaml`; they are listed separatel
 | `ignore_patterns` | `MNEMOSYNE_IGNORE_PATTERNS` | *(unset)* | no | Comma separated regexes; matching content is never stored. |
 | `importance_weight` | `MNEMOSYNE_IMPORTANCE_WEIGHT` | `0.2` | no | Importance weight in hybrid ranking. |
 | `lenient_fact_match` | `MNEMOSYNE_LENIENT_FACT_MATCH` | `false` | no | Match facts by substring instead of exact equality. |
-| `lexical_gate_min` | `MNEMOSYNE_LEXICAL_GATE_MIN` | *(none)* | no | Override the lexical admission gate (float 0.0–1.0). Defaults to the historical query-length thresholds (0.15/0.5/0.3); `0.0` admits purely-vector candidates (recall-first, at a precision cost). Read on every recall call. |
 | `llm_api_key` | `MNEMOSYNE_LLM_API_KEY` | *(unset)* | no | API key for the remote chat endpoint. |
 | `llm_base_url` | `MNEMOSYNE_LLM_BASE_URL` | *(unset)* | no | Base URL of an OpenAI-compatible chat endpoint. |
 | `llm_conflict_detection` | `MNEMOSYNE_LLM_CONFLICT_DETECTION` | `false` | no | Enable LLM-based contradiction detection during sleep. |
@@ -169,7 +168,7 @@ This list is derived by scanning the package for `os.environ.get("MNEMOSYNE_..."
 
 ---
 
-## Environment-only variables (42)
+## Environment-only variables (43)
 
 These are read with `os.environ` at their point of use and bypass
 `MnemosyneConfig` entirely. They cannot be set in `config.yaml`.
@@ -197,6 +196,7 @@ These are read with `os.environ` at their point of use and bypass
 | `MNEMOSYNE_HOST_LLM_TIMEOUT` | Timeout in seconds for host LLM backend calls. |
 | `MNEMOSYNE_IMPORTED_WEIGHT` | Veracity multiplier for imported memories. |
 | `MNEMOSYNE_INFERRED_WEIGHT` | Veracity multiplier for inferred memories. |
+| `MNEMOSYNE_LEXICAL_GATE_MIN` | Override the lexical admission gate (float 0.0–1.0, clamped; non-finite/invalid values fall back to the historical query-length thresholds 0.15/0.5/0.3). `0.0` admits purely-vector candidates (recall-first, at a precision cost). Read on every recall call; retrieval stays local (sqlite-vec + JSON/NumPy embeddings, or lexical-only FTS5 when embeddings are unavailable). |
 | `MNEMOSYNE_MCP_BANK` | Memory bank used by the MCP server. |
 | `MNEMOSYNE_MCP_TOKEN` | Bearer token for MCP SSE auth. Required for any non-loopback bind. |
 | `MNEMOSYNE_PERSONA_FILE` | Path to an external persona facts file. |

@@ -264,7 +264,6 @@ CONFIG_DESCRIPTIONS = {
     "proactive_linking": "Create cross-memory graph edges on insertion.",
     "lenient_fact_match": "Match facts by substring instead of exact equality.",
     "recall_diagnostics": "Collect per-stage recall diagnostics. See `explain=True`.",
-    "lexical_gate_min": "Override the lexical admission gate (float 0.0–1.0). Defaults to the historical query-length thresholds (0.15/0.5/0.3); `0.0` admits purely-vector candidates (recall-first, at a precision cost). Read on every recall call.",
 
     # Working memory
     "wm_max_items": "Maximum rows retained in `working_memory` before eviction.",
@@ -487,6 +486,7 @@ ENV_ONLY_DESCRIPTIONS = {
     "MNEMOSYNE_HOST_LLM_TIMEOUT": "Timeout in seconds for host LLM backend calls.",
     "MNEMOSYNE_IMPORTED_WEIGHT": "Veracity multiplier for imported memories.",
     "MNEMOSYNE_INFERRED_WEIGHT": "Veracity multiplier for inferred memories.",
+    "MNEMOSYNE_LEXICAL_GATE_MIN": "Override the lexical admission gate (float 0.0–1.0, clamped; non-finite/invalid values fall back to the historical query-length thresholds 0.15/0.5/0.3). `0.0` admits purely-vector candidates (recall-first, at a precision cost). Read on every recall call; retrieval stays local (sqlite-vec + JSON/NumPy embeddings, or lexical-only FTS5 when embeddings are unavailable).",
     "MNEMOSYNE_MCP_BANK": "Memory bank used by the MCP server.",
     "MNEMOSYNE_MCP_TOKEN": "Bearer token for MCP SSE auth. Required for any non-loopback bind.",
     "MNEMOSYNE_PERSONA_FILE": "Path to an external persona facts file.",

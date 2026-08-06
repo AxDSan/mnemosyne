@@ -45,6 +45,15 @@ def test_invalid_knob_falls_back_to_defaults(monkeypatch):
     assert _minimum_recall_relevance(["a"]) == 0.15
 
 
+def test_non_finite_knob_falls_back_to_defaults(monkeypatch):
+    # NaN and infinities are not valid gates: fall through to the defaults.
+    for bad in ("nan", "inf", "-inf"):
+        monkeypatch.setenv("MNEMOSYNE_LEXICAL_GATE_MIN", bad)
+        assert _minimum_recall_relevance(["a", "b", "c", "d"]) == 0.3
+        assert _minimum_recall_relevance(["a", "b", "c"]) == 0.5
+        assert _minimum_recall_relevance(["a"]) == 0.15
+
+
 def test_env_is_read_per_call(monkeypatch):
     # Changing the env between calls takes effect immediately (no caching).
     monkeypatch.setenv("MNEMOSYNE_LEXICAL_GATE_MIN", "0.0")
