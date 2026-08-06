@@ -66,6 +66,7 @@ environment and are **not** settable in `config.yaml`; they are listed separatel
 | `ignore_patterns` | `MNEMOSYNE_IGNORE_PATTERNS` | *(unset)* | no | Comma separated regexes; matching content is never stored. |
 | `importance_weight` | `MNEMOSYNE_IMPORTANCE_WEIGHT` | `0.2` | no | Importance weight in hybrid ranking. |
 | `lenient_fact_match` | `MNEMOSYNE_LENIENT_FACT_MATCH` | `false` | no | Match facts by substring instead of exact equality. |
+| `lexical_gate_min` | `MNEMOSYNE_LEXICAL_GATE_MIN` | *(unset)* | no | Override the lexical admission gate (float 0.0–1.0). Defaults to the historical query-length thresholds (0.15/0.5/0.3). `0.0` admits purely-vector candidates (recall-first, at a precision cost). Read on every recall call. |
 | `llm_api_key` | `MNEMOSYNE_LLM_API_KEY` | *(unset)* | no | API key for the remote chat endpoint. |
 | `llm_base_url` | `MNEMOSYNE_LLM_BASE_URL` | *(unset)* | no | Base URL of an OpenAI-compatible chat endpoint. |
 | `llm_conflict_detection` | `MNEMOSYNE_LLM_CONFLICT_DETECTION` | `false` | no | Enable LLM-based contradiction detection during sleep. |

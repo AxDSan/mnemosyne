@@ -1897,7 +1897,19 @@ def _minimum_recall_relevance(query_tokens: List[str]) -> float:
 
     One matching real word is enough for short lookup-style queries, but not
     for broad nonsense strings like "purple bicycle quantum oatmeal".
+
+    ``MNEMOSYNE_LEXICAL_GATE_MIN`` (float 0.0–1.0) overrides the gate entirely,
+    defaulting to the historical thresholds when unset. Setting it to 0.0 admits
+    purely-vector candidates (recall-first); the default keeps today's behaviour
+    so existing users are unaffected unless they opt in. The env is read on every
+    call so operators can tune it without restarting.
     """
+    env = os.environ.get("MNEMOSYNE_LEXICAL_GATE_MIN")
+    if env is not None:
+        try:
+            return min(max(float(env), 0.0), 1.0)
+        except ValueError:
+            pass  # fall through to the default thresholds
     if len(query_tokens) >= 4:
         return 0.3
     if len(query_tokens) == 3:
