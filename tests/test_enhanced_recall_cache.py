@@ -392,6 +392,130 @@ def test_new_remember_finally_invalidates_cache_refilled_during_enrichment(monke
         _close_memory(memory)
 
 
+def test_new_remember_finally_invalidates_cache_refilled_during_enrichment_exception(
+    monkeypatch, tmp_path: Path
+):
+    """A post-commit enrichment error must evict its real cache refill for fresh C."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    db_path = tmp_path / "memories.db"
+    writer = None
+    fresh = None
+    try:
+        writer = BeamMemory(session_id="session-a", db_path=db_path)
+        query = "issue 566 new insert enrichment exception cache refill"
+        inserted_id = "issue-566-new-enrichment-exception"
+        writer.remember(f"{query} baseline", source="initial", importance=0.1)
+        _call(writer, query, top_k=3)
+        assert writer._query_cache._conn.execute(
+            "SELECT COUNT(*) FROM query_cache"
+        ).fetchone()[0] == 1
+
+        refilled_rows = []
+
+        def refill_then_raise(memory_id, *args):
+            refilled = _call(writer, query, top_k=3)
+            assert memory_id in {result["id"] for result in refilled}
+            refilled_rows.append(
+                writer._query_cache._conn.execute(
+                    "SELECT COUNT(*) FROM query_cache"
+                ).fetchone()[0]
+            )
+            raise RuntimeError("new enrichment failed after cache refill")
+
+        monkeypatch.setattr(writer, "_ingest_graph_and_veracity", refill_then_raise)
+        with pytest.raises(RuntimeError, match="new enrichment failed after cache refill"):
+            writer.remember(
+                f"{query} inserted",
+                source="new",
+                importance=1.0,
+                memory_id=inserted_id,
+            )
+
+        assert refilled_rows == [1]
+        assert writer.conn.execute(
+            "SELECT content FROM working_memory WHERE id = ?", (inserted_id,)
+        ).fetchone()["content"] == f"{query} inserted"
+
+        fresh = BeamMemory(session_id="session-a", db_path=db_path)
+        assert not hasattr(fresh, "_query_cache")
+        fresh._query_cache = QueryCache(db_path=db_path.parent / "query_cache.db")
+        assert fresh._query_cache._conn.execute(
+            "SELECT COUNT(*) FROM query_cache"
+        ).fetchone()[0] == 0
+        reloaded = _call(fresh, query, top_k=3)
+        assert inserted_id in {result["id"] for result in reloaded}
+    finally:
+        try:
+            _close_memory(fresh)
+        finally:
+            _close_memory(writer)
+
+
+def test_dedup_remember_finally_invalidates_cache_refilled_during_enrichment_exception(
+    monkeypatch, tmp_path: Path
+):
+    """A dedup enrichment error must evict its real cache refill for fresh C."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    db_path = tmp_path / "memories.db"
+    writer = None
+    fresh = None
+    try:
+        writer = BeamMemory(session_id="session-a", db_path=db_path)
+        query = "issue 566 dedup enrichment exception cache refill"
+        memory_id = writer.remember(query, source="initial", importance=0.1)
+        _call(writer, query, top_k=3)
+        assert writer._query_cache._conn.execute(
+            "SELECT COUNT(*) FROM query_cache"
+        ).fetchone()[0] == 1
+
+        refilled_rows = []
+
+        def refill_then_raise(enriched_id, *args):
+            refilled = _call(writer, query, top_k=3)
+            assert enriched_id in {result["id"] for result in refilled}
+            refilled_rows.append(
+                writer._query_cache._conn.execute(
+                    "SELECT COUNT(*) FROM query_cache"
+                ).fetchone()[0]
+            )
+            raise RuntimeError("dedup enrichment failed after cache refill")
+
+        monkeypatch.setattr(writer, "_ingest_graph_and_veracity", refill_then_raise)
+        with pytest.raises(RuntimeError, match="dedup enrichment failed after cache refill"):
+            writer.remember(query, source="updated", importance=1.0)
+
+        assert refilled_rows == [1]
+        assert dict(
+            writer.conn.execute(
+                "SELECT source, importance FROM working_memory WHERE id = ?", (memory_id,)
+            ).fetchone()
+        ) == {"source": "updated", "importance": 1.0}
+
+        fresh = BeamMemory(session_id="session-a", db_path=db_path)
+        assert not hasattr(fresh, "_query_cache")
+        fresh._query_cache = QueryCache(db_path=db_path.parent / "query_cache.db")
+        assert fresh._query_cache._conn.execute(
+            "SELECT COUNT(*) FROM query_cache"
+        ).fetchone()[0] == 0
+        reloaded = _call(fresh, query, top_k=3)
+        updated = next(result for result in reloaded if result["id"] == memory_id)
+        assert updated["source"] == "updated"
+        assert updated["importance"] == 1.0
+    finally:
+        try:
+            _close_memory(fresh)
+        finally:
+            _close_memory(writer)
+
+
 def test_new_remember_write_survives_post_commit_cache_invalidation_failure(
     monkeypatch, tmp_path: Path, caplog
 ):
