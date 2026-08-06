@@ -740,6 +740,7 @@ def test_sidecar_rejection_detects_duplicate_repair_fd(tmp_path, monkeypatch):
     existing_fd = os.open(db_path, os.O_RDONLY)
     leaked_fd = None
     real_gate = repair._verify_report_gate
+    db_before = _hash(db_path)
 
     def leak_fd_after_gate(*args, conn=None, **kwargs):
         nonlocal leaked_fd
@@ -763,6 +764,8 @@ def test_sidecar_rejection_detects_duplicate_repair_fd(tmp_path, monkeypatch):
                 backup_path=backup,
             )
 
+        assert not backup.exists()
+        assert _hash(db_path) == db_before
         delta = _fd_target_counts() - before
         assert delta[str(db_path)] == 1
     finally:
