@@ -1215,6 +1215,7 @@ def cmd_hygiene(args):
         clean_noise,
         hygiene_status,
         restore_archived,
+        validate_hygiene_candidate,
     )
     from mnemosyne.doctor import open_readonly_doctor_db
 
@@ -1383,8 +1384,10 @@ def cmd_hygiene(args):
 
         candidates = []
         for idx, c in enumerate(raw):
-            if not isinstance(c, dict):
-                _fail(f"Candidate #{idx} is not a JSON object")
+            try:
+                validate_hygiene_candidate(c)
+            except ValueError as e:
+                _fail(f"Candidate #{idx}: {e}")
             try:
                 candidates.append(NoiseCandidate(
                     memory_id=c["memory_id"],
