@@ -96,6 +96,83 @@ def test_es_instruction_capture_is_not_truncated_at_the_letter_n():
     assert any("antes de subir" in m for m in matches), matches
 
 
+def test_ru_instruction_is_stored_end_to_end():
+    """#560 through the public path: a Russian directive must reach the table.
+
+    The pattern-level cases above rebuild the regex themselves, so they stay
+    green if the extractor stops using it. This drives
+    ``extract_and_store_facts`` and asserts on the stored row, and it covers the
+    punctuation boundary (the capture must stop at the comma) and the newline
+    boundary (the following line must not be swallowed).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        mem = BeamMemory(session_id="test-560-ru", db_path=Path(tmp) / "memories.db")
+        try:
+            mem.extract_and_store_facts(
+                "всегда запускай тесты перед пушем в main, это важно\n"
+                "и не забывай про линтер",
+                source_memory_id="mem-560-ru",
+            )
+            stored = [
+                row[0]
+                for row in mem.conn.execute(
+                    "SELECT instruction FROM memoria_instructions "
+                    "WHERE source_memory_id = ?",
+                    ("mem-560-ru",),
+                ).fetchall()
+            ]
+            assert stored, "ru directive stored nothing through the public path"
+            first = [s for s in stored if "запускай тесты" in s]
+            assert first, stored
+            assert not any("это важно" in s for s in first), (
+                f"capture ran past the comma boundary: {first}"
+            )
+            assert not any("линтер" in s for s in first), (
+                f"capture ran past the newline boundary: {first}"
+            )
+        finally:
+            mem.conn.close()
+
+
+def test_es_instruction_is_stored_end_to_end_without_truncation():
+    """#560 through the public path: the es capture must survive the letter n.
+
+    The doubled ``\\\\n`` truncated captures at the first ``n``, so
+    ``antes`` never made it into the stored instruction. Also asserts the
+    newline and punctuation boundaries still hold.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        mem = BeamMemory(session_id="test-560-es", db_path=Path(tmp) / "memories.db")
+        try:
+            mem.extract_and_store_facts(
+                "siempre ejecuta las pruebas antes de subir a main, por favor\n"
+                "y luego avisa al equipo",
+                source_memory_id="mem-560-es",
+            )
+            stored = [
+                row[0]
+                for row in mem.conn.execute(
+                    "SELECT instruction FROM memoria_instructions "
+                    "WHERE source_memory_id = ?",
+                    ("mem-560-es",),
+                ).fetchall()
+            ]
+            assert stored, "es directive stored nothing through the public path"
+            first = [s for s in stored if "ejecuta las pruebas" in s]
+            assert first, stored
+            assert any("antes de subir" in s for s in first), (
+                f"capture truncated at the letter 'n': {first}"
+            )
+            assert not any("por favor" in s for s in first), (
+                f"capture ran past the comma boundary: {first}"
+            )
+            assert not any("avisa" in s for s in first), (
+                f"capture ran past the newline boundary: {first}"
+            )
+        finally:
+            mem.conn.close()
+
+
 def test_de_nie_does_not_match_inside_knie():
     """German 'nie' must not match inside unrelated words such as 'Knie'."""
     matches = re.findall(
