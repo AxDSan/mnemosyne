@@ -568,7 +568,7 @@ def _bootstrap_hermes_venv(hermes_python: Path) -> bool:
             stderr = result.stderr.strip()[:500]
             print(f"  ⚠ Bootstrap failed: {stderr}", file=sys.stderr)
             return False
-        print(f"  ✓ mnemosyne-hermes installed into Hermes' venv")
+        print("  ✓ mnemosyne-hermes installed into Hermes' venv")
         return True
     except Exception as exc:
         print(f"  ⚠ Bootstrap failed: {exc}", file=sys.stderr)
@@ -920,8 +920,48 @@ import importlib
 import json
 import os
 from pathlib import Path
+import re
 import site as site_module
 import sys
+
+
+def _guard_selected_site_packages_python_compatibility(selected_site_packages: Path) -> None:
+    \"\"\"Reject a selected virtualenv that targets another Python minor version.\"\"\"
+    selected_site_packages = selected_site_packages.resolve()
+    # Standard POSIX layouts put pyvenv.cfg three levels above site-packages
+    # (/venv/lib/pythonX/site-packages); Windows needs only two. Do not let
+    # this early bootstrap probe inspect arbitrary filesystem ancestors.
+    for candidate in (selected_site_packages, *selected_site_packages.parents[:3]):
+        config_path = candidate / "pyvenv.cfg"
+        if not config_path.exists():
+            continue
+        selected_version = None
+        try:
+            config_text = config_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            config_text = ""
+        for line in config_text.splitlines():
+            name, separator, value = line.partition("=")
+            if separator and name.strip().lower() in {"version_info", "version"}:
+                match = re.search(r"(?<!\\d)(\\d+)\\.(\\d+)(?!\\d)", value)
+                if match:
+                    selected_version = (int(match.group(1)), int(match.group(2)))
+                    break
+        runtime_version = sys.version_info[:2]
+        if selected_version is None or selected_version != runtime_version:
+            selected_text = (
+                f"{selected_version[0]}.{selected_version[1]}"
+                if selected_version is not None
+                else "unknown"
+            )
+            raise RuntimeError(
+                "Mnemosyne runtime Python compatibility error: "
+                f"runtime Python {runtime_version[0]}.{runtime_version[1]}; "
+                f"selected Mnemosyne environment Python {selected_text}. "
+                "Recreate the Mnemosyne environment using Hermes' Python, "
+                "then reinstall mnemosyne-hermes."
+            )
+        return
 
 
 def activate() -> dict[str, object]:
@@ -949,6 +989,7 @@ def activate() -> dict[str, object]:
         raise RuntimeError("Invalid Mnemosyne wrapper Python executable")
     if not site_path.is_absolute() or not site_path.is_dir():
         raise RuntimeError("Invalid Mnemosyne wrapper site-packages target")
+    _guard_selected_site_packages_python_compatibility(site_path)
     package_root = site_path / "mnemosyne_hermes"
     package_init = package_root / "__init__.py"
     expected_root = package_root.resolve() if package_init.is_file() else None
@@ -1335,7 +1376,7 @@ def run_install(
         if hermes_core is None:
             print(f"\n  ⚠ Hermes' Python at {hermes_python} can't import mnemosyne core.")
             print(f"     mnemosyne-hermes is installed in YOUR Python ({sys.executable}),")
-            print(f"     but Hermes runs from a different venv.\n")
+            print("     but Hermes runs from a different venv.\n")
             if not no_bootstrap:
                 print("  → Attempting auto-bootstrap...")
                 if _bootstrap_hermes_venv(hermes_python):
@@ -1461,7 +1502,7 @@ def main(argv: list[str] | None = None) -> int:
             target = state.target
             installed = state.installed
             hermes_python = _find_hermes_python()
-            print(f"Status for mnemosyne-hermes plugin")
+            print("Status for mnemosyne-hermes plugin")
             print(f"  Plugin path: {target}")
             print(f"  State: {state.status}")
             print(f"  Mode: {state.mode}")
@@ -1473,18 +1514,18 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  Wrapper site-packages: {state.wrapper_site_packages}")
                     print(f"  Wrapper import: {'OK' if state.wrapper_import_ok else 'not checked'}")
                 else:
-                    print(f"  Type: directory (not symlink)")
-                print(f"  Plugin:    installed ✓")
+                    print("  Type: directory (not symlink)")
+                print("  Plugin:    installed ✓")
             elif state.status == "broken_symlink":
-                print(f"  Plugin:    broken symlink (target missing) ✗")
+                print("  Plugin:    broken symlink (target missing) ✗")
                 print(f"  Broken target: {state.link_target}")
-                print(f"  → Run: mnemosyne-hermes install --force")
+                print("  → Run: mnemosyne-hermes install --force")
             elif state.status == "stale_wrapper":
-                print(f"  Plugin:    stale wrapper target ✗")
+                print("  Plugin:    stale wrapper target ✗")
                 print(f"  Wrapper Python: {state.wrapper_python}")
                 print(f"  Wrapper site-packages: {state.wrapper_site_packages}")
                 print(f"  Import error: {state.wrapper_import_error}")
-                print(f"  → Re-run: mnemosyne-hermes install --mode wrapper --force --python <venv>/bin/python")
+                print("  → Re-run: mnemosyne-hermes install --mode wrapper --force --python <venv>/bin/python")
             else:
                 print(f"  NOT installed: {state.message}")
                 if state.link_target is not None:
@@ -1504,15 +1545,15 @@ def main(argv: list[str] | None = None) -> int:
                     _ver = _r.stdout.strip() or _r.stderr.strip()
                     print(f"  Hermes' Python: {hermes_python} ({_ver})")
                     if state.mode == "symlink" and hermes_python.resolve() != Path(sys.executable).resolve():
-                        print(f"  ⚠ Python version MISMATCH! Install and Hermes use different Python versions.")
+                        print("  ⚠ Python version MISMATCH! Install and Hermes use different Python versions.")
                         print(f"  → Run: {_ver.split()[1]}" if " " in _ver else "")
                 except Exception:
                     print(f"  Hermes' Python: {hermes_python} (unable to check version)")
             else:
-                print(f"  Hermes' Python: not found")
+                print("  Hermes' Python: not found")
             if installed and state.mode == "symlink" and hermes_python and hermes_python.resolve() != Path(sys.executable).resolve():
-                print(f"  → Hermes Python vs install Python mismatch means the symlink exists but Hermes")
-                print(f"     may not be able to import mnemosyne core. Run with --dry-run to diagnose.")
+                print("  → Hermes Python vs install Python mismatch means the symlink exists but Hermes")
+                print("     may not be able to import mnemosyne core. Run with --dry-run to diagnose.")
             return 0 if installed else 1
 
         if command == "cleanup":

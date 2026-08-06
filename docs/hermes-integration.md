@@ -11,9 +11,9 @@ Mnemosyne is designed as a native memory backend for the [Hermes Agent Framework
 | `mnemosyne-memory` (core) | Low-resource (Raspberry Pi, 1 GB VPS), or when using a remote embedding API | ~50 MB | No local embeddings. Point `MNEMOSYNE_EMBEDDING_API_URL` to an external endpoint. |
 | `mnemosyne-memory[embeddings]` | Mid-range systems with local embedding support | ~800 MB | Adds `fastembed` for local vector generation. Best for single-user desktop agents. |
 | `mnemosyne-memory[all]` | Full-featured — local embeddings + local LLM consolidation | ~1.5 GB | Adds `sentence-transformers` + local LLM deps (`ctransformers`). Maximum capability. |
-| `mnemosyne-hermes` | Hermes Agent users — always pair with one of the above | Same as base | Wraps core library with plugin manifest + entry points. Run `hermes config set memory.provider mnemosyne` after install. |
+| `mnemosyne-hermes` | Hermes Agent users | Includes `[embeddings]` | Wraps core library with plugin manifest + entry points and requires `mnemosyne-memory[embeddings]`. For a wrapper install, use its default embeddings dependency or add `mnemosyne-memory[all]`; `core` alone is unavailable. Run `hermes config set memory.provider mnemosyne` after install. |
 
-**Hardware guidance:** Core alone runs on a Raspberry Pi 4 (4 GB) with ~300 MB free for LLM. `[embeddings]` needs at least 2 GB free RAM. `[all]` recommends 8 GB+.
+**Hardware guidance:** Core alone runs on a Raspberry Pi 4 (4 GB) with ~300 MB free for LLM, but it is not a valid `mnemosyne-hermes` wrapper profile. `[embeddings]` needs at least 2 GB free RAM. `[all]` recommends 8 GB+.
 
 ## Setup
 
@@ -41,23 +41,117 @@ cd mnemosyne
 pip install -e "integrations/hermes[dev]"
 ```
 
-> **Docker users: use persistent side-venv wrapper mode.** This is the canonical Docker installation. Inside the official Hermes container, the mounted Hermes home is `/opt/data/`, not `~/.hermes/`. Keep the side venv on that mounted volume so both it and the wrapper survive image rebuilds:
+> **Docker users: use persistent side-venv wrapper mode.** This is the canonical Docker installation. Inside the official Hermes container, the mounted Hermes home is `/opt/data/`, not `~/.hermes/`. Keep the side venv on that mounted volume so both it and the wrapper survive image rebuilds. The side venv must use the same Python **major/minor** as the running Hermes gateway; do not create it with an unrelated `python3` from `PATH`.
+>
+> For a launcher-based Hermes installation, first derive its runtime interpreter from the resolved `hermes` launcher. This bounded launcher-sibling probe covers only that installation shape: it checks the launcher's sibling `python`, then `python3`. It is not a reproduction of the installer's broader internal discovery. If it cannot find a sibling, **stop** and determine the real gateway interpreter from the deployment; do not substitute the current-shell Python or guess another environment.
 >
 > ```bash
-> # Run inside the container once. Choose a persistent path on the mounted volume.
+> HERMES_BIN="$(command -v hermes)" || {
+>   printf 'Could not find the Hermes launcher on PATH\n' >&2
+>   exit 1
+> }
+> HERMES_BIN="$(readlink -f "$HERMES_BIN")" || {
+>   printf 'Could not resolve the Hermes launcher\n' >&2
+>   exit 1
+> }
+> if [ ! -f "$HERMES_BIN" ] || [ ! -x "$HERMES_BIN" ]; then
+>   printf 'Resolved Hermes launcher is not a regular executable file: %s\n' "$HERMES_BIN" >&2
+>   exit 1
+> fi
+> HERMES_BIN_DIR="$(dirname "$HERMES_BIN")"
+> if [ -f "$HERMES_BIN_DIR/python" ]; then
+>   HERMES_PYTHON="$HERMES_BIN_DIR/python"
+> elif [ -f "$HERMES_BIN_DIR/python3" ]; then
+>   HERMES_PYTHON="$HERMES_BIN_DIR/python3"
+> else
+>   printf 'Could not find Hermes Python beside %s\n' "$HERMES_BIN" >&2
+>   exit 1
+> fi
+> if [ ! -x "$HERMES_PYTHON" ]; then
+>   printf 'Hermes Python is not executable: %s\n' "$HERMES_PYTHON" >&2
+>   exit 1
+> fi
+> "$HERMES_PYTHON" --version || {
+>   printf 'Hermes Python failed its version probe: %s\n' "$HERMES_PYTHON" >&2
+>   exit 1
+> }
+> ```
+>
+> Then run the installation once inside the container. Wrapper mode requires `mnemosyne-hermes`, which itself requires `mnemosyne-memory[embeddings]`; select `embeddings` for the standard provider or `all` to add local-LLM extras. `core` is unavailable for wrapper installs because it cannot remove that required embeddings dependency.
+>
+> ```bash
+> set -e
+> # Choose a persistent path on the mounted volume.
 > VENV=/opt/data/venvs/mnemosyne
-> python3 -m venv "$VENV"
-> "$VENV/bin/python" -m pip install --upgrade mnemosyne-hermes
+> MNEMOSYNE_PROFILE="${MNEMOSYNE_PROFILE:-embeddings}"  # embeddings (default) or all.
+> case "$MNEMOSYNE_PROFILE" in
+>   embeddings) MNEMOSYNE_REQUIREMENT="mnemosyne-memory[embeddings]" ;;
+>   all) MNEMOSYNE_REQUIREMENT="mnemosyne-memory[all]" ;;
+>   core)
+>     printf 'MNEMOSYNE_PROFILE=core is unavailable for mnemosyne-hermes wrapper installs: mnemosyne-hermes requires mnemosyne-memory[embeddings]. Use embeddings or all.\n' >&2
+>     exit 1
+>     ;;
+>   *)
+>     printf 'Unsupported MNEMOSYNE_PROFILE: %s (expected embeddings or all)\n' "$MNEMOSYNE_PROFILE" >&2
+>     exit 1
+>     ;;
+> esac
+> "$HERMES_PYTHON" -m venv "$VENV"
+> "$VENV/bin/python" -m pip install --upgrade "$MNEMOSYNE_REQUIREMENT" mnemosyne-hermes
 >
 > export HERMES_HOME=/opt/data
 > export MNEMOSYNE_DATA_DIR=/opt/data
 > "$VENV/bin/mnemosyne-hermes" install --mode wrapper --python "$VENV/bin/python"
 > "$VENV/bin/mnemosyne-hermes" status
 > hermes config set memory.provider mnemosyne
-> hermes gateway restart
+> ```
+>
+> Restart the actual Hermes container or Compose service using its deployment tooling; do not substitute `hermes gateway restart` for that deployment restart. Once the service is running, validate the default profile from inside it:
+>
+> ```bash
+> hermes memory status
 > ```
 >
 > Wrapper mode creates a real directory at `$HERMES_HOME/plugins/mnemosyne/`. Its bootstrap adds the selected side venv's site-packages to `sys.path` before importing `mnemosyne_hermes`. Do not use the manual symlink instructions below for this installation.
+>
+> **Repair a persistent wrapper compatibility failure.** Existing wrappers whose selected venv records a different or unreadable Python major/minor now fail before activating that venv. **Before running the recovery commands, including in a fresh shell, rerun the launcher-based discovery block above in that same shell.** It sets and version-probes `HERMES_PYTHON`; do not substitute the current-shell Python. Before recovery, explicitly set `MNEMOSYNE_PROFILE` to the value used by the existing wrapper: `embeddings` or `all`. This is a documentation-local selector, not a runtime setting the recovery commands can infer. If the gateway reports that runtime-compatibility error, create a new, confirmed-empty persistent side-venv with `"$HERMES_PYTHON" -m venv` as above, install `mnemosyne-hermes` there with that same wrapper requirement, then force-refresh the wrapper with that new interpreter:
+>
+> ```bash
+> set -e
+> if [ -z "${HERMES_PYTHON:-}" ] || [ ! -f "$HERMES_PYTHON" ] || [ ! -x "$HERMES_PYTHON" ]; then
+>   printf 'HERMES_PYTHON is unset or not an executable file; rerun the launcher-based discovery block in this shell before recovery.\n' >&2
+>   exit 1
+> fi
+> export HERMES_HOME=/opt/data
+> export MNEMOSYNE_DATA_DIR=/opt/data
+> VENV=/opt/data/venvs/mnemosyne-compatible  # New dedicated venv; do not overwrite an unknown path.
+> if [ -e "$VENV" ] || [ -L "$VENV" ]; then
+>   printf 'Refusing to create recovery venv at existing path: %s\n' "$VENV" >&2
+>   exit 1
+> fi
+> if [ -z "${MNEMOSYNE_PROFILE:-}" ]; then
+>   printf 'MNEMOSYNE_PROFILE is required for recovery. Set it to the existing wrapper profile: embeddings or all.\n' >&2
+>   exit 1
+> fi
+> case "$MNEMOSYNE_PROFILE" in
+>   embeddings) MNEMOSYNE_REQUIREMENT="mnemosyne-memory[embeddings]" ;;
+>   all) MNEMOSYNE_REQUIREMENT="mnemosyne-memory[all]" ;;
+>   core)
+>     printf 'MNEMOSYNE_PROFILE=core is unavailable for mnemosyne-hermes wrapper installs: mnemosyne-hermes requires mnemosyne-memory[embeddings]. Use embeddings or all.\n' >&2
+>     exit 1
+>     ;;
+>   *)
+>     printf 'Unsupported MNEMOSYNE_PROFILE: %s (expected embeddings or all)\n' "$MNEMOSYNE_PROFILE" >&2
+>     exit 1
+>     ;;
+> esac
+> "$HERMES_PYTHON" -m venv "$VENV"
+> "$VENV/bin/python" -m pip install --upgrade "$MNEMOSYNE_REQUIREMENT" mnemosyne-hermes
+> "$VENV/bin/mnemosyne-hermes" install --mode wrapper --python "$VENV/bin/python" --force
+> "$VENV/bin/mnemosyne-hermes" status
+> ```
+>
+> `--force` replaces the existing Mnemosyne plugin target, so use it only after confirming that target is the Mnemosyne link or wrapper you intend to replace. Restart the actual container or Compose service using its deployment tooling, then run `hermes memory status` inside that service for the default profile. For an existing profile-local wrapper, run the same refresh and wrapper `status` commands with that profile's `HERMES_HOME`; do not force-replace an unknown plugin target.
 >
 > **Multiple profiles, one side venv:** after `status` confirms the base wrapper, profiles that use the same persistent side venv may each symlink their `plugins/mnemosyne` directory to that tested base wrapper. If a profile's `config.yaml` already selects `memory.provider: mnemosyne` before the base wrapper install, the installer creates the link automatically. It skips an existing profile target unless run with `--force`.
 >
@@ -78,8 +172,26 @@ pip install -e "integrations/hermes[dev]"
 > A profile-local wrapper is an equivalent runtime alternative when independent plugin directories are preferred. Use it instead of the base-wrapper link for that profile:
 >
 > ```bash
+> set -e
+> if [ -z "${VENV:-}" ] || [ ! -x "${VENV:-}/bin/python" ] || [ ! -x "${VENV:-}/bin/mnemosyne-hermes" ]; then
+>   printf 'Set VENV to the tested compatible side venv with executable bin/python and bin/mnemosyne-hermes.\n' >&2
+>   exit 1
+> fi
 > HERMES_HOME=/opt/data/profiles/work "$VENV/bin/mnemosyne-hermes" install --mode wrapper --python "$VENV/bin/python"
 > HERMES_HOME=/opt/data/profiles/work "$VENV/bin/mnemosyne-hermes" status
+> ```
+>
+> Keep the profile scope through restart and validation: in the example above, replace `<name>` below with `work` (the final path component of the `HERMES_HOME` used for wrapper refresh/status). For Docker or Compose, restart the actual deployment service with its deployment tooling and then, inside that service, run:
+>
+> ```bash
+> hermes --profile <name> memory status
+> ```
+>
+> For a local installed gateway (not Docker/Compose deployment recovery), run:
+>
+> ```bash
+> hermes --profile <name> gateway restart
+> hermes --profile <name> memory status
 > ```
 >
 > For an existing target, use `--force` only after confirming it is the Mnemosyne link or wrapper you intend to replace. Do not force-replace an unknown plugin target.
@@ -199,6 +311,16 @@ mnemosyne import-hindsight hindsight-export.json hermes
 mnemosyne doctor --bank default --format both
 mnemosyne repair --report mnemosyne-doctor.json --select working_memory:<ID> --dry-run
 ```
+
+### Preflight a direct JSON file import
+
+Before importing a JSON file directly through the Hermes provider, run:
+
+```bash
+hermes mnemosyne import --input <backup.json> --dry-run
+```
+
+This dry run validates the file and reports the import counts using a disposable database clone. It writes neither the active database nor provider audit data. Run the same command without `--dry-run` to perform the side-effecting import.
 
 ## Data Location
 

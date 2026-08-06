@@ -55,7 +55,8 @@ RECALL_SCHEMA = {
         "Search Mnemosyne for relevant memories. Uses hybrid ranking: by default "
         "50% vector similarity + 30% FTS5 text rank + 20% importance + optional "
         "temporal boost. Tune the per-query weights via vec_weight, fts_weight, "
-        "importance_weight (omit to use environment defaults). Returns ranked results."
+        "importance_weight (omit or pass null to resolve config.yaml, then environment variables, "
+        "then built-in defaults). Returns ranked results."
     ),
     "parameters": {
         "type": "object",
@@ -78,16 +79,16 @@ RECALL_SCHEMA = {
                 "default": 24,
             },
             "vec_weight": {
-                "type": "number",
-                "description": "Vector similarity weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_VEC_WEIGHT env var or built-in default 0.5.",
+                "type": ["number", "null"],
+                "description": "Vector similarity weight in hybrid scoring. Omit (or pass null) to resolve config.yaml, then MNEMOSYNE_VEC_WEIGHT, then built-in default 0.5.",
             },
             "fts_weight": {
-                "type": "number",
-                "description": "Full-text search weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_FTS_WEIGHT env var or built-in default 0.3.",
+                "type": ["number", "null"],
+                "description": "Full-text search weight in hybrid scoring. Omit (or pass null) to resolve config.yaml, then MNEMOSYNE_FTS_WEIGHT, then built-in default 0.3.",
             },
             "importance_weight": {
-                "type": "number",
-                "description": "Importance score weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_IMPORTANCE_WEIGHT env var or built-in default 0.2.",
+                "type": ["number", "null"],
+                "description": "Importance score weight in hybrid scoring. Omit (or pass null) to resolve config.yaml, then MNEMOSYNE_IMPORTANCE_WEIGHT, then built-in default 0.2.",
             },
             "explain": {
                 "type": "boolean",

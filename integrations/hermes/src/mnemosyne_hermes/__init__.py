@@ -20,7 +20,6 @@ import json
 import logging
 import os
 import re
-import sys
 import threading
 import time
 from pathlib import Path
@@ -1986,12 +1985,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         replacement_id = args.get("replacement_id", None) or None
         if not memory_id:
             return json.dumps({"error": "memory_id is required"})
-        self._beam.invalidate(memory_id, replacement_id=replacement_id if replacement_id else None)
+        ok = self._beam.invalidate(memory_id, replacement_id=replacement_id if replacement_id else None)
         self._audit_event(
             "invalidate", memory_id=memory_id, bank="private",
             source_tool="mnemosyne_invalidate",
-            metadata={"replacement_id": replacement_id} if replacement_id else None,
+            metadata={"replacement_id": replacement_id, "invalidated": ok} if replacement_id else {"invalidated": ok},
         )
+        if not ok:
+            return json.dumps({"status": "memory_not_found", "memory_id": memory_id})
         return json.dumps({"status": "invalidated", "memory_id": memory_id})
 
     def _handle_validate(self, args: Dict[str, Any]) -> str:
@@ -2454,12 +2455,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 "error": "Either input_path (for file import) or provider "
                          "(for cross-provider import) is required",
             })
-        stats = mem.import_from_file(input_path, force=force)
-        self._audit_event(
-            "import", bank="private", source_tool="mnemosyne_import",
-            metadata={"input_path": input_path, "force": force, "stats": stats},
-        )
-        return json.dumps({"status": "imported", "stats": stats})
+        stats = mem.import_from_file(input_path, force=force, dry_run=dry_run)
+        if not dry_run:
+            self._audit_event(
+                "import", bank="private", source_tool="mnemosyne_import",
+                metadata={"input_path": input_path, "force": force, "stats": stats},
+            )
+        return json.dumps({"status": "dry_run" if dry_run else "imported", "stats": stats, "dry_run": dry_run})
 
     def _handle_diagnose(self, args: Dict[str, Any]) -> str:
         from mnemosyne.diagnose import run_diagnostics

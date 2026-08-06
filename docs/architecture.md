@@ -153,7 +153,7 @@ columns without a migration step. Most DDL lives in `init_beam` in
 | `memoria_instructions` | Standing instructions extracted from conversation |
 | `memoria_preferences` | Extracted user preferences |
 | `memoria_kg` | MEMORIA knowledge-graph rows |
-| `memoria_persona` | L3 persona tier, always injected into the prompt |
+| `memoria_persona` | L3 persona store; the prompt path reads the opt-in `persona.md` file, not this table |
 
 **Self-harmonizing reasoning (SHMR)**
 
@@ -218,9 +218,10 @@ Query string
               Return top_k results
 ```
 
-The three base weights are set by `MNEMOSYNE_VEC_WEIGHT`, `MNEMOSYNE_FTS_WEIGHT`, and
-`MNEMOSYNE_IMPORTANCE_WEIGHT`, normalized to sum to 1.0, and can be overridden per
-query. They are read from the environment directly rather than through `config.yaml`.
+The three base weights resolve at request time as `config.yaml` > environment variable >
+built-in default. The shared environment-variable level is `MNEMOSYNE_VEC_WEIGHT`,
+`MNEMOSYNE_FTS_WEIGHT`, and `MNEMOSYNE_IMPORTANCE_WEIGHT`. They are normalized to sum to
+1.0 and can be overridden per query; a reload applies to the next request.
 
 ### 2. Polyphonic (`MNEMOSYNE_POLYPHONIC_RECALL=1`)
 

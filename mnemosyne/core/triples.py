@@ -86,28 +86,34 @@ def _get_conn(db_path = None) -> sqlite3.Connection:
 
 def init_triples(db_path: Path = None):
     conn = _get_conn(db_path)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS triples (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            subject TEXT NOT NULL,
-            predicate TEXT NOT NULL,
-            object TEXT NOT NULL,
-            valid_from TEXT NOT NULL,
-            valid_until TEXT,
-            source TEXT,
-            confidence REAL DEFAULT 1.0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_subject ON triples(subject)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_predicate ON triples(predicate)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_object ON triples(object)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_valid_from ON triples(valid_from)")
-    
-    conn.commit()
+    try:
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS triples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object TEXT NOT NULL,
+                valid_from TEXT NOT NULL,
+                valid_until TEXT,
+                source TEXT,
+                confidence REAL DEFAULT 1.0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_subject ON triples(subject)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_predicate ON triples(predicate)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_object ON triples(object)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_valid_from ON triples(valid_from)")
+
+        conn.commit()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 class TripleStore:

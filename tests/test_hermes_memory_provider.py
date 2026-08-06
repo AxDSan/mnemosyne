@@ -10,8 +10,6 @@ import json
 import time
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from hermes_memory_provider import MnemosyneMemoryProvider
 from mnemosyne.core.llm_backends import get_host_llm_backend
 
@@ -661,15 +659,18 @@ def test_recall_schema_advertises_scoring_weights():
     weights that BeamMemory.recall accepts (beam.py:1296-1298) so Hermes'
     tool-arg validator accepts them instead of stripping as unknown fields."""
     from hermes_memory_provider import RECALL_SCHEMA
+    from mnemosyne.tool_schemas import RECALL_SCHEMA as canonical_recall_schema
 
     props = RECALL_SCHEMA["parameters"]["properties"]
+    canonical_props = canonical_recall_schema["parameters"]["properties"]
     for key in ("vec_weight", "fts_weight", "importance_weight"):
         assert key in props, (
             f"RECALL_SCHEMA missing {key!r} — schema description claims "
             f"'50% vector + 30% FTS5 + 20% importance' but never lets the "
             f"client tune those weights"
         )
-        assert props[key]["type"] == "number"
+        assert props[key]["type"] == ["number", "null"]
+        assert props[key] == canonical_props[key]
 
 
 def test_handle_recall_forwards_scoring_weights_to_beam(monkeypatch):

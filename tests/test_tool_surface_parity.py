@@ -141,6 +141,23 @@ def test_generated_docs_match_the_code():
         )
 
 
+def test_type_renderer_escapes_union_pipes_for_markdown_tables():
+    """JSON Schema unions must not add columns to generated pipe tables."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_gendocs", REPO / "scripts" / "generate-docs.py"
+    )
+    assert spec is not None and spec.loader is not None
+    gen = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gen)
+
+    assert gen._type_of({"type": ["number", "null"]}) == "number \\| null"
+    assert gen._type_of({"anyOf": [{"type": "number"}, {"type": "null"}]}) == (
+        "number \\| null"
+    )
+
+
 @pytest.mark.parametrize("module", ["mnemosyne.mcp_server", "mnemosyne.mcp_tools"])
 def test_mcp_modules_import(module):
     """Catch an incompatible mcp SDK at test time rather than at first use.

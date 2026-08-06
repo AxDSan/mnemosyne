@@ -23,7 +23,7 @@ import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -583,6 +583,36 @@ class MnemosyneConfig:
 
         # 3. Default
         return default
+
+    def get_many(self, defaults: Dict[str, Any]) -> Dict[str, Any]:
+        """Resolve several keys from one YAML-cache generation.
+
+        The returned mapping preserves the usual ``config.yaml > env >
+        default`` precedence for each key.  Unlike repeated :meth:`get`
+        calls, the YAML values are copied while holding the existing YAML
+        lock, so an auto-reload can yield either the complete old generation
+        or the complete new generation, never a mixture of both.
+        """
+        # Keep the established auto-reload behavior, then freeze a YAML view
+        # under the same lock used by _load_yaml().  A concurrent reload must
+        # happen entirely before or after this copy.
+        self._maybe_reload()
+        with self._yaml_lock:
+            yaml_values = {
+                key: self._yaml_cache[key]
+                for key in defaults
+                if key in self._yaml_cache
+            }
+
+        resolved = {}
+        for key, default in defaults.items():
+            if key in yaml_values:
+                resolved[key] = yaml_values[key]
+                continue
+            env_var = ENV_VAR_MAP.get(key)
+            env_value = os.environ.get(env_var) if env_var else None
+            resolved[key] = env_value if env_value is not None else default
+        return resolved
 
     def get_str(self, key: str, default: str = "") -> str:
         """Get a string config value."""

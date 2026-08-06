@@ -203,7 +203,7 @@ def cmd_recall(args):
         print(f"  Content: {content[:150]}{'...' if len(content) > 150 else ''}")
         print(f"  Score: {score:.3f}")
         if r.get("entity_match"):
-            print(f"  [entity match]")
+            print("  [entity match]")
         print()
 
 
@@ -270,7 +270,6 @@ def cmd_diagnose(args):
     fix_mode = "--fix" in args
     dry_run = "--dry-run" in args
     repair_vec_working = "--repair-vec-working" in args
-    clean_args = [a for a in args if not a.startswith("--")]
 
     try:
         from mnemosyne.diagnose import run_diagnostics, auto_fix
@@ -286,14 +285,26 @@ def cmd_diagnose(args):
 
         if repair_vec_working:
             print("\n  vec_working repair requested")
+            repair_statuses = [
+                entry.get("status")
+                for entry in result.get("entries", [])
+                if entry.get("check") == "vec_working_repair_status"
+            ]
+            repair_succeeded = bool(repair_statuses) and all(
+                status == "repaired" for status in repair_statuses
+            )
+            if not dry_run and not repair_succeeded:
+                _fail("vec_working repair failed; inspect diagnostics above", exit_code=1)
 
         if fix_mode or (dry_run and not repair_vec_working):
             print("\n--- Auto-fix ---")
             fix_result = auto_fix(result.get("entries", []), dry_run=dry_run)
             if fix_result["fixed"]:
-                label = "Would fix" if dry_run else "Fixed"
                 for item in fix_result["fixed"]:
-                    print(f"  ✅ {item}")
+                    if dry_run:
+                        print(f"  ℹ {item}")
+                    else:
+                        print(f"  ✅ Fixed: {item}")
             if fix_result["failed"]:
                 for item in fix_result["failed"]:
                     print(f"  ❌ {item['label']}: {item['error']}")
@@ -1454,8 +1465,12 @@ def cmd_profile(args):
         # Captured before the write so the vec_type notice below can tell
         # whether the value actually changed.
         try:
-            from mnemosyne.core.config import get_config as _get_config
-            _prev_vec_type = _get_config().get("vec_type")
+            from mnemosyne.core.config import MnemosyneConfig
+            if config_path_arg:
+                _prev_cfg = MnemosyneConfig(config_path=Path(config_path_arg))
+            else:
+                _prev_cfg = MnemosyneConfig.get_instance()
+            _prev_vec_type = _prev_cfg.get("vec_type")
         except Exception:
             _prev_vec_type = None
 

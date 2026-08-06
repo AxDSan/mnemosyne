@@ -225,7 +225,6 @@ These are read with `os.environ` at their point of use and bypass
 `vec_weight`, `fts_weight`, and `importance_weight` are normalized to sum to 1.0
 at query time. They are the highest-leverage tuning knobs in the system.
 
-Note a real caveat: `_normalize_weights` in `mnemosyne/core/beam.py` reads these
-three from the environment directly rather than through `MnemosyneConfig`, so
-setting them in `config.yaml` alone does not affect recall. Set the environment
-variables. This is tracked as a known inconsistency.
+They resolve at request time as `config.yaml > MNEMOSYNE_*_WEIGHT > defaults`.
+A config reload applies to the next request, and enhanced-recall cache entries
+are isolated by the effective weight snapshot.

@@ -5,7 +5,6 @@ Tests for Mnemosyne BEAM architecture
 import pytest
 import tempfile
 import sqlite3
-import os
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -474,6 +473,115 @@ def test_vec_working_coverage_reports_fallback_only_when_table_unavailable(temp_
     assert repair["status"] == "skipped"
     assert repair["reason"] == "vec_working unavailable"
 
+
+@pytest.mark.parametrize("terminal_status", ["no_vectors", "empty"])
+def test_vec_working_repair_accepts_no_work_terminal_states(monkeypatch, terminal_status):
+    """Empty or vectorless stores are healthy no-op repair outcomes."""
+    coverage = {
+        "vec_working_available": True,
+        "missing_vec_working_rows": 0,
+        "status": terminal_status,
+    }
+    monkeypatch.setattr(beam_module, "vec_working_coverage", lambda _conn: coverage)
+    monkeypatch.setattr(beam_module, "_backfill_vec_working_from_memory_embeddings", lambda _conn: 0)
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        result = beam_module.repair_vec_working(conn)
+    finally:
+        conn.close()
+
+    assert result["status"] == "repaired"
+    assert result["inserted"] == 0
+    assert result["after"]["status"] == terminal_status
+
+
+def test_vec_working_repair_reports_backfill_insert_failure(temp_db, monkeypatch):
+    """Repair must not claim success while vec_working coverage remains partial."""
+    beam = BeamMemory(session_id="vec-working-repair-failure", db_path=temp_db)
+    beam.conn.execute("DROP TABLE IF EXISTS vec_working")
+    beam.conn.execute("CREATE TABLE vec_working (rowid INTEGER PRIMARY KEY, embedding TEXT)")
+    beam.conn.execute(
+        "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("unrepaired", "working source", "test", "2026-01-01T00:00:00", "vec-working-repair-failure"),
+    )
+    beam.conn.execute(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+        ("unrepaired", "[0.1, 0.2]", "test"),
+    )
+    beam.conn.commit()
+    monkeypatch.setattr(beam_module, "_wm_vec_available", lambda _conn: True)
+    monkeypatch.setattr(beam_module, "np", object())
+    monkeypatch.setattr(
+        beam_module,
+        "_vec_table_insert",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("vec insert failed")),
+    )
+
+    result = beam_module.repair_vec_working(beam.conn)
+
+    assert result["status"] == "error"
+    assert "vec insert failed" in result["error"]
+    assert result["after"]["missing_vec_working_rows"] == 1
+
+
+@pytest.mark.parametrize(
+    "coverage_error_key",
+    [
+        "missing_vec_working_rows_error",
+        "memory_embeddings_error",
+        "vec_working_rows_error",
+        "error",
+    ],
+)
+def test_vec_working_repair_reports_unavailable_coverage(monkeypatch, coverage_error_key):
+    """Any post-repair coverage error key must prevent a repaired status."""
+    coverage_results = iter([
+        {"vec_working_available": True, "missing_vec_working_rows": 1},
+        {
+            "vec_working_available": True,
+            "missing_vec_working_rows": 0,
+            "status": "complete",
+            coverage_error_key: "OperationalError: coverage unavailable",
+        },
+    ])
+    monkeypatch.setattr(beam_module, "vec_working_coverage", lambda _conn: next(coverage_results))
+    monkeypatch.setattr(beam_module, "_backfill_vec_working_from_memory_embeddings", lambda _conn: 1)
+
+    class _Connection:
+        def commit(self):
+            pass
+
+    result = beam_module.repair_vec_working(_Connection())
+
+    assert result["status"] == "error"
+    assert coverage_error_key in result["error"]
+    assert "coverage unavailable" in result["error"]
+
+
+def test_vec_working_repair_requires_complete_available_postcheck(monkeypatch):
+    """A post-repair coverage error with a default zero count is not success."""
+    coverage_results = iter([
+        {"vec_working_available": True, "missing_vec_working_rows": 1},
+        {
+            "vec_working_available": False,
+            "missing_vec_working_rows": 0,
+            "status": "error",
+            "error": "vec_working table missing",
+        },
+    ])
+    monkeypatch.setattr(beam_module, "vec_working_coverage", lambda _conn: next(coverage_results))
+    monkeypatch.setattr(beam_module, "_backfill_vec_working_from_memory_embeddings", lambda _conn: 1)
+
+    class _Connection:
+        def commit(self):
+            pass
+
+    result = beam_module.repair_vec_working(_Connection())
+
+    assert result["status"] == "error"
+    assert "coverage unavailable" in result["error"]
 
 
 class TestFactAnnotationMatching:
@@ -1149,7 +1257,7 @@ class TestExportImport:
 
     def test_beam_import_from_dict_idempotent(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
-        mid = beam.remember("Prefers dark mode", source="preference", importance=0.9)
+        beam.remember("Prefers dark mode", source="preference", importance=0.9)
         data = beam.export_to_dict()
 
         # Import into fresh DB
@@ -1362,7 +1470,7 @@ class TestCrossSessionRecall:
         assert len(results2) > 0, "Cross-session recall should find second global memory"
 
         # Test that session-scoped memory is NOT visible cross-session
-        results3 = beam_b.recall("本轮只测试", top_k=5)
+        beam_b.recall("本轮只测试", top_k=5)
         # This may or may not find it depending on scoring; the key is globals ARE found
 
     def test_fallback_scoring_finds_chinese_substrings(self, temp_db, monkeypatch):
@@ -1570,7 +1678,7 @@ class TestTieredDegradation:
 
     def test_schema_migration_adds_tier_columns(self, temp_db):
         """Wave 1: init_beam() should add tier and degraded_at columns to episodic_memory."""
-        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        BeamMemory(session_id="s1", db_path=temp_db)
         # Just creating a BeamMemory triggers init_beam which runs the migration
 
         conn = sqlite3.connect(temp_db)
@@ -1698,9 +1806,17 @@ class TestTieredDegradation:
         assert tier == 1, "Dry run should not change tier"
 
     def test_degrade_episodic_respects_batch_limit(self, temp_db, monkeypatch):
-        """Degradation should respect DEGRADE_BATCH_SIZE limit."""
+        """Degradation should respect its resolved runtime batch limit."""
         monkeypatch.setattr("mnemosyne.core.beam.TIER2_DAYS", 1)
-        monkeypatch.setattr("mnemosyne.core.beam.DEGRADE_BATCH_SIZE", 3)
+
+        class Config:
+            def get_int(self, key, default):
+                assert key == "degrade_batch"
+                assert default == 100
+                return 3
+
+        config = Config()
+        monkeypatch.setattr("mnemosyne.core.config.get_config", lambda: config)
 
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         # Consolidate 5 episodic memories first
@@ -1722,8 +1838,8 @@ class TestTieredDegradation:
         conn.close()
 
         result = beam.degrade_episodic(dry_run=False)
-        # Should degrade at most DEGRADE_BATCH_SIZE (3), not all 5
-        assert result["tier1_to_tier2"] <= 3
+        # The resolved batch size is exact, not merely an upper bound.
+        assert result["tier1_to_tier2"] == 3
 
     def test_tier_weighting_in_recall(self, temp_db, monkeypatch):
         """Tier 3 memories should score lower than tier 1 in recall."""
@@ -1925,7 +2041,7 @@ class TestVeracity:
 
     def test_schema_adds_veracity_columns(self, temp_db):
         """init_beam should add veracity to working_memory and episodic_memory."""
-        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        BeamMemory(session_id="s1", db_path=temp_db)
 
         conn = sqlite3.connect(temp_db)
         wm_cols = [r[1] for r in conn.execute("PRAGMA table_info(working_memory)").fetchall()]

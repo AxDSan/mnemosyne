@@ -22,6 +22,7 @@ import json
 import hashlib
 import threading
 import math
+from dataclasses import dataclass
 
 from mnemosyne.core.config import resolve_beam_runtime
 
@@ -43,11 +44,9 @@ except ImportError:
 # Binary vector compression (Phase 2 -- Moorcheh ITS)
 try:
     from mnemosyne.core.binary_vectors import (
-        BinaryVectorStore,
         maximally_informative_binarization as _mib,
         hamming_distance as _hamming,
         EMBEDDING_DIM,
-        BYTES_PER_VECTOR,
     )
 except ImportError:
     _mib = None
@@ -291,7 +290,10 @@ TIER3_DAYS = int(os.environ.get("MNEMOSYNE_TIER3_DAYS", "180"))
 TIER1_WEIGHT = float(os.environ.get("MNEMOSYNE_TIER1_WEIGHT", "1.0"))
 TIER2_WEIGHT = float(os.environ.get("MNEMOSYNE_TIER2_WEIGHT", "0.5"))
 TIER3_WEIGHT = float(os.environ.get("MNEMOSYNE_TIER3_WEIGHT", "0.25"))
-DEGRADE_BATCH_SIZE = int(os.environ.get("MNEMOSYNE_DEGRADE_BATCH", "100"))
+# Kept as the established default for callers that do not configure a value.
+# The actual degradation consumer resolves its value through MnemosyneConfig
+# at the start of each complete operation (see degrade_episodic()).
+DEGRADE_BATCH_SIZE = 100
 SMART_COMPRESS = os.environ.get("MNEMOSYNE_SMART_COMPRESS", "1") not in ("0", "false", "no")
 TIER3_MAX_CHARS = int(os.environ.get("MNEMOSYNE_TIER3_MAX_CHARS", "300"))
 
@@ -981,11 +983,12 @@ def init_beam(db_path: Path = None):
         _add_column_if_missing(conn, table, 'source_memory_id', 'TEXT')
 
     # --- L3 Persona (v3.10.0) ---
-    # Always-on persona tier with explicit retention classification.
+    # Explicit persona store with tier classification.
     # Tier values: 'permanent', 'long_term' (default), 'working'.
-    # Tier controls injection priority only. No eviction or decay is
-    # implemented for this table: the only writes are insert on promote,
-    # delete on demote, and the reinforcement counter bump.
+    # Tier orders persona_list output and affects nothing else; the system
+    # prompt path reads the opt-in persona.md file, not this table. No
+    # eviction or decay is implemented for this table: the only writes are
+    # insert on promote, delete on demote, and the reinforcement counter bump.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS memoria_persona (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1398,6 +1401,74 @@ def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, co
         conn.commit()
 
 
+@dataclass(frozen=True)
+class _RecallWeightSnapshot:
+    """The normalized scoring weights fixed for one recall request."""
+
+    vec: float
+    fts: float
+    importance: float
+
+    def as_tuple(self) -> tuple[float, float, float]:
+        return (self.vec, self.fts, self.importance)
+
+
+_DEFAULT_RECALL_WEIGHTS = (0.5, 0.3, 0.2)
+
+
+def _normalize_recall_weight_values(
+    vec_weight: Any,
+    fts_weight: Any,
+    importance_weight: Any,
+) -> _RecallWeightSnapshot:
+    """Normalize one finite request snapshot, or return the safe defaults.
+
+    Compatibility policy: ordinary negative values remain clamped and an
+    all-zero triplet still falls back to the historical defaults.  If any
+    resolved component is NaN or infinite (or normalization overflows), use
+    ``(0.5, 0.3, 0.2)`` for the whole request rather than letting a partial
+    value poison scoring or enhanced-cache material.
+    """
+    try:
+        values = (float(vec_weight), float(fts_weight), float(importance_weight))
+    except (TypeError, ValueError, OverflowError):
+        return _RecallWeightSnapshot(*_DEFAULT_RECALL_WEIGHTS)
+    if not all(math.isfinite(value) for value in values):
+        return _RecallWeightSnapshot(*_DEFAULT_RECALL_WEIGHTS)
+
+    clamped = tuple(max(0.0, value) for value in values)
+    total = sum(clamped)
+    if total == 0.0 or not math.isfinite(total):
+        return _RecallWeightSnapshot(*_DEFAULT_RECALL_WEIGHTS)
+
+    normalized = tuple(value / total for value in clamped)
+    if not all(math.isfinite(value) for value in normalized):
+        return _RecallWeightSnapshot(*_DEFAULT_RECALL_WEIGHTS)
+    return _RecallWeightSnapshot(*normalized)
+
+
+def _resolve_recall_weights(
+    vec_weight: Optional[float],
+    fts_weight: Optional[float],
+    importance_weight: Optional[float],
+) -> _RecallWeightSnapshot:
+    """Resolve one finite atomic snapshot with config.yaml > env > defaults."""
+    from mnemosyne.core.config import get_config
+
+    config = get_config()
+    configured = config.get_many({
+        "vec_weight": _DEFAULT_RECALL_WEIGHTS[0],
+        "fts_weight": _DEFAULT_RECALL_WEIGHTS[1],
+        "importance_weight": _DEFAULT_RECALL_WEIGHTS[2],
+    })
+
+    return _normalize_recall_weight_values(
+        vec_weight if vec_weight is not None else configured["vec_weight"],
+        fts_weight if fts_weight is not None else configured["fts_weight"],
+        importance_weight if importance_weight is not None else configured["importance_weight"],
+    )
+
+
 def _normalize_weights(vec_weight: Optional[float], fts_weight: Optional[float],
                        importance_weight: Optional[float]) -> tuple[float, float, float]:
     """
@@ -1410,21 +1481,10 @@ def _normalize_weights(vec_weight: Optional[float], fts_weight: Optional[float],
 
     After normalization: vw + fw + iw == 1.0
     """
-    vw = vec_weight if vec_weight is not None else float(os.environ.get("MNEMOSYNE_VEC_WEIGHT", "0.5"))
-    fw = fts_weight if fts_weight is not None else float(os.environ.get("MNEMOSYNE_FTS_WEIGHT", "0.3"))
-    iw = importance_weight if importance_weight is not None else float(os.environ.get("MNEMOSYNE_IMPORTANCE_WEIGHT", "0.2"))
-
-    # Clamp to non-negative
-    vw = max(0.0, vw)
-    fw = max(0.0, fw)
-    iw = max(0.0, iw)
-
-    total = vw + fw + iw
-    if total == 0.0:
-        # All zero = revert to defaults
-        return (0.5, 0.3, 0.2)
-
-    return (vw / total, fw / total, iw / total)
+    vw = vec_weight if vec_weight is not None else os.environ.get("MNEMOSYNE_VEC_WEIGHT", "0.5")
+    fw = fts_weight if fts_weight is not None else os.environ.get("MNEMOSYNE_FTS_WEIGHT", "0.3")
+    iw = importance_weight if importance_weight is not None else os.environ.get("MNEMOSYNE_IMPORTANCE_WEIGHT", "0.2")
+    return _normalize_recall_weight_values(vw, fw, iw).as_tuple()
 
 
 def _normalize_datetime_utc(dt: datetime) -> datetime:
@@ -1534,6 +1594,20 @@ def _temporal_boost(memory_timestamp_str: str, query_time: datetime,
 
     hours_delta = (query_time - ts).total_seconds() / 3600.0
     return math.exp(-hours_delta / halflife_hours)
+
+
+def _resolve_temporal_halflife(value: Any) -> float:
+    """Return the finite, positive temporal half-life used by recall."""
+    raw_value = (
+        os.environ.get("MNEMOSYNE_TEMPORAL_HALFLIFE_HOURS", "24")
+        if value is None
+        else value
+    )
+    try:
+        resolved = float(raw_value)
+    except (TypeError, ValueError, OverflowError):
+        return 24.0
+    return resolved if math.isfinite(resolved) and resolved > 0 else 24.0
 
 
 def _vec_available(conn: sqlite3.Connection) -> bool:
@@ -2214,7 +2288,8 @@ def _wm_vec_delete(conn: sqlite3.Connection, memory_id: str) -> None:
     conn.execute("DELETE FROM vec_working WHERE rowid = ?", (rowid,))
 
 
-def _store_working_embedding(conn: sqlite3.Connection, memory_id: str, embedding: List[float], *, commit_vec: bool = True) -> None:
+def _store_working_embedding(conn: sqlite3.Connection, memory_id: str, embedding: List[float], *,
+                             commit_vec: bool = True, strict_vec: bool = False) -> None:
     """Store working-memory embedding in fallback and sqlite-vec stores.
 
     ``memory_embeddings`` remains the compatibility/fallback store. When the
@@ -2236,6 +2311,8 @@ def _store_working_embedding(conn: sqlite3.Connection, memory_id: str, embedding
     try:
         _wm_vec_upsert(conn, memory_id, embedding, commit=commit_vec)
     except Exception as exc:
+        if strict_vec:
+            raise
         logger.warning(
             "vec_working upsert failed for '%s' (%s): %s",
             memory_id, type(exc).__name__, exc,
@@ -2246,27 +2323,18 @@ def _backfill_vec_working_from_memory_embeddings(conn: sqlite3.Connection) -> in
     """Idempotently mirror fallback working embeddings into vec_working."""
     if not _wm_vec_available(conn) or np is None:
         return 0
-    try:
-        rows = conn.execute("""
-            SELECT wm.id, wm.rowid, me.embedding_json
-            FROM working_memory wm
-            JOIN memory_embeddings me ON me.memory_id = wm.id
-            LEFT JOIN vec_working vw ON vw.rowid = wm.rowid
-            WHERE vw.rowid IS NULL
-        """).fetchall()
-    except Exception:
-        return 0
+    rows = conn.execute("""
+        SELECT wm.id, wm.rowid, me.embedding_json
+        FROM working_memory wm
+        JOIN memory_embeddings me ON me.memory_id = wm.id
+        LEFT JOIN vec_working vw ON vw.rowid = wm.rowid
+        WHERE vw.rowid IS NULL
+    """).fetchall()
     inserted = 0
     for row in rows:
-        try:
-            embedding = json.loads(row["embedding_json"])
-            _vec_table_insert(conn, "vec_working", int(row["rowid"]), embedding)
-            inserted += 1
-        except Exception as exc:
-            logger.warning(
-                "vec_working backfill skipped '%s' (%s): %s",
-                row["id"], type(exc).__name__, exc,
-            )
+        embedding = json.loads(row["embedding_json"])
+        _vec_table_insert(conn, "vec_working", int(row["rowid"]), embedding)
+        inserted += 1
     return inserted
 
 
@@ -2384,11 +2452,36 @@ def repair_vec_working(conn: sqlite3.Connection, *, dry_run: bool = False) -> Di
     try:
         result["inserted"] = _backfill_vec_working_from_memory_embeddings(conn)
         conn.commit()
-        result["status"] = "repaired"
     except Exception as exc:
         result["status"] = "error"
         result["error"] = f"{type(exc).__name__}: {exc}"
     result["after"] = vec_working_coverage(conn)
+    if result.get("status") != "error":
+        after = result["after"]
+        coverage_errors = {
+            key: value
+            for key, value in after.items()
+            if key == "error" or key.endswith("_error")
+        }
+        unresolved = after.get("missing_vec_working_rows")
+        if (
+            after.get("status") not in {"complete", "no_vectors", "empty"}
+            or after.get("vec_working_available") is not True
+            or coverage_errors
+            or unresolved != 0
+        ):
+            result["status"] = "error"
+            if coverage_errors:
+                details = "; ".join(
+                    f"{key}: {value}" for key, value in coverage_errors.items()
+                )
+                result["error"] = f"vec_working repair coverage unavailable: {details}"
+            elif unresolved is None:
+                result["error"] = "vec_working repair coverage unavailable"
+            else:
+                result["error"] = f"vec_working repair incomplete: {unresolved} rows unresolved"
+        else:
+            result["status"] = "repaired"
     return result
 
 
@@ -2420,10 +2513,69 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     vec_ok = _vec_available(conn)
 
     def _count(sql: str) -> int:
+        return int(conn.execute(sql).fetchone()[0])
+
+    def _commit_reindex_writes() -> None:
+        """Commit a rebuild boundary even when BEAM normally defers commits."""
+        if isinstance(conn, _BeamConnection):
+            conn._real_commit()
+        else:
+            conn.commit()
+
+    def _embed_chunk(store: str, chunk) -> Any:
         try:
-            return int(conn.execute(sql).fetchone()[0])
-        except Exception:
-            return 0
+            vectors = _embeddings.embed([row["content"] for row in chunk])
+        except Exception as exc:
+            raise RuntimeError(
+                f"{store} embedding batch failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        if vectors is None:
+            raise RuntimeError(f"{store} embedding batch returned no embeddings")
+        try:
+            vector_count = len(vectors)
+        except TypeError as exc:
+            raise RuntimeError(f"{store} embedding batch returned an invalid result") from exc
+        if vector_count != len(chunk):
+            raise RuntimeError(
+                f"{store} embedding batch returned {vector_count} embeddings "
+                f"for {len(chunk)} source rows"
+            )
+        for index, vector in enumerate(vectors):
+            if isinstance(vector, (str, bytes)) or getattr(vector, "ndim", 1) != 1:
+                raise RuntimeError(
+                    f"{store} embedding vector {index} must be one-dimensional"
+                )
+            try:
+                values = list(vector)
+            except TypeError as exc:
+                raise RuntimeError(
+                    f"{store} embedding vector {index} is not a convertible numeric vector"
+                ) from exc
+            if len(values) != target_dim:
+                raise RuntimeError(
+                    f"{store} embedding vector {index} has dimension {len(values)}; "
+                    f"expected {target_dim}"
+                )
+            for value in values:
+                if isinstance(value, (str, bytes)):
+                    raise RuntimeError(
+                        f"{store} embedding vector {index} is not a convertible numeric vector"
+                    )
+                if isinstance(value, (list, tuple)) or getattr(value, "ndim", 0) != 0:
+                    raise RuntimeError(
+                        f"{store} embedding vector {index} must be one-dimensional"
+                    )
+                try:
+                    numeric_value = float(value)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise RuntimeError(
+                        f"{store} embedding vector {index} is not a convertible numeric vector"
+                    ) from exc
+                if not math.isfinite(numeric_value):
+                    raise RuntimeError(
+                        f"{store} embedding vector {index} must contain only finite values"
+                    )
+        return vectors
 
     wm_total = _count("SELECT COUNT(*) FROM working_memory "
                       "WHERE content IS NOT NULL AND length(content) > 0")
@@ -2444,6 +2596,10 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
 
     if not _embeddings.available():
         raise RuntimeError("Embedding model unavailable; cannot reindex vectors.")
+    if ep_total and not vec_ok and _mib is None:
+        raise RuntimeError(
+            "episodic_memory vector backend unavailable; cannot reindex episodic vectors."
+        )
 
     # 1) Recreate the sqlite-vec tables at the active dimension. vec_facts has no
     #    writer yet but is recreated so its declared dim can't mismatch a query.
@@ -2453,7 +2609,7 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
             conn.execute(
                 f"CREATE VIRTUAL TABLE {table} USING vec0(embedding {vec_type}[{target_dim}])"
             )
-        conn.commit()
+        _commit_reindex_writes()
 
     # 2) Working memory -> memory_embeddings (+ vec_working), via the shared write
     #    helper so the float-JSON and sqlite-vec stores stay consistent.
@@ -2464,13 +2620,13 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     ).fetchall()
     for start in range(0, len(wm_rows), batch_size):
         chunk = wm_rows[start:start + batch_size]
-        vecs = _embeddings.embed([r["content"] for r in chunk])
-        if vecs is None:
-            break
+        vecs = _embed_chunk("working_memory", chunk)
         for r, vec in zip(chunk, vecs):
-            _store_working_embedding(conn, r["id"], np.asarray(vec).tolist(), commit_vec=False)
+            _store_working_embedding(
+                conn, r["id"], np.asarray(vec).tolist(), commit_vec=False, strict_vec=True
+            )
             wm_done += 1
-        conn.commit()
+        _commit_reindex_writes()
         if progress:
             progress("working_memory", wm_done, wm_total)
 
@@ -2483,26 +2639,27 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     ).fetchall()
     for start in range(0, len(ep_rows), batch_size):
         chunk = ep_rows[start:start + batch_size]
-        vecs = _embeddings.embed([r["content"] for r in chunk])
-        if vecs is None:
-            break
+        vecs = _embed_chunk("episodic_memory", chunk)
         for r, vec in zip(chunk, vecs):
             arr = np.asarray(vec)
             rowid = int(r["rowid"])
             if vec_ok:
                 _vec_table_insert(conn, "vec_episodes", rowid, arr.tolist(), commit=False)
             if _mib is not None:
-                try:
-                    conn.execute(
-                        "UPDATE episodic_memory SET binary_vector = ? WHERE rowid = ?",
-                        (_mib(arr), rowid),
-                    )
-                except Exception:
-                    pass
+                conn.execute(
+                    "UPDATE episodic_memory SET binary_vector = ? WHERE rowid = ?",
+                    (_mib(arr), rowid),
+                )
             ep_done += 1
-        conn.commit()
+        _commit_reindex_writes()
         if progress:
             progress("episodic_memory", ep_done, ep_total)
+
+    if wm_done != wm_total or ep_done != ep_total:
+        raise RuntimeError(
+            "Reindex incomplete: processed "
+            f"{wm_done}/{wm_total} working and {ep_done}/{ep_total} episodic rows"
+        )
 
     plan["status"] = "reindexed"
     plan["working_memory_reindexed"] = wm_done
@@ -5478,7 +5635,8 @@ class BeamMemory:
                fts_weight: float = None,
                importance_weight: float = None,
                explain: bool = False,
-               _cross_session: Optional[bool] = None) -> List[Dict]:
+               _cross_session: Optional[bool] = None,
+               _resolved_weights: Optional[_RecallWeightSnapshot] = None) -> List[Dict]:
         """
         Hybrid recall across working_memory + episodic_memory.
         Uses sqlite-vec + FTS5 for episodic, FTS5 for working.
@@ -5508,11 +5666,11 @@ class BeamMemory:
 
         Configurable hybrid scoring (Phase 4):
             vec_weight: Weight for vector (dense) similarity in episodic scoring.
-                None = use env var MNEMOSYNE_VEC_WEIGHT or default 0.5.
+                None = resolve config.yaml, then MNEMOSYNE_VEC_WEIGHT, then default 0.5.
             fts_weight: Weight for FTS5 text relevance in episodic scoring.
-                None = use env var MNEMOSYNE_FTS_WEIGHT or default 0.3.
+                None = resolve config.yaml, then MNEMOSYNE_FTS_WEIGHT, then default 0.3.
             importance_weight: Weight for importance score in all scoring.
-                None = use env var MNEMOSYNE_IMPORTANCE_WEIGHT or default 0.2.
+                None = resolve config.yaml, then MNEMOSYNE_IMPORTANCE_WEIGHT, then default 0.2.
 
             The three episodic weights are automatically normalized to sum to 1.0.
             Working memory uses a derived split: keyword gets (1 - importance_weight) * 0.6,
@@ -5566,8 +5724,39 @@ class BeamMemory:
         query_words = _recall_tokens(query_lower)
 
         # ---- Configurable hybrid scoring setup (Phase 4) ----
-        vw, fw, iw = _normalize_weights(vec_weight, fts_weight, importance_weight)
+        weight_snapshot = (
+            _resolved_weights
+            if _resolved_weights is not None
+            else _resolve_recall_weights(vec_weight, fts_weight, importance_weight)
+        )
+        vw, fw, iw = weight_snapshot.as_tuple()
         _explain_trace = None
+
+        # ---- Query intent weight adjustment ----
+        # This is deliberately a small opt-in shim, not a new recall mode:
+        # keep the existing hybrid pipeline, but bias its vector/FTS/importance
+        # weights toward the query shape when no caller supplied weights.
+        # Example: temporal/status queries should care more about recency and
+        # exact terms, while preference/fact lookups can lean more on semantic
+        # similarity. The env gate preserves current default behavior for
+        # deployments that have not explicitly chosen intent-aware recall.
+        # If any weight was explicitly passed by the caller, skip intent
+        # adjustment -- explicit caller weights win.
+        if (os.environ.get("MNEMOSYNE_QUERY_INTENT", "0") == "1"
+                and _resolved_weights is None
+                and vec_weight is None and fts_weight is None
+                and importance_weight is None):
+            try:
+                from mnemosyne.core.query_intent import classify_intent, adjust_weights
+                _intent = classify_intent(query)
+                vw, fw, iw = adjust_weights(
+                    base_vec=vw, base_fts=fw, base_importance=iw,
+                    intent=_intent,
+                )
+                vw, fw, iw = _normalize_recall_weight_values(vw, fw, iw).as_tuple()
+            except Exception:
+                logger.debug("query intent adjustment failed, using default weights", exc_info=True)
+
         if explain:
             from mnemosyne.core.recall_diagnostics import RecallExplainTrace
             _explain_trace = RecallExplainTrace(
@@ -5587,29 +5776,6 @@ class BeamMemory:
                 },
                 weights={"vec": vw, "fts": fw, "importance": iw, "temporal": temporal_weight},
             )
-
-        # ---- Query intent weight adjustment ----
-        # This is deliberately a small opt-in shim, not a new recall mode:
-        # keep the existing hybrid pipeline, but bias its vector/FTS/importance
-        # weights toward the query shape when no caller supplied weights.
-        # Example: temporal/status queries should care more about recency and
-        # exact terms, while preference/fact lookups can lean more on semantic
-        # similarity. The env gate preserves current default behavior for
-        # deployments that have not explicitly chosen intent-aware recall.
-        # If any weight was explicitly passed by the caller, skip intent
-        # adjustment -- explicit caller weights win.
-        if (os.environ.get("MNEMOSYNE_QUERY_INTENT", "0") == "1"
-                and vec_weight is None and fts_weight is None
-                and importance_weight is None):
-            try:
-                from mnemosyne.core.query_intent import classify_intent, adjust_weights
-                _intent = classify_intent(query)
-                vw, fw, iw = adjust_weights(
-                    base_vec=vw, base_fts=fw, base_importance=iw,
-                    intent=_intent,
-                )
-            except Exception:
-                logger.debug("query intent adjustment failed, using default weights", exc_info=True)
 
         # Query embeddings are used by several recall subpaths. Compute the
         # vector at most once per recall() call, then reuse it for working
@@ -5634,10 +5800,7 @@ class BeamMemory:
 
         # ---- Temporal scoring setup ----
         parsed_query_time = _parse_query_time(query_time)
-        if temporal_halflife is not None:
-            th_halflife = temporal_halflife
-        else:
-            th_halflife = float(os.environ.get("MNEMOSYNE_TEMPORAL_HALFLIFE_HOURS", "24"))
+        th_halflife = _resolve_temporal_halflife(temporal_halflife)
 
         # [C4] Recall path diagnostics -- lazy import to avoid module-
         # load coupling. Counters are recorded AFTER the per-row
@@ -5795,9 +5958,6 @@ class BeamMemory:
                 )
         broad_multi_hit_query = len(query_words) >= 4 and len(matched_query_tokens) >= 2
         for row in rows:
-            content_lower = row["content"].lower()
-            content_words_list = content_lower.split()
-            content_words_set = set(content_words_list)
             if wm_ranks and row["id"] in wm_ranks:
                 normalized = 1.0 - ((wm_ranks[row["id"]] - min_rank) / rng)
                 lexical = _lexical_relevance(query_words, row["content"], query_lower)
@@ -6130,11 +6290,9 @@ class BeamMemory:
 
         # ---- Pre-compute query binary vector (Phase 5 binary voice) ----
         query_bv = None
-        query_emb_for_bv = None
         if embeddings_available and _mib is not None:
             emb_result = _get_query_embedding()
             if emb_result is not None:
-                query_emb_for_bv = emb_result
                 query_bv = _mib(emb_result)
 
         # ---- Episodic memory (vec + FTS5 hybrid) ----
@@ -6253,7 +6411,6 @@ class BeamMemory:
             fact_bonus = 0.0
             binary_bonus = 0.0
             memory_id = row["id"]
-            content_lower = row["content"].lower()
             bv = row["binary_vector"]
             lexical = _lexical_relevance(query_words, row["content"], query_lower)
             # FTS rank says a candidate matched *a* term; it does not mean the
@@ -6744,6 +6901,7 @@ class BeamMemory:
         associative_depth: int,
         mmr_lambda: float,
         recall_kwargs: Dict[str, Any],
+        weights: Optional[tuple[float, float, float]] = None,
     ) -> str:
         """Build a versioned opaque key for one effective enhanced request."""
         def canonicalize(value: Any) -> Any:
@@ -6757,32 +6915,41 @@ class BeamMemory:
                 return [canonicalize(item) for item in value]
             if isinstance(value, set):
                 return sorted(canonicalize(item) for item in value)
-            if value is None or isinstance(value, (str, int, float, bool)):
+            if isinstance(value, float):
+                return value if math.isfinite(value) else None
+            if value is None or isinstance(value, (str, int, bool)):
                 return value
             return str(value)
 
-        raw_weights = (
-            recall_kwargs.get("vec_weight"),
-            recall_kwargs.get("fts_weight"),
-            recall_kwargs.get("importance_weight"),
-        )
-        resolved_weights = _normalize_weights(*raw_weights)
-        if (all(weight is None for weight in raw_weights)
-                and os.environ.get("MNEMOSYNE_QUERY_INTENT", "0") == "1"
-                and classify_intent is not None and adjust_weights is not None):
-            try:
-                resolved_weights = adjust_weights(
-                    base_vec=resolved_weights[0],
-                    base_fts=resolved_weights[1],
-                    base_importance=resolved_weights[2],
-                    intent=classify_intent(expanded_query),
-                )
-            except Exception:
-                logger.debug("query intent adjustment failed while building cache key", exc_info=True)
+        if weights is None:
+            raw_weights = (
+                recall_kwargs.get("vec_weight"),
+                recall_kwargs.get("fts_weight"),
+                recall_kwargs.get("importance_weight"),
+            )
+            resolved_weights = _resolve_recall_weights(*raw_weights).as_tuple()
+            if (all(weight is None for weight in raw_weights)
+                    and use_intent
+                    and os.environ.get("MNEMOSYNE_QUERY_INTENT", "0") == "1"
+                    and classify_intent is not None and adjust_weights is not None):
+                try:
+                    resolved_weights = _normalize_recall_weight_values(
+                        *adjust_weights(
+                            base_vec=resolved_weights[0],
+                            base_fts=resolved_weights[1],
+                            base_importance=resolved_weights[2],
+                            intent=classify_intent(expanded_query),
+                        )
+                    ).as_tuple()
+                except Exception:
+                    logger.debug("query intent adjustment failed while building cache key", exc_info=True)
+        else:
+            resolved_weights = weights
 
-        temporal_halflife = recall_kwargs.get("temporal_halflife")
-        if temporal_halflife is None:
-            temporal_halflife = float(os.environ.get("MNEMOSYNE_TEMPORAL_HALFLIFE_HOURS", "24"))
+        temporal_halflife = _resolve_temporal_halflife(recall_kwargs.get("temporal_halflife"))
+        effective_recall_kwargs = dict(recall_kwargs)
+        if "temporal_halflife" in effective_recall_kwargs:
+            effective_recall_kwargs["temporal_halflife"] = temporal_halflife
 
         db_namespace = str(self.db_path.resolve())
         payload = {
@@ -6794,7 +6961,7 @@ class BeamMemory:
                 "cross_session": bool(runtime.cross_session),
             },
             "top_k": top_k,
-            "recall_kwargs": canonicalize(recall_kwargs),
+            "recall_kwargs": canonicalize(effective_recall_kwargs),
             "resolved": {
                 "weights": resolved_weights,
                 "temporal_halflife": temporal_halflife,
@@ -6880,29 +7047,59 @@ class BeamMemory:
 
         original_query = query
         expanded_query = query
+        if "temporal_halflife" in kwargs:
+            kwargs["temporal_halflife"] = _resolve_temporal_halflife(kwargs["temporal_halflife"])
+        raw_weights = (
+            kwargs.get("vec_weight"),
+            kwargs.get("fts_weight"),
+            kwargs.get("importance_weight"),
+        )
+        weight_snapshot = _resolve_recall_weights(*raw_weights)
+        intent_adjusted_weights = False
 
         # 1. Query intent classification
-        if use_intent and classify_intent is not None:
+        if (all(weight is None for weight in raw_weights)
+                and use_intent and classify_intent is not None):
             intent = classify_intent(query)
             if intent.category != "general" and adjust_weights is not None:
-                vec_weight, fts_weight, importance_weight = _normalize_weights(
-                    kwargs.pop("vec_weight", None),
-                    kwargs.pop("fts_weight", None),
-                    kwargs.pop("importance_weight", None),
-                )
                 vw, fw, iw = adjust_weights(
-                    base_vec=vec_weight,
-                    base_fts=fts_weight,
-                    base_importance=importance_weight,
+                    base_vec=weight_snapshot.vec,
+                    base_fts=weight_snapshot.fts,
+                    base_importance=weight_snapshot.importance,
                     intent=intent,
                 )
-                kwargs["vec_weight"] = vw
-                kwargs["fts_weight"] = fw
-                kwargs["importance_weight"] = iw
+                weight_snapshot = _normalize_recall_weight_values(vw, fw, iw)
+                intent_adjusted_weights = True
+                kwargs["vec_weight"] = weight_snapshot.vec
+                kwargs["fts_weight"] = weight_snapshot.fts
+                kwargs["importance_weight"] = weight_snapshot.importance
 
         # 2. Synonym expansion
         if use_synonyms and expand_query is not None:
             expanded_query = expand_query(query)
+
+        if (not intent_adjusted_weights
+                and all(weight is None for weight in raw_weights)
+                and use_intent
+                and os.environ.get("MNEMOSYNE_QUERY_INTENT", "0") == "1"
+                and classify_intent is not None and adjust_weights is not None):
+            try:
+                vw, fw, iw = adjust_weights(
+                    base_vec=weight_snapshot.vec,
+                    base_fts=weight_snapshot.fts,
+                    base_importance=weight_snapshot.importance,
+                    intent=classify_intent(expanded_query),
+                )
+                weight_snapshot = _normalize_recall_weight_values(vw, fw, iw)
+            except Exception:
+                logger.debug("query intent adjustment failed while resolving enhanced weights", exc_info=True)
+
+        # The opaque cache key contains raw recall kwargs too.  Store the
+        # effective finite snapshot there, so an explicit ``inf``/``nan``
+        # cannot enter key material even though it was safely defaulted above.
+        kwargs["vec_weight"] = weight_snapshot.vec
+        kwargs["fts_weight"] = weight_snapshot.fts
+        kwargs["importance_weight"] = weight_snapshot.importance
 
         # 3. Query cache check.  Opaque v2 keys use QueryCache's exact-only
         # path, so no semantic tier can reuse a different effective request.
@@ -6921,6 +7118,7 @@ class BeamMemory:
             associative_depth=associative_depth,
             mmr_lambda=mmr_lambda,
             recall_kwargs=kwargs,
+            weights=weight_snapshot.as_tuple(),
         )
         cached = None
         if use_cache and not explain and QueryCache is not None:
@@ -6937,7 +7135,11 @@ class BeamMemory:
 
         # 4. Run base recall with expanded query
         results = self.recall(
-            expanded_query, top_k=top_k * 2, _cross_session=runtime.cross_session, **kwargs
+            expanded_query,
+            top_k=top_k * 2,
+            _cross_session=runtime.cross_session,
+            _resolved_weights=weight_snapshot,
+            **kwargs,
         )
         if explain:
             return results
@@ -7955,6 +8157,12 @@ class BeamMemory:
 
         Returns summary of tier transitions performed.
         """
+        # Resolve once so a config reload cannot make the tier-1 and tier-2
+        # candidate queries use different batch semantics mid-operation.
+        # MnemosyneConfig preserves config.yaml > env > default precedence.
+        from mnemosyne.core.config import get_config
+        degrade_batch_size = get_config().get_int("degrade_batch", DEGRADE_BATCH_SIZE)
+
         cursor = self.conn.cursor()
         now = datetime.now()
         results = {"status": "dry_run" if dry_run else "degraded",
@@ -7971,7 +8179,7 @@ class BeamMemory:
                 SELECT id, rowid, content, importance FROM episodic_memory
                 WHERE tier = 1 AND created_at < ?
                 ORDER BY created_at ASC LIMIT ?
-            """, (tier2_cutoff, DEGRADE_BATCH_SIZE))
+            """, (tier2_cutoff, degrade_batch_size))
             tier1_rows = cursor.fetchall()
         except Exception as exc:
             logger.warning(
@@ -7987,7 +8195,7 @@ class BeamMemory:
                 SELECT id, rowid, content FROM episodic_memory
                 WHERE tier = 2 AND created_at < ?
                 ORDER BY created_at ASC LIMIT ?
-            """, (tier3_cutoff, DEGRADE_BATCH_SIZE // 2))
+            """, (tier3_cutoff, degrade_batch_size // 2))
             tier2_rows = cursor.fetchall()
         except Exception as exc:
             logger.warning(
@@ -8706,7 +8914,7 @@ class BeamMemory:
 
         # Cross-session MEMORIA dedup: clean up redundant entries across sessions
         if not dry_run:
-            dedup_result = self._deduplicate_memoria_cross_session()
+            self._deduplicate_memoria_cross_session()
 
         return {
             "status": "dry_run" if dry_run else ("consolidated" if items_consolidated else "no_op"),

@@ -66,7 +66,53 @@ def _stage_pending_write(payload: Dict[str, Any]) -> str:
     }
     (pending_dir / f"{pid}.json").write_text(json.dumps(record, indent=2))
     return pid
+
+
+def _guard_selected_site_packages_python_compatibility(selected_site_packages: Path) -> None:
+    """Reject a selected virtualenv that targets another Python minor version."""
+    selected_site_packages = selected_site_packages.resolve()
+    # Standard POSIX layouts put pyvenv.cfg three levels above site-packages
+    # (/venv/lib/pythonX/site-packages); Windows needs only two. Do not let
+    # this early bootstrap probe inspect arbitrary filesystem ancestors.
+    for candidate in (selected_site_packages, *selected_site_packages.parents[:3]):
+        config_path = candidate / "pyvenv.cfg"
+        if not config_path.exists():
+            continue
+        selected_version: tuple[int, int] | None = None
+        try:
+            config_text = config_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            config_text = ""
+        for line in config_text.splitlines():
+            name, separator, value = line.partition("=")
+            if separator and name.strip().lower() in {"version_info", "version"}:
+                match = re.search(r"(?<!\d)(\d+)\.(\d+)(?!\d)", value)
+                if match:
+                    selected_version = (int(match.group(1)), int(match.group(2)))
+                    break
+        runtime_version = sys.version_info[:2]
+        if selected_version is None or selected_version != runtime_version:
+            selected_text = (
+                f"{selected_version[0]}.{selected_version[1]}"
+                if selected_version is not None
+                else "unknown"
+            )
+            raise RuntimeError(
+                "Mnemosyne runtime Python compatibility error: "
+                f"runtime Python {runtime_version[0]}.{runtime_version[1]}; "
+                f"selected Mnemosyne environment Python {selected_text}. "
+                "Recreate the Mnemosyne environment using Hermes' Python, "
+                "then reinstall mnemosyne-hermes."
+            )
+        return
+
+
 _mnemosyne_root = Path(__file__).resolve().parent.parent
+# Legacy source-checkout providers use the repository root here. Only a
+# provider resolved directly from a virtualenv site-packages directory selects
+# an external runtime whose Python version must be checked.
+if _mnemosyne_root.name == "site-packages":
+    _guard_selected_site_packages_python_compatibility(_mnemosyne_root)
 if str(_mnemosyne_root) not in sys.path:
     sys.path.insert(0, str(_mnemosyne_root))
 
@@ -528,7 +574,8 @@ RECALL_SCHEMA = {
         "Search Mnemosyne for relevant memories. Uses hybrid ranking: by default "
         "50% vector similarity + 30% FTS5 text rank + 20% importance + optional "
         "temporal boost. Tune the per-query weights via vec_weight, fts_weight, "
-        "importance_weight (omit to use environment defaults). Returns ranked results."
+        "importance_weight (omit or pass null to resolve config.yaml, then environment variables, "
+        "then built-in defaults). Returns ranked results."
     ),
     "parameters": {
         "type": "object",
@@ -551,16 +598,16 @@ RECALL_SCHEMA = {
                 "default": 24,
             },
             "vec_weight": {
-                "type": "number",
-                "description": "Vector similarity weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_VEC_WEIGHT env var or built-in default 0.5.",
+                "type": ["number", "null"],
+                "description": "Vector similarity weight in hybrid scoring. Omit (or pass null) to resolve config.yaml, then MNEMOSYNE_VEC_WEIGHT, then built-in default 0.5.",
             },
             "fts_weight": {
-                "type": "number",
-                "description": "Full-text search weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_FTS_WEIGHT env var or built-in default 0.3.",
+                "type": ["number", "null"],
+                "description": "Full-text search weight in hybrid scoring. Omit (or pass null) to resolve config.yaml, then MNEMOSYNE_FTS_WEIGHT, then built-in default 0.3.",
             },
             "importance_weight": {
-                "type": "number",
-                "description": "Importance score weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_IMPORTANCE_WEIGHT env var or built-in default 0.2.",
+                "type": ["number", "null"],
+                "description": "Importance score weight in hybrid scoring. Omit (or pass null) to resolve config.yaml, then MNEMOSYNE_IMPORTANCE_WEIGHT, then built-in default 0.2.",
             },
             "explain": {
                 "type": "boolean",
@@ -3512,12 +3559,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 "error": "Either input_path (for file import) or provider "
                          "(for cross-provider import) is required",
             })
-        stats = mem.import_from_file(input_path, force=force)
-        self._audit_event(
-            "import", bank="private", source_tool="mnemosyne_import",
-            metadata={"input_path": input_path, "force": force, "stats": stats},
-        )
-        return json.dumps({"status": "imported", "stats": stats})
+        stats = mem.import_from_file(input_path, force=force, dry_run=dry_run)
+        if not dry_run:
+            self._audit_event(
+                "import", bank="private", source_tool="mnemosyne_import",
+                metadata={"input_path": input_path, "force": force, "stats": stats},
+            )
+        return json.dumps({"status": "dry_run" if dry_run else "imported", "stats": stats, "dry_run": dry_run})
 
     def _handle_diagnose(self, args: Dict[str, Any]) -> str:
         from mnemosyne.diagnose import run_diagnostics
