@@ -5646,6 +5646,39 @@ class BeamMemory:
             return {"context": "\n".join(ctx_lines), "facts": facts, "source": "memoria_preferences"}
         return {"context": "", "facts": [], "source": "fallback"}
 
+    def _attach_recall_metadata(self, results: List[Dict]) -> List[Dict]:
+        """Attach parsed metadata using at most one query per memory tier."""
+        ids_by_tier = {"working": [], "episodic": []}
+        for item in results:
+            tier = item.get("tier")
+            memory_id = item.get("id")
+            if tier in ids_by_tier and memory_id:
+                ids_by_tier[tier].append(memory_id)
+
+        metadata_by_id = {}
+        for tier, memory_ids in ids_by_tier.items():
+            if not memory_ids:
+                continue
+            table = "working_memory" if tier == "working" else "episodic_memory"
+            unique_ids = list(dict.fromkeys(memory_ids))
+            placeholders = ",".join("?" for _ in unique_ids)
+            rows = self.conn.execute(
+                f"SELECT id, metadata_json FROM {table} WHERE id IN ({placeholders})",
+                unique_ids,
+            ).fetchall()
+            for row in rows:
+                try:
+                    parsed = json.loads(row["metadata_json"] or "{}")
+                except (TypeError, ValueError):
+                    parsed = {}
+                metadata_by_id[(tier, row["id"])] = parsed if isinstance(parsed, dict) else {}
+
+        for item in results:
+            item["metadata"] = metadata_by_id.get(
+                (item.get("tier"), item.get("id")), {}
+            )
+        return results
+
     def recall(self, query: str, top_k: int = 40, *,
                from_date: Optional[str] = None, to_date: Optional[str] = None,
                source: Optional[str] = None, topic: Optional[str] = None,
@@ -5732,6 +5765,7 @@ class BeamMemory:
                 veracity=veracity, memory_type=memory_type,
                 cross_session=cross_session,
             )
+            self._attach_recall_metadata(poly_results)
             if explain:
                 return {
                     "query": query,
@@ -6895,6 +6929,8 @@ class BeamMemory:
                 final_results = final_results[:top_k]
             except Exception:
                 logger.debug("fact recall integration failed (non-fatal)", exc_info=True)
+
+        self._attach_recall_metadata(final_results)
 
         if _explain_trace is not None:
             _explain_trace.set_embedding(
