@@ -7283,6 +7283,7 @@ class BeamMemory:
                                 "associative": True,
                                 "connecting_edge": rel.get("edge_type", "related"),
                                 "assoc_depth": rel.get("depth", 1),
+                                "metadata": {},
                             })
                 results.extend(assoc_results[:5])
             except Exception:
