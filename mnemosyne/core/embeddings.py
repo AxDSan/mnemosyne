@@ -375,10 +375,10 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
                 time.sleep(retry_delay(attempt))
                 continue
             logger.warning(
-                "Embedding API request failed after 3 attempts: %s: %s; "
+                "Embedding API request failed after 3 attempts: %s at %s; "
                 "dense vectors were not generated",
                 type(exc).__name__,
-                exc,
+                _safe_endpoint(url),
             )
             return None
         except Exception as exc:
@@ -391,9 +391,9 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
                     time.sleep(retry_delay(attempt))
                     continue
             logger.warning(
-                "Embedding API request failed: %s: %s; dense vectors were not generated",
+                "Embedding API request failed: %s at %s; dense vectors were not generated",
                 type(exc).__name__,
-                exc,
+                _safe_endpoint(url),
             )
             return None
 

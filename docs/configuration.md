@@ -6,7 +6,7 @@ Mnemosyne is designed to work with zero configuration. All settings have sensibl
 
 | Variable | Default | Description |
 |---|---|---|
-| `MNEMOSYNE_EMBEDDING_API_URL` | `${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}` | Base URL of an OpenAI-compatible embedding endpoint. Include its route prefix when required (for example, Ollama uses `http://127.0.0.1:11434/v1`). Falls back to `OPENROUTER_BASE_URL`. |
+| `MNEMOSYNE_EMBEDDING_API_URL` | `https://openrouter.ai/api/v1` | Base URL of an OpenAI-compatible embedding endpoint. Custom endpoints are opt-in, receive embedding input, and must include their route prefix when required (for example, Ollama uses `http://127.0.0.1:11434/v1`). Failed or unavailable embeddings preserve memory storage and lexical/FTS5 retrieval. |
 | `MNEMOSYNE_EMBEDDING_API_KEY` | `${OPENROUTER_API_KEY:-${OPENAI_API_KEY:-}}` | Preferred name for embedding API key. Falls back to `OPENROUTER_API_KEY`, then `OPENAI_API_KEY`. |
 
 ## Data Directory

@@ -104,3 +104,25 @@ def test_embed_api_stops_after_three_transient_attempts(monkeypatch):
     assert sleep.call_count == 2
     warning.assert_called_once()
     assert "after 3 attempts" in warning.call_args.args[0]
+
+
+def test_embed_api_network_warning_redacts_exception_url(monkeypatch):
+    monkeypatch.setenv(
+        "MNEMOSYNE_EMBEDDING_API_URL",
+        "https://username:secret@example.test/v1?token=hidden",
+    )
+    error = urllib.error.URLError(
+        "failed at https://username:secret@example.test/v1?token=hidden"
+    )
+
+    with patch("urllib.request.urlopen", side_effect=error), \
+         patch("mnemosyne.core.embeddings.logger.warning") as warning, \
+         patch("mnemosyne.core.embeddings.time.sleep"):
+        assert embeddings._embed_api(["offline"]) is None
+
+    warning.assert_called_once()
+    rendered = " ".join(str(value) for value in warning.call_args.args)
+    assert "https://example.test/v1" in rendered
+    assert "username" not in rendered
+    assert "secret" not in rendered
+    assert "hidden" not in rendered
