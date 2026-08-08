@@ -228,7 +228,7 @@ _PREFETCH_RAW_SOURCES = {"conversation"}
 _PREFETCH_DISTILLED_SOURCES = {
     "preference", "correction", "fact", "identity", "insight", "sleep_consolidation",
 }
-_PREFETCH_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_./:-]*", re.IGNORECASE)
+_PREFETCH_TOKEN_RE = re.compile(r"[^\W_][\w./:-]*", re.IGNORECASE | re.UNICODE)
 _PREFETCH_DEDUP_STOPWORDS = _PREFETCH_FRAGMENT_STOPWORDS | frozenset({
     "about", "after", "before", "because", "could", "from", "have", "into",
     "like", "more", "need", "needs", "than", "them", "they", "want", "wants",
@@ -355,9 +355,21 @@ def _strip_prefetch_prefix(content: str) -> str:
     return c
 
 
+def _is_prefetch_cjk_char(char: str) -> bool:
+    """Match the CJK ranges supported by the core lexical recall path."""
+    return (
+        "\u4e00" <= char <= "\u9fff"
+        or "\u3040" <= char <= "\u30ff"
+        or "\uac00" <= char <= "\ud7af"
+    )
+
+
 def _prefetch_tokens(content: str) -> Set[str]:
     c = _strip_prefetch_prefix(content).lower()
-    tokens: Set[str] = set()
+    # Core recall scores spaceless CJK text by character overlap. Preserve that
+    # evidence in the stricter automatic-prefetch gate instead of discarding an
+    # already-relevant result merely because the adapter's word regex is ASCII.
+    tokens: Set[str] = {char for char in c if _is_prefetch_cjk_char(char)}
     for token in _PREFETCH_TOKEN_RE.findall(c):
         # Keep internal URL/path separators, but trim sentence punctuation so
         # canonical facts ending in "branding." still match query token

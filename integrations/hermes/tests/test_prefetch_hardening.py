@@ -113,6 +113,42 @@ def test_prefetch_requires_two_distinctive_lexical_terms(monkeypatch):
     assert "Cedar Bakery" in bakery
 
 
+def test_prefetch_supports_cjk_lexical_evidence():
+    p = _provider([
+        {
+            "content": "東京では静かな喫茶店を好む。",
+            "source": "preference",
+            "timestamp": "2026-08-08T00:00:00Z",
+            "importance": 0.9,
+            "score": 0.8,
+            "keyword_score": 0.8,
+            "trust_tier": "STATED",
+        },
+    ])
+
+    block = p.prefetch("東京で静かな喫茶店を探している")
+
+    assert "静かな喫茶店" in block
+
+
+def test_prefetch_supports_cyrillic_lexical_evidence():
+    p = _provider([
+        {
+            "content": "Пользователь предпочитает тёмную резервную копию.",
+            "source": "preference",
+            "timestamp": "2026-08-08T00:00:00Z",
+            "importance": 0.9,
+            "score": 0.8,
+            "keyword_score": 0.8,
+            "trust_tier": "STATED",
+        },
+    ])
+
+    block = p.prefetch("Найди тёмную резервную копию")
+
+    assert "тёмную резервную копию" in block
+
+
 def test_canonical_generic_override_does_not_change_normal_prefetch(monkeypatch):
     monkeypatch.setenv(
         "MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS",
