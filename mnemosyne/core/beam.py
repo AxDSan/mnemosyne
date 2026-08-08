@@ -1393,7 +1393,6 @@ def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, co
         return
     try:
         cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
-        conn.commit()
     except sqlite3.OperationalError:
         # Another connection/process may win the check-then-ALTER race. Only
         # suppress the error when a fresh schema read proves the requested
@@ -1401,6 +1400,9 @@ def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, co
         cursor.execute(f"PRAGMA table_info({table})")
         if column not in {row[1] for row in cursor.fetchall()}:
             raise
+    else:
+        # Commit errors are not DDL races and must remain fail-loud.
+        conn.commit()
 
 
 @dataclass(frozen=True)

@@ -56,6 +56,32 @@ def test_add_column_reraises_when_column_is_still_missing():
         _add_column_if_missing(conn, "working_memory", "author_id", "TEXT")
 
 
+class SuccessfulAlterCursor:
+    def execute(self, _sql):
+        return self
+
+    def fetchall(self):
+        return [(0, "id")]
+
+
+class CommitFailingConnection:
+    def __init__(self):
+        self._cursor = SuccessfulAlterCursor()
+
+    def cursor(self):
+        return self._cursor
+
+    def commit(self):
+        raise sqlite3.OperationalError("database is locked")
+
+
+def test_add_column_does_not_suppress_commit_failure():
+    conn = CommitFailingConnection()
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        _add_column_if_missing(conn, "working_memory", "author_id", "TEXT")
+
+
 def test_concurrent_first_open_completes_for_all_callers(tmp_path):
     db_path = tmp_path / "concurrent-first-open.db"
 
