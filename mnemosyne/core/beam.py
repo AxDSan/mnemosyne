@@ -1385,13 +1385,22 @@ def _sanitize_utf8(text: str) -> str:
 
 
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, col_type: str):
-    """Safely add a column if it doesn't already exist (SQLite migration helper)."""
+    """Add a migration column idempotently across concurrent initializers."""
     cursor = conn.cursor()
     cursor.execute(f"PRAGMA table_info({table})")
     existing = {row[1] for row in cursor.fetchall()}
-    if column not in existing:
+    if column in existing:
+        return
+    try:
         cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
         conn.commit()
+    except sqlite3.OperationalError:
+        # Another connection/process may win the check-then-ALTER race. Only
+        # suppress the error when a fresh schema read proves the requested
+        # column now exists; unrelated DDL failures must remain visible.
+        cursor.execute(f"PRAGMA table_info({table})")
+        if column not in {row[1] for row in cursor.fetchall()}:
+            raise
 
 
 @dataclass(frozen=True)
