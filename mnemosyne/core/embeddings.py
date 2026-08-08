@@ -6,14 +6,18 @@ Falls back to keyword-only if neither is available.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import ssl
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import List, Optional
 from functools import lru_cache
+
+logger = logging.getLogger(__name__)
 
 try:
     import numpy as np
@@ -300,6 +304,15 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
     return False
 
 
+def _safe_endpoint(url: str) -> str:
+    """Return an endpoint suitable for logs without userinfo or query data."""
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    if parts.port is not None:
+        host = f"{host}:{parts.port}"
+    return urllib.parse.urlunsplit((parts.scheme, host, parts.path, "", ""))
+
+
 def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     """Embed texts via OpenAI-compatible API (OpenRouter or custom endpoint)."""
     global _API_CALL_COUNT
@@ -348,13 +361,25 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
                 if attempt < 2:
                     time.sleep(retry_delay(attempt))
                     continue
+            logger.warning(
+                "Embedding API request failed: HTTP %s from %s; "
+                "dense vectors were not generated",
+                exc.code,
+                _safe_endpoint(url),
+            )
             return None
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
             # Network failures are transient often enough to warrant the same
             # bounded retry policy as HTTP 5xx responses.
             if attempt < 2:
                 time.sleep(retry_delay(attempt))
                 continue
+            logger.warning(
+                "Embedding API request failed after 3 attempts: %s: %s; "
+                "dense vectors were not generated",
+                type(exc).__name__,
+                exc,
+            )
             return None
         except Exception as exc:
             # Preserve compatibility with mocked/custom transports that expose
@@ -365,6 +390,11 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
                 if attempt < 2:
                     time.sleep(retry_delay(attempt))
                     continue
+            logger.warning(
+                "Embedding API request failed: %s: %s; dense vectors were not generated",
+                type(exc).__name__,
+                exc,
+            )
             return None
 
     return None
