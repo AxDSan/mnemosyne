@@ -168,6 +168,7 @@ def _get_embedding_dim(model_name: str) -> int:
         "sentence-transformers/paraphrase-multilingual-mpnet-base-v2": 768,
         # --- Multilingual BGE ---
         "BAAI/bge-m3": 1024,            # M3: multilingual (100+ langs), 1024-dim
+        "bge-m3": 1024,                 # Common remote/API alias
         "BAAI/bge-multilingual-gemma2": 3584,
         # --- OpenAI ---
         "openai/text-embedding-3-small": 1536,

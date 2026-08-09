@@ -32,7 +32,15 @@ def test_get_embedding_dim_multilingual_models():
     assert embeddings._get_embedding_dim("intfloat/multilingual-e5-small") == 384
     assert embeddings._get_embedding_dim("intfloat/multilingual-e5-base") == 768
     assert embeddings._get_embedding_dim("intfloat/multilingual-e5-large") == 1024
-    assert embeddings._get_embedding_dim("BAAI/bge-m3") == 1024
+
+
+@pytest.mark.parametrize("model", ["BAAI/bge-m3", "bge-m3"])
+def test_get_embedding_dim_bge_m3_aliases(monkeypatch, model):
+    """Both canonical and common bge-m3 names resolve to 1024 dimensions."""
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDING_DIM", raising=False)
+    for key in ("MNEMOSYNE_NO_EMBEDDINGS", "MNEMOSYNE_SKIP_EMBEDDINGS", "MNEMOSYNE_EMBEDDINGS_OFF"):
+        monkeypatch.delenv(key, raising=False)
+    assert embeddings._get_embedding_dim(model) == 1024
 
 
 def test_get_embedding_dim_jina_models():
