@@ -29,6 +29,20 @@ def _isolate_hermes_python_sources(tmp_path, monkeypatch):
     monkeypatch.delenv("VIRTUAL_ENV", raising=False)
 
 
+def _mark_as_venv(bin_dir):
+    """Give a fixture's ``bin/`` the ``pyvenv.cfg`` that makes it a real venv.
+
+    Discovery accepts an interpreter beside the launcher only once the directory
+    is shown to be a virtual environment, so a fixture modelling a pip/pipx
+    install needs the marker a real one always has. Without it the layout is
+    indistinguishable from ``~/.local/bin``, which holds a launcher and an
+    unrelated ``python`` and is exactly the #618 failure.
+    """
+    (bin_dir.parent / "pyvenv.cfg").write_text(
+        "home = /usr/bin\ninclude-system-site-packages = false\n", encoding="utf-8"
+    )
+
+
 def _make_profile(hermes_home, name, provider):
     profile = hermes_home / "profiles" / name
     profile.mkdir(parents=True)
@@ -50,6 +64,7 @@ def test_find_hermes_python_follows_wrapper_script_to_real_venv(tmp_path, monkey
     real_python = real_bin / "python"
     real_python.write_text("#!/bin/sh\n", encoding="utf-8")
     real_python.chmod(0o755)
+    _mark_as_venv(real_bin)
 
     # PATH shim in ~/.local/bin that execs the real Hermes binary.
     shim_dir = tmp_path / ".local" / "bin"
@@ -84,6 +99,7 @@ def test_resolve_hermes_bin_returns_direct_executable_for_plain_entrypoint(
     python = bin_dir / "python"
     python.write_text("#!/bin/sh\n", encoding="utf-8")
     python.chmod(0o755)
+    _mark_as_venv(bin_dir)
 
     _isolate_hermes_python_sources(tmp_path, monkeypatch)
     monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(hermes))
@@ -106,6 +122,7 @@ def test_resolve_hermes_bin_follows_symlink_to_wrapper_script_to_real_venv(
     real_python = real_bin / "python"
     real_python.write_text("#!/bin/sh\n", encoding="utf-8")
     real_python.chmod(0o755)
+    _mark_as_venv(real_bin)
 
     shim_dir = tmp_path / ".local" / "bin"
     shim_dir.mkdir(parents=True)
@@ -137,6 +154,7 @@ def test_resolve_hermes_bin_resolves_relative_exec_target(tmp_path, monkeypatch)
     real_python = real_bin / "python"
     real_python.write_text("#!/bin/sh\n", encoding="utf-8")
     real_python.chmod(0o755)
+    _mark_as_venv(real_bin)
 
     shim = tmp_path / "hermes"
     shim.write_text(
@@ -266,6 +284,7 @@ def test_resolve_hermes_bin_ignores_cwd_decoy_for_dot_slash_target(
     real_python = real_bin / "python"
     real_python.write_text("#!/bin/sh\n", encoding="utf-8")
     real_python.chmod(0o755)
+    _mark_as_venv(real_bin)
 
     # A same-named decoy in the process working directory must not win.
     cwd = tmp_path / "cwd"
@@ -297,6 +316,7 @@ def test_resolve_hermes_bin_follows_env_prefix_exec_target(tmp_path, monkeypatch
     real_python = real_bin / "python"
     real_python.write_text("#!/bin/sh\n", encoding="utf-8")
     real_python.chmod(0o755)
+    _mark_as_venv(real_bin)
 
     shim_dir = tmp_path / "shim"
     shim_dir.mkdir()
@@ -330,6 +350,7 @@ def test_resolve_hermes_bin_follows_pre_exec_assignment_target(tmp_path, monkeyp
     real_python = real_bin / "python"
     real_python.write_text("#!/bin/sh\n", encoding="utf-8")
     real_python.chmod(0o755)
+    _mark_as_venv(real_bin)
 
     shim_dir = tmp_path / "shim"
     shim_dir.mkdir()
