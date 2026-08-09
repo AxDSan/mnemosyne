@@ -29,9 +29,8 @@ These tests pin:
 
 from __future__ import annotations
 
-import sqlite3
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -214,7 +213,7 @@ class TestBeamRecallInstrumentation:
         # so FTS in BEAM mode also returns nothing.
         # (BEAM_MODE filters stop-words; we want a query whose
         # content-words don't match seeded content.)
-        results = beam.recall(
+        beam.recall(
             "qzzx-no-such-token-xyzzy", top_k=10
         )
 
@@ -248,7 +247,7 @@ class TestBeamRecallInstrumentation:
             importance=0.5,
         )
 
-        results = beam.recall("qzzx-no-such-token-xyzzy", top_k=10)
+        beam.recall("qzzx-no-such-token-xyzzy", top_k=10)
         snap = get_recall_diagnostics()
         # EM fallback fired.
         assert snap["totals"]["calls_using_em_fallback"] == 1
@@ -340,7 +339,7 @@ class TestReviewHardening:
         # Recall from alice-session for "Alice" — FTS will match
         # foreign-row by content, but it gets dropped by wm_where
         # because session_id doesn't match and scope is 'session'.
-        results = beam.recall("Alice", top_k=10)
+        beam.recall("Alice", top_k=10)
 
         snap = get_recall_diagnostics()
         # Post-filter: foreign-row didn't survive, so wm_fts_kept = 0.
@@ -388,7 +387,7 @@ class TestReviewHardening:
         # overlap with content). Substring scoring produces 0 +
         # 0 + 0 + 0 + 0 → relevance below threshold; rows
         # scanned but NOT kept.
-        results = beam.recall("xyzqwvu", top_k=10)
+        beam.recall("xyzqwvu", top_k=10)
 
         snap = get_recall_diagnostics()
         assert snap["totals"]["calls_using_em_fallback"] == 1
@@ -428,7 +427,7 @@ class TestReviewHardening:
         beam.remember("Alice prefers Vim", source="pref", importance=0.7)
         beam.remember("Bob owns auth", source="fact", importance=0.8)
 
-        results = beam.recall("Alice Vim", top_k=10)
+        beam.recall("Alice Vim", top_k=10)
         snap = get_recall_diagnostics()
 
         total_kept = sum(
@@ -436,6 +435,7 @@ class TestReviewHardening:
         )
         # Working-tier results in the output (excluding entity-aware
         # boosts which credit no tier).
+        results = beam.recall("Alice Vim", top_k=10)
         wm_results = [r for r in results if r.get("tier") == "working" and not r.get("entity_match")]
         em_results = [r for r in results if r.get("tier") == "episodic" and not r.get("entity_match")]
         attributable = len(wm_results) + len(em_results)
@@ -615,14 +615,28 @@ class TestPolyphonicFallbackDiagnostics:
         `em_fallback_rate` must read 1.0 and the engine's
         degraded-path signal must flow into the process-global
         diagnostics."""
+        import numpy as np
+
         monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
         monkeypatch.setattr(
             "mnemosyne.core.beam._vec_available", lambda conn: False
         )
+        # Force the vector voice to actually run: without embeddings
+        # available (CI without fastembed), _recall_polyphonic passes
+        # query_embedding=None and the vector voice early-returns
+        # before touching the fallback flag — which would make this
+        # test trivially pass for the wrong reason.
+        monkeypatch.setattr(
+            "mnemosyne.core.embeddings.available", lambda: True
+        )
+        monkeypatch.setattr(
+            "mnemosyne.core.embeddings.embed",
+            lambda texts: np.ones((len(texts), 384), dtype=np.float32),
+        )
         beam = BeamMemory(session_id="poly-e2e", db_path=temp_db)
         beam.remember("Alice prefers Vim", source="pref", importance=0.7)
 
-        results = beam.recall("Alice", top_k=10)
+        beam.recall("Alice", top_k=10)
         snap = get_recall_diagnostics()
         assert snap["totals"]["calls"] == 1
         assert snap["totals"]["calls_using_em_fallback"] == 1, (
@@ -671,7 +685,15 @@ class TestPolyphonicFallbackDiagnostics:
         beam.conn.commit()
 
         monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
-        results = beam.recall("Alice", top_k=10)
+        # Deterministic vector voice (see sibling test for why).
+        monkeypatch.setattr(
+            "mnemosyne.core.embeddings.available", lambda: True
+        )
+        monkeypatch.setattr(
+            "mnemosyne.core.embeddings.embed",
+            lambda texts: np.ones((len(texts), 384), dtype=np.float32),
+        )
+        beam.recall("Alice", top_k=10)
         snap = get_recall_diagnostics()
         assert snap["totals"]["calls"] == 1
         assert snap["totals"]["calls_using_em_fallback"] == 0, (
