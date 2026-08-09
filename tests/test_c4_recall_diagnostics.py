@@ -513,3 +513,168 @@ class TestReviewHardening:
         snap = get_recall_diagnostics()
         # And the diagnostics record the call.
         assert snap["totals"]["calls"] == 1
+
+
+class TestPolyphonicFallbackDiagnostics:
+    """C4 follow-up: `fallback_rate` must be real on the polyphonic
+    path.
+
+    #668 wired tier hits + call counts into the polyphonic branch but
+    never called `record_fallback_used()`, so `em_fallback_rate` /
+    `wm_fallback_rate` stayed 0 under `MNEMOSYNE_POLYPHONIC_RECALL=1`
+    even when the vector voice degraded from the sqlite-vec fast path
+    to a numpy full-scan. These tests pin the new degraded-path
+    signal: the engine exposes `last_call_fallback` per recall and the
+    polyphonic diagnostics block records it as `em_fallback_used`.
+
+    `wm` stays False by design — the polyphonic engine has no
+    substring-scoring tier for working memory (documented in
+    docs/benchmarking.md).
+    """
+
+    def test_engine_last_call_fallback_defaults_false(self, temp_db):
+        """A freshly built engine starts with no degraded-path signal.
+        The default must not trip any operator alarm before the first
+        recall runs."""
+        from mnemosyne.core.polyphonic_recall import PolyphonicRecallEngine
+
+        engine = PolyphonicRecallEngine(db_path=temp_db)
+        assert engine.last_call_fallback == {"em": False, "wm": False}
+
+    def test_engine_flags_em_fallback_when_sqlite_vec_unavailable(
+        self, temp_db, monkeypatch
+    ):
+        """When sqlite-vec is unavailable the vector voice's EM tier
+        degrades to the numpy full-scan; the engine must expose that
+        as `last_call_fallback["em"] = True` so beam.py can record
+        it."""
+        import numpy as np
+
+        from mnemosyne.core.polyphonic_recall import PolyphonicRecallEngine
+
+        monkeypatch.setattr(
+            "mnemosyne.core.beam._vec_available", lambda conn: False
+        )
+        beam = BeamMemory(session_id="poly-fb", db_path=temp_db)
+        beam.consolidate_to_episodic(
+            summary="polyphonic fallback target content",
+            source_wm_ids=["seed"],
+            importance=0.5,
+        )
+        engine = PolyphonicRecallEngine(db_path=temp_db, conn=beam.conn)
+        # Real query vector so the voice runs; numpy is the only EM
+        # path when _vec_available is patched False.
+        query_vec = np.ones(384, dtype=np.float32)
+        engine._vector_voice(query_vec)
+        assert engine.last_call_fallback["em"] is True
+
+    def test_engine_keeps_em_flag_false_on_sqlite_vec_fast_path(
+        self, temp_db, monkeypatch
+    ):
+        """When sqlite-vec serves the EM tier, the numpy fallback did
+        NOT run — `last_call_fallback["em"]` must stay False."""
+        import json
+
+        import numpy as np
+
+        from mnemosyne.core.beam import _vec_available, _vec_insert
+        from mnemosyne.core.polyphonic_recall import PolyphonicRecallEngine
+
+        beam = BeamMemory(session_id="poly-fb2", db_path=temp_db)
+        if not _vec_available(beam.conn):
+            pytest.skip("sqlite-vec not available in this environment")
+        # Seed an EM row + its vec_episodes entry so the sqlite-vec
+        # fast path can actually serve the query (mirrors
+        # test_em_sqlite_vec_fast_path_metadata_backend).
+        beam.conn.execute(
+            "INSERT INTO episodic_memory (id, content, source, timestamp, importance) "
+            "VALUES ('poly-em-fast', 'fast path target', 'test', datetime('now'), 0.5)"
+        )
+        em_rowid = beam.conn.execute(
+            "SELECT rowid FROM episodic_memory WHERE id = ?",
+            ("poly-em-fast",),
+        ).fetchone()[0]
+        target_vec = np.ones(384, dtype=np.float32)
+        beam.conn.execute(
+            "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json) "
+            "VALUES (?, ?)",
+            ("poly-em-fast", json.dumps(target_vec.tolist())),
+        )
+        _vec_insert(beam.conn, em_rowid, target_vec.tolist())
+        beam.conn.commit()
+
+        engine = PolyphonicRecallEngine(db_path=temp_db, conn=beam.conn)
+        engine._vector_voice(target_vec)
+        assert engine.last_call_fallback["em"] is False
+
+    def test_recall_records_em_fallback_rate_under_polyphonic(
+        self, temp_db, monkeypatch
+    ):
+        """End-to-end: with POLYPHONIC_RECALL=1 and sqlite-vec
+        unavailable, every recall degrades the EM vector path, so
+        `em_fallback_rate` must read 1.0 and the engine's
+        degraded-path signal must flow into the process-global
+        diagnostics."""
+        monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
+        monkeypatch.setattr(
+            "mnemosyne.core.beam._vec_available", lambda conn: False
+        )
+        beam = BeamMemory(session_id="poly-e2e", db_path=temp_db)
+        beam.remember("Alice prefers Vim", source="pref", importance=0.7)
+
+        results = beam.recall("Alice", top_k=10)
+        snap = get_recall_diagnostics()
+        assert snap["totals"]["calls"] == 1
+        assert snap["totals"]["calls_using_em_fallback"] == 1, (
+            f"em fallback not recorded on polyphonic path: {snap}"
+        )
+        assert snap["totals"]["em_fallback_rate"] == 1.0
+        # WM has no substring tier in the polyphonic engine.
+        assert snap["totals"]["wm_fallback_rate"] == 0.0
+        # The engine signal surfaced to the diagnostics block.
+        assert getattr(beam, "_last_polyphonic_fallback", {}).get("em") is True
+
+    def test_recall_no_em_fallback_when_fast_path_healthy(
+        self, temp_db, monkeypatch
+    ):
+        """End-to-end healthy path: sqlite-vec serves the EM tier, so
+        em_fallback_rate stays 0. This is the operator-facing alarm
+        contract — the gauge only trips on real degradation."""
+        import json
+
+        import numpy as np
+
+        from mnemosyne.core.beam import _vec_available, _vec_insert
+
+        beam = BeamMemory(session_id="poly-e2e2", db_path=temp_db)
+        if not _vec_available(beam.conn):
+            pytest.skip("sqlite-vec not available in this environment")
+        # Seed an EM row + vec_episodes entry so the sqlite-vec fast
+        # path actually serves the EM tier (a plain remember() writes
+        # working memory only — an empty vec_episodes legitimately
+        # degrades to numpy and would false-positive this test).
+        beam.conn.execute(
+            "INSERT INTO episodic_memory (id, content, source, timestamp, importance) "
+            "VALUES ('poly-em-healthy', 'Alice was here in episodic', 'test', datetime('now'), 0.7)"
+        )
+        em_rowid = beam.conn.execute(
+            "SELECT rowid FROM episodic_memory WHERE id = ?",
+            ("poly-em-healthy",),
+        ).fetchone()[0]
+        target_vec = np.ones(384, dtype=np.float32)
+        beam.conn.execute(
+            "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json) "
+            "VALUES (?, ?)",
+            ("poly-em-healthy", json.dumps(target_vec.tolist())),
+        )
+        _vec_insert(beam.conn, em_rowid, target_vec.tolist())
+        beam.conn.commit()
+
+        monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
+        results = beam.recall("Alice", top_k=10)
+        snap = get_recall_diagnostics()
+        assert snap["totals"]["calls"] == 1
+        assert snap["totals"]["calls_using_em_fallback"] == 0, (
+            f"healthy sqlite-vec path falsely flagged as fallback: {snap}"
+        )
+        assert snap["totals"]["em_fallback_rate"] == 0.0
