@@ -22,6 +22,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **Invalidation replacement links now require an accessible memory (#676).** `mnemosyne_invalidate` rejects an unknown or out-of-scope non-empty `replacement_id` before changing the target, so rejected replacements do not create links at invalidation time.
 - **`bge-m3` embedding alias resolves its 1024-dimensional vectors (#666).** The unqualified model name now resolves identically to `BAAI/bge-m3`, avoiding an unknown-model startup error when no explicit dimension override is set.
 - **MCP invalidate now reports scope-safe failure (#660).** `mnemosyne_invalidate` returns `memory_not_found` instead of claiming success when its target is outside the current scope or cannot be mutated, preserving scope isolation.
 - **Recall diagnostics were dead under `MNEMOSYNE_POLYPHONIC_RECALL=1`.** The polyphonic branch of `BeamMemory.recall()` returned before the C4 recording block, so every recall that ran through the polyphonic engine (vector/graph/fact/temporal voices) never incremented `mnemosyne_recall_diagnostics` counters — the tool reported `calls: 0` under the flag that production deployments use. The polyphonic branch now records tier hits and call counts itself, mapping engine voices to the existing diagnostic tiers (`vector`→`wm_vec`, `graph`→`em_vec`, `fact`→`em_fts`). Recording is read-only signal and never alters recall behavior. Documented in `docs/benchmarking.md`.

@@ -184,8 +184,9 @@ INVALIDATE_SCHEMA = {
     "name": "mnemosyne_invalidate",
     "description": (
         "Mark a memory as expired or superseded. Provide memory_id from recall results. "
-        "Optionally provide replacement_id to chain old to new. An unknown ID or one "
-        "not mutable in the current scope returns status: memory_not_found."
+        "Optionally provide a replacement_id that must resolve to a working-memory or episodic-memory "
+        "record that is accessible in the current session or global scope to chain old to new. "
+        "An unknown or out-of-scope target or replacement returns status: memory_not_found."
     ),
     "parameters": {
         "type": "object",

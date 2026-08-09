@@ -132,7 +132,7 @@ Import Mnemosyne memories from a JSON file or another memory provider (Hindsight
 
 ### 11. `mnemosyne_invalidate`
 
-Mark a memory as expired or superseded. Provide memory_id from recall results. Optionally provide replacement_id to chain old to new. An unknown ID or one not mutable in the current scope returns status: memory_not_found.
+Mark a memory as expired or superseded. Provide memory_id from recall results. Optionally provide a replacement_id that must resolve to a working-memory or episodic-memory record that is accessible in the current session or global scope to chain old to new. An unknown or out-of-scope target or replacement returns status: memory_not_found.
 
 | Parameter | Type | Required | Default |
 |-----------|------|----------|---------|

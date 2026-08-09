@@ -4216,6 +4216,60 @@ class BeamMemory:
         Otherwise sets valid_until to now (immediate expiry).
         """
         cursor = self.conn.cursor()
+        if replacement_id:
+            if replacement_id == memory_id:
+                return False
+
+            # The replacement lookup and target update are one write
+            # transaction. For a direct call, BEGIN IMMEDIATE obtains
+            # SQLite's write lock before validation, so another connection
+            # cannot delete a replacement between validation and the link
+            # update. A batch may already own a transaction after earlier
+            # DML; do not begin, commit, or roll back that caller-owned
+            # transaction here.
+            owns_transaction = not self.conn.in_transaction
+
+            def validate_and_invalidate() -> bool:
+                replacement_found = False
+                for table in ("working_memory", "episodic_memory"):
+                    cursor.execute(
+                        f"""
+                        SELECT 1 FROM {table}
+                        WHERE id = ? AND (session_id = ? OR scope = 'global')
+                        LIMIT 1
+                        """,
+                        (replacement_id, self.session_id),
+                    )
+                    if cursor.fetchone() is not None:
+                        replacement_found = True
+                        break
+                if not replacement_found:
+                    return False
+
+                now = datetime.now().isoformat()
+                cursor.execute("""
+                    UPDATE working_memory
+                    SET valid_until = ?, superseded_by = ?
+                    WHERE id = ? AND (session_id = ? OR scope = 'global')
+                """, (now, replacement_id, memory_id, self.session_id))
+                if cursor.rowcount == 0:
+                    cursor.execute("""
+                        UPDATE episodic_memory
+                        SET valid_until = ?, superseded_by = ?
+                        WHERE id = ? AND (session_id = ? OR scope = 'global')
+                    """, (now, replacement_id, memory_id, self.session_id))
+                return cursor.rowcount > 0
+
+            if owns_transaction:
+                with _guarded_transaction(self.conn):
+                    cursor.execute("BEGIN IMMEDIATE")
+                    invalidated = validate_and_invalidate()
+            else:
+                invalidated = validate_and_invalidate()
+            if invalidated:
+                self._invalidate_query_cache()
+            return invalidated
+
         now = datetime.now().isoformat()
         # Try working_memory first
         cursor.execute("""
