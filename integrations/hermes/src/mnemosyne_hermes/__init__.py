@@ -592,7 +592,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._reflect_disabled_for_cron = _parse_env_bool("MNEMOSYNE_REFLECT_DISABLED_FOR_CRON", True)
         self._reflect_max_calls_per_session = _parse_env_optional_int("MNEMOSYNE_REFLECT_MAX_CALLS_PER_SESSION", 3)
         self._reflect_calls_this_session = 0
-        self._reflect_budget_lock = threading.Lock()
         self._ignore_patterns: List[str] = []  # Regex patterns to filter from memory
         self._sync_roles: Set[str] = {"user"}
         _sync_env = os.environ.get("MNEMOSYNE_SYNC_ROLES")
@@ -1048,6 +1047,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         """Initialize Mnemosyne beam for this session."""
+        with self._ensure_beam_access_lock():
+            self._initialize_locked(session_id, **kwargs)
+
+    def _initialize_locked(self, session_id: str, **kwargs) -> None:
+        """Rebuild provider state while the Beam access lock is held."""
         # C27: clear stale state from any prior init attempt so a re-init
         # returns the provider to a clean slate. _beam reset is critical
         # for the primary->skip-context re-init case (codex review finding
@@ -2905,16 +2909,19 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             logger.debug("Mnemosyne session-end sleep failed: %s", e)
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
-        if not self._beam or action not in ("add", "replace"):
+        if action not in ("add", "replace"):
             return
         try:
-            scope = "global" if target == "user" else "session"
-            self._beam.remember(
-                content=content,
-                source=f"builtin_memory_{target}",
-                importance=0.7 if target == "user" else 0.5,
-                scope=scope,
-            )
+            with self._beam_session_scope("") as beam:
+                if beam is None:
+                    return
+                scope = "global" if target == "user" else "session"
+                beam.remember(
+                    content=content,
+                    source=f"builtin_memory_{target}",
+                    importance=0.7 if target == "user" else 0.5,
+                    scope=scope,
+                )
         except Exception as e:
             logger.debug("Mnemosyne mirror write failed: %s", e)
 
