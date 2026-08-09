@@ -255,6 +255,114 @@ def test_per_call_session_id_cannot_override_gateway_scope(surface: str) -> None
     assert beam.channel_id == "hermes_gateway-topic"
 
 
+def test_temporary_sync_scope_does_not_advance_durable_session_counters() -> None:
+    provider, beam = _provider_with_recording_beam()
+    provider._turn_count = 9
+    provider._auto_sleep_enabled = True
+    auto_sleep_sessions: list[tuple[str, str]] = []
+    provider._maybe_auto_sleep = lambda: auto_sleep_sessions.append(
+        (provider._session_id, beam.session_id)
+    )
+
+    provider.sync_turn(
+        "temporary child session turn",
+        "",
+        session_id="SESS-B",
+    )
+
+    assert beam.observed_sessions == [("hermes_SESS-B", "hermes_SESS-B")]
+    assert provider._turn_count == 9
+    assert auto_sleep_sessions == []
+    assert provider._session_id == "hermes_SESS-A"
+    assert beam.session_id == "hermes_SESS-A"
+    assert beam.channel_id == "hermes_SESS-A"
+
+
+def test_gateway_scoped_sync_turn_advances_the_durable_counter() -> None:
+    provider, beam = _provider_with_recording_beam(
+        session_id="hermes_gateway-topic",
+        gateway_session_key="gateway-topic",
+    )
+    provider._turn_count = 8
+    provider._auto_sleep_enabled = False
+
+    provider.sync_turn(
+        "gateway child session turn",
+        "",
+        session_id="transient-child-session",
+    )
+
+    assert beam.observed_sessions == [("hermes_gateway-topic", "hermes_gateway-topic")]
+    assert provider._turn_count == 9
+    assert provider._session_id == "hermes_gateway-topic"
+
+
+def test_auto_sleep_trigger_revalidates_the_durable_turn_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auto_sleep_entered = threading.Event()
+    release_auto_sleep = threading.Event()
+    expected_sessions: list[str] = []
+
+    class _SourceBeam(_RecordingBeam):
+        db_path = "memory.db"
+        author_type = "agent"
+
+        def get_working_stats(self) -> dict[str, int]:
+            return {"total": 2}
+
+        def _count_unconsolidated_before(self, _cutoff: str) -> int:
+            return 1
+
+        def sleep_all_sessions(self) -> None:
+            raise AssertionError("auto-sleep must use a worker-local Beam")
+
+    class _WorkerBeam:
+        calls: list[dict[str, Any]] = []
+
+        def __init__(self, **kwargs: Any) -> None:
+            type(self).calls.append(dict(kwargs))
+
+        def sleep_all_sessions(self) -> None:
+            raise AssertionError("a stale auto-sleep trigger must be discarded")
+
+    provider, _ = _provider_with_recording_beam()
+    provider._beam = _SourceBeam()
+    provider._turn_count = 9
+    provider._auto_sleep_enabled = True
+    provider._auto_sleep_threshold = 1
+    provider._reserve_reflection_budget_locked = lambda _reason: None
+    original_auto_sleep = provider._maybe_auto_sleep
+
+    def blocked_auto_sleep(*, expected_session_id: str = "") -> None:
+        expected_sessions.append(expected_session_id)
+        auto_sleep_entered.set()
+        if not release_auto_sleep.wait(timeout=5):
+            raise TimeoutError("auto-sleep trigger was not released")
+        original_auto_sleep(expected_session_id=expected_session_id)
+
+    provider._maybe_auto_sleep = blocked_auto_sleep
+    monkeypatch.setattr(mnemosyne_hermes, "_get_beam_class", lambda: _WorkerBeam)
+
+    sync_turn = threading.Thread(
+        target=provider.sync_turn,
+        args=("durable session turn before switch", ""),
+    )
+    sync_turn.start()
+    assert auto_sleep_entered.wait(timeout=5)
+
+    provider.on_session_switch("SESS-B", reset=True)
+    release_auto_sleep.set()
+    sync_turn.join(timeout=5)
+
+    assert not sync_turn.is_alive()
+    assert expected_sessions == ["hermes_SESS-A"]
+    assert _WorkerBeam.calls == []
+    assert provider._sync_turn_diagnostics()["failed"] == 0
+    assert provider._session_id == "hermes_SESS-B"
+    assert provider._turn_count == 0
+
+
 def test_gateway_scope_survives_compression_switch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -341,6 +449,8 @@ def test_switch_waits_for_inflight_turn_without_mixing_sessions() -> None:
     provider, _ = _provider_with_recording_beam()
     beam = _BlockingBeam()
     provider._beam = beam
+    beam_lock = _ObservedRLock()
+    provider._beam_access_lock = beam_lock
 
     def run_turn() -> None:
         try:
@@ -363,10 +473,12 @@ def test_switch_waits_for_inflight_turn_without_mixing_sessions() -> None:
     turn = threading.Thread(target=run_turn)
     turn.start()
     assert turn_started.wait(timeout=5)
+    beam_lock.waiting.clear()
 
     switch = threading.Thread(target=run_switch)
     switch.start()
-    assert not switch_done.wait(timeout=0.1)
+    assert beam_lock.waiting.wait(timeout=5)
+    switch_blocked = not switch_done.wait(timeout=0.1)
 
     release_turn.set()
     turn.join(timeout=5)
@@ -375,6 +487,7 @@ def test_switch_waits_for_inflight_turn_without_mixing_sessions() -> None:
     assert not turn.is_alive()
     assert not switch.is_alive()
     assert not thread_errors
+    assert switch_blocked
     assert switch_done.is_set()
     assert observations == [
         (
@@ -574,31 +687,47 @@ def test_failed_init_switches_pending_retry_to_latest_gateway_scope(
 
 def test_retry_cannot_publish_old_session_after_switch() -> None:
     provider = MnemosyneMemoryProvider()
+    beam_lock = _ObservedRLock()
+    provider._beam_access_lock = beam_lock
     provider._retry_init_args = ("SESS-A", {})
     provider._retry_init_at = 0
     init_started = threading.Event()
     release_init = threading.Event()
     switch_done = threading.Event()
+    init_releases: list[bool] = []
+    thread_errors: list[BaseException] = []
 
     def blocked_initialize(session_id: str, **_kwargs: Any) -> None:
         init_started.set()
-        assert release_init.wait(timeout=5)
+        init_releases.append(release_init.wait(timeout=5))
         provider._beam = _RecordingBeam(f"hermes_{session_id}")
         provider._session_id = f"hermes_{session_id}"
 
     provider.initialize = blocked_initialize
-    retry = threading.Thread(target=provider._maybe_retry_init)
+
+    def run_retry() -> None:
+        try:
+            provider._maybe_retry_init()
+        except BaseException as exc:
+            thread_errors.append(exc)
+
+    def run_switch() -> None:
+        try:
+            provider.on_session_switch("SESS-B")
+        except BaseException as exc:
+            thread_errors.append(exc)
+        finally:
+            switch_done.set()
+
+    retry = threading.Thread(target=run_retry)
     retry.start()
     assert init_started.wait(timeout=5)
+    beam_lock.waiting.clear()
 
-    switch = threading.Thread(
-        target=lambda: (
-            provider.on_session_switch("SESS-B"),
-            switch_done.set(),
-        )
-    )
+    switch = threading.Thread(target=run_switch)
     switch.start()
-    assert not switch_done.wait(timeout=0.1)
+    assert beam_lock.waiting.wait(timeout=5)
+    switch_blocked = not switch_done.wait(timeout=0.1)
 
     release_init.set()
     retry.join(timeout=5)
@@ -606,6 +735,9 @@ def test_retry_cannot_publish_old_session_after_switch() -> None:
 
     assert not retry.is_alive()
     assert not switch.is_alive()
+    assert not thread_errors
+    assert init_releases == [True]
+    assert switch_blocked
     assert switch_done.is_set()
     assert provider._session_id == "hermes_SESS-B"
     assert provider._beam is not None
@@ -777,6 +909,9 @@ def test_session_end_reservation_and_snapshot_share_switch_lock(
     worker_started = threading.Event()
     release_worker = threading.Event()
     switch_done = threading.Event()
+    reservation_releases: list[bool] = []
+    worker_releases: list[bool] = []
+    thread_errors: list[BaseException] = []
 
     class _SourceBeam:
         session_id = "hermes_SESS-A"
@@ -784,40 +919,62 @@ def test_session_end_reservation_and_snapshot_share_switch_lock(
         author_id = "author"
         author_type = "agent"
         channel_id = "channel"
+        canonical_owner_id = "profile-owner"
+        agent_context = "cron"
 
     class _SleepBeam:
         calls: list[dict[str, Any]] = []
+        identities: list[tuple[str | None, str | None]] = []
 
         def __init__(self, **kwargs: Any) -> None:
             type(self).calls.append(dict(kwargs))
 
         def sleep(self) -> None:
+            type(self).identities.append(
+                (
+                    getattr(self, "canonical_owner_id", None),
+                    getattr(self, "agent_context", None),
+                )
+            )
             worker_started.set()
-            assert release_worker.wait(timeout=5)
+            worker_releases.append(release_worker.wait(timeout=5))
 
     provider = MnemosyneMemoryProvider()
     provider._beam = _SourceBeam()
+    beam_lock = _ObservedRLock()
+    provider._beam_access_lock = beam_lock
     provider.SESSION_END_SLEEP_TIMEOUT_SECONDS = 1
 
     def reserve_locked(_reason: str) -> None:
         reservation_entered.set()
-        assert release_reservation.wait(timeout=5)
+        reservation_releases.append(release_reservation.wait(timeout=5))
 
     provider._reserve_reflection_budget_locked = reserve_locked
     monkeypatch.setattr(mnemosyne_hermes, "_get_beam_class", lambda: _SleepBeam)
 
-    session_end = threading.Thread(target=provider.on_session_end, args=([],))
+    def run_session_end() -> None:
+        try:
+            provider.on_session_end([])
+        except BaseException as exc:
+            thread_errors.append(exc)
+
+    def run_switch() -> None:
+        try:
+            provider.on_session_switch("SESS-B")
+        except BaseException as exc:
+            thread_errors.append(exc)
+        finally:
+            switch_done.set()
+
+    session_end = threading.Thread(target=run_session_end)
     session_end.start()
     assert reservation_entered.wait(timeout=5)
+    beam_lock.waiting.clear()
 
-    switch = threading.Thread(
-        target=lambda: (
-            provider.on_session_switch("SESS-B"),
-            switch_done.set(),
-        )
-    )
+    switch = threading.Thread(target=run_switch)
     switch.start()
-    assert not switch_done.wait(timeout=0.1)
+    assert beam_lock.waiting.wait(timeout=5)
+    switch_blocked = not switch_done.wait(timeout=0.1)
 
     release_reservation.set()
     assert worker_started.wait(timeout=5)
@@ -829,6 +986,10 @@ def test_session_end_reservation_and_snapshot_share_switch_lock(
 
     assert not session_end.is_alive()
     assert not switch.is_alive()
+    assert not thread_errors
+    assert reservation_releases == [True]
+    assert worker_releases == [True]
+    assert switch_blocked
     assert switch_done.is_set()
     assert _SleepBeam.calls == [
         {
@@ -839,6 +1000,7 @@ def test_session_end_reservation_and_snapshot_share_switch_lock(
             "channel_id": "channel",
         }
     ]
+    assert _SleepBeam.identities == [("profile-owner", "cron")]
 
 
 def test_session_end_sleep_blocks_concurrent_sync_turn(
@@ -930,7 +1092,7 @@ def test_session_end_sleep_blocks_concurrent_memory_write(
     provider._beam = _SourceBeam()
     beam_lock = _ObservedRLock()
     provider._beam_access_lock = beam_lock
-    provider.SESSION_END_SLEEP_TIMEOUT_SECONDS = 1
+    provider.SESSION_END_SLEEP_TIMEOUT_SECONDS = 10
     monkeypatch.setattr(mnemosyne_hermes, "_get_beam_class", lambda: _SleepBeam)
 
     def end_session() -> None:
@@ -952,8 +1114,8 @@ def test_session_end_sleep_blocks_concurrent_memory_write(
 
     write_thread = threading.Thread(target=write)
     write_thread.start()
-    attempted_lock = beam_lock.waiting.wait(timeout=0.1)
-    write_blocked = not write_started.is_set()
+    attempted_lock = beam_lock.waiting.wait(timeout=5)
+    write_blocked = not write_started.wait(timeout=0.1)
 
     release_sleep.set()
     session_end.join(timeout=5)
@@ -980,6 +1142,8 @@ def test_auto_sleep_reservation_and_snapshot_share_switch_lock(
     release_worker = threading.Event()
     switch_done = threading.Event()
     thread_errors: list[BaseException] = []
+    reservation_releases: list[bool] = []
+    worker_releases: list[bool] = []
 
     class _SourceBeam:
         session_id = "hermes_SESS-A"
@@ -987,6 +1151,8 @@ def test_auto_sleep_reservation_and_snapshot_share_switch_lock(
         author_id = "author"
         author_type = "agent"
         channel_id = "channel"
+        canonical_owner_id = "profile-owner"
+        agent_context = "cron"
 
         def get_working_stats(self) -> dict[str, int]:
             return {"total": 2}
@@ -1002,27 +1168,42 @@ def test_auto_sleep_reservation_and_snapshot_share_switch_lock(
 
     class _WorkerBeam:
         calls: list[dict[str, Any]] = []
+        identities: list[tuple[str | None, str | None]] = []
 
         def __init__(self, **kwargs: Any) -> None:
             type(self).calls.append(dict(kwargs))
 
         def sleep(self) -> None:
+            type(self).identities.append(
+                (
+                    getattr(self, "canonical_owner_id", None),
+                    getattr(self, "agent_context", None),
+                )
+            )
             worker_started.set()
-            assert release_worker.wait(timeout=5)
+            worker_releases.append(release_worker.wait(timeout=5))
 
         def sleep_all_sessions(self) -> None:
+            type(self).identities.append(
+                (
+                    getattr(self, "canonical_owner_id", None),
+                    getattr(self, "agent_context", None),
+                )
+            )
             worker_started.set()
-            assert release_worker.wait(timeout=5)
+            worker_releases.append(release_worker.wait(timeout=5))
 
     provider = MnemosyneMemoryProvider()
     provider._beam = _SourceBeam()
+    beam_lock = _ObservedRLock()
+    provider._beam_access_lock = beam_lock
     provider._auto_sleep_threshold = 1
     provider._auto_sleep_enabled = True
     provider._AUTO_SLEEP_TIMEOUT_SECONDS = 1
 
     def reserve_locked(_reason: str) -> None:
         reservation_entered.set()
-        assert release_reservation.wait(timeout=5)
+        reservation_releases.append(release_reservation.wait(timeout=5))
 
     provider._reserve_reflection_budget_locked = reserve_locked
     monkeypatch.setattr(mnemosyne_hermes, "_get_beam_class", lambda: _WorkerBeam)
@@ -1037,15 +1218,20 @@ def test_auto_sleep_reservation_and_snapshot_share_switch_lock(
     auto_sleep.start()
     assert reservation_entered.wait(timeout=5), thread_errors
     assert not thread_errors
+    beam_lock.waiting.clear()
 
-    switch = threading.Thread(
-        target=lambda: (
-            provider.on_session_switch("SESS-B"),
-            switch_done.set(),
-        )
-    )
+    def run_switch() -> None:
+        try:
+            provider.on_session_switch("SESS-B")
+        except BaseException as exc:
+            thread_errors.append(exc)
+        finally:
+            switch_done.set()
+
+    switch = threading.Thread(target=run_switch)
     switch.start()
-    assert not switch_done.wait(timeout=0.1)
+    assert beam_lock.waiting.wait(timeout=5)
+    switch_blocked = not switch_done.wait(timeout=0.1)
 
     release_reservation.set()
     assert worker_started.wait(timeout=5)
@@ -1056,6 +1242,9 @@ def test_auto_sleep_reservation_and_snapshot_share_switch_lock(
     assert not auto_sleep.is_alive()
     assert not switch.is_alive()
     assert not thread_errors
+    assert reservation_releases == [True]
+    assert worker_releases == [True]
+    assert switch_blocked
     assert switch_done.is_set()
     assert _WorkerBeam.calls == [
         {
@@ -1066,6 +1255,198 @@ def test_auto_sleep_reservation_and_snapshot_share_switch_lock(
             "channel_id": "channel",
         }
     ]
+    assert _WorkerBeam.identities == [("profile-owner", "cron")]
+
+
+def test_auto_sleep_eligibility_and_snapshot_share_switch_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stats_started = threading.Event()
+    release_stats = threading.Event()
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    switch_done = threading.Event()
+    stats_sessions: list[tuple[str, str]] = []
+    eligibility_sessions: list[tuple[str, str]] = []
+    thread_errors: list[BaseException] = []
+
+    class _SourceBeam:
+        session_id = "hermes_SESS-A"
+        channel_id = "hermes_SESS-A"
+        db_path = "memory.db"
+        author_id = "author"
+        author_type = "agent"
+        canonical_owner_id = "profile-owner"
+        agent_context = "primary"
+
+        def get_working_stats(self) -> dict[str, int]:
+            stats_sessions.append((self.session_id, self.channel_id))
+            stats_started.set()
+            if not release_stats.wait(timeout=5):
+                raise TimeoutError("auto-sleep stats were not released")
+            return {"total": 2}
+
+        def _count_unconsolidated_before(self, _cutoff: str) -> int:
+            eligibility_sessions.append((self.session_id, self.channel_id))
+            return 1
+
+        def sleep_all_sessions(self) -> None:
+            raise AssertionError("auto-sleep must use a worker-local Beam")
+
+    class _WorkerBeam:
+        calls: list[dict[str, Any]] = []
+
+        def __init__(self, **kwargs: Any) -> None:
+            type(self).calls.append(dict(kwargs))
+
+        def sleep_all_sessions(self) -> None:
+            worker_started.set()
+            if not release_worker.wait(timeout=5):
+                raise TimeoutError("auto-sleep worker was not released")
+
+    provider = MnemosyneMemoryProvider()
+    provider._beam = _SourceBeam()
+    provider._session_id = "hermes_SESS-A"
+    provider._auto_sleep_threshold = 1
+    provider._auto_sleep_enabled = True
+    provider._AUTO_SLEEP_TIMEOUT_SECONDS = 1
+    beam_lock = _ObservedRLock()
+    provider._beam_access_lock = beam_lock
+    provider._reserve_reflection_budget_locked = lambda _reason: None
+    monkeypatch.setattr(mnemosyne_hermes, "_get_beam_class", lambda: _WorkerBeam)
+
+    def run_auto_sleep() -> None:
+        try:
+            provider._maybe_auto_sleep()
+        except BaseException as exc:
+            thread_errors.append(exc)
+
+    def run_switch() -> None:
+        try:
+            provider.on_session_switch("SESS-B")
+        except BaseException as exc:
+            thread_errors.append(exc)
+        finally:
+            switch_done.set()
+
+    auto_sleep = threading.Thread(target=run_auto_sleep)
+    auto_sleep.start()
+    assert stats_started.wait(timeout=5)
+    beam_lock.waiting.clear()
+
+    switch = threading.Thread(target=run_switch)
+    switch.start()
+    attempted_lock = beam_lock.waiting.wait(timeout=5)
+    switch_blocked = not switch_done.wait(timeout=0.1)
+
+    release_stats.set()
+    release_worker.set()
+    auto_sleep.join(timeout=5)
+    switch.join(timeout=5)
+
+    assert not auto_sleep.is_alive()
+    assert not switch.is_alive()
+    assert not thread_errors
+    assert attempted_lock
+    assert switch_blocked
+    assert switch_done.is_set()
+    assert worker_started.is_set()
+    assert stats_sessions == [("hermes_SESS-A", "hermes_SESS-A")]
+    assert eligibility_sessions == [("hermes_SESS-A", "hermes_SESS-A")]
+    assert _WorkerBeam.calls == [
+        {
+            "session_id": "hermes_SESS-A",
+            "db_path": "memory.db",
+            "author_id": "author",
+            "author_type": "agent",
+            "channel_id": "hermes_SESS-A",
+        }
+    ]
+    assert provider._session_id == "hermes_SESS-B"
+
+
+def test_reinitialize_rebuilds_beam_bound_tool_adapters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mnemosyne_hermes import persona_adapter as persona_adapter_module
+    from mnemosyne_hermes import sync_adapter as sync_adapter_module
+
+    sync_constructed: list[str] = []
+    persona_constructed: list[str] = []
+    sync_handled: list[str] = []
+    persona_handled: list[str] = []
+    sync_shutdown: list[str] = []
+
+    class _SyncAdapter:
+        def __init__(self, beam: Any, _config: dict[str, Any]) -> None:
+            self._beam = beam
+            sync_constructed.append(beam.session_id)
+
+        def handle_tool_call(self, _tool_name: str, _args: dict[str, Any]) -> str:
+            sync_handled.append(self._beam.session_id)
+            return self._beam.session_id
+
+        def shutdown(self) -> None:
+            sync_shutdown.append(self._beam.session_id)
+
+    class _PersonaAdapter:
+        def __init__(self, beam: Any, _config: dict[str, Any]) -> None:
+            self._beam = beam
+            persona_constructed.append(beam.session_id)
+
+        def handle_tool_call(self, _tool_name: str, _args: dict[str, Any]) -> str:
+            persona_handled.append(self._beam.session_id)
+            return self._beam.session_id
+
+    class _ReinitializedBeam(_RecordingBeam):
+        author_type = "agent"
+
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(kwargs["session_id"])
+            self.channel_id = kwargs.get("channel_id") or self.session_id
+            self.db_path = kwargs.get("db_path")
+
+    monkeypatch.setattr(sync_adapter_module, "SyncAdapter", _SyncAdapter)
+    monkeypatch.setattr(persona_adapter_module, "PersonaAdapter", _PersonaAdapter)
+    monkeypatch.setattr(
+        mnemosyne_hermes,
+        "_get_beam_class",
+        lambda: _ReinitializedBeam,
+    )
+
+    provider, _ = _provider_with_recording_beam()
+    provider.has_tool = lambda _name: True
+    try:
+        assert (
+            provider.handle_tool_call("mnemosyne_sync_status", {})
+            == "hermes_SESS-A"
+        )
+        assert (
+            provider.handle_tool_call("mnemosyne_persona_list", {})
+            == "hermes_SESS-A"
+        )
+
+        provider.initialize("SESS-B", auto_sleep=False)
+
+        assert (
+            provider.handle_tool_call("mnemosyne_sync_status", {})
+            == "hermes_SESS-B"
+        )
+        assert (
+            provider.handle_tool_call("mnemosyne_persona_list", {})
+            == "hermes_SESS-B"
+        )
+        assert sync_constructed == ["hermes_SESS-A", "hermes_SESS-B"]
+        assert persona_constructed == ["hermes_SESS-A", "hermes_SESS-B"]
+        assert sync_handled == ["hermes_SESS-A", "hermes_SESS-B"]
+        assert persona_handled == ["hermes_SESS-A", "hermes_SESS-B"]
+        assert sync_shutdown == ["hermes_SESS-A"]
+    finally:
+        provider.shutdown()
+
+    assert sync_shutdown == ["hermes_SESS-A", "hermes_SESS-B"]
+    assert provider._provider_sync_adapter is None
+    assert provider._provider_persona_adapter is None
 
 
 def test_reinitialize_closes_existing_audit_log() -> None:
@@ -1082,9 +1463,17 @@ def test_reinitialize_closes_existing_audit_log() -> None:
 def test_shutdown_closes_existing_audit_log() -> None:
     provider = MnemosyneMemoryProvider()
     audit = Mock()
+    sync_adapter = Mock()
+    persona_adapter = Mock()
     provider._audit = audit
+    provider._provider_sync_adapter = sync_adapter
+    provider._provider_persona_adapter = persona_adapter
 
     provider.shutdown()
 
     audit.close.assert_called_once_with()
+    sync_adapter.shutdown.assert_called_once_with()
+    persona_adapter.shutdown.assert_called_once_with()
     assert provider._audit is None
+    assert provider._provider_sync_adapter is None
+    assert provider._provider_persona_adapter is None

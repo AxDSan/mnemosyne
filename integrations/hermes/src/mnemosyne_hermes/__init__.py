@@ -610,6 +610,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Mnemosyne bank (separate SQLite DB). Default OFF for backward compatibility.
         self._profile_isolation_enabled = False
         self._memory: Optional[Any] = None
+        self._provider_sync_adapter: Optional[Any] = None
+        self._provider_persona_adapter: Optional[Any] = None
         self._gateway_session_key = ""
         self._channel_id_explicit = False
         # Default scope for remember() calls when not explicitly specified.
@@ -661,6 +663,23 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 logger.debug("Audit log initialized: %s", db_path)
         except Exception as exc:
             logger.debug("Audit log init skipped: %s", exc)
+
+    def _clear_provider_adapters(self) -> None:
+        """Drop adapters that retain the Beam being replaced or closed."""
+        for attr_name in ("_provider_sync_adapter", "_provider_persona_adapter"):
+            adapter = getattr(self, attr_name, None)
+            if adapter is not None:
+                shutdown = getattr(adapter, "shutdown", None)
+                if callable(shutdown):
+                    try:
+                        shutdown()
+                    except Exception:
+                        logger.debug(
+                            "Mnemosyne: could not close provider adapter %s",
+                            attr_name,
+                            exc_info=True,
+                        )
+            setattr(self, attr_name, None)
 
     def _audit_event(self, action: str, **kwargs) -> None:
         """Record an audit event. Never raises, never blocks."""
@@ -1060,6 +1079,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # _beam active, causing system_prompt_block() to report "Active"
         # and handle_tool_call() to silently write into the wrong session.
         # _init_error reset complements this for the failure-recovery case.
+        self._clear_provider_adapters()
         if self._memory is not None:
             try:
                 self._memory.close()
@@ -1466,10 +1486,17 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 int(self._sync_turn_telemetry.get("max_queue_length") or 0),
                 in_flight,
             )
+        should_auto_sleep = False
+        auto_sleep_session_id = ""
         try:
             with self._beam_session_scope(session_id) as beam:
                 if beam is None:
                     return
+                beam_session_id = getattr(beam, "session_id", None)
+                durable_session_id = getattr(
+                    self, "_session_id", beam_session_id
+                )
+                durable_operation = beam_session_id == durable_session_id
                 if "user" in self._sync_roles and user_content and len(user_content) > 5 and not self._should_filter(user_content):
                     user_limit = _sync_turn_user_limit()
                     uc = user_content[:user_limit] if user_limit > 0 else user_content
@@ -1492,10 +1519,17 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         scope=self._default_scope,
                         extract_entities=True,
                     )
-                self._turn_count += 1
-                should_auto_sleep = self._auto_sleep_enabled and self._turn_count % 10 == 0
+                if durable_operation:
+                    self._turn_count += 1
+                    should_auto_sleep = (
+                        self._auto_sleep_enabled and self._turn_count % 10 == 0
+                    )
+                    if should_auto_sleep:
+                        auto_sleep_session_id = beam.session_id
             if should_auto_sleep:
-                self._maybe_auto_sleep()
+                self._maybe_auto_sleep(
+                    expected_session_id=auto_sleep_session_id,
+                )
             with self._sync_turn_lock:
                 self._sync_turn_telemetry["completed"] += 1
                 self._sync_turn_telemetry["last_error"] = None
@@ -1558,52 +1592,89 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 )
                 break  # One identity memory per turn
 
-    def _maybe_auto_sleep(self) -> None:
-        try:
-            stats = self._beam.get_working_stats()
-            working = stats.get("total", 0)
-            if working > self._auto_sleep_threshold:
-                # Cheap eligibility check: are there any unconsolidated
-                # working memories old enough to consolidate? Avoids
-                # spinning up a full sleep pass just to find nothing
-                # eligible (common with longer TTLs after a prior
-                # auto-sleep already consolidated everything).
-                cutoff = (datetime.now() - timedelta(hours=_get_working_memory_ttl_hours() // 2)).isoformat()
-                eligible = self._beam._count_unconsolidated_before(cutoff)
-                if eligible == 0:
-                    return
+    def _auto_sleep_snapshot_locked(self, expected_session_id: str = ""):
+        """Return one immutable auto-sleep snapshot while Beam is locked."""
+        beam_ref = self._beam
+        if beam_ref is None:
+            return None
+        if expected_session_id and beam_ref.session_id != expected_session_id:
+            return None
+        stats = beam_ref.get_working_stats()
+        working = stats.get("total", 0)
+        if working <= self._auto_sleep_threshold:
+            return None
 
-                with self._ensure_beam_access_lock():
-                    skip = self._reserve_reflection_budget_locked("auto_sleep")
-                    if skip is not None:
-                        logger.info("Mnemosyne auto-sleep skipped: %s", json.dumps(skip))
-                        return
-                    beam_ref = self._beam
-                    if beam_ref is None:
-                        return
-                    sleep_args = {
-                        "session_id": beam_ref.session_id,
-                        "db_path": beam_ref.db_path,
-                        "author_id": beam_ref.author_id,
-                        "author_type": beam_ref.author_type,
-                        "channel_id": beam_ref.channel_id,
-                    }
+        # Avoid spinning up a full sleep pass when no old unconsolidated rows
+        # remain. This read belongs to the same session snapshot as the stats.
+        cutoff = (
+            datetime.now()
+            - timedelta(hours=_get_working_memory_ttl_hours() // 2)
+        ).isoformat()
+        eligible = beam_ref._count_unconsolidated_before(cutoff)
+        if eligible == 0:
+            return None
+
+        skip = self._reserve_reflection_budget_locked("auto_sleep")
+        if skip is not None:
+            logger.info("Mnemosyne auto-sleep skipped: %s", json.dumps(skip))
+            return None
+        sleep_args = {
+            "session_id": beam_ref.session_id,
+            "db_path": beam_ref.db_path,
+            "author_id": beam_ref.author_id,
+            "author_type": beam_ref.author_type,
+            "channel_id": beam_ref.channel_id,
+        }
+        sleep_all_sessions = hasattr(beam_ref, "sleep_all_sessions")
+        canonical_owner_id = getattr(beam_ref, "canonical_owner_id", "default")
+        agent_context = getattr(
+            beam_ref,
+            "agent_context",
+            getattr(self, "_agent_context", "primary"),
+        )
+        return (
+            working,
+            eligible,
+            sleep_args,
+            sleep_all_sessions,
+            canonical_owner_id,
+            agent_context,
+        )
+
+    def _maybe_auto_sleep(self, *, expected_session_id: str = "") -> None:
+        try:
+            with self._ensure_beam_access_lock():
+                snapshot = self._auto_sleep_snapshot_locked(expected_session_id)
+            if snapshot is not None:
+                (
+                    working,
+                    eligible,
+                    sleep_args,
+                    sleep_all_sessions,
+                    canonical_owner_id,
+                    agent_context,
+                ) = snapshot
 
                 logger.info("Mnemosyne auto-sleep: working=%d, eligible=%d > threshold=%d", working, eligible, self._auto_sleep_threshold)
                 # The daemon must own a separate BeamMemory/SQLite connection.
                 # The source Beam selects the compatible sleep operation, but is
                 # never used from the worker thread (see root provider #498).
-                sleep_all_sessions = hasattr(beam_ref, "sleep_all_sessions")
                 beam_lock = self._ensure_beam_access_lock()
 
                 def _sleep_isolated():
                     try:
                         BeamClass = _get_beam_class()
-                        sleep_beam = BeamClass(
-                            **sleep_args,
-                        )
                         with beam_lock:
-                            (sleep_beam.sleep_all_sessions if sleep_all_sessions else sleep_beam.sleep)()
+                            sleep_beam = BeamClass(
+                                **sleep_args,
+                            )
+                            sleep_beam.canonical_owner_id = canonical_owner_id
+                            sleep_beam.agent_context = agent_context
+                            (
+                                sleep_beam.sleep_all_sessions
+                                if sleep_all_sessions
+                                else sleep_beam.sleep
+                            )()
                     except Exception as inner:
                         logger.debug("Mnemosyne auto-sleep worker failed: %s", inner)
 
@@ -2883,6 +2954,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     "author_type": beam.author_type,
                     "channel_id": beam.channel_id,
                 }
+                canonical_owner_id = getattr(
+                    beam, "canonical_owner_id", "default"
+                )
+                agent_context = getattr(
+                    beam,
+                    "agent_context",
+                    getattr(self, "_agent_context", "primary"),
+                )
                 beam_lock = self._ensure_beam_access_lock()
 
             def _sleep_with_logging():
@@ -2892,7 +2971,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 try:
                     with beam_lock:
                         BeamClass = _get_beam_class()
-                        BeamClass(**sleep_args).sleep()
+                        sleep_beam = BeamClass(**sleep_args)
+                        sleep_beam.canonical_owner_id = canonical_owner_id
+                        sleep_beam.agent_context = agent_context
+                        sleep_beam.sleep()
                 except Exception as inner:
                     logger.debug("Mnemosyne session-end sleep failed: %s", inner)
 
@@ -2963,6 +3045,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 unregister_hermes_host_llm()
             except Exception as exc:
                 logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
+        self._clear_provider_adapters()
         if self._memory is not None:
             try:
                 self._memory.close()
