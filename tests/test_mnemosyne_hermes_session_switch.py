@@ -41,6 +41,26 @@ class _RecordingBeam:
         self.observed_sessions.append((self.session_id, self.channel_id))
 
 
+class _ObservedRLock:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self.waiting = threading.Event()
+
+    def acquire(self, *args: Any, **kwargs: Any) -> bool:
+        self.waiting.set()
+        return self._lock.acquire(*args, **kwargs)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self) -> _ObservedRLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.release()
+
+
 def _provider_with_recording_beam(
     *,
     session_id: str = "hermes_SESS-A",
@@ -275,6 +295,71 @@ def test_switch_waits_for_inflight_turn_without_mixing_sessions() -> None:
     assert provider._turn_count == 0
 
 
+def test_switch_waits_for_inflight_tool_write_without_mixing_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool_started = threading.Event()
+    release_tool = threading.Event()
+    switch_done = threading.Event()
+    writes: list[tuple[str, str]] = []
+    tool_results: list[str] = []
+
+    class _BlockingToolBeam(_RecordingBeam):
+        def remember(self, **_kwargs: Any) -> str:
+            before = (self.session_id, self.channel_id)
+            tool_started.set()
+            assert release_tool.wait(timeout=5)
+            after = (self.session_id, self.channel_id)
+            assert after == before
+            writes.append(after)
+            return "memory-id"
+
+    provider, _ = _provider_with_recording_beam()
+    beam = _BlockingToolBeam()
+    provider._beam = beam
+    beam_lock = _ObservedRLock()
+    provider._beam_access_lock = beam_lock
+    provider.has_tool = lambda name: name == "mnemosyne_remember"
+    monkeypatch.setattr(mnemosyne_hermes, "_write_approval_enabled", lambda: False)
+
+    tool = threading.Thread(
+        target=lambda: tool_results.append(
+            provider.handle_tool_call(
+                "mnemosyne_remember",
+                {"content": "tool write before switch"},
+            )
+        )
+    )
+    tool.start()
+    assert tool_started.wait(timeout=5)
+    beam_lock.waiting.clear()
+
+    switch = threading.Thread(
+        target=lambda: (
+            provider.on_session_switch("SESS-B"),
+            switch_done.set(),
+        )
+    )
+    switch.start()
+    try:
+        assert beam_lock.waiting.wait(timeout=5)
+        assert not switch_done.is_set()
+    finally:
+        release_tool.set()
+        tool.join(timeout=5)
+        switch.join(timeout=5)
+
+    assert not tool.is_alive()
+    assert not switch.is_alive()
+    assert switch_done.is_set()
+    assert len(tool_results) == 1
+    assert '"status": "stored"' in tool_results[0]
+    assert writes == [("hermes_SESS-A", "hermes_SESS-A")]
+    assert provider._session_id == "hermes_SESS-B"
+    assert beam.session_id == "hermes_SESS-B"
+    assert beam.channel_id == "hermes_SESS-B"
+
+
 def test_failed_init_switches_pending_retry_to_latest_gateway_scope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -450,6 +535,64 @@ def test_session_end_reservation_and_snapshot_share_switch_lock(
             "channel_id": "channel",
         }
     ]
+
+
+def test_session_end_sleep_blocks_concurrent_sync_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleep_started = threading.Event()
+    release_sleep = threading.Event()
+    turn_write_started = threading.Event()
+    writes: list[tuple[str, str]] = []
+
+    class _SourceBeam(_RecordingBeam):
+        db_path = "memory.db"
+        author_id = "author"
+        author_type = "agent"
+
+        def remember(self, **_kwargs: Any) -> None:
+            turn_write_started.set()
+            writes.append((self.session_id, self.channel_id))
+
+    class _SleepBeam:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        def sleep(self) -> None:
+            sleep_started.set()
+            assert release_sleep.wait(timeout=5)
+
+    provider, _ = _provider_with_recording_beam()
+    provider._beam = _SourceBeam()
+    beam_lock = _ObservedRLock()
+    provider._beam_access_lock = beam_lock
+    provider.SESSION_END_SLEEP_TIMEOUT_SECONDS = 1
+    monkeypatch.setattr(mnemosyne_hermes, "_get_beam_class", lambda: _SleepBeam)
+
+    session_end = threading.Thread(target=provider.on_session_end, args=([],))
+    session_end.start()
+    assert sleep_started.wait(timeout=5)
+    beam_lock.waiting.clear()
+
+    sync_turn = threading.Thread(
+        target=provider.sync_turn,
+        args=("user write while session-end sleep runs", ""),
+    )
+    sync_turn.start()
+    try:
+        assert beam_lock.waiting.wait(timeout=5)
+        assert not turn_write_started.is_set()
+    finally:
+        release_sleep.set()
+        session_end.join(timeout=5)
+        sync_turn.join(timeout=5)
+        if provider._session_end_thread is not None:
+            provider._session_end_thread.join(timeout=5)
+
+    assert not session_end.is_alive()
+    assert not sync_turn.is_alive()
+    assert turn_write_started.is_set()
+    assert writes == [("hermes_SESS-A", "hermes_SESS-A")]
 
 
 def test_auto_sleep_reservation_and_snapshot_share_switch_lock(

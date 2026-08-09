@@ -564,7 +564,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._sync_turn_lock = threading.Lock()
         # Serialize Beam/SQLite access with the auto_sleep daemon. Separate
         # connections to the same WAL database must not run Beam work together.
-        self._beam_access_lock = threading.Lock()
+        # Tool dispatch holds this lock while handlers run. Some handlers
+        # (sleep and diagnose) reuse helpers that acquire the same lock, so it
+        # must be re-entrant while still excluding switches and other workers.
+        self._beam_access_lock = threading.RLock()
         self._sync_turn_telemetry: Dict[str, Any] = {
             "pending_queue_length": 0,
             "max_queue_length": 0,
@@ -1366,7 +1369,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         except AttributeError:
             # setdefault atomically publishes one per-instance lock when
             # concurrent __new__ callers both need lazy initialization.
-            return self.__dict__.setdefault("_beam_access_lock", threading.Lock())
+            lock_factory = getattr(threading, "RLock", threading.Lock)
+            return self.__dict__.setdefault("_beam_access_lock", lock_factory())
 
     def _provider_session_id(self, session_id: str) -> str:
         """Normalize a Hermes session ID without displacing gateway scope."""
@@ -1620,97 +1624,105 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if tool_name == "mnemosyne_sleep" and self._reflect_disabled_for_cron and (self._agent_context or "").strip().lower() == "cron":
             return json.dumps(self._reflection_skip_response("reflect_disabled_for_cron", "tool"))
         self._maybe_retry_init()
-        if not self._beam:
-            # C27: structured response carries the actual failure reason
-            # instead of a generic "not initialized" string. Status field
-            # is parseable by tool consumers; `reason` is human-readable for
-            # the agent to relay to the user. The `error` field is kept
-            # alongside `status` so callers using the prior "if 'error' in
-            # payload" pattern (codex review finding #4) don't silently
-            # misclassify unavailable as success.
-            reason = self._init_error_reason()
-            return json.dumps({
-                "status": "memory_unavailable",
-                "tool": tool_name,
-                "reason": reason,
-                "error": f"Mnemosyne unavailable: {reason}",
-            })
         try:
-            if tool_name == "mnemosyne_remember":
-                return self._handle_remember(args)
-            elif tool_name == "mnemosyne_batch":
-                return self._handle_batch(args)
-            elif tool_name == "mnemosyne_recall":
-                return self._handle_recall(args)
-            elif tool_name == "mnemosyne_shared_remember":
-                return self._handle_shared_remember(args)
-            elif tool_name == "mnemosyne_shared_recall":
-                return self._handle_shared_recall(args)
-            elif tool_name == "mnemosyne_shared_forget":
-                return self._handle_shared_forget(args)
-            elif tool_name == "mnemosyne_shared_stats":
-                return self._handle_shared_stats(args)
-            elif tool_name == "mnemosyne_sleep":
-                return self._handle_sleep(args)
-            elif tool_name == "mnemosyne_stats":
-                return self._handle_stats(args)
-            elif tool_name == "mnemosyne_invalidate":
-                return self._handle_invalidate(args)
-            elif tool_name == "mnemosyne_validate":
-                return self._handle_validate(args)
-            elif tool_name == "mnemosyne_get":
-                return self._handle_get(args)
-            elif tool_name == "mnemosyne_triple_add":
-                return self._handle_triple_add(args)
-            elif tool_name == "mnemosyne_triple_query":
-                return self._handle_triple_query(args)
-            elif tool_name == "mnemosyne_triple_end":
-                return self._handle_triple_end(args)
-            elif tool_name == "mnemosyne_remember_canonical":
-                return self._handle_remember_canonical(args)
-            elif tool_name == "mnemosyne_recall_canonical":
-                return self._handle_recall_canonical(args)
-            elif tool_name == "mnemosyne_forget_canonical":
-                return self._handle_forget_canonical(args)
-            elif tool_name == "mnemosyne_apply_pending":
-                return self._handle_apply_pending(args)
-            elif tool_name == "mnemosyne_model_card":
-                return self._handle_model_card(args)
-            elif tool_name == "mnemosyne_model_refresh":
-                return self._handle_model_refresh(args)
-            elif tool_name == "mnemosyne_scratchpad_write":
-                return self._handle_scratchpad_write(args)
-            elif tool_name == "mnemosyne_scratchpad_read":
-                return self._handle_scratchpad_read(args)
-            elif tool_name == "mnemosyne_scratchpad_clear":
-                return self._handle_scratchpad_clear(args)
-            elif tool_name == "mnemosyne_export":
-                return self._handle_export(args)
-            elif tool_name == "mnemosyne_update":
-                return self._handle_update(args)
-            elif tool_name == "mnemosyne_forget":
-                return self._handle_forget(args)
-            elif tool_name == "mnemosyne_import":
-                return self._handle_import(args)
-            elif tool_name == "mnemosyne_diagnose":
-                return self._handle_diagnose(args)
-            elif tool_name == "mnemosyne_recall_diagnostics":
-                return self._handle_recall_diagnostics(args)
-            elif tool_name == "mnemosyne_task_progress":
-                return self._handle_task_progress(args)
-            elif tool_name == "mnemosyne_graph_query":
-                return self._handle_graph_query(args)
-            elif tool_name == "mnemosyne_graph_link":
-                return self._handle_graph_link(args)
-            elif tool_name.startswith("mnemosyne_sync_"):
-                return self._handle_sync_tool(tool_name, args)
-            elif tool_name.startswith("mnemosyne_persona_"):
-                return self._handle_persona_tool(tool_name, args)
-            else:
-                return json.dumps({"error": f"Unknown Mnemosyne tool: {tool_name}"})
+            # Tools use the durable session selected by on_session_switch().
+            # Hold the same session lock for the complete dispatch so a write,
+            # recall, or sleep cannot be re-attributed mid-operation.
+            with self._beam_session_scope("") as beam:
+                if beam is None:
+                    # C27: structured response carries the actual failure reason
+                    # instead of a generic "not initialized" string. Status field
+                    # is parseable by tool consumers; `reason` is human-readable for
+                    # the agent to relay to the user. The `error` field is kept
+                    # alongside `status` so callers using the prior "if 'error' in
+                    # payload" pattern (codex review finding #4) don't silently
+                    # misclassify unavailable as success.
+                    reason = self._init_error_reason()
+                    return json.dumps({
+                        "status": "memory_unavailable",
+                        "tool": tool_name,
+                        "reason": reason,
+                        "error": f"Mnemosyne unavailable: {reason}",
+                    })
+                return self._dispatch_tool_call_locked(tool_name, args)
         except Exception as e:
             logger.error("Mnemosyne tool %s failed: %s", tool_name, e)
             return json.dumps({"error": f"Mnemosyne tool '{tool_name}' failed: {e}"})
+
+    def _dispatch_tool_call_locked(self, tool_name: str, args: Dict[str, Any]) -> str:
+        """Dispatch one tool while the durable Beam session lock is held."""
+        if tool_name == "mnemosyne_remember":
+            return self._handle_remember(args)
+        elif tool_name == "mnemosyne_batch":
+            return self._handle_batch(args)
+        elif tool_name == "mnemosyne_recall":
+            return self._handle_recall(args)
+        elif tool_name == "mnemosyne_shared_remember":
+            return self._handle_shared_remember(args)
+        elif tool_name == "mnemosyne_shared_recall":
+            return self._handle_shared_recall(args)
+        elif tool_name == "mnemosyne_shared_forget":
+            return self._handle_shared_forget(args)
+        elif tool_name == "mnemosyne_shared_stats":
+            return self._handle_shared_stats(args)
+        elif tool_name == "mnemosyne_sleep":
+            return self._handle_sleep(args)
+        elif tool_name == "mnemosyne_stats":
+            return self._handle_stats(args)
+        elif tool_name == "mnemosyne_invalidate":
+            return self._handle_invalidate(args)
+        elif tool_name == "mnemosyne_validate":
+            return self._handle_validate(args)
+        elif tool_name == "mnemosyne_get":
+            return self._handle_get(args)
+        elif tool_name == "mnemosyne_triple_add":
+            return self._handle_triple_add(args)
+        elif tool_name == "mnemosyne_triple_query":
+            return self._handle_triple_query(args)
+        elif tool_name == "mnemosyne_triple_end":
+            return self._handle_triple_end(args)
+        elif tool_name == "mnemosyne_remember_canonical":
+            return self._handle_remember_canonical(args)
+        elif tool_name == "mnemosyne_recall_canonical":
+            return self._handle_recall_canonical(args)
+        elif tool_name == "mnemosyne_forget_canonical":
+            return self._handle_forget_canonical(args)
+        elif tool_name == "mnemosyne_apply_pending":
+            return self._handle_apply_pending(args)
+        elif tool_name == "mnemosyne_model_card":
+            return self._handle_model_card(args)
+        elif tool_name == "mnemosyne_model_refresh":
+            return self._handle_model_refresh(args)
+        elif tool_name == "mnemosyne_scratchpad_write":
+            return self._handle_scratchpad_write(args)
+        elif tool_name == "mnemosyne_scratchpad_read":
+            return self._handle_scratchpad_read(args)
+        elif tool_name == "mnemosyne_scratchpad_clear":
+            return self._handle_scratchpad_clear(args)
+        elif tool_name == "mnemosyne_export":
+            return self._handle_export(args)
+        elif tool_name == "mnemosyne_update":
+            return self._handle_update(args)
+        elif tool_name == "mnemosyne_forget":
+            return self._handle_forget(args)
+        elif tool_name == "mnemosyne_import":
+            return self._handle_import(args)
+        elif tool_name == "mnemosyne_diagnose":
+            return self._handle_diagnose(args)
+        elif tool_name == "mnemosyne_recall_diagnostics":
+            return self._handle_recall_diagnostics(args)
+        elif tool_name == "mnemosyne_task_progress":
+            return self._handle_task_progress(args)
+        elif tool_name == "mnemosyne_graph_query":
+            return self._handle_graph_query(args)
+        elif tool_name == "mnemosyne_graph_link":
+            return self._handle_graph_link(args)
+        elif tool_name.startswith("mnemosyne_sync_"):
+            return self._handle_sync_tool(tool_name, args)
+        elif tool_name.startswith("mnemosyne_persona_"):
+            return self._handle_persona_tool(tool_name, args)
+        else:
+            return json.dumps({"error": f"Unknown Mnemosyne tool: {tool_name}"})
 
     def _handle_sync_tool(self, tool_name: str, args: Dict[str, Any]) -> str:
         try:
@@ -2867,14 +2879,16 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     "author_type": beam.author_type,
                     "channel_id": beam.channel_id,
                 }
+                beam_lock = self._ensure_beam_access_lock()
 
             def _sleep_with_logging():
                 # Wrap the target so exceptions get logged at the same
                 # severity the previous synchronous version used, instead
                 # of bubbling out as an uncaught daemon-thread traceback.
                 try:
-                    BeamClass = _get_beam_class()
-                    BeamClass(**sleep_args).sleep()
+                    with beam_lock:
+                        BeamClass = _get_beam_class()
+                        BeamClass(**sleep_args).sleep()
                 except Exception as inner:
                     logger.debug("Mnemosyne session-end sleep failed: %s", inner)
 
