@@ -719,7 +719,7 @@ def test_packaged_provider_auto_sleep_uses_worker_local_beam(monkeypatch, provid
     provider._beam = SourceBeam()
     provider._auto_sleep_threshold = 1
     provider._beam_access_lock = threading.Lock()
-    provider._reserve_reflection_budget = lambda _reason: None
+    provider._reserve_reflection_budget_locked = lambda _reason: None
     monkeypatch.setattr(module, "_get_beam_class", lambda: WorkerBeam)
     monkeypatch.setattr(module, "threading", types.SimpleNamespace(Thread=InlineThread))
 
