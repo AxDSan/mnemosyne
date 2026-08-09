@@ -647,7 +647,8 @@ class Mnemosyne:
     def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
         """Mark a memory as expired or superseded. Delegates to BEAM."""
         result = self.beam.invalidate(memory_id, replacement_id=replacement_id)
-        self._emit_wrapper("MEMORY_INVALIDATED", memory_id, replacement_id=replacement_id)
+        if result:
+            self._emit_wrapper("MEMORY_INVALIDATED", memory_id, replacement_id=replacement_id)
         return result
 
     # ------------------------------------------------------------------

@@ -104,6 +104,12 @@ class TestToolSchemas:
         assert "mnemosyne_export" in names
         assert "mnemosyne_import" in names
 
+    def test_invalidate_schema_documents_scope_safe_failure(self):
+        """Invalidate must not reveal whether an out-of-scope ID exists."""
+        invalidate_tool = next(t for t in TOOLS if t["name"] == "mnemosyne_invalidate")
+        assert "memory_not_found" in invalidate_tool["description"]
+        assert "not mutable in the current scope" in invalidate_tool["description"]
+
     def test_batch_schema_has_operations(self):
         batch_tool = next(t for t in TOOLS if t["name"] == "mnemosyne_batch")
         schema = batch_tool["input_schema"]
@@ -216,6 +222,53 @@ class TestToolHandlers:
         assert result["status"] == "stored"
         assert result["bank"] == "personal"
         assert create_instance.call_args.kwargs["bank"] == "personal"
+
+    def test_handle_invalidate_preserves_session_scope_and_reports_not_found(self, tmp_path, monkeypatch):
+        """MCP invalidate must not report success for a foreign session row."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        foreign = _create_instance(session_id="foreign-session", bank="default")
+        foreign_id = foreign.beam.remember("foreign session memory", scope="session")
+
+        mcp = _create_instance(bank="default")
+        same_session_id = mcp.beam.remember("mcp session memory", scope="session")
+        global_id = mcp.beam.remember("global memory", scope="global")
+
+        wrapper_events = []
+        monkeypatch.setattr(
+            mcp_tools.Mnemosyne,
+            "_emit_wrapper",
+            lambda _self, event_type, memory_id, **kwargs: wrapper_events.append(
+                (event_type, memory_id, kwargs)
+            ),
+        )
+        failed = handle_tool_call("mnemosyne_invalidate", {
+            "memory_id": foreign_id,
+            "replacement_id": same_session_id,
+        })
+        assert failed["status"] == "memory_not_found"
+        assert failed["memory_id"] == foreign_id
+        assert wrapper_events == []
+        foreign_row = mcp.beam.conn.execute(
+            "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?", (foreign_id,)
+        ).fetchone()
+        assert tuple(foreign_row) == (None, None)
+
+        assert handle_tool_call("mnemosyne_invalidate", {"memory_id": same_session_id}) == {
+            "status": "invalidated",
+            "memory_id": same_session_id,
+        }
+        assert handle_tool_call("mnemosyne_invalidate", {"memory_id": global_id}) == {
+            "status": "invalidated",
+            "memory_id": global_id,
+        }
+        successful_rows = mcp.beam.conn.execute(
+            "SELECT valid_until FROM working_memory WHERE id IN (?, ?)",
+            (same_session_id, global_id),
+        ).fetchall()
+        assert len(successful_rows) == 2
+        assert all(row[0] for row in successful_rows)
 
     def test_handle_batch_multiple_remember(self, tmp_path, monkeypatch):
         monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))

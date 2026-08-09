@@ -515,7 +515,8 @@ def _handle_invalidate(arguments: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": "memory_id is required"}
     bank = _resolve_bank(arguments)
     mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
-    mem.invalidate(memory_id, replacement_id=replacement_id)
+    if not mem.invalidate(memory_id, replacement_id=replacement_id):
+        return {"status": "memory_not_found", "memory_id": memory_id}
     return {"status": "invalidated", "memory_id": memory_id}
 
 
