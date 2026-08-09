@@ -185,7 +185,9 @@ INVALIDATE_SCHEMA = {
     "description": (
         "Mark a memory as expired or superseded. Provide memory_id from recall results. "
         "Optionally provide replacement_id to chain old to new. An unknown ID or one "
-        "not mutable in the current scope returns status: memory_not_found."
+        "not mutable in the current scope returns status: memory_not_found. A "
+        "replacement_id that is unknown or not visible in the current scope returns "
+        "status: replacement_not_found and leaves the memory untouched."
     ),
     "parameters": {
         "type": "object",

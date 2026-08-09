@@ -507,6 +507,25 @@ def _handle_stats(arguments: Dict[str, Any]) -> Dict[str, Any]:
     return {"provider": "mnemosyne", "session_id": mem._session_id if hasattr(mem, "_session_id") else None, "stats": _serialize(stats)}
 
 
+def _resolves_in_scope(mem: MnemosyneInstance, memory_id: str) -> bool:
+    """Report whether ``memory_id`` names a row this session may link to.
+
+    Mirrors the scope predicate ``BeamMemory.invalidate`` applies to the row it
+    mutates, so a supersession link can only ever point at a memory the caller
+    can already see, in either the working or the episodic tier.
+    """
+    conn = mem.beam.conn
+    session_id = mem.beam.session_id
+    for table in ("working_memory", "episodic_memory"):
+        row = conn.execute(
+            f"SELECT 1 FROM {table} WHERE id = ? AND (session_id = ? OR scope = 'global') LIMIT 1",
+            (memory_id, session_id),
+        ).fetchone()
+        if row is not None:
+            return True
+    return False
+
+
 def _handle_invalidate(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_invalidate tool call."""
     memory_id = arguments.get("memory_id", "")
@@ -515,6 +534,15 @@ def _handle_invalidate(arguments: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": "memory_id is required"}
     bank = _resolve_bank(arguments)
     mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
+    # A replacement that does not resolve would be written into superseded_by
+    # as a dangling pointer, hiding the row from recall with nothing to follow.
+    # Refuse before mutating rather than record a link that leads nowhere.
+    if replacement_id and not _resolves_in_scope(mem, replacement_id):
+        return {
+            "status": "replacement_not_found",
+            "memory_id": memory_id,
+            "replacement_id": replacement_id,
+        }
     if not mem.invalidate(memory_id, replacement_id=replacement_id):
         return {"status": "memory_not_found", "memory_id": memory_id}
     return {"status": "invalidated", "memory_id": memory_id}

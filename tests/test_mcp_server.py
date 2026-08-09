@@ -109,6 +109,7 @@ class TestToolSchemas:
         invalidate_tool = next(t for t in TOOLS if t["name"] == "mnemosyne_invalidate")
         assert "memory_not_found" in invalidate_tool["description"]
         assert "not mutable in the current scope" in invalidate_tool["description"]
+        assert "replacement_not_found" in invalidate_tool["description"]
 
     def test_batch_schema_has_operations(self):
         batch_tool = next(t for t in TOOLS if t["name"] == "mnemosyne_batch")
@@ -269,6 +270,103 @@ class TestToolHandlers:
         ).fetchall()
         assert len(successful_rows) == 2
         assert all(row[0] for row in successful_rows)
+
+    def test_handle_invalidate_unknown_id_changes_nothing(self, tmp_path, monkeypatch):
+        """An ID that resolves nowhere must not report success or touch a row."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        mcp = _create_instance(bank="default")
+        mcp.beam.remember("mcp untouched session memory", scope="session")
+        mcp.beam.remember("mcp untouched global memory", scope="global")
+        before = [
+            tuple(row) for row in mcp.beam.conn.execute(
+                "SELECT id, valid_until, superseded_by FROM working_memory ORDER BY id"
+            ).fetchall()
+        ]
+
+        wrapper_events = []
+        monkeypatch.setattr(
+            mcp_tools.Mnemosyne,
+            "_emit_wrapper",
+            lambda _self, event_type, memory_id, **kwargs: wrapper_events.append(
+                (event_type, memory_id, kwargs)
+            ),
+        )
+
+        assert handle_tool_call("mnemosyne_invalidate", {"memory_id": "deadbeefdeadbeef"}) == {
+            "status": "memory_not_found",
+            "memory_id": "deadbeefdeadbeef",
+        }
+        assert wrapper_events == []
+        assert mcp.beam.get("deadbeefdeadbeef") is None
+        after = [
+            tuple(row) for row in mcp.beam.conn.execute(
+                "SELECT id, valid_until, superseded_by FROM working_memory ORDER BY id"
+            ).fetchall()
+        ]
+        assert after == before
+
+    def test_handle_invalidate_rejects_unresolvable_replacement(self, tmp_path, monkeypatch):
+        """A replacement that resolves nowhere must not become a dangling link."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        mcp = _create_instance(bank="default")
+        memory_id = mcp.beam.remember("mcp supersession target", scope="session")
+
+        wrapper_events = []
+        monkeypatch.setattr(
+            mcp_tools.Mnemosyne,
+            "_emit_wrapper",
+            lambda _self, event_type, memory_id, **kwargs: wrapper_events.append(
+                (event_type, memory_id, kwargs)
+            ),
+        )
+
+        assert handle_tool_call("mnemosyne_invalidate", {
+            "memory_id": memory_id,
+            "replacement_id": "notarealid00000",
+        }) == {
+            "status": "replacement_not_found",
+            "memory_id": memory_id,
+            "replacement_id": "notarealid00000",
+        }
+        assert wrapper_events == []
+        row = mcp.beam.conn.execute(
+            "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?", (memory_id,)
+        ).fetchone()
+        assert tuple(row) == (None, None)
+
+        # Both IDs unknown: the replacement is checked first, and neither
+        # answer may claim the memory was invalidated.
+        both_unknown = handle_tool_call("mnemosyne_invalidate", {
+            "memory_id": "notarealid00001",
+            "replacement_id": "alsofake0000000",
+        })
+        assert both_unknown["status"] == "replacement_not_found"
+        assert wrapper_events == []
+
+    def test_handle_invalidate_working_tier_records_supersession(self, tmp_path, monkeypatch):
+        """A working-tier memory invalidates for real, with the link recorded."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        mcp = _create_instance(bank="default")
+        original_id = mcp.beam.remember("mcp working tier original", scope="session")
+        replacement_id = mcp.beam.remember("mcp working tier replacement", scope="session")
+
+        assert handle_tool_call("mnemosyne_invalidate", {
+            "memory_id": original_id,
+            "replacement_id": replacement_id,
+        }) == {"status": "invalidated", "memory_id": original_id}
+
+        row = mcp.beam.conn.execute(
+            "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?",
+            (original_id,),
+        ).fetchone()
+        assert row["valid_until"]
+        assert row["superseded_by"] == replacement_id
 
     def test_handle_batch_multiple_remember(self, tmp_path, monkeypatch):
         monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
