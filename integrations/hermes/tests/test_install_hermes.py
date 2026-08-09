@@ -246,6 +246,140 @@ def test_resolve_hermes_bin_returns_none_for_wrapper_loop(tmp_path, monkeypatch)
     assert install_mod._resolve_hermes_bin(str(shim)) is None
 
 
+def test_resolve_hermes_bin_ignores_cwd_decoy_for_dot_slash_target(
+    tmp_path, monkeypatch
+):
+    """`exec ./hermes-real` must resolve beside the wrapper, not a CWD decoy."""
+    _skip_on_windows()
+
+    real_bin = tmp_path / "bin"
+    real_bin.mkdir(parents=True)
+    shim = real_bin / "hermes"
+    shim.write_text(
+        '#!/usr/bin/env bash\nexec ./hermes-real "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    real_hermes = real_bin / "hermes-real"
+    real_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_hermes.chmod(0o755)
+    real_python = real_bin / "python"
+    real_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_python.chmod(0o755)
+
+    # A same-named decoy in the process working directory must not win.
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    decoy_hermes = cwd / "hermes-real"
+    decoy_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+    decoy_hermes.chmod(0o755)
+    decoy_python = cwd / "python"
+    decoy_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    decoy_python.chmod(0o755)
+    monkeypatch.chdir(cwd)
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(shim))
+
+    assert install_mod._resolve_hermes_bin(str(shim)) == real_hermes
+    assert install_mod._find_hermes_python() == real_python
+
+
+def test_resolve_hermes_bin_follows_env_prefix_exec_target(tmp_path, monkeypatch):
+    """`exec env FOO=bar /real/hermes` must resolve to the real binary, not env."""
+    _skip_on_windows()
+
+    real_bin = tmp_path / "real" / "bin"
+    real_bin.mkdir(parents=True)
+    real_hermes = real_bin / "hermes"
+    real_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_hermes.chmod(0o755)
+    real_python = real_bin / "python"
+    real_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_python.chmod(0o755)
+
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "hermes"
+    shim.write_text(
+        f'#!/usr/bin/env bash\nexec env FOO=bar "{real_hermes}" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    # Decoy python beside the wrapper: proves we did not stop at the wrapper.
+    decoy_python = shim_dir / "python"
+    decoy_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    decoy_python.chmod(0o755)
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(shim))
+
+    assert install_mod._resolve_hermes_bin(str(shim)) == real_hermes
+    assert install_mod._find_hermes_python() == real_python
+
+
+def test_resolve_hermes_bin_follows_pre_exec_assignment_target(tmp_path, monkeypatch):
+    """`FOO=bar exec /real/hermes` must resolve to the real binary."""
+    _skip_on_windows()
+
+    real_bin = tmp_path / "real" / "bin"
+    real_bin.mkdir(parents=True)
+    real_hermes = real_bin / "hermes"
+    real_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_hermes.chmod(0o755)
+    real_python = real_bin / "python"
+    real_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_python.chmod(0o755)
+
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "hermes"
+    shim.write_text(
+        f'#!/usr/bin/env bash\nFOO=bar exec "{real_hermes}" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    decoy_python = shim_dir / "python"
+    decoy_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    decoy_python.chmod(0o755)
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(shim))
+
+    assert install_mod._resolve_hermes_bin(str(shim)) == real_hermes
+    assert install_mod._find_hermes_python() == real_python
+
+
+def test_resolve_hermes_bin_rejects_unsupported_env_option(tmp_path, monkeypatch):
+    """`exec env -u FOO ...` takes an argument we will not parse, so it is unresolved."""
+    _skip_on_windows()
+
+    real_bin = tmp_path / "real" / "bin"
+    real_bin.mkdir(parents=True)
+    real_hermes = real_bin / "hermes"
+    real_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_hermes.chmod(0o755)
+
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "hermes"
+    shim.write_text(
+        f'#!/usr/bin/env bash\nexec env -u FOO "{real_hermes}" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    # A decoy python beside the wrapper must NOT be selected via a fallback.
+    decoy_python = shim_dir / "python"
+    decoy_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    decoy_python.chmod(0o755)
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(shim))
+
+    assert install_mod._resolve_hermes_bin(str(shim)) is None
+    assert install_mod._find_hermes_python() is None
+
+
 def test_default_install_links_single_home(tmp_path):
     _skip_on_windows()
 

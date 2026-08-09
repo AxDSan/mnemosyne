@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -507,48 +508,117 @@ def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
 _MAX_WRAPPER_READ_BYTES = 4096
 
 
-def _read_wrapper_exec_target(path: Path) -> str | None:
-    """Return the first `exec` target from a shell wrapper script, or None."""
+def _is_env_assignment(token: str) -> bool:
+    """True if the token is a plain ``NAME=value`` shell assignment."""
+    name, sep, value = token.partition("=")
+    if not sep or not name:
+        return False
+    if not (name[0].isalpha() or name[0] == "_"):
+        return False
+    if not all(char.isalnum() or char == "_" for char in name):
+        return False
+    # Reject command/parameter substitution we cannot evaluate.
+    return not value.startswith(("$", "`"))
+
+
+def _strip_env_prefix(tokens: list[str]) -> list[str] | None:
+    """Consume ``env`` assignments and no-arg flags, returning the command.
+
+    Returns None for any option that takes an argument (``-u NAME``, ``-C DIR``,
+    ``-S ...``) or is otherwise unrecognized, so an unfamiliar layout is rejected
+    rather than misread.
+    """
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            index += 1
+            break
+        if token in ("-", "-i", "--ignore-environment"):
+            index += 1
+            continue
+        if token.startswith("-"):
+            return None
+        if _is_env_assignment(token):
+            index += 1
+            continue
+        break
+    return tokens[index:]
+
+
+def _wrapper_exec_target(path: Path) -> tuple[bool, str | None]:
+    """Inspect a launcher for an ``exec`` handoff to another program.
+
+    Returns ``(is_wrapper, target)``:
+      * ``(False, None)`` - no ``exec`` handoff; treat ``path`` as the binary.
+      * ``(True, target)`` - wrapper execs ``target`` (a path or command name).
+      * ``(True, None)``   - wrapper uses a form we will not resolve; callers
+                             must not fall back to the wrapper itself.
+
+    Supported forms (trailing ``"$@"`` and arguments ignored)::
+
+        exec /path/to/hermes "$@"
+        exec "./hermes" "$@"
+        VAR=val exec /path/to/hermes "$@"
+        exec env [VAR=val ...] /path/to/hermes "$@"
+    """
     try:
         with path.open("r", encoding="utf-8", errors="replace") as fh:
             source = fh.read(_MAX_WRAPPER_READ_BYTES)
     except (OSError, UnicodeDecodeError):
-        return None
-    # Matches shell wrappers like:
-    #   exec "/path/to/hermes" "$@"
-    #   exec /path/to/hermes "$@"
-    match = re.search(
-        r'^\s*exec\s+(?:"([^"]+)"|\'([^\']+)\'|(\S+))',
-        source,
-        flags=re.MULTILINE,
-    )
-    if not match:
-        return None
-    return next(g for g in match.groups() if g)
+        return False, None
+
+    for raw_line in source.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            tokens = shlex.split(line, comments=True)
+        except ValueError:
+            continue
+
+        index = 0
+        while index < len(tokens) and _is_env_assignment(tokens[index]):
+            index += 1
+        tokens = tokens[index:]
+        if not tokens or tokens[0] != "exec":
+            continue
+
+        # This line hands off with exec, so the wrapper is never the target.
+        rest = tokens[1:]
+        if not rest or rest[0].startswith("-"):
+            return True, None
+        if rest[0] == "env":
+            rest = _strip_env_prefix(rest[1:])
+            if not rest:
+                return True, None
+        return True, rest[0]
+
+    return False, None
 
 
 def _resolve_exec_target(raw_target: str, wrapper: Path) -> Path | None:
-    """Normalize an exec target from a wrapper script.
+    """Turn an ``exec`` target into a concrete executable path.
 
-    Absolute paths are returned as-is. Relative paths are resolved against the
-    wrapper's directory. Bare command names are resolved via PATH lookup.
+    Absolute paths are used as-is, explicit relative paths (``./hermes``,
+    ``../bin/hermes``, ``bin/hermes``) resolve against the wrapper's own
+    directory, and bare command names go through PATH. The raw target is
+    classified before ``Path`` drops a leading ``./``, so a relative launcher is
+    never shadowed by a same-named file in the process working directory.
     """
-    try:
-        target = Path(raw_target).expanduser()
-    except (OSError, RuntimeError):
-        return None
+    expanded = os.path.expanduser(raw_target)
 
-    if target.is_absolute():
-        return target if target.is_file() else None
+    if os.path.isabs(expanded):
+        candidate = Path(expanded)
+    elif os.sep in expanded or (os.altsep and os.altsep in expanded):
+        candidate = wrapper.parent / expanded
+    else:
+        found = shutil.which(expanded)
+        if not found:
+            return None
+        candidate = Path(found)
 
-    if os.path.dirname(str(target)):
-        # Explicit relative path such as ./bin/hermes or ../bin/hermes.
-        candidate = wrapper.parent / target
-        return candidate if candidate.is_file() else None
-
-    # Bare command name such as hermes: resolve via PATH lookup.
-    found = shutil.which(raw_target)
-    return Path(found) if found else None
+    return candidate if candidate.is_file() else None
 
 
 def _resolve_hermes_bin(hermes_bin: str) -> Path | None:
@@ -586,9 +656,14 @@ def _resolve_hermes_bin(hermes_bin: str) -> Path | None:
             )
             return None
 
-        exec_target = _read_wrapper_exec_target(canonical)
-        if not exec_target:
+        is_wrapper, exec_target = _wrapper_exec_target(canonical)
+        if not is_wrapper:
             return canonical
+        if exec_target is None:
+            LOGGER.debug(
+                "Hermes wrapper %r uses an unsupported exec form", hermes_bin
+            )
+            return None
 
         next_path = _resolve_exec_target(exec_target, canonical)
         if next_path is None:
