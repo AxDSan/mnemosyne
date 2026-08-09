@@ -822,6 +822,73 @@ class TestToolHandlers:
         assert candidate.suggested_action == "archive"
         assert candidate.content_length == 4
 
+    @pytest.mark.parametrize("importance", [2.0, -0.25])
+    def test_hygiene_audit_candidates_with_out_of_range_importance_clean_from_stored_row(
+        self, tmp_path, monkeypatch, importance
+    ):
+        """MCP audit output can be confirmed for finite legacy importance values.
+
+        Candidate importance is audit metadata: archive must preserve the
+        current stored value, not the stale value supplied by the audit.
+        """
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        stored = handle_tool_call(
+            "mnemosyne_remember",
+            {"content": "heartbeat", "source": "heartbeat", "importance": importance},
+        )
+        assert stored["status"] == "stored"
+        memory_id = stored["memory_id"]
+
+        audited = handle_tool_call(
+            "mnemosyne_hygiene_audit",
+            {"tables": ["working_memory"], "min_score": 0.0},
+        )
+        candidates = audited["report"]["candidates"]
+        assert len(candidates) == 1
+        assert candidates[0]["memory_id"] == memory_id
+        assert candidates[0]["importance"] == importance
+
+        # Simulate a legitimate intervening row update: the audit candidate
+        # remains the exact input to clean, but it must not overwrite storage.
+        mem = _create_instance(bank="default")
+        try:
+            mem.beam.conn.execute(
+                "UPDATE working_memory SET importance = ? WHERE id = ?", (0.75, memory_id)
+            )
+            mem.beam.conn.commit()
+        finally:
+            mem.beam.conn.close()
+
+        cleaned = handle_tool_call(
+            "mnemosyne_hygiene_clean",
+            {
+                "candidates_json": json.dumps(candidates),
+                "action": "archive",
+                "confirm": True,
+            },
+        )
+
+        assert cleaned["status"] == "applied"
+        assert cleaned["result"] == {
+            "deleted": 0,
+            "archived": 1,
+            "kept": 0,
+            "flagged": 0,
+            "errors": [],
+            "log_entries": 1,
+        }
+        mem = _create_instance(bank="default")
+        try:
+            row = mem.beam.conn.execute(
+                "SELECT importance, metadata_json FROM working_memory WHERE id = ?", (memory_id,)
+            ).fetchone()
+            assert row[0] == 0
+            assert json.loads(row[1])["_original_importance"] == 0.75
+        finally:
+            mem.beam.conn.close()
+
     def test_unknown_tool(self):
         """Unknown tool raises ValueError."""
         with pytest.raises(ValueError, match="Unknown tool"):
