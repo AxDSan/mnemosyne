@@ -236,6 +236,34 @@ def test_known_root_without_pyvenv_cfg_is_rejected(tmp_path, monkeypatch):
     assert install._find_hermes_python() == damaged
 
 
+def test_known_root_python_must_be_executable(tmp_path, monkeypatch):
+    """A validated venv whose bin/python cannot be executed is not a runtime.
+
+    Everything downstream runs the candidate as `<python> -m pip ...`, so the
+    known-root branch is held to the same executable check the launcher branch
+    already applies.
+    """
+    home = tmp_path / "hermes-home"
+    venv_python = _make_venv(home / "hermes-agent" / "venv")
+    venv_python.chmod(0o644)
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "user-home"))
+
+    found = install._find_hermes_python()
+
+    assert found is None
+    assert found != venv_python
+
+    # Same layout, now executable: the root is found again, so the rejection
+    # above is the missing permission bit and nothing else about the fixture.
+    venv_python.chmod(0o755)
+    assert install._find_hermes_python() == venv_python
+
+
 def test_run_install_fails_clearly_when_nothing_validates(tmp_path, monkeypatch, capsys):
     """The no-validated-venv path must stop and name --python, not install anyway."""
     system_bin = tmp_path / "usr" / "bin"

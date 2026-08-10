@@ -805,7 +805,9 @@ def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[P
     #    `venv` is not evidence that it is one. A half-removed environment, or
     #    one whose base interpreter is gone, leaves `bin/python` in place with
     #    no pyvenv.cfg beside it, and bootstrapping into that is the failure
-    #    this function exists to prevent.
+    #    this function exists to prevent. The candidate must also be executable,
+    #    since everything downstream runs it as `<python> -m pip ...`; a file
+    #    that cannot be executed is not a runtime.
     for root in [
         hermes_home_path / "hermes-agent",
         Path.home() / "hermes-agent",
@@ -815,7 +817,11 @@ def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[P
     ]:
         for venv_name in ("venv", ".venv"):
             candidate = root / venv_name / "bin" / "python"
-            if candidate.is_file() and _is_venv_bin_dir(candidate.parent):
+            if (
+                candidate.is_file()
+                and os.access(candidate, os.X_OK)
+                and _is_venv_bin_dir(candidate.parent)
+            ):
                 return candidate
 
     # 3. Check if we're running inside Hermes' venv ourselves
