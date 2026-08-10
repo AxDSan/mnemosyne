@@ -22,6 +22,8 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **Windows Git Bash/MSYS backup destinations no longer silently land on a drive-relative path (#659).** `mnemosyne backup /c/...` now writes to the intended `C:/...` destination. Ambiguous POSIX-rooted destinations are rejected before backup creation instead of reporting success for a different location; native Windows, UNC, and relative paths remain supported.
+
 - **Invalidation replacement links now require an accessible memory (#676).** `mnemosyne_invalidate` rejects an unknown or out-of-scope non-empty `replacement_id` before changing the target, so rejected replacements do not create links at invalidation time.
 - **`bge-m3` embedding alias resolves its 1024-dimensional vectors (#666).** The unqualified model name now resolves identically to `BAAI/bge-m3`, avoiding an unknown-model startup error when no explicit dimension override is set.
 - **MCP invalidate now reports scope-safe failure (#660).** `mnemosyne_invalidate` returns `memory_not_found` instead of claiming success when its target is outside the current scope or cannot be mutated, preserving scope isolation.

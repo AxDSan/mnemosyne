@@ -10,7 +10,7 @@ import os
 import sys
 import json
 import importlib.metadata
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import NoReturn
 
 def _default_data_dir() -> str:
@@ -1013,11 +1013,52 @@ def cmd_sync_generate_key(args):
     print("\nStore this key securely. It is the only way to decrypt synced payloads.", file=sys.stderr)
 
 
+def _normalize_backup_output_dir_arg(value: str, *, windows: bool | None = None) -> str:
+    """Normalize an explicit backup directory at the CLI boundary.
+
+    Git Bash/MSYS passes Windows drive paths as ``/c/...``. Passing that raw
+    spelling to ``pathlib.Path`` on Windows creates a drive-relative ``\\c\\...``
+    path, so a successful backup can land somewhere other than the directory the
+    user named. Convert only the unambiguous MSYS drive form. Other POSIX-rooted
+    paths are rejected before the backup backend runs instead of being silently
+    redirected.
+    """
+    if windows is None:
+        windows = os.name == "nt"
+    if not windows or not value.startswith("/"):
+        return value
+
+    unc_parts = value[2:].split("/") if value.startswith("//") else []
+    if (
+        value.startswith("//")
+        and not value.startswith("///")
+        and len(unc_parts) >= 2
+        and unc_parts[0]
+        and unc_parts[1]
+        and PureWindowsPath(value).is_absolute()
+    ):
+        return value
+
+    if (
+        len(value) >= 2
+        and value[1].isascii()
+        and value[1].isalpha()
+        and (len(value) == 2 or value[2] in "/\\")
+    ):
+        remainder = value[2:].replace("\\", "/") if len(value) > 2 else "/"
+        return f"{value[1].upper()}:{remainder}"
+
+    raise ValueError(
+        "On Windows, backup paths beginning with '/' must use an MSYS drive path "
+        "such as /c/backups, or a native absolute path such as C:/backups."
+    )
+
+
 def cmd_backup(args):
     """Create a compressed backup of the database."""
     from mnemosyne.dr.recovery import create_backup
-    output_dir = Path(args[0]) if args else None
     try:
+        output_dir = Path(_normalize_backup_output_dir_arg(args[0])) if args else None
         result = create_backup(backup_dir=output_dir)
         print(f"Backup created: {result['backup_path']}")
         print(f"  Original size: {result['original_size']:,} bytes")
