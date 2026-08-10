@@ -240,13 +240,17 @@ MNEMOSYNE_EMBEDDING_DIM=768
 
 | Variable | Default | Description |
 |---|---|---|
-| `MNEMOSYNE_LLM_ENABLED` | `false` | Enable LLM summarization during sleep cycle |
+| `MNEMOSYNE_LLM_ENABLED` | `true` | Global gate for host, remote, and local LLM-backed consolidation. Resolved from the environment when the local-LLM module is imported; currently not controlled by `config.yaml` `llm_enabled`. |
 | `MNEMOSYNE_LLM_N_CTX` | `2048` | Context window size for the local model |
-| `MNEMOSYNE_LLM_MAX_TOKENS` | `512` | Maximum output tokens per summary |
+| `MNEMOSYNE_LLM_MAX_TOKENS` | `2048` | Maximum output tokens per summary |
 | `MNEMOSYNE_LLM_N_THREADS` | `4` | CPU threads for local inference |
 | `MNEMOSYNE_LLM_REPO` | `openbmb/MiniCPM5-1B-GGUF` | HuggingFace repo for GGUF model |
 | `MNEMOSYNE_LLM_FILE` | `MiniCPM5-1B-Q4_K_M.gguf` | GGUF filename |
 | `MNEMOSYNE_SLEEP_PROMPT` | *(built-in)* | Optional sleep/consolidation prompt override. Supports `{source}`, `{memories}`, and `{memory_count}` placeholders for language-specific summaries. |
+
+`MNEMOSYNE_LLM_ENABLED=false` disables all LLM-backed consolidation, including Hermes host routing and configured remote endpoints; Mnemosyne then uses its AAAK/no-LLM fallback. The generated [configuration reference](api/configuration.mdx) records the current distinction between this environment gate and the separately declared `config.yaml` key.
+
+When the gate is enabled and neither a usable host backend nor a configured remote endpoint succeeds, Mnemosyne falls back to the local GGUF model. Its default cache location is `~/.hermes/mnemosyne/models`; the first local fallback can download the configured model from Hugging Face.
 
 ### Remote LLM (OpenAI-compatible)
 
@@ -259,7 +263,7 @@ Use a remote model instead of the local MiniCPM5-1B GGUF:
 | `MNEMOSYNE_LLM_MODEL` | *(none)* | Model identifier sent in requests |
 | `MNEMOSYNE_LLM_TIMEOUT` | `60` | HTTP timeout in seconds for remote LLM calls. Increase for slow proxies or models with long generation times (e.g. `300` for reasoning models routed through local proxies). |
 
-When `MNEMOSYNE_LLM_BASE_URL` is set, Mnemosyne uses the remote endpoint for consolidation. Falls back to local ctransformers if the remote is unreachable, then to AAAK encoding.
+With `MNEMOSYNE_LLM_ENABLED` enabled, Mnemosyne uses the remote endpoint when no host call was attempted, `MNEMOSYNE_LLM_BASE_URL` is set, and `MNEMOSYNE_FORCE_LOCAL` is not enabled. On failure it falls back to the local GGUF backend, then AAAK encoding.
 
 Works with: llama.cpp server, vLLM, Ollama, LM Studio, or any OpenAI-compatible API.
 
@@ -305,10 +309,12 @@ When the host call fails, the adapter falls back to the local GGUF model rather 
 
 ### Fallback Chain
 
+With `MNEMOSYNE_LLM_ENABLED=true`:
+
 ```
 0. Host LLM adapter (if MNEMOSYNE_HOST_LLM_ENABLED=true AND a backend is registered)
    ↓ (on failure: skip remote, go to local)
-1. Remote LLM (if MNEMOSYNE_LLM_BASE_URL is set AND host is not enabled)
+1. Remote LLM (if no host call was attempted, MNEMOSYNE_LLM_BASE_URL is set, AND MNEMOSYNE_FORCE_LOCAL is not enabled)
    ↓ (on failure)
 2. Local LLM (llama-cpp-python / ctransformers + MiniCPM5-1B GGUF)
    ↓ (on failure or not installed)
