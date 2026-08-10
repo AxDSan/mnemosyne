@@ -2121,7 +2121,12 @@ def main(argv: list[str] | None = None) -> int:
                         "  Will refuse to replace the existing wrapper without "
                         "--migrate-wrapper-to-symlink."
                     )
-                if hermes_python:
+                # Only a symlink install bootstraps Hermes' environment;
+                # run_install() does not even look for an interpreter in wrapper
+                # mode. Reporting a bootstrap here described something that
+                # would never run, and `--python` made it print for wrapper
+                # installs specifically.
+                if hermes_python and getattr(args, "mode", "symlink") == "symlink":
                     print(f"  Will bootstrap: {not getattr(args, 'no_bootstrap', False)}")
                 return 1 if invalid_wrapper_migration_args or refuses_wrapper_migration else 0
 

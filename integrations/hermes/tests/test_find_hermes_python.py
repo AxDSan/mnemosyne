@@ -493,6 +493,40 @@ def test_dry_run_reports_explicitly_selected_interpreter(tmp_path, monkeypatch, 
     assert str(discovered) not in out
 
 
+def test_wrapper_dry_run_does_not_report_a_bootstrap(tmp_path, monkeypatch, capsys):
+    """Wrapper installs never bootstrap, so the dry run must not claim one.
+
+    `--python` is honoured in both modes, so it gave the wrapper dry run a
+    truthy interpreter and printed `Will bootstrap: True` for work that
+    `run_install()` does not do in wrapper mode.
+    """
+    chosen = _make_venv(tmp_path / "chosen")
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "user-home"))
+
+    rc = install.main(
+        ["install", "--dry-run", "--mode", "wrapper", "--python", str(chosen)]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Will bootstrap:" not in out
+    # The interpreter is still reported; only the bootstrap claim is dropped.
+    assert f"Wrapper Python: {chosen}" in out
+
+    # Same interpreter under a symlink install still reports the bootstrap, so
+    # the line is gated on mode and not simply deleted.
+    rc = install.main(
+        ["install", "--dry-run", "--mode", "symlink", "--python", str(chosen)]
+    )
+    assert rc == 0
+    assert "Will bootstrap: True" in capsys.readouterr().out
+
+
 def test_run_install_honours_explicit_python(hermes_world, tmp_path, monkeypatch):
     """--python reaches discovery in symlink mode, not just wrapper mode."""
     bootstrapped: list[Path] = []
