@@ -7,9 +7,18 @@ Mnemosyne is a personal project that grew into something useful. If you're here,
 ```bash
 git clone https://github.com/AxDSan/mnemosyne.git
 cd mnemosyne
+
+# Core tests (matches the CI default and avoids embedding-model downloads)
 pip install -e ".[all,dev]"
-python -m pytest tests/ -v
+MNEMOSYNE_NO_EMBEDDINGS=1 python -m pytest tests/ -v
+
+# Hermes integration tests
+pip install -e "./integrations/hermes[dev]"
+MNEMOSYNE_NO_EMBEDDINGS=1 python -m pytest integrations/hermes/tests/ -v
 ```
+
+The Hermes provider is packaged separately from `mnemosyne-memory`, so its
+editable install is required before running `integrations/hermes/tests/`.
 
 ## What You Can Do
 
@@ -62,7 +71,7 @@ Mnemosyne is intentionally minimal. Every addition is weighed against these prin
 
 1. **Open an issue first** for non-trivial changes. This prevents wasted effort.
 2. **Keep it focused.** One PR per logical change.
-3. **Add tests.** If you fix a bug or add a feature, include a test in `tests/`.
+3. **Add tests.** If you fix a bug or add a feature, include coverage in the appropriate suite: `tests/` for core behavior or `integrations/hermes/tests/` for Hermes-provider behavior.
 4. **Update the README** if user-facing behavior changes.
 5. **Bump the version** in `mnemosyne/__init__.py` and update `CHANGELOG.md`.
 
