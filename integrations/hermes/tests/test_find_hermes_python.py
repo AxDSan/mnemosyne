@@ -165,6 +165,29 @@ def test_empty_explicit_python_is_rejected_not_ignored(hermes_world, empty):
     assert install._find_hermes_python() == hermes_world.venv_python
 
 
+def test_explicit_python_path_keeps_its_trailing_whitespace(hermes_world, tmp_path):
+    """A POSIX filename may end in a space, and --python must preserve it.
+
+    The blank check strips only to decide whether anything was named. Stripping
+    the value that gets returned would name a path that does not exist here,
+    silently sending the install elsewhere.
+    """
+    # A venv whose only interpreter has a filename ending in a space, so the
+    # path string ends in one and the stripped form names nothing.
+    venv = tmp_path / "padded"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    padded_python = _write_executable(venv / "bin" / "python ", "#!/bin/sh\nexit 0\n")
+    assert str(padded_python).endswith(" ")
+    assert not Path(str(padded_python).strip()).exists()
+
+    found = install._find_hermes_python(explicit_python=str(padded_python))
+
+    assert found == padded_python
+    assert found.is_file()
+    assert found != hermes_world.venv_python
+
+
 def test_cli_reports_an_empty_python_instead_of_installing(hermes_world, capsys):
     """The CLI surfaces it as an error and exits non-zero rather than guessing."""
     rc = install.main(["install", "--dry-run", "--python", ""])

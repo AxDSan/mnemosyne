@@ -791,8 +791,12 @@ def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[P
     #    would answer with a different interpreter than the one the user asked
     #    for -- exactly the silent substitution this branch exists to prevent.
     if explicit_python is not None:
-        selected = str(explicit_python).strip()
-        if not selected:
+        selected = str(explicit_python)
+        # Strip only to decide whether anything was named. A POSIX path may
+        # legitimately begin or end with whitespace, so stripping the value we
+        # return would select a different interpreter than the one requested,
+        # or fail to find it at all.
+        if not selected.strip():
             raise ValueError(
                 "--python was given an empty value. Pass the path to Hermes' "
                 "interpreter, or omit --python to let the installer find it."
