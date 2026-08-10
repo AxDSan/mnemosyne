@@ -16,6 +16,7 @@ Two layouts still returned the wrong interpreter with #620 alone:
   ``bin/python`` is a symlink to its base interpreter, so the venv was discarded.
 """
 
+import os
 import stat
 import sys
 from dataclasses import dataclass
@@ -140,6 +141,105 @@ def test_non_exec_launcher_does_not_hijack_a_known_hermes_root(tmp_path, monkeyp
 
     assert found == venv_python
     assert found != shim_python
+
+
+def _launcher_world(tmp_path, monkeypatch, launcher_body, *, binary=False):
+    """A launcher on PATH beside a validated decoy venv, plus a valid Hermes root.
+
+    The shim directory here is itself a real venv, so `pyvenv.cfg` validation
+    cannot save us: whether the sibling is trusted rests entirely on how the
+    launcher is classified. Returns (decoy_python, hermes_python).
+    """
+    shim_venv = tmp_path / "decoy-venv"
+    decoy_python = _make_venv(shim_venv)
+    launcher = shim_venv / "bin" / "hermes"
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    if binary:
+        launcher.write_bytes(launcher_body)
+    else:
+        launcher.write_text(launcher_body, encoding="utf-8")
+    launcher.chmod(0o755)
+
+    home = tmp_path / "hermes-home"
+    hermes_python = _make_venv(home / "hermes-agent" / "venv")
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("PATH", str(shim_venv / "bin"))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "user-home"))
+    return decoy_python, hermes_python
+
+
+def test_oversized_shebang_wrapper_is_not_treated_as_a_binary(tmp_path, monkeypatch):
+    """A handoff past the read bound must not be read as "no handoff".
+
+    The parser only reads a bounded prefix. Returning "not a wrapper" for a
+    shebang script it could not read to the end licenses the caller to trust the
+    interpreter beside the shim, which is the #618 outcome via a longer file.
+    """
+    padding = "# filler\n" * 700
+    body = f'#!/usr/bin/env bash\n{padding}exec "/opt/hermes/real/bin/hermes" "$@"\n'
+    encoded = body.encode()
+    assert len(encoded) > install._MAX_WRAPPER_READ_BYTES
+    # The handoff has to fall past the bound or this asserts nothing.
+    assert b"exec" not in encoded[: install._MAX_WRAPPER_READ_BYTES]
+
+    decoy_python, hermes_python = _launcher_world(tmp_path, monkeypatch, body)
+    launcher = tmp_path / "decoy-venv" / "bin" / "hermes"
+
+    assert install._wrapper_exec_target(launcher) == (True, None)
+
+    found = install._find_hermes_python()
+    assert found == hermes_python
+    assert found != decoy_python
+
+
+def test_non_shebang_executable_stays_a_direct_launcher(tmp_path, monkeypatch):
+    """A compiled console script has no exec line, and that is a real answer.
+
+    Failing closed here would break the pipx/#388 layout the launcher branch
+    exists to serve, so the read must distinguish "binary" from "unreadable".
+    """
+    decoy_python, _ = _launcher_world(
+        tmp_path, monkeypatch, b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 64, binary=True
+    )
+    launcher = tmp_path / "decoy-venv" / "bin" / "hermes"
+
+    assert install._wrapper_exec_target(launcher) == (False, None)
+    assert install._find_hermes_python() == decoy_python
+
+
+def test_unreadable_launcher_is_not_treated_as_a_binary(tmp_path, monkeypatch):
+    """If we cannot read the launcher we cannot classify it, so we must not guess."""
+    decoy_python, hermes_python = _launcher_world(
+        tmp_path, monkeypatch, "#!/bin/sh\nexec /opt/hermes/bin/hermes \"$@\"\n"
+    )
+    launcher = tmp_path / "decoy-venv" / "bin" / "hermes"
+    launcher.chmod(0o111)  # executable, not readable
+
+    if os.access(launcher, os.R_OK):  # pragma: no cover - root ignores the bit
+        pytest.skip("running as root; the unreadable case cannot be modelled")
+
+    assert install._wrapper_exec_target(launcher) == (True, None)
+
+    found = install._find_hermes_python()
+    assert found == hermes_python
+    assert found != decoy_python
+
+
+def test_unparseable_exec_line_is_not_treated_as_a_binary(tmp_path, monkeypatch):
+    """An exec line that will not tokenize is an unresolved handoff, not the absence of one."""
+    decoy_python, hermes_python = _launcher_world(
+        tmp_path, monkeypatch, '#!/bin/sh\nexec "/opt/hermes/bin/hermes "$@"\n'
+    )
+    launcher = tmp_path / "decoy-venv" / "bin" / "hermes"
+
+    assert install._wrapper_exec_target(launcher) == (True, None)
+
+    found = install._find_hermes_python()
+    assert found == hermes_python
+    assert found != decoy_python
 
 
 def test_explicit_python_is_authoritative(hermes_world, tmp_path):

@@ -600,10 +600,13 @@ def _wrapper_exec_target(path: Path) -> tuple[bool, str | None]:
     """Inspect a launcher for an ``exec`` handoff to another program.
 
     Returns ``(is_wrapper, target)``:
-      * ``(False, None)`` - no ``exec`` handoff; treat ``path`` as the binary.
+      * ``(False, None)`` - read the launcher and it has no ``exec`` handoff;
+                             treat ``path`` as the binary.
       * ``(True, target)`` - wrapper execs ``target`` (a path or command name).
-      * ``(True, None)``   - wrapper uses a form we will not resolve; callers
-                             must not fall back to the wrapper itself.
+      * ``(True, None)``   - the handoff is unresolvable *or* undeterminable
+                             (unreadable, larger than the read bound, or
+                             unparseable); callers must not fall back to the
+                             wrapper itself.
 
     Supported forms (trailing ``"$@"`` and arguments ignored)::
 
@@ -612,11 +615,30 @@ def _wrapper_exec_target(path: Path) -> tuple[bool, str | None]:
         VAR=val exec /path/to/hermes "$@"
         exec env [VAR=val ...] /path/to/hermes "$@"
     """
+    # Every uncertain answer below is (True, None): "this may hand off, and we
+    # cannot say where". (False, None) is a positive finding -- we read the
+    # launcher and it is a binary -- because it licenses the caller to trust the
+    # interpreter sitting beside it. Confusing the two is how an unrelated
+    # sibling python gets bootstrapped (#618).
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as fh:
-            source = fh.read(_MAX_WRAPPER_READ_BYTES)
-    except (OSError, UnicodeDecodeError):
+        with path.open("rb") as fh:
+            raw = fh.read(_MAX_WRAPPER_READ_BYTES + 1)
+    except OSError:
+        return True, None
+
+    if not raw.startswith(b"#!"):
+        # A compiled console script has no exec line to read, and reading it is
+        # how we know that. Binary mode keeps this decision independent of the
+        # bytes decoding cleanly.
         return False, None
+
+    if len(raw) > _MAX_WRAPPER_READ_BYTES:
+        # A shebang script larger than the bound. Its handoff may sit past the
+        # part we read, so calling it a direct executable would trust whatever
+        # python happens to sit beside it.
+        return True, None
+
+    source = raw.decode("utf-8", errors="replace")
 
     for raw_line in source.splitlines():
         line = raw_line.strip()
@@ -625,6 +647,10 @@ def _wrapper_exec_target(path: Path) -> tuple[bool, str | None]:
         try:
             tokens = shlex.split(line, comments=True)
         except ValueError:
+            # Unbalanced quoting. If the line could be the handoff, skipping it
+            # would let the file reach the "not a wrapper" return below.
+            if "exec" in line:
+                return True, None
             continue
 
         index = 0
