@@ -2,7 +2,7 @@
 
 Mnemosyne is a local-first memory system built entirely on SQLite. There is no external database and no required network service: storage, indexing, and retrieval all run in-process against a single file.
 
-Network access is opt-in and never on the retrieval path. Four subsystems can reach out when you configure them: sync (`mnemosyne sync`), remote LLM summarization (`MNEMOSYNE_LLM_BASE_URL`), API-served embeddings (`MNEMOSYNE_EMBEDDING_API_URL`), and LLM conflict detection. With none of them configured, Mnemosyne makes no network calls and needs no API keys.
+SQLite and lexical retrieval do not require network access. Four configured subsystems can reach out: sync (`mnemosyne sync`), remote LLM summarization (`MNEMOSYNE_LLM_BASE_URL` or `MNEMOSYNE_LLM_PROVIDER`), API-served embeddings (`MNEMOSYNE_EMBEDDING_API_URL`, including query-time embedding requests), and LLM conflict detection. In addition, the default-enabled local GGUF fallback can download its approximately 656 MB model from Hugging Face on its first uncached use. Set `MNEMOSYNE_LLM_ENABLED=false` for AAAK-only consolidation, or pre-cache the GGUF model; cached local fallback does not require network access.
 
 ## BEAM: Bilevel Episodic-Associative Memory
 
@@ -295,7 +295,7 @@ sleep()
     ├── Chunk by token budget
     ├── Summarize via LLM
     │     ├── Host backend (if MNEMOSYNE_HOST_LLM_ENABLED=true and registered)
-    │     ├── Remote OpenAI-compatible API (if BASE_URL set)
+    │     ├── Remote OpenAI-compatible API (if an explicit or provider-preset-resolved base URL is available)
     │     ├── Local GGUF (ctransformers / llama-cpp-python)
     │     └── AAAK encoding (keyword-based, no LLM)
     ├── Store summary in episodic_memory with embedding
