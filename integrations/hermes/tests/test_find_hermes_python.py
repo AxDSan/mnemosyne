@@ -242,6 +242,57 @@ def test_unparseable_exec_line_is_not_treated_as_a_binary(tmp_path, monkeypatch)
     assert found != decoy_python
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        '#!/bin/sh\nif true; then exec "/opt/hermes/bin/hermes" "$@"; fi\n',
+        '#!/bin/sh\n[ -x /opt/hermes ] && exec "/opt/hermes/bin/hermes" "$@"\n',
+        '#!/bin/sh\ncd /tmp; exec "/opt/hermes/bin/hermes" "$@"\n',
+        '#!/bin/sh\nrun() { exec "/opt/hermes/bin/hermes" "$@"; }\nrun "$@"\n',
+        '#!/bin/sh\nsh -c "exec /opt/hermes/bin/hermes"\n',
+    ],
+    ids=["if-then", "and-chain", "sequence", "function", "nested-sh-c"],
+)
+def test_unsupported_exec_form_is_not_treated_as_a_binary(tmp_path, monkeypatch, body):
+    """A handoff we cannot parse is still a handoff, not the absence of one.
+
+    Only the leading `exec ...` form is resolved. Every other shape must fail
+    closed, because "no handoff" is what licenses trusting the launcher's
+    sibling interpreter.
+    """
+    decoy_python, hermes_python = _launcher_world(tmp_path, monkeypatch, body)
+    launcher = tmp_path / "decoy-venv" / "bin" / "hermes"
+
+    assert install._wrapper_exec_target(launcher) == (True, None)
+
+    found = install._find_hermes_python()
+    assert found == hermes_python
+    assert found != decoy_python
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "#!/usr/bin/env python3\nfrom hermes.cli import main\nmain()\n",
+        "#!/usr/bin/env python3\nimport os\nos.execv(target, argv)\n",
+        '#!/usr/bin/env python3\nexec(compile(src, path, "exec"))\n',
+    ],
+    ids=["plain", "os-execv", "exec-builtin"],
+)
+def test_python_console_script_stays_a_direct_launcher(tmp_path, monkeypatch, body):
+    """Failing closed on the word `exec` anywhere would break the pipx layout.
+
+    A console script that calls `os.execv` or the `exec` builtin is still a
+    direct launcher, so the check matches a leading `exec` word rather than the
+    substring.
+    """
+    decoy_python, _ = _launcher_world(tmp_path, monkeypatch, body)
+    launcher = tmp_path / "decoy-venv" / "bin" / "hermes"
+
+    assert install._wrapper_exec_target(launcher) == (False, None)
+    assert install._find_hermes_python() == decoy_python
+
+
 def test_explicit_python_is_authoritative(hermes_world, tmp_path):
     """--python wins over every probe, including a valid PATH venv."""
     chosen = _make_venv(tmp_path / "chosen")

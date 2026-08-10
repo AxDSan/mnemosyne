@@ -596,6 +596,19 @@ def _strip_env_prefix(tokens: list[str]) -> list[str] | None:
     return tokens[index:]
 
 
+def _mentions_exec(tokens: list[str]) -> bool:
+    """True if any token is an ``exec`` we did not parse as the leading form.
+
+    Matches a bare ``exec`` token (``if true; then exec /x; fi``) and one nested
+    inside a quoted argument (``sh -c "exec /x"``), which arrives as a single
+    token. Deliberately exact on the first word rather than a substring search:
+    a Python console script containing ``os.execv(...)`` or ``exec(code)`` is a
+    direct launcher, and treating it as an unresolvable wrapper would break the
+    pipx layout the launcher branch exists to serve.
+    """
+    return any(token.split(maxsplit=1)[:1] == ["exec"] for token in tokens if token)
+
+
 def _wrapper_exec_target(path: Path) -> tuple[bool, str | None]:
     """Inspect a launcher for an ``exec`` handoff to another program.
 
@@ -658,6 +671,12 @@ def _wrapper_exec_target(path: Path) -> tuple[bool, str | None]:
             index += 1
         tokens = tokens[index:]
         if not tokens or tokens[0] != "exec":
+            # A handoff we cannot read as the supported leading form, such as
+            # `if true; then exec /opt/hermes/bin/hermes "$@"; fi`. Skipping the
+            # line lets the file reach the "no handoff" return and licenses the
+            # caller to trust the launcher's sibling interpreter.
+            if _mentions_exec(tokens):
+                return True, None
             continue
 
         # This line hands off with exec, so the wrapper is never the target.
