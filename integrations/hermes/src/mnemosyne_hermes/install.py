@@ -785,8 +785,19 @@ def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[P
     #    given, including when it looks wrong: the caller validates it and
     #    reports against the interpreter the user actually named, which beats
     #    silently probing for a different one.
-    if explicit_python:
-        return Path(explicit_python).expanduser()
+    #
+    #    None is the only "not supplied" signal. An empty or blank --python is a
+    #    supplied value that names nothing, and falling through to discovery
+    #    would answer with a different interpreter than the one the user asked
+    #    for -- exactly the silent substitution this branch exists to prevent.
+    if explicit_python is not None:
+        selected = str(explicit_python).strip()
+        if not selected:
+            raise ValueError(
+                "--python was given an empty value. Pass the path to Hermes' "
+                "interpreter, or omit --python to let the installer find it."
+            )
+        return Path(selected).expanduser()
 
     hermes_home_path = hermes_home()
 

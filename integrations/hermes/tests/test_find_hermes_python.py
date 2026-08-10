@@ -150,6 +150,30 @@ def test_explicit_python_is_authoritative(hermes_world, tmp_path):
     assert install._find_hermes_python(explicit_python=str(chosen)) == chosen
 
 
+@pytest.mark.parametrize("empty", ["", "   ", "\t\n"])
+def test_empty_explicit_python_is_rejected_not_ignored(hermes_world, empty):
+    """An empty --python names nothing; falling through would substitute silently.
+
+    `hermes_world` leaves a valid implicit candidate in place, so discovery
+    would happily answer with a different interpreter than the one the user
+    asked for. None stays the only "not supplied" signal.
+    """
+    with pytest.raises(ValueError, match="empty value"):
+        install._find_hermes_python(explicit_python=empty)
+
+    # The implicit candidate that would have been substituted is still there.
+    assert install._find_hermes_python() == hermes_world.venv_python
+
+
+def test_cli_reports_an_empty_python_instead_of_installing(hermes_world, capsys):
+    """The CLI surfaces it as an error and exits non-zero rather than guessing."""
+    rc = install.main(["install", "--dry-run", "--python", ""])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--python was given an empty value" in err
+
+
 def test_venv_python_symlink_is_not_resolved(tmp_path, monkeypatch):
     """A venv's bin/python symlinks to its base interpreter; resolving loses the venv."""
     base = _write_executable(tmp_path / "base" / "bin" / "python3.11", "#!/bin/sh\nexit 0\n")
