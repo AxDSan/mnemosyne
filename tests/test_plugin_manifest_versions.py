@@ -84,6 +84,37 @@ def _build_standalone_wheel(hermes_root: Path, tmp_path: Path) -> Path:
     return wheels[0]
 
 
+def _build_core_wheel(tmp_path: Path) -> Path:
+    build_root = tmp_path / "core"
+    shutil.copytree(
+        ROOT,
+        build_root,
+        ignore=shutil.ignore_patterns(
+            ".git", "build", "dist", "*.egg-info", "__pycache__"
+        ),
+    )
+    wheel_dir = tmp_path / "core-wheels"
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "wheel",
+            "--no-deps",
+            "--wheel-dir",
+            str(wheel_dir),
+            ".",
+        ],
+        cwd=build_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    wheels = list(wheel_dir.glob("*.whl"))
+    assert len(wheels) == 1, f"expected one core wheel, found {wheels}"
+    return wheels[0]
+
+
 def _wheel_metadata(archive: zipfile.ZipFile) -> bytes:
     metadata_paths = [
         path for path in archive.namelist() if path.endswith(".dist-info/METADATA")
@@ -170,3 +201,10 @@ def test_standalone_hermes_release_wheel_is_ready_for_0_6_0(tmp_path):
         assert metadata["Name"] == "mnemosyne-hermes"
         assert metadata["Version"] == "0.6.0"
         assert _manifest_version_from_wheel(archive, manifest_path) == "0.6.0"
+
+
+def test_core_wheel_ships_the_hermes_memory_provider_plugin_manifest(tmp_path):
+    wheel = _build_core_wheel(tmp_path)
+
+    with zipfile.ZipFile(wheel) as archive:
+        assert "hermes_memory_provider/plugin.yaml" in archive.namelist()
