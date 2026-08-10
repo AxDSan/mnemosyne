@@ -295,7 +295,7 @@ sleep()
     ├── Chunk by token budget
     ├── Summarize via LLM
     │     ├── Host backend (if MNEMOSYNE_HOST_LLM_ENABLED=true and registered)
-    │     ├── Remote OpenAI-compatible API (if an explicit or provider-preset-resolved base URL is available)
+    │     ├── Remote OpenAI-compatible API (if `MNEMOSYNE_LLM_ENABLED=true`, no host call was attempted, an explicit or provider-preset-resolved base URL is available, and `MNEMOSYNE_FORCE_LOCAL` is not enabled)
     │     ├── Local GGUF (ctransformers / llama-cpp-python)
     │     └── AAAK encoding (keyword-based, no LLM)
     ├── Store summary in episodic_memory with embedding
