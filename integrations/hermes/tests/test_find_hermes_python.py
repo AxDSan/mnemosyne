@@ -264,6 +264,80 @@ def test_known_root_python_must_be_executable(tmp_path, monkeypatch):
     assert install._find_hermes_python() == venv_python
 
 
+def test_stale_virtual_env_pointing_outside_a_venv_is_rejected(tmp_path, monkeypatch):
+    """`VIRTUAL_ENV` is an environment variable, not proof that a venv is live.
+
+    A stale or hand-set value such as `/usr` names `/usr/bin/python` and would
+    hand bootstrap the system interpreter, which is the outcome this function
+    exists to prevent.
+    """
+    fake_usr = tmp_path / "usr"
+    system_python = _write_executable(fake_usr / "bin" / "python", "#!/bin/sh\nexit 0\n")
+    assert not (fake_usr / "pyvenv.cfg").exists()
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-home"))
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.setenv("VIRTUAL_ENV", str(fake_usr))
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "user-home"))
+
+    found = install._find_hermes_python()
+
+    assert found is None
+    assert found != system_python
+
+    # A real venv at the same variable is still honoured, so the rejection above
+    # is the missing marker rather than the branch being dead.
+    real = _make_venv(tmp_path / "real-venv")
+    monkeypatch.setenv("VIRTUAL_ENV", str(tmp_path / "real-venv"))
+    assert install._find_hermes_python() == real
+
+
+def test_virtual_env_interpreter_must_be_executable(tmp_path, monkeypatch):
+    """A venv whose bin/python cannot be executed is not a runtime here either."""
+    venv_python = _make_venv(tmp_path / "active-venv")
+    venv_python.chmod(0o644)
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-home"))
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.setenv("VIRTUAL_ENV", str(tmp_path / "active-venv"))
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "user-home"))
+
+    assert install._find_hermes_python() is None
+
+    venv_python.chmod(0o755)
+    assert install._find_hermes_python() == venv_python
+
+
+def test_active_prefix_interpreter_must_be_validated(tmp_path, monkeypatch):
+    """`sys.prefix != sys.base_prefix` describes the running interpreter only.
+
+    It says nothing about the `bin/python` being asked for here, which can be
+    absent or non-executable in a partially built environment.
+    """
+    prefix = tmp_path / "active-prefix"
+    prefix_python = _make_venv(prefix)
+    prefix_python.chmod(0o644)
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-home"))
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", str(prefix))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "user-home"))
+
+    assert install._find_hermes_python() is None
+
+    prefix_python.chmod(0o755)
+    assert install._find_hermes_python() == prefix_python
+
+    # And a prefix that is not a venv at all is rejected outright.
+    bare = tmp_path / "bare-prefix"
+    _write_executable(bare / "bin" / "python", "#!/bin/sh\nexit 0\n")
+    monkeypatch.setattr(sys, "prefix", str(bare))
+    assert install._find_hermes_python() is None
+
+
 def test_run_install_fails_clearly_when_nothing_validates(tmp_path, monkeypatch, capsys):
     """The no-validated-venv path must stop and name --python, not install anyway."""
     system_bin = tmp_path / "usr" / "bin"

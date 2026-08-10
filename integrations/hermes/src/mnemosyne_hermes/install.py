@@ -746,6 +746,26 @@ def _is_venv_bin_dir(bin_dir: Path) -> bool:
     return (bin_dir.parent / "pyvenv.cfg").is_file()
 
 
+def _is_validated_venv_python(candidate: Path) -> bool:
+    """Return whether ``candidate`` is usable as Hermes' runtime.
+
+    The single predicate every *implicitly discovered* candidate must satisfy,
+    so the launcher, the known install roots, ``sys.prefix`` and ``VIRTUAL_ENV``
+    cannot drift apart. Only ``--python`` bypasses it, deliberately: an
+    explicitly named interpreter is reported against by the caller rather than
+    silently swapped for another.
+
+    The candidate must exist as a file, be executable (everything downstream
+    runs it as ``<python> -m pip install ...``, so a file that cannot be
+    executed is not a runtime), and live in a real virtualenv.
+    """
+    return (
+        candidate.is_file()
+        and os.access(candidate, os.X_OK)
+        and _is_venv_bin_dir(candidate.parent)
+    )
+
+
 def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[Path]:
     """Try to find Hermes' python executable for dep validation.
 
@@ -794,20 +814,17 @@ def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[P
         resolved = _resolve_hermes_bin(hermes_bin)
         if resolved:
             bin_dir = resolved.parent
-            if _is_venv_bin_dir(bin_dir):
-                for py_name in ("python", "python3"):
-                    candidate = bin_dir / py_name
-                    if candidate.is_file() and os.access(candidate, os.X_OK):
-                        return candidate
+            for py_name in ("python", "python3"):
+                candidate = bin_dir / py_name
+                if _is_validated_venv_python(candidate):
+                    return candidate
 
     # 2. Check known hermes-agent checkout / install roots with a venv.
     #    Held to the same bar as the launcher sibling above: a directory named
     #    `venv` is not evidence that it is one. A half-removed environment, or
     #    one whose base interpreter is gone, leaves `bin/python` in place with
     #    no pyvenv.cfg beside it, and bootstrapping into that is the failure
-    #    this function exists to prevent. The candidate must also be executable,
-    #    since everything downstream runs it as `<python> -m pip ...`; a file
-    #    that cannot be executed is not a runtime.
+    #    this function exists to prevent.
     for root in [
         hermes_home_path / "hermes-agent",
         Path.home() / "hermes-agent",
@@ -817,24 +834,27 @@ def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[P
     ]:
         for venv_name in ("venv", ".venv"):
             candidate = root / venv_name / "bin" / "python"
-            if (
-                candidate.is_file()
-                and os.access(candidate, os.X_OK)
-                and _is_venv_bin_dir(candidate.parent)
-            ):
+            if _is_validated_venv_python(candidate):
                 return candidate
 
-    # 3. Check if we're running inside Hermes' venv ourselves
+    # 3. Check if we're running inside Hermes' venv ourselves.
+    #    `sys.prefix != sys.base_prefix` says the *running* interpreter is in a
+    #    venv; it says nothing about the bin/python being asked for here, which
+    #    can be absent or non-executable in a partially built environment.
     if sys.prefix != sys.base_prefix:
         venv_python = Path(sys.prefix) / "bin" / "python"
-        if venv_python.is_file():
+        if _is_validated_venv_python(venv_python):
             return venv_python
 
-    # 4. Check VIRTUAL_ENV env var (uv-managed or explicit)
+    # 4. Check VIRTUAL_ENV env var (uv-managed or explicit).
+    #    This is an ordinary environment variable, not an assertion that a venv
+    #    is live: a stale or hand-set `VIRTUAL_ENV=/usr` names `/usr/bin/python`
+    #    and would hand bootstrap the system interpreter, which is the outcome
+    #    this function exists to prevent.
     ve = os.environ.get("VIRTUAL_ENV")
     if ve:
         candidate = Path(ve) / "bin" / "python"
-        if candidate.is_file():
+        if _is_validated_venv_python(candidate):
             return candidate
 
     # Nothing validated. Better to stop and let the caller ask for --python
