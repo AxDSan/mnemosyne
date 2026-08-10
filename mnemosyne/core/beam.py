@@ -3555,7 +3555,12 @@ class BeamMemory:
                 try:
                     vec = _embeddings.embed([content])
                     if vec is not None and len(vec) == 1:
-                        _store_working_embedding(self.conn, memory_id, vec[0])
+                        _store_working_embedding(
+                            self.conn,
+                            memory_id,
+                            vec[0],
+                            commit_vec=not self.conn._defer_commit,
+                        )
                 except Exception as exc:
                     logger.warning(
                         "remember: embedding storage failed for '%s' (%s): %s",
@@ -4505,7 +4510,12 @@ class BeamMemory:
             try:
                 vec = _embeddings.embed([content])
                 if vec is not None and len(vec) > 0:
-                    _store_working_embedding(self.conn, memory_id, vec[0])
+                    _store_working_embedding(
+                        self.conn,
+                        memory_id,
+                        vec[0],
+                        commit_vec=not self.conn._defer_commit,
+                    )
             except Exception as exc:
                 logger.warning(
                     "update_working: embedding refresh failed for %s"
