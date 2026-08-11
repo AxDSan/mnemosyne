@@ -407,12 +407,14 @@ def test_prefetch_injects_polyphonic_user_transcript():
     assert "norway news marker" in block
 
 
-def test_prefetch_excludes_foreign_polyphonic_row_without_lexical_evidence():
-    """"A polyphonic [USER] row from a foreign session/channel (no shared
-    topical terms with the query) must not be injected -- the adapter still
-    enforces the lexical gate for polyphonic results, so a relevant transcript
-    is injected while an unrelated one from another session/channel is kept
-    out."""
+def test_prefetch_excludes_polyphonic_row_without_lexical_evidence():
+    """A polyphonic [USER] row that shares no topical terms with the query must
+    not be injected -- the adapter still enforces the lexical gate for
+    polyphonic results, so a matching transcript is injected while an unrelated
+    one is kept out. (Session/channel scope isolation is not the adapter's job:
+    `BeamMemory.recall()` already returns only in-scope rows via its candidate
+    queries -- see the core `test_recall_session_scope_excludes_foreign_row_sharing_query_terms`
+    for the two-session shared-term case.)"""
     p = _provider([
         {
             "content": "[USER] carol said the norway news marker is on page two",
@@ -438,3 +440,38 @@ def test_prefetch_excludes_foreign_polyphonic_row_without_lexical_evidence():
 
     assert "norway news marker" in block
     assert "sentinelxyz" not in block
+
+
+def test_prefetch_ranks_polyphonic_rows_by_strongest_voice():
+    """When multiple polyphonic rows all clear the lexical gate, prefetch ranks
+    them by the strongest voice contribution (`_prefetch_topic_signal` uses
+    max(voice_scores)), so the row with the stronger voice is injected first.
+    The adapter ranks honestly from `voice_scores` rather than fabricating
+    linear per-signal values."""
+    p = _provider([
+        {
+            "content": "[USER] carol said the norway news marker is on page two",
+            "source": "conversation",
+            "timestamp": "2026-08-11T09:00:00Z",
+            "importance": 0.5,
+            "score": 0.034,
+            "voice_scores": {"vector": 0.019, "temporal": 0.016},
+            "trust_tier": "STATED",
+        },
+        {
+            "content": "[USER] bob tracked the norway news marker in the log",
+            "source": "conversation",
+            "timestamp": "2026-08-11T09:01:00Z",
+            "importance": 0.5,
+            "score": 0.034,
+            "voice_scores": {"vector": 0.050, "temporal": 0.012},
+            "trust_tier": "STATED",
+        },
+    ])
+
+    block = p.prefetch("norway news marker")
+
+    assert "bob tracked" in block and "carol said" in block
+    assert block.index("bob tracked") < block.index("carol said"), (
+        "row with the stronger voice contribution should rank first"
+    )

@@ -599,6 +599,40 @@ class TestE5ResultShape:
         row = next((r for r in results if r["id"] == seed_id), None)
         assert row is not None, f"stub row missing from recall: {results}"
         vs = row.get("voice_scores", {})
-        assert set(vs) & {"vector", "graph", "fact", "temporal"}, (
-            f"expected polyphonic voice provenance in voice_scores, got {vs}"
+        assert vs == {"vector": 0.019, "temporal": 0.016}, (
+            "expected the exact polyphonic voice_scores mapping from the "
+            f"engine stub (not merely a supported key), got {vs}"
+        )
+
+    def test_recall_session_scope_excludes_foreign_row_sharing_query_terms(
+        self, temp_db, monkeypatch, disable_llm
+    ):
+        """Scope isolation: a foreign-session row that shares the query terms
+        under another session's scope is excluded by recall. Scope filtering is
+        engine-independent -- it is applied to the candidate queries inside
+        `BeamMemory.recall()` (session_id OR scope='global') -- so the Hermes
+        prefetch adapter, which consumes recall() output, can never see or
+        inject a foreign-session transcript that lexically matches a query.
+        Uses the deterministic linear path: polyphonic recall with embeddings
+        disabled returns no hits, which would make a real-engine scope test
+        vacuous. The scope predicate is identical for both engines."""
+        monkeypatch.delenv("MNEMOSYNE_POLYPHONIC_RECALL", raising=False)
+        beam_a = BeamMemory(session_id="scope-a", db_path=temp_db)
+        beam_b = BeamMemory(session_id="scope-b", db_path=temp_db)
+
+        marker = "scopezonemarkerx"
+        a_id = beam_a.remember(
+            f"[USER] carol discussed the {marker} deploy today",
+            source="conversation", importance=0.5,
+        )
+        b_id = beam_b.remember(
+            f"[USER] {marker} news marker is on page two",
+            source="conversation", importance=0.9,
+        )
+
+        results = beam_a.recall(marker, top_k=10)
+        ids = {r["id"] for r in results}
+        assert a_id in ids, "own-session row missing from recall -- test vacuous"
+        assert b_id not in ids, (
+            "foreign-session row sharing query terms leaked into session scope"
         )
