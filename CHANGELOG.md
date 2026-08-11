@@ -50,11 +50,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
   rotates the agent session through `/new`, `/resume`, `/branch`, undo, or context
   compression, so subsequent writes, reads, and tools use the active session.
 
-### Changed
-
-- MCP remember, batch, and shared-surface extraction policies now support strict tri-state server defaults with caller-preserving omission semantics across MCP and Hermes writes.
-
-## [3.16.0] - 2026-08-01
+## [3.17.0] - 2026-08-11
 
 ### Added
 
@@ -63,6 +59,15 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
   and legacy SSE transports. It uses the MCP SDK session manager for session
   creation, routing, and explicit DELETE termination; network-exposed binds
   retain the existing `MNEMOSYNE_MCP_TOKEN` bearer-token requirement.
+
+### Changed
+
+- MCP remember, batch, and shared-surface extraction policies now support strict tri-state server defaults with caller-preserving omission semantics across MCP and Hermes writes.
+
+### Fixed
+
+- Source-built MCP images install the checked-out code with native vector dependencies while excluding local environment files, Hermes/Mnemosyne runtime state, SQLite databases, backups, and logs from image layers.
+- MCP batch vector writes now remain inside the deferred transaction so a later operation failure rolls the entire batch back atomically.
 
 ## [3.15.1] - 2026-07-30
 
