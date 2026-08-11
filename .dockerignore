@@ -3,6 +3,12 @@
 .env
 .env.*
 .hermes
+.mnemosyne
+*.db
+*.db-wal
+*.db-shm
+backups
+logs
 __pycache__
 *.pyc
 .planning
