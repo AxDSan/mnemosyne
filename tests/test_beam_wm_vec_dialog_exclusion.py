@@ -222,3 +222,102 @@ def test_explicit_conversation_source_filter_still_returns_dialog(temp_db, monke
     assert any(i.startswith("dialog-") for i in ids), (
         "explicit source='conversation' recall must still surface dialog rows"
     )
+
+
+def test_explicit_topic_filter_bypasses_default_exclusion(temp_db, monkeypatch):
+    """topic= is stored in the source column, so an explicit topic filter
+    must also bypass the default dense-source exclusion."""
+    beam = BeamMemory(session_id="flood-session", db_path=temp_db)
+    _flood_db(beam, dialog_count=20)
+    _enable_embeddings(monkeypatch, _unit_query_vec())
+
+    results = beam.recall(QUERY, top_k=10, topic="conversation")
+    ids = [r["id"] for r in results]
+    assert any(i.startswith("dialog-") for i in ids), (
+        "explicit topic='conversation' recall must still surface dialog rows"
+    )
+
+
+def test_fts_only_default_recall_still_returns_conversation_rows(temp_db):
+    """The exclusion is dense-pool-only: a default recall whose query matches
+    conversation rows lexically must still return them via FTS."""
+    beam = BeamMemory(session_id="flood-session", db_path=temp_db)
+    _flood_db(beam, dialog_count=20)
+    # No embeddings enabled: the vector voice is unavailable, FTS alone
+    # must surface the matching conversation rows.
+    results = beam.recall("обсуждение прогноз погоды", top_k=10)
+    ids = [r["id"] for r in results]
+    assert any(i.startswith("dialog-") for i in ids), (
+        "FTS-only default recall must still return matching conversation rows"
+    )
+
+
+def test_default_vec_predicate_excludes_consolidated_rows(temp_db, monkeypatch):
+    """#427: consolidated rows must not compete with hot unconsolidated
+    memories in the default dense pool (mirrors get_context)."""
+    monkeypatch.setenv("MNEMOSYNE_LEXICAL_GATE_MIN", "0.0")
+    beam = BeamMemory(session_id="flood-session", db_path=temp_db)
+    now = datetime.now().isoformat()
+    query = _unit_query_vec()
+    conn = beam.conn
+    # Consolidated row: topically CLOSER to the query than the fact.
+    conn.execute(
+        "INSERT INTO working_memory "
+        "(id, content, source, timestamp, session_id, scope, consolidated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("old-consolidated", "старый консолидированный факт про погоду", "fact",
+         now, "flood-session", "session", now),
+    )
+    # Hot unconsolidated fact: semantically relevant but farther in the pool.
+    conn.execute(
+        "INSERT INTO working_memory "
+        "(id, content, source, timestamp, session_id, scope) VALUES (?, ?, ?, ?, ?, ?)",
+        ("hot-fact", "создание мониторов через CLI скрипт", "fact",
+         now, "flood-session", "session"),
+    )
+    conn.execute(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+        ("old-consolidated", json_dumps(_near_vec(query, seed=1)), "test-model"),
+    )
+    conn.execute(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+        ("hot-fact", json_dumps(_far_vec(query)), "test-model"),
+    )
+    conn.commit()
+    _enable_embeddings(monkeypatch, query)
+
+    results = beam.recall("nova alpha monitor add beta", top_k=10)
+    ids = [r["id"] for r in results]
+    assert "hot-fact" in ids, (
+        "hot unconsolidated fact must reach recall via the dense voice"
+    )
+    assert "old-consolidated" not in ids, (
+        "consolidated rows must not compete for dense candidates by default"
+    )
+
+
+def test_polyphonic_path_applies_default_dense_source_filter(temp_db, monkeypatch):
+    """MNEMOSYNE_POLYPHONIC_RECALL=1 returns before the linear predicate runs;
+    the engine's vector voice must apply the same default dense-source
+    exclusion before its top-K selection so dialog cannot starve the fact."""
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
+    monkeypatch.setattr(
+        "mnemosyne.core.local_llm.llm_available", lambda: False
+    )
+    beam = BeamMemory(session_id="flood-session", db_path=temp_db)
+    _flood_db(beam, dialog_count=60)
+    query = _unit_query_vec()
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        beam_module._embeddings, "embed_query", lambda _query: query
+    )
+    monkeypatch.setattr(
+        beam_module._embeddings, "embed", lambda queries: [query]
+    )
+
+    results = beam.recall(QUERY, top_k=10)
+    ids = [r["id"] for r in results]
+    assert FACT_ID in ids, (
+        "polyphonic vector voice must exclude dialog rows before top-K "
+        "selection; recall returned %s" % (ids[:5],)
+    )

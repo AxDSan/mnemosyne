@@ -6248,7 +6248,10 @@ class BeamMemory:
         # topically identical to their own dialog rows, so the nearest-N pool
         # saturates with them and starves distilled facts out of the dense
         # voice (facts semantically matching a query can rank beyond the pool
-        # and surface with dense_score=0.0 or not at all). An explicit
+        # and surface with dense_score=0.0 or not at all). Consolidated rows
+        # (consolidated_at IS NOT NULL) are likewise kept out of the default
+        # dense candidates: per #427 they must not compete with hot
+        # unconsolidated memories (mirrors get_context). An explicit
         # source=/topic= filter keeps the caller in control — asking for
         # conversation rows directly still works.
         wm_vec_where = wm_where
@@ -6256,6 +6259,7 @@ class BeamMemory:
             wm_vec_where = (
                 f"{wm_where} AND (source IS NULL OR "
                 f"(source <> 'conversation' AND source NOT LIKE 'honcho%'))"
+                f" AND consolidated_at IS NULL"
             )
 
         # ---- Working memory (vector search) ----
@@ -7925,6 +7929,11 @@ class BeamMemory:
                 query=query,
                 query_embedding=query_embedding,
                 top_k=top_k * 2,  # over-fetch for filter dropouts
+                # Explicit source=/topic= filters must not be pre-empted by
+                # the default dense-source exclusion (dialog / honcho /
+                # consolidated rows) inside the vector voice — the caller
+                # asked for those rows directly (#696).
+                default_dense_source_filter=not (source or topic),
             )
         except Exception as exc:
             logger.exception("polyphonic recall engine failed: %s", exc)

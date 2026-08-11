@@ -133,7 +133,8 @@ class PolyphonicRecallEngine:
         }
     
     def recall(self, query: str, query_embedding: np.ndarray = None,
-               top_k: int = 10, context_budget: int = 4000) -> List[PolyphonicResult]:
+               top_k: int = 10, context_budget: int = 4000,
+               *, default_dense_source_filter: bool = True) -> List[PolyphonicResult]:
         """
         Polyphonic recall: all 4 voices in parallel, then combine.
         
@@ -142,12 +143,20 @@ class PolyphonicRecallEngine:
             query_embedding: Optional pre-computed embedding
             top_k: Number of results to return
             context_budget: Max tokens for context assembly
+            default_dense_source_filter: When True (default), the vector
+                voice's working-memory tier applies the default dense-source
+                predicate (exclude raw dialog / honcho sources and
+                consolidated rows). Callers that pass an explicit
+                source=/topic= filter must set this to False so explicitly
+                requested rows are not filtered out before top-K selection.
             
         Returns:
             List of PolyphonicResult, sorted by combined score
         """
         # Run all 4 voices
-        vector_results = self._vector_voice(query_embedding)
+        vector_results = self._vector_voice(
+            query_embedding, default_dense_source_filter=default_dense_source_filter
+        )
         graph_results = self._graph_voice(query)
         fact_results = self._fact_voice(query)
         temporal_results = self._temporal_voice(query)
@@ -166,7 +175,7 @@ class PolyphonicRecallEngine:
         
         return context
     
-    def _vector_voice(self, query_embedding) -> List[RecallResult]:
+    def _vector_voice(self, query_embedding, default_dense_source_filter: bool = True) -> List[RecallResult]:
         """
         Voice 1: Dense semantic similarity over WM + EM.
 
@@ -439,14 +448,27 @@ class PolyphonicRecallEngine:
             # Same WHERE clause shape as beam._wm_vec_search: skip
             # invalidated / superseded rows so vector voice never
             # surfaces ghost rows the linear path would have hidden.
+            # Under the default dense-source filter (#696 / #427), raw
+            # dialog / honcho rows and consolidated rows are excluded
+            # BEFORE top-K selection — mirroring the linear recall path
+            # so the polyphonic engine cannot have its nearest-N pool
+            # saturated by dialog when the linear path would not.
+            wm_dense_predicate = ""
+            if default_dense_source_filter:
+                wm_dense_predicate = (
+                    " AND (wm.source IS NULL OR (wm.source <> 'conversation'"
+                    " AND wm.source NOT LIKE 'honcho%'))"
+                    " AND wm.consolidated_at IS NULL"
+                )
             try:
                 wm_rows = conn.execute(
-                    """
+                    f"""
                     SELECT wm.id AS memory_id, me.embedding_json
                     FROM memory_embeddings me
                     JOIN working_memory wm ON me.memory_id = wm.id
                     WHERE wm.superseded_by IS NULL
                       AND (wm.valid_until IS NULL OR julianday(wm.valid_until) > julianday(?))
+                      {wm_dense_predicate}
                     LIMIT ?
                     """,
                     (now_iso, vec_limit),
