@@ -237,7 +237,7 @@ MNEMOSYNE_EMBEDDING_DIM=<actual-output-dimension>
 #### Changing an embedding model safely
 
 1. Persist `MNEMOSYNE_EMBEDDING_MODEL` with the target model in the deployment configuration, so it survives restarts. If `MNEMOSYNE_EMBEDDING_DIM` is non-empty, persist the intended explicit dimension there too; for an unknown or custom model, use it only when you know the model's actual output dimension.
-2. Stop the provider or gateway before reindexing to avoid concurrent writers.
+2. Stop the provider or gateway and every other process that can write to the same local SQLite database before reindexing.
 3. Before invoking any reindex command, run the CLI from the same persisted deployment environment/configuration that the provider or gateway will use after restart—or load/export that exact configuration into the admin shell. Confirm both the target model and any explicit `MNEMOSYNE_EMBEDDING_DIM` are the post-restart values.
 4. Inspect the non-mutating rebuild plan:
 
@@ -252,8 +252,8 @@ MNEMOSYNE_EMBEDDING_DIM=<actual-output-dimension>
    mnemosyne reindex --model <target-model> --yes
    ```
 
-   The CLI creates a backup by default, re-embeds working and episodic memory, and rebuilds sqlite-vec tables at the dimension selected by that effective configuration. `--model` affects only that invocation; it does not override an explicit `MNEMOSYNE_EMBEDDING_DIM`. Therefore, the target sqlite-vec dimension is not determined by the `--model` name alone.
-6. Restart the provider or gateway and smoke-test recall.
+   The CLI creates a backup by default, re-embeds working and episodic memory, and, when sqlite-vec is available, rebuilds its tables at the dimension selected by that effective configuration. `--model` affects only that invocation; it does not override an explicit `MNEMOSYNE_EMBEDDING_DIM`. Therefore, the target sqlite-vec dimension is not determined by the `--model` name alone.
+6. Restart the provider or gateway and verify recall for both working and episodic memory through the deployment's configured retrieval path.
 
 See [Health and repair](cli-reference.md#health-and-repair) for the `reindex` command and flag reference.
 
