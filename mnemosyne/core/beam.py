@@ -6242,6 +6242,22 @@ class BeamMemory:
         
         wm_where = " AND ".join(wm_where_clauses)
 
+        # Vector pool isolation (#696): raw dialog capture (source='conversation',
+        # legacy honcho imports) stays fully FTS-reachable but is excluded from
+        # the working-memory DENSE candidate pool. Conversational queries are
+        # topically identical to their own dialog rows, so the nearest-N pool
+        # saturates with them and starves distilled facts out of the dense
+        # voice (facts semantically matching a query can rank beyond the pool
+        # and surface with dense_score=0.0 or not at all). An explicit
+        # source=/topic= filter keeps the caller in control — asking for
+        # conversation rows directly still works.
+        wm_vec_where = wm_where
+        if not (source or topic):
+            wm_vec_where = (
+                f"{wm_where} AND (source IS NULL OR "
+                f"(source <> 'conversation' AND source NOT LIKE 'honcho%'))"
+            )
+
         # ---- Working memory (vector search) ----
         wm_vec_sims = {}
         if embeddings_available:
@@ -6250,7 +6266,7 @@ class BeamMemory:
                 if emb_result is not None:
                     wm_vec = _wm_vec_search(self.conn, emb_result,
                                               k=max(top_k, 20) if _BEAM_MODE else max(top_k * 3, 50),
-                                              where_sql=wm_where,
+                                              where_sql=wm_vec_where,
                                               where_params=tuple(wm_params))
                     for vr in wm_vec:
                         wm_vec_sims[vr["id"]] = vr["sim"]
