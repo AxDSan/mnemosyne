@@ -4,6 +4,9 @@
 .env.*
 .hermes
 .mnemosyne
+results
+[[]bank[]]
+.codegraph
 *.db
 *.db-wal
 *.db-shm
