@@ -27,7 +27,6 @@ all arms run with flag=ON to test against the polyphonic engine
 instead of the inline bonus shortcut.
 """
 
-import os
 import sqlite3
 import tempfile
 from datetime import datetime, timedelta, timezone
