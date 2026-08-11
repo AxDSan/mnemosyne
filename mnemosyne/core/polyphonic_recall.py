@@ -214,6 +214,12 @@ class PolyphonicRecallEngine:
         ablation experiments. Returns empty so RRF fusion sees no
         vector contribution.
         """
+        # Reset per-call fallback state before any early-return path:
+        # a prior call may have recorded em=True; if this call exits
+        # early (voice disabled, missing/empty embedding, zero norm)
+        # the engine would otherwise inherit stale degraded state and
+        # beam.py would record a false fallback for this call.
+        self.last_call_fallback = {"em": False, "wm": False}
         if _env_disabled("MNEMOSYNE_VOICE_VECTOR"):
             return []
         if query_embedding is None or np is None:

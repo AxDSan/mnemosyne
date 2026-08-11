@@ -427,15 +427,15 @@ class TestReviewHardening:
         beam.remember("Alice prefers Vim", source="pref", importance=0.7)
         beam.remember("Bob owns auth", source="fact", importance=0.8)
 
-        beam.recall("Alice Vim", top_k=10)
+        results = beam.recall("Alice Vim", top_k=10)
         snap = get_recall_diagnostics()
 
         total_kept = sum(
             snap["by_tier"][tier]["total_hits"] for tier in RECALL_TIERS
         )
         # Working-tier results in the output (excluding entity-aware
-        # boosts which credit no tier).
-        results = beam.recall("Alice Vim", top_k=10)
+        # boosts which credit no tier). Results and snapshot come from
+        # the SAME recall call.
         wm_results = [r for r in results if r.get("tier") == "working" and not r.get("entity_match")]
         em_results = [r for r in results if r.get("tier") == "episodic" and not r.get("entity_match")]
         attributable = len(wm_results) + len(em_results)
@@ -568,6 +568,121 @@ class TestPolyphonicFallbackDiagnostics:
         engine._vector_voice(query_vec)
         assert engine.last_call_fallback["em"] is True
 
+    def test_engine_resets_fallback_flag_before_early_return(
+        self, temp_db, monkeypatch
+    ):
+        """[CodeRabbit #677] A cached engine can record em=True on one
+        call, then return early on the next (voice disabled, missing
+        embedding, empty vector, zero norm). Without a reset at the
+        top of _vector_voice, BeamMemory.recall() would inherit the
+        PRIOR call's fallback state and raise a false em_fallback_rate
+        alarm. Two-call regression: degraded first, early-return
+        second, flag must read clean defaults."""
+        import numpy as np
+
+        from mnemosyne.core.polyphonic_recall import PolyphonicRecallEngine
+
+        monkeypatch.setattr(
+            "mnemosyne.core.beam._vec_available", lambda conn: False
+        )
+        beam = BeamMemory(session_id="poly-reset", db_path=temp_db)
+        beam.consolidate_to_episodic(
+            summary="reset regression target",
+            source_wm_ids=["seed"],
+            importance=0.5,
+        )
+        engine = PolyphonicRecallEngine(db_path=temp_db, conn=beam.conn)
+
+        # Call 1: degraded (sqlite-vec unavailable) → em=True.
+        engine._vector_voice(np.ones(384, dtype=np.float32))
+        assert engine.last_call_fallback["em"] is True
+
+        # Call 2: early return — the voice is disabled, so the vector
+        # voice exits before touching the EM tier. The flag must NOT
+        # leak the prior call's degraded state.
+        monkeypatch.setenv("MNEMOSYNE_VOICE_VECTOR", "0")
+        engine._vector_voice(np.ones(384, dtype=np.float32))
+        assert engine.last_call_fallback == {"em": False, "wm": False}
+
+    def test_engine_no_em_fallback_on_deterministic_fast_path(
+        self, temp_db, monkeypatch
+    ):
+        """Healthy-path fallback contract WITHOUT requiring the
+        sqlite-vec extension: serve the vec_episodes ANN query from a
+        fake result set through a delegating connection, so the
+        sqlite-vec fast path is exercised deterministically in every
+        environment. The flag must stay False (no numpy degradation).
+        This keeps the healthy case covered even on CI without
+        sqlite-vec; the real-extension integration lives in
+        test_recall_no_em_fallback_when_fast_path_healthy."""
+        import json
+
+        import numpy as np
+
+        from mnemosyne.core.polyphonic_recall import PolyphonicRecallEngine
+
+        beam = BeamMemory(session_id="poly-fast-det", db_path=temp_db)
+        # Seed an EM row + its memory_embeddings entry (the JOIN the
+        # fake ANN result maps through).
+        beam.conn.execute(
+            "INSERT INTO episodic_memory (id, content, source, timestamp, importance) "
+            "VALUES ('poly-det-fast', 'deterministic fast path target', 'test', datetime('now'), 0.5)"
+        )
+        em_rowid = beam.conn.execute(
+            "SELECT rowid FROM episodic_memory WHERE id = ?",
+            ("poly-det-fast",),
+        ).fetchone()[0]
+        target_vec = np.ones(384, dtype=np.float32)
+        beam.conn.execute(
+            "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json) "
+            "VALUES (?, ?)",
+            ("poly-det-fast", json.dumps(target_vec.tolist())),
+        )
+        beam.conn.commit()
+
+        class _FakeCursor:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def fetchall(self):
+                return self._rows
+
+        class _FakeVecConnection:
+            """Delegates everything to the real connection except the
+            vec_episodes MATCH query, which returns a canned ANN hit."""
+
+            def __init__(self, real, fake_rows):
+                object.__setattr__(self, "_real", real)
+                object.__setattr__(self, "_fake", fake_rows)
+
+            def execute(self, sql, params=()):
+                if "FROM vec_episodes" in str(sql) and "MATCH" in str(sql):
+                    return _FakeCursor(self._fake)
+                return self._real.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        fake_rows = [{"rowid": em_rowid, "distance": 0.0}]
+        fake_conn = _FakeVecConnection(beam.conn, fake_rows)
+
+        # Force the sqlite-vec branch without the extension loaded.
+        monkeypatch.setattr(
+            "mnemosyne.core.beam._vec_available", lambda conn: True
+        )
+        monkeypatch.setattr(
+            "mnemosyne.core.beam._effective_vec_type", lambda conn: "f32"
+        )
+
+        engine = PolyphonicRecallEngine(db_path=temp_db, conn=fake_conn)
+        results = engine._vector_voice(target_vec)
+        # The ANN hit survived the superseded/valid_until JOIN → EM
+        # was consumed via the fast path → no fallback flag.
+        assert engine.last_call_fallback["em"] is False
+        assert any(
+            r.memory_id == "poly-det-fast" for r in results
+        ), f"fake fast path did not surface seeded EM row: {results}"
+
     def test_engine_keeps_em_flag_false_on_sqlite_vec_fast_path(
         self, temp_db, monkeypatch
     ):
@@ -614,7 +729,11 @@ class TestPolyphonicFallbackDiagnostics:
         unavailable, every recall degrades the EM vector path, so
         `em_fallback_rate` must read 1.0 and the engine's
         degraded-path signal must flow into the process-global
-        diagnostics."""
+        diagnostics. The degraded path must still return the seeded
+        embedding-backed episodic memory, and WM must never be
+        flagged (no substring tier in the polyphonic engine)."""
+        import json
+
         import numpy as np
 
         monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
@@ -635,8 +754,22 @@ class TestPolyphonicFallbackDiagnostics:
         )
         beam = BeamMemory(session_id="poly-e2e", db_path=temp_db)
         beam.remember("Alice prefers Vim", source="pref", importance=0.7)
+        # Seed an embedding-backed EPISODIC memory so the degraded
+        # vector voice has a real EM target to return (a working-only
+        # corpus would exercise the flag without proving the degraded
+        # path still surfaces episodic results).
+        beam.conn.execute(
+            "INSERT INTO episodic_memory (id, content, source, timestamp, importance) "
+            "VALUES ('poly-em-degraded', 'polyphonic episodic target', 'test', datetime('now'), 0.6)"
+        )
+        beam.conn.execute(
+            "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json) "
+            "VALUES (?, ?)",
+            ("poly-em-degraded", json.dumps(np.ones(384, dtype=np.float32).tolist())),
+        )
+        beam.conn.commit()
 
-        beam.recall("Alice", top_k=10)
+        results = beam.recall("Alice", top_k=10)
         snap = get_recall_diagnostics()
         assert snap["totals"]["calls"] == 1
         assert snap["totals"]["calls_using_em_fallback"] == 1, (
@@ -647,13 +780,21 @@ class TestPolyphonicFallbackDiagnostics:
         assert snap["totals"]["wm_fallback_rate"] == 0.0
         # The engine signal surfaced to the diagnostics block.
         assert getattr(beam, "_last_polyphonic_fallback", {}).get("em") is True
+        # WM stays clean by design.
+        assert getattr(beam, "_last_polyphonic_fallback", {}).get("wm") is False
+        # The degraded path still returns the seeded episodic memory.
+        assert any(
+            r.get("content") == "polyphonic episodic target" for r in results
+        ), f"degraded recall did not return seeded EM row: {results}"
 
     def test_recall_no_em_fallback_when_fast_path_healthy(
         self, temp_db, monkeypatch
     ):
         """End-to-end healthy path: sqlite-vec serves the EM tier, so
         em_fallback_rate stays 0. This is the operator-facing alarm
-        contract — the gauge only trips on real degradation."""
+        contract — the gauge only trips on real degradation. The
+        healthy path must return the seeded episodic memory, and WM
+        must never be flagged."""
         import json
 
         import numpy as np
@@ -693,10 +834,16 @@ class TestPolyphonicFallbackDiagnostics:
             "mnemosyne.core.embeddings.embed",
             lambda texts: np.ones((len(texts), 384), dtype=np.float32),
         )
-        beam.recall("Alice", top_k=10)
+        results = beam.recall("Alice", top_k=10)
         snap = get_recall_diagnostics()
         assert snap["totals"]["calls"] == 1
         assert snap["totals"]["calls_using_em_fallback"] == 0, (
             f"healthy sqlite-vec path falsely flagged as fallback: {snap}"
         )
         assert snap["totals"]["em_fallback_rate"] == 0.0
+        # WM has no substring tier in the polyphonic engine.
+        assert getattr(beam, "_last_polyphonic_fallback", {}).get("wm") is False
+        # The healthy path still returns the seeded episodic memory.
+        assert any(
+            r.get("content") == "Alice was here in episodic" for r in results
+        ), f"healthy recall did not return seeded EM row: {results}"
