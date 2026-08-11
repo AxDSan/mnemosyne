@@ -1,5 +1,8 @@
 .git
 .gitignore
+.env
+.env.*
+.hermes
 __pycache__
 *.pyc
 .planning
