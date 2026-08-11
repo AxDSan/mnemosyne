@@ -3299,8 +3299,12 @@ _provider: Optional[Any] = None
 
 def register(ctx):
     """Called by Hermes plugin loader to register CLI commands and tools."""
-    # Register the memory provider first so Hermes discovers it
-    register_memory_provider(ctx)
+    # Register the memory provider first so Hermes discovers it. Only the
+    # memory-provider discovery path (plugins/memory/) provides
+    # register_memory_provider on ctx; the standalone PluginManager path
+    # does not, so guard it.
+    if hasattr(ctx, "register_memory_provider"):
+        register_memory_provider(ctx)
 
     from .cli import register_cli, mnemosyne_command
     ctx.register_cli_command(
