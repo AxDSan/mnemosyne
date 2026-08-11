@@ -7985,6 +7985,25 @@ class BeamMemory:
                       "unknown": UNKNOWN_WEIGHT}
         tier_weight_map = {1: TIER1_WEIGHT, 2: TIER2_WEIGHT, 3: TIER3_WEIGHT}
 
+        # Emit the standard per-signal relevance fields nested consumers
+        # expect. The Hermes provider's prefetch filter thresholds on
+        # keyword_score / fts_score / dense_score (via _prefetch_topic_signal)
+        # and a 0.20 score floor; a raw RRF combined_score (~0.02-0.05) and
+        # voice_scores alone never satisfy it, so raw [USER] conversation
+        # transcripts were scored ~0 and silently dropped from prefetch when
+        # polyphonic recall was enabled. Recompute the same lexical / vector
+        # / recency signal the linear path uses so the scales match.
+        query_lower = query.lower()
+        query_tokens = _recall_tokens(query_lower)
+        poly_iw = float(os.environ.get("MNEMOSYNE_IMPORTANCE_WEIGHT", "0.2"))
+        wm_vec_sims_map = {}
+        if query_embedding is not None:
+            try:
+                _w = _wm_vec_search(self.conn, query_embedding, k=1000)
+                wm_vec_sims_map = {vr["id"]: float(vr["sim"]) for vr in _w}
+            except Exception:
+                wm_vec_sims_map = {}
+
         final = []
         cursor = self.conn.cursor()
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -8025,6 +8044,41 @@ class BeamMemory:
 
             row_dict["score"] = score
             row_dict["voice_scores"] = dict(r.voice_scores)
+
+            # Emit linear-path-compatible per-signal scores and keep `score`
+            # on a comparable 0-1 scale so the Hermes prefetch filter (and any
+            # other relevance-thresholding consumer) can gate on them
+            # regardless of which recall engine produced the row.
+            _content = row_dict.get("content") or ""
+            _kw = _lexical_relevance(query_tokens, _content, query_lower)
+            _dense = wm_vec_sims_map.get(memory_id, 0.0)
+            _imp = min(max(float(row_dict.get("importance") or 0.0), 0.0), 1.0)
+            _decay = _recency_decay(row_dict.get("timestamp") or "")
+            _kw_share = (1.0 - poly_iw) * 0.6
+            _rc_share = (1.0 - poly_iw) * 0.4
+            _base = _kw * _kw_share + _imp * poly_iw + (_kw ** 2) * 0.08
+            if _dense > 0:
+                _base = _base * 0.80 + _dense * 0.20
+            _lin_score = _base * (_rc_share + (1.0 - _rc_share) * _decay)
+            # Apply the same veracity / tier multipliers the RRF score received
+            # so the linear-comparable score preserves the ordering semantics
+            # the engine path already composes (stated > unknown, tier decay).
+            if not _env_disabled("MNEMOSYNE_VERACITY_MULTIPLIER"):
+                _lin_score *= weight_map.get(
+                    row_dict.get("veracity") or "unknown", UNKNOWN_WEIGHT
+                )
+            if row_dict.get("tier") == "episodic":
+                _lin_score *= tier_weight_map.get(
+                    row_dict.get("degradation_tier") or 1, 1.0
+                )
+            row_dict["keyword_score"] = round(_kw, 4)
+            row_dict["fts_score"] = round(_kw, 4)
+            row_dict["dense_score"] = round(_dense, 4)
+            # Keep the RRF multi-voice ordering when it is stronger,
+            # otherwise let the linear relevance score carry the ordering so
+            # any relevance threshold sees a comparable 0-1 scale.
+            if row_dict["score"] < _lin_score:
+                row_dict["score"] = round(_lin_score, 4)
             final.append(row_dict)
             # No early-break: dedup needs to see all candidates before
             # truncation, otherwise a wm row dropped from top-K by an

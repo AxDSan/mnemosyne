@@ -568,3 +568,38 @@ class TestE5ResultShape:
             assert r.get("content"), (
                 f"result has no content; engine didn't map row back: {r}"
             )
+
+    def test_polyphonic_results_emit_per_signal_scores(
+        self, temp_db, monkeypatch, disable_llm
+    ):
+        """Flag ON: polyphonic results emit the same per-signal
+        keyword/fts/dense scores (and a threshold-comparable `score`) as the
+        linear path.
+
+        The Hermes provider's prefetch filter gates on
+        keyword_score/fts_score/dense_score (via _prefetch_topic_signal) and a
+        0.20 score floor. When polyphonic recall was enabled the engine only
+        carried a tiny RRF `combined_score` and `voice_scores`, so raw [USER]
+        conversation transcripts were scored ~0 and silently dropped. Every
+        polyphonic result must therefore carry these fields so nested
+        consumers don't need a per-engine special case."""
+        monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
+        beam = BeamMemory(session_id="e5-signals", db_path=temp_db)
+        marker = "e5signalsmarkerabc"
+        _seed_recallable_content(beam, [
+            (f"[USER] carol mentioned the {marker} deploy today", "conversation", 0.5),
+            (f"the {marker} launch window closes friday", "conversation", 0.6),
+        ])
+
+        results = beam.recall(f"the {marker} deploy", top_k=10)
+        # In the no-embeddings CI env a voice may not match, so the engine can
+        # return zero rows (matching the suite's defensive convention). The
+        # contract under test: ANY polyphonic result carries the per-signal
+        # scores the Hermes prefetch filter depends on.
+        for r in results:
+            for field in ("keyword_score", "fts_score", "dense_score"):
+                assert field in r, f"polyphonic result missing {field}: {r}"
+                assert isinstance(r[field], (int, float)), (
+                    f"{field} not numeric: {r}"
+                )
+            assert isinstance(r["score"], (int, float))
