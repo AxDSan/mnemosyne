@@ -296,6 +296,93 @@ def test_default_vec_predicate_excludes_consolidated_rows(temp_db, monkeypatch):
     )
 
 
+def _polyphonic_explicit_filter_db(beam):
+    """30 distilled 'fact' rows whose embeddings are CLOSER to the query
+    than a single far dialog row.
+
+    Without a pre-top-K predicate the dialog row ranks 31st — beyond the
+    vector voice's top-20 slice — and the post-engine source filter then
+    drops it entirely, exactly the starvation the linear path prevents via
+    wm_where. With the explicit predicate (wm.source = 'conversation') the
+    pool is restricted before scoring and the dialog row survives.
+    """
+    now = datetime.now().isoformat()
+    query = _unit_query_vec()
+    conn = beam.conn
+    rows = []
+    embeddings = []
+    for i in range(30):
+        mem_id = f"fact-near-{i:02d}"
+        rows.append(
+            (mem_id, f"инструкция мониторинг kuma правило {i}", "fact",
+             now, "flood-session", "session")
+        )
+        embeddings.append((mem_id, _near_vec(query, seed=100 + i)))
+    rows.append(
+        ("dialog-far", "обсуждение прогноз погоды kuma", "conversation",
+         now, "flood-session", "session")
+    )
+    embeddings.append(("dialog-far", _far_vec(query)))
+    conn.executemany(
+        "INSERT INTO working_memory "
+        "(id, content, source, timestamp, session_id, scope) VALUES (?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    for mem_id, vec in embeddings:
+        conn.execute(
+            "INSERT INTO memory_embeddings (memory_id, embedding_json, model) "
+            "VALUES (?, ?, ?)",
+            (mem_id, json_dumps(vec), "test-model"),
+        )
+    conn.commit()
+
+
+def _enable_polyphonic(monkeypatch, query_vec):
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
+    monkeypatch.setattr(
+        "mnemosyne.core.local_llm.llm_available", lambda: False
+    )
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        beam_module._embeddings, "embed_query", lambda _query: query_vec
+    )
+    monkeypatch.setattr(
+        beam_module._embeddings, "embed", lambda queries: [query_vec]
+    )
+
+
+def test_polyphonic_explicit_source_predicate_applied_before_topk(temp_db, monkeypatch):
+    """Explicit source= must reach the engine as a real predicate, not just
+    disable the default exclusion: 30 closer 'fact' rows would otherwise
+    occupy the top-20 vector voice and starve the requested dialog row out
+    of the candidate pool before the post-engine source filter runs."""
+    beam = BeamMemory(session_id="flood-session", db_path=temp_db)
+    _polyphonic_explicit_filter_db(beam)
+    _enable_polyphonic(monkeypatch, _unit_query_vec())
+
+    results = beam.recall(QUERY, top_k=10, source="conversation")
+    ids = [r["id"] for r in results]
+    assert "dialog-far" in ids, (
+        "explicit source='conversation' must be applied before top-K "
+        f"selection; recall returned {ids[:5]}"
+    )
+
+
+def test_polyphonic_explicit_topic_predicate_applied_before_topk(temp_db, monkeypatch):
+    """topic= is stored in the source column, so the polyphonic engine must
+    apply the same pre-top-K equality predicate for it."""
+    beam = BeamMemory(session_id="flood-session", db_path=temp_db)
+    _polyphonic_explicit_filter_db(beam)
+    _enable_polyphonic(monkeypatch, _unit_query_vec())
+
+    results = beam.recall(QUERY, top_k=10, topic="conversation")
+    ids = [r["id"] for r in results]
+    assert "dialog-far" in ids, (
+        "explicit topic='conversation' must be applied before top-K "
+        f"selection; recall returned {ids[:5]}"
+    )
+
+
 def test_polyphonic_path_applies_default_dense_source_filter(temp_db, monkeypatch):
     """MNEMOSYNE_POLYPHONIC_RECALL=1 returns before the linear predicate runs;
     the engine's vector voice must apply the same default dense-source

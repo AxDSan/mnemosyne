@@ -7438,7 +7438,12 @@ class BeamMemory:
             },
         }
         material = json.dumps(canonicalize(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        return "v2:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+        # Opaque schema version bump (v2 -> v3): the default dense
+        # candidate predicate changed (dialog / honcho / consolidated
+        # exclusion, #696 / #427), so pre-change opaque cache entries can
+        # still contain dialog, honcho or consolidated dense candidates.
+        # Bumping the prefix guarantees those entries are never reused.
+        return "v3:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     def recall_enhanced(self, query: str, top_k: int = 40, *,
                         use_cache: bool = True,
@@ -7525,7 +7530,7 @@ class BeamMemory:
         kwargs["fts_weight"] = weight_snapshot.fts
         kwargs["importance_weight"] = weight_snapshot.importance
 
-        # 3. Query cache check.  Opaque v2 keys use QueryCache's exact-only
+        # 3. Query cache check.  Opaque v3 keys use QueryCache's exact-only
         # path, so no semantic tier can reuse a different effective request.
         runtime = resolve_beam_runtime()
         explain = bool(kwargs.get("explain", False))
@@ -7932,8 +7937,12 @@ class BeamMemory:
                 # Explicit source=/topic= filters must not be pre-empted by
                 # the default dense-source exclusion (dialog / honcho /
                 # consolidated rows) inside the vector voice — the caller
-                # asked for those rows directly (#696).
+                # asked for those rows directly (#696). The explicit values
+                # are propagated as real predicates so they apply BEFORE
+                # top-K selection, mirroring the linear wm_where semantics.
                 default_dense_source_filter=not (source or topic),
+                source=source,
+                topic=topic,
             )
         except Exception as exc:
             logger.exception("polyphonic recall engine failed: %s", exc)

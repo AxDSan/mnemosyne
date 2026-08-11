@@ -31,7 +31,7 @@ import json
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List
+from typing import Dict, List, Optional
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -134,10 +134,12 @@ class PolyphonicRecallEngine:
     
     def recall(self, query: str, query_embedding: np.ndarray = None,
                top_k: int = 10, context_budget: int = 4000,
-               *, default_dense_source_filter: bool = True) -> List[PolyphonicResult]:
+               *, default_dense_source_filter: bool = True,
+               source: Optional[str] = None,
+               topic: Optional[str] = None) -> List[PolyphonicResult]:
         """
         Polyphonic recall: all 4 voices in parallel, then combine.
-        
+
         Args:
             query: Text query
             query_embedding: Optional pre-computed embedding
@@ -149,13 +151,24 @@ class PolyphonicRecallEngine:
                 consolidated rows). Callers that pass an explicit
                 source=/topic= filter must set this to False so explicitly
                 requested rows are not filtered out before top-K selection.
-            
+            source: When set, the vector voice's working-memory tier applies
+                ``wm.source = source`` BEFORE top-K selection -- mirroring the
+                linear path's wm_where semantics so an explicit source filter
+                cannot be starved out of the candidate pool by closer rows of
+                other sources.
+            topic: Same as ``source`` -- topics are stored in the source
+                field for now (pending a dedicated topic column), exactly as
+                beam._wm_search does.
+
         Returns:
             List of PolyphonicResult, sorted by combined score
         """
         # Run all 4 voices
         vector_results = self._vector_voice(
-            query_embedding, default_dense_source_filter=default_dense_source_filter
+            query_embedding,
+            default_dense_source_filter=default_dense_source_filter,
+            source=source,
+            topic=topic,
         )
         graph_results = self._graph_voice(query)
         fact_results = self._fact_voice(query)
@@ -175,7 +188,9 @@ class PolyphonicRecallEngine:
         
         return context
     
-    def _vector_voice(self, query_embedding, default_dense_source_filter: bool = True) -> List[RecallResult]:
+    def _vector_voice(self, query_embedding, default_dense_source_filter: bool = True,
+                      source: Optional[str] = None,
+                      topic: Optional[str] = None) -> List[RecallResult]:
         """
         Voice 1: Dense semantic similarity over WM + EM.
 
@@ -454,7 +469,20 @@ class PolyphonicRecallEngine:
             # so the polyphonic engine cannot have its nearest-N pool
             # saturated by dialog when the linear path would not.
             wm_dense_predicate = ""
-            if default_dense_source_filter:
+            wm_dense_params = []
+            if source:
+                # Explicit source filter: mirror beam._wm_search semantics
+                # (source = ?) and apply BEFORE top-K selection so the
+                # requested rows cannot be starved out of the dense pool by
+                # closer rows of other sources.
+                wm_dense_predicate = " AND wm.source = ?"
+                wm_dense_params.append(source)
+            elif topic:
+                # Topic is stored in the source field for now (pending a
+                # dedicated topic column) -- same as beam._wm_search.
+                wm_dense_predicate = " AND wm.source = ?"
+                wm_dense_params.append(topic)
+            elif default_dense_source_filter:
                 wm_dense_predicate = (
                     " AND (wm.source IS NULL OR (wm.source <> 'conversation'"
                     " AND wm.source NOT LIKE 'honcho%'))"
@@ -471,7 +499,7 @@ class PolyphonicRecallEngine:
                       {wm_dense_predicate}
                     LIMIT ?
                     """,
-                    (now_iso, vec_limit),
+                    (now_iso, *wm_dense_params, vec_limit),
                 ).fetchall()
             except sqlite3.OperationalError:
                 wm_rows = []

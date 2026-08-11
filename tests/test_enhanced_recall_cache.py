@@ -76,6 +76,62 @@ def _close_memory(memory: BeamMemory | None) -> None:
         memory.conn.close()
 
 
+def test_legacy_v2_opaque_entry_not_reused_after_dense_predicate_schema_bump(
+    enhanced, tmp_path: Path
+):
+    """#696/#427 regression: the default dense candidate predicate changed
+    (dialog / honcho / consolidated exclusion), so an opaque cache entry
+    created under the pre-change v2 schema must never be reused — it could
+    still contain dialog, honcho or consolidated dense candidates."""
+    memory, calls = enhanced
+    snapshot = beam_module._resolve_recall_weights(None, None, None)
+    effective_kwargs = {
+        "vec_weight": snapshot.vec,
+        "fts_weight": snapshot.fts,
+        "importance_weight": snapshot.importance,
+    }
+    key = memory._enhanced_recall_cache_key(
+        original_query="alpha query",
+        expanded_query="alpha query",
+        top_k=40,
+        runtime=SimpleNamespace(cross_session=False),
+        use_weibull=False,
+        use_mmr=False,
+        use_intent=False,
+        use_synonyms=False,
+        use_associative=False,
+        associative_depth=1,
+        mmr_lambda=0.7,
+        recall_kwargs=effective_kwargs,
+        weights=snapshot.as_tuple(),
+    )
+    assert key.startswith("v3:"), (
+        "opaque cache schema must have been bumped to v3, got "
+        f"{key.split(':')[0]}"
+    )
+
+    # Plant a stale entry under the OLD opaque schema (same request
+    # material, legacy prefix) BEFORE the current v3 entry exists.
+    legacy_key = "v2:" + key[len("v3:"):]
+    memory._query_cache = QueryCache(db_path=tmp_path / "query_cache.db")
+    memory._query_cache.put_opaque(
+        legacy_key, [{"id": "stale-v2", "content": "old predicate result"}]
+    )
+
+    results = _call(memory, "alpha query")
+    assert len(calls) == 1, (
+        "base recall must run: the legacy v2 opaque entry must not be reused"
+    )
+    assert not any(r.get("id") == "stale-v2" for r in results), (
+        "pre-change v2 cache entry must never surface"
+    )
+
+    # And the current v3 entry IS a hit on the next identical call.
+    again = _call(memory, "alpha query")
+    assert len(calls) == 1, "identical request must hit the v3 opaque entry"
+    assert again == results
+
+
 def test_successful_invalidate_clears_persisted_enhanced_recall_cache(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
@@ -707,7 +763,7 @@ def test_successful_invalidate_episodic_memory_invalidates_enhanced_recall_cache
             _close_memory(memory)
 
 
-def test_v2_request_digest_is_opaque_persisted_and_exact_hits_once(enhanced):
+def test_v3_request_digest_is_opaque_persisted_and_exact_hits_once(enhanced):
     memory, calls = enhanced
 
     first = _call(memory, "private query", top_k=3)
@@ -719,9 +775,9 @@ def test_v2_request_digest_is_opaque_persisted_and_exact_hits_once(enhanced):
     rows = memory._query_cache._conn.execute("SELECT normalized FROM query_cache").fetchall()
     assert len(rows) == 1
     key = rows[0][0]
-    assert key.startswith("v2:")
-    assert len(key) == len("v2:") + 64
-    assert all(character in "0123456789abcdef" for character in key[3:])
+    assert key.startswith("v3:")
+    assert len(key) == len("v3:") + 64
+    assert all(character in "0123456789abcdef" for character in key[4:])
     assert "private query" not in key
     assert "session-a" not in key
     assert str(memory.db_path) not in key

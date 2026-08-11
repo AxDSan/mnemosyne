@@ -567,7 +567,8 @@ class TestReviewHardening:
         class _FakeEngine:
             def __init__(self, results):
                 self._results = results
-            def recall(self, *, query, query_embedding, top_k):
+            def recall(self, *, query, query_embedding, top_k,
+                       default_dense_source_filter=True, source=None, topic=None):
                 return self._results
 
         engine = _FakeEngine([

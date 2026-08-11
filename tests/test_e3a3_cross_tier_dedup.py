@@ -277,8 +277,11 @@ class _FakeEngine:
         self._results = results
         self.last_top_k = None
 
-    def recall(self, *, query, query_embedding, top_k):
+    def recall(self, *, query, query_embedding, top_k,
+               default_dense_source_filter=True, source=None, topic=None):
         self.last_top_k = top_k
+        self.last_source = source
+        self.last_topic = topic
         return self._results
 
 
