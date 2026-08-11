@@ -7,6 +7,10 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Polyphonic recall now injects raw conversation transcripts into Hermes prefetch (#696, #615, #677).** When `MNEMOSYNE_POLYPHONIC_RECALL=1`, the polyphonic engine only populated `score` (a small RRF `combined_score`) and `voice_scores` on its results, omitting the `keyword_score` / `fts_score` / `dense_score` fields the Hermes provider's prefetch filter (and its 0.20 score floor) reads. Raw `[USER]` working-memory rows were consequently scored ~0 and silently dropped from automatic prefetch. The polyphonic path now emits the standard per-signal scores on a linear-comparable 0-1 scale (with the existing veracity/tier multipliers applied), so raw conversation transcripts surface in prefetch under the polyphonic flag.
+
 ### Added
 
 - **MCP clients can now retire canonical facts with `mnemosyne_forget_canonical` (#723).** The tool is discoverable and callable by default over MCP; retirement removes the current slot from active recall while preserving it as history.
