@@ -2219,9 +2219,11 @@ def _effective_vec_type(conn: sqlite3.Connection, table: str = "vec_episodes") -
     return "float32"
 
 
-def _vec_insert(conn: sqlite3.Connection, rowid: int, embedding: List[float]):
+def _vec_insert(
+    conn: sqlite3.Connection, rowid: int, embedding: List[float], *, commit: bool = True
+):
     """Insert embedding into the episodic sqlite-vec table."""
-    _vec_table_insert(conn, "vec_episodes", rowid, embedding)
+    _vec_table_insert(conn, "vec_episodes", rowid, embedding, commit=commit)
 
 
 def _vec_table_insert(conn: sqlite3.Connection, table: str, rowid: int, embedding: List[float], *, commit: bool = True):
@@ -8222,7 +8224,9 @@ class BeamMemory:
                 # DELETE+INSERT to refresh.
                 if vec_available_now:
                     cursor.execute("DELETE FROM vec_episodes WHERE rowid = ?", (rowid,))
-                    _vec_insert(self.conn, rowid, np.asarray(vec[0]).tolist())
+                    _vec_insert(
+                        self.conn, rowid, np.asarray(vec[0]).tolist(), commit=False
+                    )
                 else:
                     cursor.execute("""
                         INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model)
@@ -8359,7 +8363,7 @@ class BeamMemory:
                     cursor.execute("ROLLBACK TO degrade_row")
                     cursor.execute("RELEASE degrade_row")
                 except Exception:
-                    logger.info("Regex extraction failed, skipping", exc_info=True)
+                    logger.info("degrade_episodic: rollback failed", exc_info=True)
 
         # --- Degrade tier 2 → tier 3: smart extraction (keep key entities) ---
         for row in tier2_rows:
@@ -8385,7 +8389,7 @@ class BeamMemory:
                     cursor.execute("ROLLBACK TO degrade_row")
                     cursor.execute("RELEASE degrade_row")
                 except Exception:
-                    logger.info("Regex extraction failed, skipping", exc_info=True)
+                    logger.info("degrade_episodic: rollback failed", exc_info=True)
 
         self.conn.commit()
         return results
