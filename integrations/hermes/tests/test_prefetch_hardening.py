@@ -380,3 +380,61 @@ def test_canonical_prefetch_respects_higher_distinctive_token_minimum(monkeypatc
     rows = _canonical_prefetch_rows(store, "default", "fragrant jasmine soup")
 
     assert rows == []
+
+
+def test_prefetch_injects_polyphonic_user_transcript():
+    """A raw [USER] conversation row returned by the polyphonic engine (which
+    carries only `voice_scores` provenance -- no linear keyword/fts/dense
+    fields and an RRF-scale `score`) is now injected by prefetch.
+
+    Regression: the adapter used to drop these on the missing per-signal
+    signal together with the 0.20 score floor, so raw conversation transcripts
+    never surfaced in prefetch under MNEMOSYNE_POLYPHONIC_RECALL=1."""
+    p = _provider([
+        {
+            "content": "[USER] carol said the norway news marker is on page two",
+            "source": "conversation",
+            "timestamp": "2026-08-11T09:00:00Z",
+            "importance": 0.5,
+            "score": 0.034,                       # RRF-scale combined score
+            "voice_scores": {"vector": 0.019, "temporal": 0.016},  # polyphonic
+            "trust_tier": "STATED",
+        },
+    ])
+
+    block = p.prefetch("norway news marker")
+
+    assert "norway news marker" in block
+
+
+def test_prefetch_excludes_foreign_polyphonic_row_without_lexical_evidence():
+    """"A polyphonic [USER] row from a foreign session/channel (no shared
+    topical terms with the query) must not be injected -- the adapter still
+    enforces the lexical gate for polyphonic results, so a relevant transcript
+    is injected while an unrelated one from another session/channel is kept
+    out."""
+    p = _provider([
+        {
+            "content": "[USER] carol said the norway news marker is on page two",
+            "source": "conversation",
+            "timestamp": "2026-08-11T09:00:00Z",
+            "importance": 0.5,
+            "score": 0.034,
+            "voice_scores": {"vector": 0.019, "temporal": 0.016},
+            "trust_tier": "STATED",
+        },
+        {
+            "content": "[USER] unrelated sentinelxyz chat about quantum logs",
+            "source": "conversation",
+            "timestamp": "2026-08-11T10:00:00Z",
+            "importance": 0.9,
+            "score": 0.05,
+            "voice_scores": {"graph": 0.02, "fact": 0.015},
+            "trust_tier": "STATED",
+        },
+    ])
+
+    block = p.prefetch("norway news marker")
+
+    assert "norway news marker" in block
+    assert "sentinelxyz" not in block

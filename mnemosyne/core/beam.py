@@ -6052,7 +6052,6 @@ class BeamMemory:
                 channel_id=channel_id,
                 veracity=veracity, memory_type=memory_type,
                 cross_session=cross_session,
-                importance_weight=importance_weight,
             )
             # [C4] Polyphonic path diagnostics. The linear-path recording
             # below (record_call / record_tier_hits at the end of recall())
@@ -7921,8 +7920,7 @@ class BeamMemory:
                            channel_id: Optional[str] = None,
                            veracity: Optional[str] = None,
                            memory_type: Optional[str] = None,
-                           cross_session: Optional[bool] = None,
-                           importance_weight: Optional[float] = None) -> List[Dict]:
+                           cross_session: Optional[bool] = None) -> List[Dict]:
         """[E5] Polyphonic recall path.
 
         Delegates to PolyphonicRecallEngine when MNEMOSYNE_POLYPHONIC_RECALL=1.
@@ -7987,58 +7985,9 @@ class BeamMemory:
                       "unknown": UNKNOWN_WEIGHT}
         tier_weight_map = {1: TIER1_WEIGHT, 2: TIER2_WEIGHT, 3: TIER3_WEIGHT}
 
-        # Emit the standard per-signal relevance fields nested consumers
-        # expect. The Hermes provider's prefetch filter thresholds on
-        # keyword_score / fts_score / dense_score (via _prefetch_topic_signal)
-        # and a 0.20 score floor; a raw RRF combined_score (~0.02-0.05) and
-        # voice_scores alone never satisfy it, so raw [USER] conversation
-        # transcripts were scored ~0 and silently dropped from prefetch when
-        # polyphonic recall was enabled. Recompute the same lexical / vector
-        # / recency signal the linear path uses so the scales match.
-        query_lower = query.lower()
-        query_tokens = _recall_tokens(query_lower)
-        # Resolve the importance weight through the same linear scoring
-        # contract, so a config or caller-provided weight affects both recall
-        # paths consistently (the polyphonic branch returns before recall()
-        # normalizes weights for the linear scorer).
-        _, _, poly_iw = _normalize_weights(None, None, importance_weight)
-        wm_vec_sims_map = {}
-
         final = []
         cursor = self.conn.cursor()
         now_iso = datetime.now(timezone.utc).isoformat()
-
-        # Bounded dense-similarity lookup scoped to the polyphonic candidate
-        # IDs only -- not a broad k=N vector search. Fetch just the candidates'
-        # embeddings and cosine-compare against the query vector, using the
-        # same memory_embeddings source as the linear path, so the fallback
-        # JSON scan never touches unrelated working-memory rows.
-        if query_embedding is not None and polyphonic_results:
-            try:
-                _cand_ids = [
-                    r.memory_id for r in polyphonic_results
-                    if not r.memory_id.startswith("cf_")
-                ]
-                if _cand_ids:
-                    _ph = ",".join("?" * len(_cand_ids))
-                    _emb_rows = cursor.execute(
-                        f"SELECT memory_id, embedding_json FROM memory_embeddings "
-                        f"WHERE memory_id IN ({_ph})",
-                        tuple(_cand_ids),
-                    ).fetchall()
-                    _qnorm = float(np.linalg.norm(query_embedding))
-                    for _mid, _ej in _emb_rows:
-                        try:
-                            _v = np.array(json.loads(_ej), dtype=np.float32)
-                            _vn = float(np.linalg.norm(_v))
-                            if _qnorm > 0 and _vn > 0:
-                                wm_vec_sims_map[_mid] = float(
-                                    np.dot(query_embedding, _v) / (_qnorm * _vn)
-                                )
-                        except Exception:
-                            continue
-            except Exception:
-                wm_vec_sims_map = {}
 
         for r in polyphonic_results:
             memory_id = r.memory_id
@@ -8076,41 +8025,6 @@ class BeamMemory:
 
             row_dict["score"] = score
             row_dict["voice_scores"] = dict(r.voice_scores)
-
-            # Emit linear-path-compatible per-signal scores and keep `score`
-            # on a comparable 0-1 scale so the Hermes prefetch filter (and any
-            # other relevance-thresholding consumer) can gate on them
-            # regardless of which recall engine produced the row.
-            _content = row_dict.get("content") or ""
-            _kw = _lexical_relevance(query_tokens, _content, query_lower)
-            _dense = wm_vec_sims_map.get(memory_id, 0.0)
-            _imp = min(max(float(row_dict.get("importance") or 0.0), 0.0), 1.0)
-            _decay = _recency_decay(row_dict.get("timestamp") or "")
-            _kw_share = (1.0 - poly_iw) * 0.6
-            _rc_share = (1.0 - poly_iw) * 0.4
-            _base = _kw * _kw_share + _imp * poly_iw + (_kw ** 2) * 0.08
-            if _dense > 0:
-                _base = _base * 0.80 + _dense * 0.20
-            _lin_score = _base * (_rc_share + (1.0 - _rc_share) * _decay)
-            # Apply the same veracity / tier multipliers the RRF score received
-            # so the linear-comparable score preserves the ordering semantics
-            # the engine path already composes (stated > unknown, tier decay).
-            if not _env_disabled("MNEMOSYNE_VERACITY_MULTIPLIER"):
-                _lin_score *= weight_map.get(
-                    row_dict.get("veracity") or "unknown", UNKNOWN_WEIGHT
-                )
-            if row_dict.get("tier") == "episodic":
-                _lin_score *= tier_weight_map.get(
-                    row_dict.get("degradation_tier") or 1, 1.0
-                )
-            row_dict["keyword_score"] = round(_kw, 4)
-            row_dict["fts_score"] = round(_kw, 4)
-            row_dict["dense_score"] = round(_dense, 4)
-            # Keep the RRF multi-voice ordering when it is stronger,
-            # otherwise let the linear relevance score carry the ordering so
-            # any relevance threshold sees a comparable 0-1 scale.
-            if row_dict["score"] < _lin_score:
-                row_dict["score"] = round(_lin_score, 4)
             final.append(row_dict)
             # No early-break: dedup needs to see all candidates before
             # truncation, otherwise a wm row dropped from top-K by an

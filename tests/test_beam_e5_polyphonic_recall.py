@@ -568,26 +568,19 @@ class TestE5ResultShape:
                 f"result has no content; engine didn't map row back: {r}"
             )
 
-    def test_polyphonic_results_emit_per_signal_scores(
+    def test_polyphonic_results_expose_voice_provenance(
         self, temp_db, monkeypatch, disable_llm
     ):
-        """Flag ON: polyphonic results emit the same per-signal
-        keyword/fts/dense scores (and a threshold-comparable `score`) as the
-        linear path.
-
-        The Hermes provider's prefetch filter gates on
-        keyword_score/fts_score/dense_score (via _prefetch_topic_signal) and a
-        0.20 score floor. When polyphonic recall was enabled the engine only
-        carried a tiny RRF `combined_score` and `voice_scores`, so raw [USER]
-        conversation transcripts were scored ~0 and silently dropped. Stubbing
-        the engine to return the seeded row deterministically forces the
-        scoring path to run, so we assert the emitted fields instead of letting
-        an empty result set pass vacuously."""
+        """Flag ON: polyphonic results expose `voice_scores` provenance -- the
+        field the Hermes prefetch adapter keys its eligibility on -- instead of
+        the linear per-signal keyword/fts/dense fields. Stubbing the engine
+        makes this non-vacuous: the seeded row is returned and must carry
+        polyphonic voice keys so downstream adapters can detect it as an
+        engine-ranked result rather than dropping it for the missing fields."""
         monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
-        beam = BeamMemory(session_id="e5-signals", db_path=temp_db)
-        marker = "e5signalsmarkerabc"
+        beam = BeamMemory(session_id="e5-voice", db_path=temp_db)
         seed_id = beam.remember(
-            f"[USER] carol mentioned the {marker} deploy today",
+            "[USER] carol discussed the voiceprovenancemarker deploy today",
             source="conversation", importance=0.5,
         )
 
@@ -596,65 +589,16 @@ class TestE5ResultShape:
         class _StubEngine:
             def recall(self, query, query_embedding=None, top_k=10):
                 return [PolyphonicResult(
-                    memory_id=seed_id, combined_score=0.5,
-                    voice_scores={"vector": 0.9}, metadata={},
+                    memory_id=seed_id, combined_score=0.035,
+                    voice_scores={"vector": 0.019, "temporal": 0.016},
+                    metadata={},
                 )]
 
         monkeypatch.setattr(beam, "_get_polyphonic_engine", lambda: _StubEngine())
-
-        results = beam.recall(f"the {marker} deploy", top_k=10)
-        marker_row = next((r for r in results if r["id"] == seed_id), None)
-        assert marker_row is not None, (
-            "stubbed engine returned the seed but mapping/filters dropped it; "
-            f"got {[r['content'] for r in results]}"
-        )
-        for field in ("keyword_score", "fts_score", "dense_score"):
-            assert field in marker_row, f"polyphonic result missing {field}"
-            assert isinstance(marker_row[field], (int, float))
-        assert marker_row["keyword_score"] > 0, f"keyword_score not positive: {marker_row}"
-        assert marker_row["fts_score"] > 0, f"fts_score not positive: {marker_row}"
-        assert marker_row["score"] >= 0.20, (
-            f"score below the prefetch floor (0.20): {marker_row}"
-        )
-
-    def test_polyphonic_per_signal_score_preserves_veracity_ordering(
-        self, temp_db, monkeypatch, disable_llm
-    ):
-        """Flag ON: the linear-comparable score still applies the veracity
-        multiplier, so a 'stated' row outranks an equally-relevant 'unknown'
-        row on the polyphonic path (regression for v1 dropping veracity)."""
-        monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
-        beam = BeamMemory(session_id="e5-veracity", db_path=temp_db)
-        marker = "e5veracitymarkerabc"
-        stated_id = beam.remember(
-            f"carol finalized the {marker} plan", source="conversation",
-            importance=0.5, veracity="stated",
-        )
-        unknown_id = beam.remember(
-            f"dave discussed the {marker} plan", source="conversation",
-            importance=0.5, veracity="unknown",
-        )
-
-        from mnemosyne.core.polyphonic_recall import PolyphonicResult
-
-        class _StubEngine:
-            def recall(self, query, query_embedding=None, top_k=10):
-                return [
-                    PolyphonicResult(memory_id=stated_id, combined_score=0.5,
-                                     voice_scores={"vector": 0.9}, metadata={}),
-                    PolyphonicResult(memory_id=unknown_id, combined_score=0.5,
-                                     voice_scores={"vector": 0.9}, metadata={}),
-                ]
-
-        monkeypatch.setattr(beam, "_get_polyphonic_engine", lambda: _StubEngine())
-
-        results = beam.recall(f"the {marker} plan", top_k=10)
-        by_id = {r["id"]: r for r in results}
-        assert stated_id in by_id and unknown_id in by_id, (
-            f"both seeded rows should surface: {list(by_id)}"
-        )
-        assert by_id[stated_id]["score"] > by_id[unknown_id]["score"], (
-            "stated row should outrank unknown row (veracity multiplier applied "
-            f"to the linear-comparable score): "
-            f"stated={by_id[stated_id]['score']} unknown={by_id[unknown_id]['score']}"
+        results = beam.recall("voiceprovenancemarker", top_k=10)
+        row = next((r for r in results if r["id"] == seed_id), None)
+        assert row is not None, f"stub row missing from recall: {results}"
+        vs = row.get("voice_scores", {})
+        assert set(vs) & {"vector", "graph", "fact", "temporal"}, (
+            f"expected polyphonic voice provenance in voice_scores, got {vs}"
         )
