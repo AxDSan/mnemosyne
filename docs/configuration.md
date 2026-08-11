@@ -204,9 +204,9 @@ MNEMOSYNE_EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L
 MNEMOSYNE_EMBEDDING_MODEL=intfloat/multilingual-e5-base
 ```
 
-The embedding dimension resolves in this order: an explicit `MNEMOSYNE_EMBEDDING_DIM` (positive integer) takes precedence for every model; otherwise the built-in table below provides known dimensions; an unknown model with no explicit dimension **fails loudly at startup** rather than silently assuming 384. Blank/whitespace-only `MNEMOSYNE_EMBEDDING_DIM` is treated as unset (common in Docker Compose and `.env` files).
+The embedding dimension resolves in this order: a non-empty explicit `MNEMOSYNE_EMBEDDING_DIM` (positive integer) takes precedence for every model; otherwise Mnemosyne uses its built-in mappings, including the examples below; an unknown model with no explicit dimension **fails loudly at startup** rather than silently assuming 384. Blank/whitespace-only `MNEMOSYNE_EMBEDDING_DIM` is treated as unset (common in Docker Compose and `.env` files).
 
-Supported models with known dimensions:
+Examples of models with built-in dimension mappings (not an exhaustive model catalog):
 
 | Model | Dims | Language |
 |---|---|---|
@@ -226,13 +226,36 @@ Supported models with known dimensions:
 | `openai/text-embedding-3-small` | 1,536 | API |
 | `openai/text-embedding-3-large` | 3,072 | API |
 
-For models not in the table (e.g. `mxbai-embed-large` via a custom endpoint), set the dimension explicitly:
+For an unknown or custom model (for example, `mxbai-embed-large` via a custom endpoint), set a non-empty explicit dimension only when you know its actual output dimension:
 
 ```bash
-MNEMOSYNE_EMBEDDING_DIM=768
+MNEMOSYNE_EMBEDDING_DIM=<actual-output-dimension>
 ```
 
-> **Warning:** Changing the embedding model after data has been stored will cause a dimension mismatch. The vec0 virtual table is locked to the dimension it was created with. **Stores created under the old silent-384 fallback**: setting the model's true dimension can trigger the existing dimension-mismatch guard, so operators may need the documented reindex/recovery path rather than treating the override as a one-step fix.
+> **Warning:** Changing the embedding model after data has been stored requires a reindex, even when the old and new models have the same dimension: their embedding spaces are incompatible. When dimensions differ, the vec0 virtual table is also locked to the dimension it was created with. **Stores created under the old silent-384 fallback**: setting the model's true dimension can trigger the existing dimension-mismatch guard, so use the reindex path below rather than treating the override as a one-step fix.
+
+#### Changing an embedding model safely
+
+1. Persist `MNEMOSYNE_EMBEDDING_MODEL` with the target model in the deployment configuration, so it survives restarts. If `MNEMOSYNE_EMBEDDING_DIM` is non-empty, persist the intended explicit dimension there too; for an unknown or custom model, use it only when you know the model's actual output dimension.
+2. Stop the provider or gateway before reindexing to avoid concurrent writers.
+3. Before invoking any reindex command, run the CLI from the same persisted deployment environment/configuration that the provider or gateway will use after restart—or load/export that exact configuration into the admin shell. Confirm both the target model and any explicit `MNEMOSYNE_EMBEDDING_DIM` are the post-restart values.
+4. Inspect the non-mutating rebuild plan:
+
+   ```bash
+   mnemosyne reindex --model <target-model> --dry-run
+   ```
+
+   It **must** report the intended model and intended dimension. Do **not** run `--yes` if either differs from the post-restart configuration.
+5. Run the rebuild only after that check passes:
+
+   ```bash
+   mnemosyne reindex --model <target-model> --yes
+   ```
+
+   The CLI creates a backup by default, re-embeds working and episodic memory, and rebuilds sqlite-vec tables at the dimension selected by that effective configuration. `--model` affects only that invocation; it does not override an explicit `MNEMOSYNE_EMBEDDING_DIM`. Therefore, the target sqlite-vec dimension is not determined by the `--model` name alone.
+6. Restart the provider or gateway and smoke-test recall.
+
+See [Health and repair](cli-reference.md#health-and-repair) for the `reindex` command and flag reference.
 
 ## LLM Consolidation
 
