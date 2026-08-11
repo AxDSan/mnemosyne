@@ -253,7 +253,7 @@ MNEMOSYNE_EMBEDDING_DIM=<actual-output-dimension>
    ```
 
    The CLI creates a backup by default, re-embeds working and episodic memory, and, when sqlite-vec is available, rebuilds its tables at the dimension selected by that effective configuration. `--model` affects only that invocation; it does not override an explicit `MNEMOSYNE_EMBEDDING_DIM`. Therefore, the target sqlite-vec dimension is not determined by the `--model` name alone.
-6. Restart the provider or gateway and verify recall for both working and episodic memory through the deployment's configured retrieval path.
+6. Restart the provider or gateway and verify recall for both working and episodic memory through the deployment's configured retrieval path. When sqlite-vec is available, also verify vector-backed recall for both tiers.
 
 See [Health and repair](cli-reference.md#health-and-repair) for the `reindex` command and flag reference.
 
