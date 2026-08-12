@@ -352,3 +352,89 @@ def test_max_candidates_exact_not_truncated(temp_db, monkeypatch, disable_llm):
     res = A.resolve_cross_session_conflicts(max_candidates=1)
     assert res["rows_scanned"] == 1
     assert res["candidates_truncated"] is False
+
+
+def _insert_episodic_dup(A, mem_id, content):
+    """Insert an episodic row that reuses a working-memory id (id collision
+    across banks: `id` is only unique per bank)."""
+    now = datetime.now().isoformat()
+    A.conn.execute(
+        "INSERT INTO episodic_memory "
+        "(id, content, source, timestamp, session_id, importance, metadata_json,"
+        " summary_of, valid_until, superseded_by, scope, recall_count,"
+        " last_recalled, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (mem_id, content, "conversation", now, "tA", 0.7, "{}", None,
+         None, None, "global", 0, None, now),
+    )
+    A.conn.commit()
+
+
+def test_max_llm_validations_negative_normalized(temp_db, monkeypatch, disable_llm):
+    """A negative `max_llm_validations` override is clamped to >= 1 so it does
+    not trigger the cap immediately and still permits LLM-confirmed resolution."""
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    import mnemosyne.core.llm_conflict_detector as lcd
+    monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+
+    A = BeamMemory(session_id="tA", db_path=temp_db)
+    ids = [A.remember(f"[USER] favorite color variant {i}", source="conversation",
+                      importance=0.7, scope="global") for i in range(2)]
+    A._detect_conflicts = (
+        lambda items, similarity_threshold=0.88, min_gap_hours=1.0: [(ids[0], ids[1])]
+    )
+    calls = {"n": 0}
+    monkeypatch.setattr(
+        lcd, "validate_conflict_pair",
+        lambda older, newer, session_id=None, db_path=None: (
+            calls.__setitem__("n", calls["n"] + 1) or (True, 0.9, "new")
+        ),
+    )
+    res = A.resolve_cross_session_conflicts(max_llm_validations=-5)
+    assert calls["n"] == 1, "negative cap must clamp to at least 1 validation"
+    assert res["invalidated"] == 1
+    assert res["llm_cap_reached"] is False
+
+
+def test_invalidate_respects_bank(temp_db, disable_llm):
+    """`invalidate(..., bank=...)` supersedes only the named bank's row even when
+    an identical id exists in the other bank."""
+    A = BeamMemory(session_id="tA", db_path=temp_db)
+    stale = A.remember("[USER] favorite color is blue", source="conversation",
+                       importance=0.7, scope="global")
+    repl = A.remember("[USER] favorite color is green now", source="conversation",
+                      importance=0.7, scope="global")
+    _insert_episodic_dup(A, stale, "[USER] favorite color is blue")
+
+    assert A.invalidate(stale, replacement_id=repl, bank="episodic_memory") is True
+    w = A.conn.execute(
+        "SELECT superseded_by FROM working_memory WHERE id = ?", (stale,)
+    ).fetchone()
+    e = A.conn.execute(
+        "SELECT superseded_by FROM episodic_memory WHERE id = ?", (stale,)
+    ).fetchone()
+    assert w[0] is None, "bank binding must not supersede the working copy"
+    assert e[0] == repl, "the episodic copy must be superseded"
+
+
+def test_duplicate_id_across_banks_not_cross_resolved(temp_db, monkeypatch, disable_llm):
+    """A duplicate id across banks makes the detector's pair ambiguous: the
+    resolver must not cross-supersede the other bank's row."""
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    A = BeamMemory(session_id="tA", db_path=temp_db)
+    blue = A.remember("[USER] favorite color is blue", source="conversation",
+                      importance=0.7, scope="global")
+    green = A.remember("[USER] favorite color is green now", source="conversation",
+                       importance=0.7, scope="global")
+    _insert_episodic_dup(A, blue, "[USER] favorite color is blue")
+    A._detect_conflicts = _stub_detect_pair(blue, green)
+
+    res = A.resolve_cross_session_conflicts()
+    assert res["status"] == "no_op"
+    assert res["invalidated"] == 0
+    w = A.conn.execute(
+        "SELECT superseded_by FROM working_memory WHERE id = ?", (blue,)
+    ).fetchone()
+    e = A.conn.execute(
+        "SELECT superseded_by FROM episodic_memory WHERE id = ?", (blue,)
+    ).fetchone()
+    assert w[0] is None and e[0] is None, "ambiguous duplicate id must not cross-supersede"

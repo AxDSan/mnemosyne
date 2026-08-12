@@ -4541,12 +4541,21 @@ class BeamMemory:
                 operation, type(exc).__name__, exc,
             )
 
-    def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
+    def invalidate(self, memory_id: str, replacement_id: str = None,
+                   bank: Optional[str] = None) -> bool:
         """
         Mark a memory as invalid/superseded.
         If replacement_id is provided, sets superseded_by.
         Otherwise sets valid_until to now (immediate expiry).
+
+        `bank` binds the supersession to a single table (`working_memory` or
+        `episodic_memory`) when id values are shared across banks: without it,
+        the target is resolved working-first, which can supersede the wrong
+        bank's row when a duplicate id exists in both. `None` preserves the
+        existing working-first behavior.
         """
+        if bank is not None and bank not in ("working_memory", "episodic_memory"):
+            raise ValueError(f"invalid bank: {bank!r}")
         cursor = self.conn.cursor()
         if replacement_id:
             if replacement_id == memory_id:
@@ -4579,6 +4588,14 @@ class BeamMemory:
                     return False
 
                 now = datetime.now(timezone.utc).isoformat()
+                if bank is not None:
+                    cursor.execute(
+                        f"UPDATE {bank} "
+                        f"SET valid_until = ?, superseded_by = ? "
+                        f"WHERE id = ? AND (session_id = ? OR scope = 'global')",
+                        (now, replacement_id, memory_id, self.session_id),
+                    )
+                    return cursor.rowcount > 0
                 cursor.execute("""
                     UPDATE working_memory
                     SET valid_until = ?, superseded_by = ?
@@ -4603,27 +4620,24 @@ class BeamMemory:
             return invalidated
 
         now = datetime.now(timezone.utc).isoformat()
-        # Try working_memory first
-        cursor.execute("""
-            UPDATE working_memory
-            SET valid_until = ?, superseded_by = ?
-            WHERE id = ? AND (session_id = ? OR scope = 'global')
-        """, (now, replacement_id, memory_id, self.session_id))
-        if cursor.rowcount > 0:
-            self.conn.commit()
-            self._invalidate_query_cache()
-            return True
-        # Try episodic_memory
-        cursor.execute("""
-            UPDATE episodic_memory
-            SET valid_until = ?, superseded_by = ?
-            WHERE id = ? AND (session_id = ? OR scope = 'global')
-        """, (now, replacement_id, memory_id, self.session_id))
-        invalidated = cursor.rowcount > 0
+        # With a bank binding, touch only that table; otherwise try
+        # working_memory first, then episodic_memory.
+        targets = (bank,) if bank is not None else ("working_memory", "episodic_memory")
+        for table in targets:
+            cursor.execute(
+                f"""UPDATE {table}
+                    SET valid_until = ?, superseded_by = ?
+                    WHERE id = ? AND (session_id = ? OR scope = 'global')
+                """,
+                (now, replacement_id, memory_id, self.session_id),
+            )
+            if cursor.rowcount > 0:
+                self.conn.commit()
+                self._invalidate_query_cache()
+                return True
         self.conn.commit()
-        if invalidated:
-            self._invalidate_query_cache()
-        return invalidated
+        self._invalidate_query_cache()
+        return False
 
     def _embedding_map(self, memory_ids: List[str]) -> Dict[str, np.ndarray]:
         """Load float32 embeddings for memory ids.
