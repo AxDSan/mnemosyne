@@ -9,6 +9,7 @@ Model cache: ~/.hermes/mnemosyne/models/
 Default model: openbmb/MiniCPM5-1B-GGUF (Q4_K_M, ~656MB)
 """
 
+import logging
 import os
 import sys
 import re
@@ -19,6 +20,8 @@ from typing import List, Optional
 DEFAULT_MODEL_REPO = "openbmb/MiniCPM5-1B-GGUF"
 DEFAULT_MODEL_FILE = "MiniCPM5-1B-Q4_K_M.gguf"
 MODEL_CACHE_DIR = Path.home() / ".hermes" / "mnemosyne" / "models"
+
+logger = logging.getLogger(__name__)
 
 LLM_ENABLED = os.environ.get("MNEMOSYNE_LLM_ENABLED", "true").lower() in ("1", "true", "yes")
 LLM_MAX_TOKENS=int(os.environ.get("MNEMOSYNE_LLM_MAX_TOKENS", "2048") or "2048")
@@ -114,6 +117,21 @@ def _download_model() -> Path:
             "huggingface_hub not installed. Run: pip install huggingface-hub"
         )
 
+    default_artifact = (
+        DEFAULT_MODEL_REPO == "openbmb/MiniCPM5-1B-GGUF"
+        and DEFAULT_MODEL_FILE == "MiniCPM5-1B-Q4_K_M.gguf"
+    )
+    size_notice = " (approximately 656 MB)" if default_artifact else ""
+    logger.warning(
+        "Downloading local LLM model %s from %s%s to %s. "
+        "The current operation will block until the download completes. "
+        "Set MNEMOSYNE_LLM_ENABLED=false for AAAK-only consolidation, "
+        "or pre-cache the GGUF to avoid this download.",
+        DEFAULT_MODEL_FILE,
+        DEFAULT_MODEL_REPO,
+        size_notice,
+        MODEL_CACHE_DIR,
+    )
     downloaded = hf_hub_download(
         repo_id=DEFAULT_MODEL_REPO,
         filename=DEFAULT_MODEL_FILE,

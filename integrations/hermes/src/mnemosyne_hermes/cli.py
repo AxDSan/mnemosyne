@@ -5,15 +5,74 @@ Available via: hermes mnemosyne <subcommand>
 
 from __future__ import annotations
 
-import json
 import importlib.metadata
+import json
 import os
+import sqlite3
 from pathlib import Path
 
 _BANK_HELP = (
     "Mnemosyne bank to operate on. Defaults to the active Hermes profile's bank "
     "when profile_isolation is enabled, otherwise the shared default bank."
 )
+
+# Persistent table columns read unconditionally by Mnemosyne's JSON exporter:
+# Mnemosyne.export_to_file(), BeamMemory.export_to_dict(), and the TripleStore,
+# AnnotationStore, and CanonicalStore export_all() methods. Checking this
+# contract through SQLite's read-only URI gives selected banks a fail-closed
+# boundary before constructing Beam/Mnemosyne (whose schema setup is intentionally
+# write-capable). It deliberately excludes optional sync and vector storage.
+_EXPORT_REQUIRED_COLUMNS = {
+    "working_memory": frozenset({
+        "id", "content", "source", "timestamp", "session_id", "importance",
+        "metadata_json", "valid_until", "superseded_by", "scope", "recall_count",
+        "last_recalled", "created_at", "veracity", "consolidated_at",
+        "consolidation_claimed_at",
+    }),
+    "episodic_memory": frozenset({
+        "id", "content", "source", "timestamp", "session_id", "importance",
+        "metadata_json", "summary_of", "valid_until", "superseded_by", "scope",
+        "recall_count", "last_recalled", "created_at",
+    }),
+    "scratchpad": frozenset({"id", "content", "session_id", "created_at", "updated_at"}),
+    "consolidation_log": frozenset({
+        "id", "session_id", "items_consolidated", "summary_preview", "created_at",
+    }),
+    "memories": frozenset({
+        "id", "content", "source", "timestamp", "session_id", "importance",
+        "metadata_json", "created_at",
+    }),
+    "memory_embeddings": frozenset({"memory_id", "embedding_json", "model", "created_at"}),
+    "triples": frozenset({
+        "id", "subject", "predicate", "object", "valid_from", "valid_until",
+        "source", "confidence", "created_at",
+    }),
+    "annotations": frozenset({
+        "id", "memory_id", "kind", "value", "source", "confidence", "created_at",
+    }),
+    "canonical_facts": frozenset({
+        "id", "owner_id", "category", "name", "body", "source", "confidence",
+        "version", "valid_from", "valid_until", "created_at",
+    }),
+}
+_EXPORT_REQUIRED_TABLES = frozenset(_EXPORT_REQUIRED_COLUMNS)
+# Distinct from ``None``: ``None`` is the valid shared/default-bank selection.
+_BANK_RESOLUTION_FAILED = object()
+
+
+def _export_schema_is_complete_read_only(db_path: Path) -> bool:
+    """Check selected export tables and read columns without opening it writable."""
+    db_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    conn = sqlite3.connect(db_uri, uri=True)
+    try:
+        for table, required_columns in _EXPORT_REQUIRED_COLUMNS.items():
+            # Table names are from the local fixed contract, not user input.
+            columns = {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
+            if not required_columns <= columns:
+                return False
+    finally:
+        conn.close()
+    return True
 
 
 def _distribution_version(distribution: str) -> str:
@@ -127,7 +186,8 @@ def _resolve_cli_bank(args, cmd):
          (mirrors the provider's HERMES_HOME-basename fallback)
       3. ``None`` -> default/legacy bank (unchanged behavior)
 
-    Never raises: any failure falls back to ``None`` (the default bank).
+    Never raises: resolution failures use a private sentinel so named exports
+    can fail closed rather than silently selecting the default bank.
     """
     try:
         MnemosyneMemoryProvider = _get_provider_class()
@@ -137,7 +197,15 @@ def _resolve_cli_bank(args, cmd):
             explicit = getattr(args, "bank", None)
             if explicit:
                 bank = sanitize(explicit)
-                return bank if bank != "default" else None
+                if (
+                    cmd == "export"
+                    and bank == "default"
+                    and str(explicit).strip().lower() != "default"
+                ):
+                    return _BANK_RESOLUTION_FAILED
+                if bank == "default":
+                    return "default" if cmd == "export" else None
+                return bank
 
         hermes_home = os.environ.get("HERMES_HOME", "")
         if not hermes_home or not _profile_isolation_enabled(hermes_home):
@@ -148,7 +216,7 @@ def _resolve_cli_bank(args, cmd):
         bank = sanitize(basename)
         return bank if bank != "default" else None
     except Exception:
-        return None
+        return _BANK_RESOLUTION_FAILED if cmd == "export" else None
 
 
 def mnemosyne_command(args):
@@ -163,22 +231,10 @@ def mnemosyne_command(args):
         print(f"Mnemosyne Hermes {_distribution_version('mnemosyne-hermes')}")
         return 0
 
-    # Register Hermes host LLM backend so sleep uses Hermes' provider.
-    # Use a try/except fallback chain: the relative import works when loaded
-    # as part of the mnemosyne_hermes package; the absolute import is needed
-    # when this module is loaded standalone (e.g. Hermes user-plugin
-    # discovery via importlib.util.spec_from_file_location, which does not
-    # set up the parent package — breaking relative imports silently).
-    try:
-        try:
-            from .hermes_llm_adapter import register_hermes_host_llm
-        except ImportError:
-            from mnemosyne_hermes.hermes_llm_adapter import register_hermes_host_llm
-        register_hermes_host_llm()
-    except Exception:
-        pass
-
     bank = _resolve_cli_bank(args, cmd)
+    if cmd == "export" and bank is _BANK_RESOLUTION_FAILED:
+        print("Bank resolution failed")
+        return 1
 
     # Reject unknown named banks BEFORE touching the filesystem. Mnemosyne(bank=)
     # would otherwise lazily create an empty bank directory + DB on first access
@@ -203,6 +259,39 @@ def mnemosyne_command(args):
             # clean error, never escape as a raw traceback.
             print(f"Bank validation failed: {e}")
             return 1
+
+    if cmd == "export" and bank:
+        try:
+            from mnemosyne.core.banks import get_bank_db_path_read_only
+            db_path = get_bank_db_path_read_only(bank)
+            if not db_path.is_file():
+                print(f"Bank not found: {bank}")
+                return 1
+            if not _export_schema_is_complete_read_only(db_path):
+                print(f"Bank schema incomplete: {bank}")
+                return 1
+        except (FileNotFoundError, ValueError):
+            # Named exports require an existing bank database before the beam
+            # or output path can be initialized.
+            print(f"Bank not found: {bank}")
+            return 1
+        except Exception:
+            print("Bank validation failed")
+            return 1
+
+    # Register Hermes host LLM only after export validation. A rejected named
+    # export must not alter host-level runtime state before it exits fail-closed.
+    # Use a try/except fallback chain: the relative import works when loaded
+    # as part of the mnemosyne_hermes package; the absolute import is needed
+    # when this module is loaded standalone via importlib discovery.
+    try:
+        try:
+            from .hermes_llm_adapter import register_hermes_host_llm
+        except ImportError:
+            from mnemosyne_hermes.hermes_llm_adapter import register_hermes_host_llm
+        register_hermes_host_llm()
+    except Exception:
+        pass
 
     try:
         if bank:
@@ -260,7 +349,7 @@ def mnemosyne_command(args):
         # Unknown-bank guard now runs before the beam is built (see top of
         # mnemosyne_command), so bank is guaranteed to exist here.
         try:
-            from mnemosyne.diagnose import run_diagnostics, auto_fix
+            from mnemosyne.diagnose import auto_fix, run_diagnostics
             result = run_diagnostics(bank=bank)
             resolved_bank = bank or "default"
             print("\nMnemosyne Diagnostics")
@@ -299,7 +388,7 @@ def mnemosyne_command(args):
             return 1
         try:
             from mnemosyne.core.memory import Mnemosyne
-            mem = Mnemosyne(session_id="hermes_default")
+            mem = Mnemosyne(session_id="hermes_default", bank=bank)
             result = mem.export_to_file(output_path)
             print(f"Exported {result['working_memory_count']} working, {result['episodic_memory_count']} episodic, {result['legacy_memories_count']} legacy, {result['triples_count']} triples to {output_path}")
         except Exception as e:
