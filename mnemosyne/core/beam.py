@@ -9487,24 +9487,6 @@ class BeamMemory:
         if not dry_run:
             self._deduplicate_memoria_cross_session()
 
-        # Cross-session global contradiction resolution (opt-in, default off).
-        if _cross_session_conflict_resolution_enabled():
-            try:
-                _cs = self.resolve_cross_session_conflicts(dry_run=dry_run)
-                cross_session = {
-                    "pairs_flagged": int(_cs.get("pairs_flagged", 0)),
-                    "conflicts_resolved": int(_cs.get("conflicts_resolved", 0)),
-                    "invalidated": int(_cs.get("invalidated", 0)),
-                }
-            except Exception as exc:
-                logger.error(
-                    "sleep_all_sessions: cross-session resolution failed: %s",
-                    exc, exc_info=True,
-                )
-                cross_session = {"error": repr(exc)}
-        else:
-            cross_session = {"pairs_flagged": 0, "conflicts_resolved": 0, "invalidated": 0}
-
         return {
             "status": "dry_run" if dry_run else ("consolidated" if items_consolidated else "no_op"),
             "sessions_scanned": len(session_rows),
@@ -9518,7 +9500,6 @@ class BeamMemory:
                 "proposals": model_refresh_proposals,
                 "applied": model_refresh_applied,
             },
-            "cross_session": cross_session,
             "session_results": session_results,
             "degradation": degrade_result
         }
@@ -9529,7 +9510,7 @@ class BeamMemory:
         min_gap_hours: Optional[float] = None,
     ) -> Dict:
         """Resolve factual contradictions among global-scope memories across
-        sessions (the cross-session step of `sleep_all_sessions`).
+        sessions, exposed as an on-demand, operator-invoked tool.
 
         Selects not-superseded `scope='global'` rows from BOTH working_memory
         and episodic_memory across all sessions, groups them by source, runs the
@@ -9545,6 +9526,12 @@ class BeamMemory:
 
         Session-private rows are never considered (they cannot be seen
         cross-thread), so session isolation is preserved.
+
+        This is phase one of the cross-session resolution work: candidate
+        reporting (`dry_run=True`) and explicit apply (`dry_run=False`). An
+        automatic invocation from `sleep_all_sessions` is deliberately deferred
+        to a follow-up PR, so resolution only ever happens on an explicit
+        operator action.
 
         Gated by ``MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION`` (default off);
         when disabled this returns a no-op result.
