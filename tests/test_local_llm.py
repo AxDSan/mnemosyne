@@ -769,30 +769,61 @@ class TestModelCacheDirOverride:
             assert str(module.MODEL_CACHE_DIR) == "/tmp/models "
 
     def test_module_state_is_restored_after_the_override_is_unset(self, monkeypatch):
-        """The reload dance must not leak a stale path into later tests."""
+        """The reload dance must not leak a stale path into later tests.
+
+        Compared against the state captured before the context rather than the
+        built-in default, so the assertion holds when the developer running the
+        suite has MNEMOSYNE_MODEL_CACHE_DIR set in their own environment.
+        """
+        before = (local_llm.MODEL_CACHE_DIR, local_llm.MODEL_CACHE_DIR_FROM_ENV)
+
         with _model_cache_env(monkeypatch, "/tmp/leak-check") as module:
             assert module.MODEL_CACHE_DIR == Path("/tmp/leak-check")
-        assert local_llm.MODEL_CACHE_DIR == self._DEFAULT
-        assert local_llm.MODEL_CACHE_DIR_FROM_ENV is False
+
+        assert (local_llm.MODEL_CACHE_DIR, local_llm.MODEL_CACHE_DIR_FROM_ENV) == before
 
     def test_module_state_is_restored_when_the_body_raises(self, monkeypatch):
         """A failing assertion must not leak the overridden path either."""
+        before = (local_llm.MODEL_CACHE_DIR, local_llm.MODEL_CACHE_DIR_FROM_ENV)
+
         with pytest.raises(RuntimeError, match="boom"):
             with _model_cache_env(monkeypatch, "/tmp/raises") as module:
                 assert module.MODEL_CACHE_DIR == Path("/tmp/raises")
                 raise RuntimeError("boom")
 
-        assert local_llm.MODEL_CACHE_DIR == self._DEFAULT
-        assert local_llm.MODEL_CACHE_DIR_FROM_ENV is False
+        assert (local_llm.MODEL_CACHE_DIR, local_llm.MODEL_CACHE_DIR_FROM_ENV) == before
 
-    def test_lookup_and_download_both_use_the_override(self, monkeypatch, tmp_path):
+    def test_resolution_is_import_time_not_call_time(self, monkeypatch, tmp_path):
+        """Changing the variable after import must not move the cache.
+
+        Without this, a call-time implementation that re-read os.environ on every
+        access would satisfy every other test here, and the spec is explicit that
+        resolution happens at import.
+        """
+        chosen = tmp_path / "at-import"
+
+        with _model_cache_env(monkeypatch, str(chosen)) as module:
+            assert module.MODEL_CACHE_DIR == chosen
+
+            # Nested so the change is undone before the restoring reload runs.
+            with monkeypatch.context() as later:
+                later.setenv("MNEMOSYNE_MODEL_CACHE_DIR", str(tmp_path / "too-late"))
+                assert module.MODEL_CACHE_DIR == chosen
+                assert module._model_path() is None  # looks under chosen, not too-late
+                chosen.mkdir(parents=True)
+                (chosen / module.DEFAULT_MODEL_FILE).write_bytes(b"gguf")
+                assert module._model_path() == chosen / module.DEFAULT_MODEL_FILE
+
+    def test_lookup_and_download_both_use_the_override(
+        self, monkeypatch, tmp_path, caplog
+    ):
         """One directory for the cached-file check, the mkdir and hf_hub_download."""
         relocated = tmp_path / "elsewhere"
         self._select(monkeypatch, relocated)
-        recorded = {}
+        calls = []
 
         def fake_download(**kwargs):
-            recorded.update(kwargs)
+            calls.append(kwargs)
             target = Path(kwargs["local_dir"]) / kwargs["filename"]
             target.write_bytes(b"gguf")
             return str(target)
@@ -801,13 +832,26 @@ class TestModelCacheDirOverride:
             sys.modules, "huggingface_hub", MagicMock(hf_hub_download=fake_download)
         )
 
-        got = local_llm._download_model()
+        with caplog.at_level(logging.WARNING, logger=local_llm.__name__):
+            got = local_llm._download_model()
 
-        assert recorded["local_dir"] == str(relocated)
+        assert calls[0]["local_dir"] == str(relocated)
         assert got.parent == relocated
         assert relocated.is_dir()
-        # And the lookup agrees, so a second call short-circuits.
+        # The pre-download notice must name where the model is actually going.
+        assert str(relocated) in caplog.records[0].getMessage()
+
+        # The lookup agrees, and a second call short-circuits on the cached file
+        # rather than downloading again. Calling _download_model() rather than
+        # _model_path() is the point: it exercises the existing-file branch.
         assert local_llm._model_path() == relocated / local_llm.DEFAULT_MODEL_FILE
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=local_llm.__name__):
+            again = local_llm._download_model()
+        assert again == got
+        assert len(calls) == 1
+        assert caplog.records == []
+
 
     def test_uncreatable_override_fails_naming_the_variable_and_path(
         self, monkeypatch, tmp_path, caplog
@@ -824,11 +868,14 @@ class TestModelCacheDirOverride:
         for expected in ("MNEMOSYNE_MODEL_CACHE_DIR", str(blocker / "models")):
             assert expected in str(excinfo.value)
         # Logged as well as raised: _load_llm swallows the exception, so the
-        # raise alone would never reach the user.
-        assert any("MNEMOSYNE_MODEL_CACHE_DIR" in r.getMessage() for r in caplog.records)
+        # raise alone would never reach the user. Both facts must survive the
+        # trip through the logger, not just the variable name.
+        logged = caplog.records[0].getMessage()
+        assert "MNEMOSYNE_MODEL_CACHE_DIR" in logged
+        assert str(blocker / "models") in logged
 
     def test_unwritable_override_fails_naming_the_variable_and_path(
-        self, monkeypatch, tmp_path, restore_modes
+        self, monkeypatch, tmp_path, restore_modes, caplog
     ):
         """Creatable is not the same as usable."""
         readonly = tmp_path / "readonly"
@@ -840,11 +887,15 @@ class TestModelCacheDirOverride:
         if os.access(readonly, os.W_OK):  # pragma: no cover - root ignores the bit
             pytest.skip("running as root; the unwritable case cannot be modelled")
 
-        with pytest.raises(RuntimeError) as excinfo:
-            local_llm._ensure_model_cache_dir()
+        with caplog.at_level(logging.ERROR, logger=local_llm.__name__):
+            with pytest.raises(RuntimeError) as excinfo:
+                local_llm._ensure_model_cache_dir()
 
-        assert "MNEMOSYNE_MODEL_CACHE_DIR" in str(excinfo.value)
-        assert str(readonly) in str(excinfo.value)
+        for expected in ("MNEMOSYNE_MODEL_CACHE_DIR", str(readonly)):
+            assert expected in str(excinfo.value)
+            # Logged too: _load_llm swallows the exception, so the log is the
+            # only channel that actually reaches the user.
+            assert expected in caplog.records[0].getMessage()
 
     def test_writable_but_unsearchable_override_is_rejected(
         self, monkeypatch, tmp_path, restore_modes
@@ -900,15 +951,21 @@ class TestModelCacheDirOverride:
 
         assert str(default) not in str(excinfo.value)
 
-    def test_unset_default_failure_suggests_the_variable(self, monkeypatch, tmp_path):
+    def test_unset_default_failure_suggests_the_variable(
+        self, monkeypatch, tmp_path, caplog
+    ):
         """With no override set, the error offers one instead of blaming it."""
         blocker = tmp_path / "plain"
         blocker.write_text("file", encoding="utf-8")
         self._select(monkeypatch, blocker / "models", from_env=False)
 
-        with pytest.raises(RuntimeError) as excinfo:
-            local_llm._ensure_model_cache_dir()
+        with caplog.at_level(logging.ERROR, logger=local_llm.__name__):
+            with pytest.raises(RuntimeError) as excinfo:
+                local_llm._ensure_model_cache_dir()
 
-        message = str(excinfo.value)
-        assert "Set MNEMOSYNE_MODEL_CACHE_DIR to relocate it." in message
-        assert "is set to" not in message
+        logged = caplog.records[0].getMessage()
+        for message in (str(excinfo.value), logged):
+            assert str(blocker / "models") in message
+            assert "Set MNEMOSYNE_MODEL_CACHE_DIR to relocate it." in message
+            # Must not blame a variable the user never set.
+            assert "is set to" not in message
