@@ -22,12 +22,10 @@ RRF-vs-linear-scoring, not dedup-behavior asymmetry.
 """
 from __future__ import annotations
 
-import os
-import sqlite3
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List
 
 import pytest
 
