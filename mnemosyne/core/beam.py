@@ -3388,6 +3388,23 @@ def _wm_vec_search_fallback(conn: sqlite3.Connection, query_embedding, k: int = 
     return results[:k]
 
 
+def _cross_session_conflict_resolution_enabled() -> bool:
+    """Master switch for the cross-session global contradiction pass (default off)."""
+    return os.environ.get(
+        "MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "0"
+    ).lower() in ("1", "true", "yes")
+
+
+def _cross_session_min_gap_hours() -> float:
+    """Min hour-gap for cross-session pairs. Defaults to 0: statements in
+    independent threads are not subject to the intra-conversation back-to-back
+    heuristic, so no minimum time gap is required between them."""
+    try:
+        return float(os.environ.get("MNEMOSYNE_CROSS_SESSION_MIN_GAP_HOURS", "0") or 0)
+    except ValueError:
+        return 0.0
+
+
 class BeamMemory:
     """
     BEAM memory interface.
@@ -9055,6 +9072,7 @@ class BeamMemory:
               AND timestamp < ?
               AND consolidated_at IS NULL
               AND (pinned IS NULL OR pinned = 0)
+              AND superseded_by IS NULL
             ORDER BY timestamp ASC
             LIMIT {SLEEP_BATCH_SIZE}
         """, (self.session_id, cutoff))
@@ -9469,6 +9487,24 @@ class BeamMemory:
         if not dry_run:
             self._deduplicate_memoria_cross_session()
 
+        # Cross-session global contradiction resolution (opt-in, default off).
+        if _cross_session_conflict_resolution_enabled():
+            try:
+                _cs = self.resolve_cross_session_conflicts(dry_run=dry_run)
+                cross_session = {
+                    "pairs_flagged": int(_cs.get("pairs_flagged", 0)),
+                    "conflicts_resolved": int(_cs.get("conflicts_resolved", 0)),
+                    "invalidated": int(_cs.get("invalidated", 0)),
+                }
+            except Exception as exc:
+                logger.error(
+                    "sleep_all_sessions: cross-session resolution failed: %s",
+                    exc, exc_info=True,
+                )
+                cross_session = {"error": repr(exc)}
+        else:
+            cross_session = {"pairs_flagged": 0, "conflicts_resolved": 0, "invalidated": 0}
+
         return {
             "status": "dry_run" if dry_run else ("consolidated" if items_consolidated else "no_op"),
             "sessions_scanned": len(session_rows),
@@ -9482,8 +9518,120 @@ class BeamMemory:
                 "proposals": model_refresh_proposals,
                 "applied": model_refresh_applied,
             },
+            "cross_session": cross_session,
             "session_results": session_results,
             "degradation": degrade_result
+        }
+
+    def resolve_cross_session_conflicts(
+        self,
+        dry_run: bool = False,
+        min_gap_hours: Optional[float] = None,
+    ) -> Dict:
+        """Resolve factual contradictions among global-scope memories across
+        sessions (the cross-session step of `sleep_all_sessions`).
+
+        Selects not-superseded `scope='global'` rows from BOTH working_memory
+        and episodic_memory across all sessions, groups them by source, runs the
+        existing heuristic `_detect_conflicts` (with a relaxed `min_gap_hours`,
+        since the intra-conversation back-to-back heuristic does not apply to
+        independent threads), optionally confirms each pair with
+        `validate_conflict_pair` when LLM conflict detection is enabled, and
+        marks the older row superseded via
+        ``invalidate(older_id, replacement_id=newer_id)`` (cross-session-safe
+        for `scope='global'` rows; recall already filters `superseded_by IS
+        NULL`, so the loser vanishes from every surface while its history is
+        preserved).
+
+        Session-private rows are never considered (they cannot be seen
+        cross-thread), so session isolation is preserved.
+
+        Gated by ``MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION`` (default off);
+        when disabled this returns a no-op result.
+        """
+        if not _cross_session_conflict_resolution_enabled():
+            return {
+                "status": "disabled",
+                "message": "cross-session conflict resolution disabled "
+                           "(set MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION=1)",
+                "rows_scanned": 0, "pairs_flagged": 0,
+                "conflicts_resolved": 0, "invalidated": 0,
+            }
+
+        if min_gap_hours is None:
+            min_gap_hours = _cross_session_min_gap_hours()
+
+        cursor = self.conn.cursor()
+        now = datetime.now().isoformat()
+
+        rows = []
+        for table in ("working_memory", "episodic_memory"):
+            try:
+                cursor.execute(
+                    f"SELECT id, content, source, timestamp, scope, session_id "
+                    f"FROM {table} WHERE scope = 'global' "
+                    f"AND superseded_by IS NULL "
+                    f"AND (valid_until IS NULL OR valid_until > ?)",
+                    (now,),
+                )
+                for r in cursor.fetchall():
+                    d = dict(r)
+                    d["_table"] = table
+                    rows.append(d)
+            except Exception:
+                continue
+
+        grouped: Dict[str, List[Dict]] = {}
+        for row in rows:
+            grouped.setdefault(row.get("source") or "unknown", []).append(row)
+        for key in grouped:
+            grouped[key].sort(key=lambda x: (x.get("timestamp") or ""))
+
+        from mnemosyne.core.llm_conflict_detector import (
+            LLM_CONFLICT_DETECTION_ENABLED,
+            validate_conflict_pair,
+        )
+
+        pairs_flagged = 0
+        conflicts_resolved = 0
+        invalidated = 0
+        for source, items in grouped.items():
+            if len(items) < 2:
+                continue
+            conflicts = self._detect_conflicts(items, min_gap_hours=min_gap_hours)
+            pairs_flagged += len(conflicts)
+            if not conflicts:
+                continue
+            content_map = {i["id"]: i.get("content", "") for i in items}
+            for older_id, newer_id in conflicts:
+                older = next((i for i in items if i["id"] == older_id), None)
+                newer = next((i for i in items if i["id"] == newer_id), None)
+                if older is None or newer is None:
+                    continue
+                if older.get("superseded_by") or newer.get("superseded_by"):
+                    continue
+                confirmed = True
+                if LLM_CONFLICT_DETECTION_ENABLED:
+                    is_conflict, _, _ = validate_conflict_pair(
+                        content_map.get(older_id, ""),
+                        content_map.get(newer_id, ""),
+                        session_id=self.session_id,
+                        db_path=self.db_path,
+                    )
+                    confirmed = is_conflict
+                if not confirmed:
+                    continue
+                if not dry_run:
+                    if self.invalidate(older_id, replacement_id=newer_id):
+                        invalidated += 1
+                conflicts_resolved += 1
+
+        return {
+            "status": "dry_run" if dry_run else ("resolved" if invalidated else "no_op"),
+            "pairs_flagged": pairs_flagged,
+            "conflicts_resolved": conflicts_resolved,
+            "invalidated": invalidated,
+            "rows_scanned": len(rows),
         }
 
     def get_consolidation_log(self, limit: int = 10) -> List[Dict]:
