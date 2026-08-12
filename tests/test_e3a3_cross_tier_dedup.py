@@ -25,7 +25,7 @@ from __future__ import annotations
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 import pytest
 
