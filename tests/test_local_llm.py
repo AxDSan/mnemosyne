@@ -716,13 +716,19 @@ def _model_cache_env(monkeypatch, value):
     `finally` instead would run before fixture teardown and leave the module
     describing an environment that no longer exists.
     """
-    with monkeypatch.context() as patched:
-        if value is None:
-            patched.delenv("MNEMOSYNE_MODEL_CACHE_DIR", raising=False)
-        else:
-            patched.setenv("MNEMOSYNE_MODEL_CACHE_DIR", value)
-        yield importlib.reload(local_llm)
-    importlib.reload(local_llm)
+    try:
+        with monkeypatch.context() as patched:
+            if value is None:
+                patched.delenv("MNEMOSYNE_MODEL_CACHE_DIR", raising=False)
+            else:
+                patched.setenv("MNEMOSYNE_MODEL_CACHE_DIR", value)
+            yield importlib.reload(local_llm)
+    finally:
+        # Ordering matters: the inner context exits first, restoring the
+        # environment, and only then is the module reloaded to match it. The
+        # `finally` covers a raising body, which would otherwise skip the
+        # restoring reload and leak the overridden path into later tests.
+        importlib.reload(local_llm)
 
 
 class TestModelCacheDirOverride:
@@ -766,6 +772,16 @@ class TestModelCacheDirOverride:
         """The reload dance must not leak a stale path into later tests."""
         with _model_cache_env(monkeypatch, "/tmp/leak-check") as module:
             assert module.MODEL_CACHE_DIR == Path("/tmp/leak-check")
+        assert local_llm.MODEL_CACHE_DIR == self._DEFAULT
+        assert local_llm.MODEL_CACHE_DIR_FROM_ENV is False
+
+    def test_module_state_is_restored_when_the_body_raises(self, monkeypatch):
+        """A failing assertion must not leak the overridden path either."""
+        with pytest.raises(RuntimeError, match="boom"):
+            with _model_cache_env(monkeypatch, "/tmp/raises") as module:
+                assert module.MODEL_CACHE_DIR == Path("/tmp/raises")
+                raise RuntimeError("boom")
+
         assert local_llm.MODEL_CACHE_DIR == self._DEFAULT
         assert local_llm.MODEL_CACHE_DIR_FROM_ENV is False
 
