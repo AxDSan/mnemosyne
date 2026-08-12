@@ -254,3 +254,58 @@ def test_detect_conflicts_min_gap_threshold(temp_db, disable_llm):
     assert A._detect_conflicts(close, min_gap_hours=1.0) == []
     conflicts = A._detect_conflicts(far, min_gap_hours=1.0)
     assert len(conflicts) == 1 and conflicts[0] == ("older", "newer")
+
+
+def test_dry_run_and_apply_chained_counts_match(temp_db, monkeypatch, disable_llm):
+    """A dry run and an explicit apply report identical conflict counts for
+    chained candidate pairs ((A,B),(B,C)) — the chain guard must apply in both
+    modes, so a dry run truly reports what an apply will do."""
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    A = BeamMemory(session_id="tA", db_path=temp_db)
+    ids = [A.remember(f"[USER] favorite color is variant number {i}",
+                      source="conversation", importance=0.7, scope="global")
+           for i in range(3)]
+    A._detect_conflicts = _stub_detect_pair(*ids)  # -> [(id0,id1),(id1,id2)]
+    dry = A.resolve_cross_session_conflicts(dry_run=True)
+    app = A.resolve_cross_session_conflicts(dry_run=False)
+    assert dry["conflicts_resolved"] == app["conflicts_resolved"] == 1
+    assert app["invalidated"] == 1
+    # id1 became a replacement and must not itself be superseded (no orphans).
+    r1 = A.conn.execute(
+        "SELECT superseded_by FROM working_memory WHERE id = ?", (ids[1],)
+    ).fetchone()
+    assert r1[0] is None, "replacement row must stay live"
+    r0 = A.conn.execute(
+        "SELECT superseded_by FROM working_memory WHERE id = ?", (ids[0],)
+    ).fetchone()
+    assert r0[0] == ids[1]
+
+
+def test_llm_validation_cap_bounds_calls(temp_db, monkeypatch, disable_llm):
+    """With LLM confirmation on, an apply runs at most `max_llm_validations`
+    LLM calls per invocation — independent of candidate count — so a provider
+    tool never issues unbounded LLM round-trips while its shared lock is held."""
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    import mnemosyne.core.llm_conflict_detector as lcd
+    monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+
+    A = BeamMemory(session_id="tA", db_path=temp_db)
+    ids = [A.remember(f"[USER] favorite color is variant number {i}",
+                      source="conversation", importance=0.7, scope="global")
+           for i in range(4)]
+    # Two non-chained pairs: (id0,id1) and (id2,id3).
+    A._detect_conflicts = (
+        lambda items, similarity_threshold=0.88, min_gap_hours=1.0: [(ids[0], ids[1]), (ids[2], ids[3])]
+    )
+    calls = {"n": 0}
+    monkeypatch.setattr(
+        lcd, "validate_conflict_pair",
+        lambda older, newer, session_id=None, db_path=None: (
+            calls.__setitem__("n", calls["n"] + 1) or (True, 0.9, "new")
+        ),
+    )
+    res = A.resolve_cross_session_conflicts(max_llm_validations=1)
+    assert calls["n"] == 1, "LLM validation calls must be capped"
+    assert res["llm_validations"] == 1
+    assert res["invalidated"] == 1
+    assert res["llm_cap_reached"] is True

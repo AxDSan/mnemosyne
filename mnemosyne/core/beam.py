@@ -3441,6 +3441,28 @@ def _decode_sqlite_vec_binary(blob: bytes, vec_type: str) -> np.ndarray:
     return np.frombuffer(blob, dtype=np.float32).copy()
 
 
+_CROSS_SESSION_MAX_LLM_VALIDATIONS = 20
+
+
+def _cross_session_max_llm_validations() -> int:
+    """Per-run cap on LLM confirmation calls during a cross-session apply.
+
+    With `MNEMOSYNE_LLM_CONFLICT_DETECTION` on, an apply issues one
+    `validate_conflict_pair` LLM call per confirmed candidate pair. Each call is
+    a network round-trip that, for a provider tool, runs while the shared Beam
+    access lock is held (it serializes auto-sleep and every other tool call), so
+    unbounded LLM work would stall the whole provider. The cap bounds that to a
+    fixed per-invocation budget; any candidate pairs beyond the cap are left
+    pending for a later explicit run. Independent of `max_candidates`; override
+    with ``MNEMOSYNE_CROSS_SESSION_MAX_LLM_VALIDATIONS`` (default 20).
+    """
+    raw = os.environ.get("MNEMOSYNE_CROSS_SESSION_MAX_LLM_VALIDATIONS", "").strip()
+    try:
+        return max(1, int(raw)) if raw else _CROSS_SESSION_MAX_LLM_VALIDATIONS
+    except ValueError:
+        return _CROSS_SESSION_MAX_LLM_VALIDATIONS
+
+
 class BeamMemory:
     """
     BEAM memory interface.
@@ -9547,6 +9569,7 @@ class BeamMemory:
         dry_run: bool = False,
         min_gap_hours: Optional[float] = None,
         max_candidates: Optional[int] = None,
+        max_llm_validations: Optional[int] = None,
     ) -> Dict:
         """Resolve factual contradictions among global-scope memories across
         sessions, exposed as an on-demand, operator-invoked tool.
@@ -9571,7 +9594,13 @@ class BeamMemory:
         bounded per bank by `max_candidates` (default from
         `MNEMOSYNE_CROSS_SESSION_MAX_CANDIDATES`, else 10000) to keep the
         pairwise scan and embedding load bounded; truncation is reported in the
-        result payload.
+        result payload. LLM confirmation is also bounded per run by
+        `max_llm_validations` (default from
+        `MNEMOSYNE_CROSS_SESSION_MAX_LLM_VALIDATIONS`, else 20): when the cap is
+        reached the pass stops issuing further validation calls and leaves any
+        remaining candidate pairs pending for a later explicit run — this bounds
+        network round-trips that a provider tool performs while its shared Beam
+        access lock is held.
 
         This is phase one of the cross-session resolution work: candidate
         reporting (`dry_run=True`) and explicit apply (`dry_run=False`). An
@@ -9589,6 +9618,7 @@ class BeamMemory:
                            "(set MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION=1)",
                 "rows_scanned": 0, "pairs_flagged": 0,
                 "conflicts_resolved": 0, "invalidated": 0,
+                "llm_validations": 0, "llm_cap_reached": False,
                 "candidates_truncated": False,
             }
 
@@ -9596,6 +9626,8 @@ class BeamMemory:
             min_gap_hours = _cross_session_min_gap_hours()
         if max_candidates is None:
             max_candidates = _cross_session_max_candidates()
+        if max_llm_validations is None:
+            max_llm_validations = _cross_session_max_llm_validations()
 
         cursor = self.conn.cursor()
         now = datetime.now().isoformat()
@@ -9636,6 +9668,8 @@ class BeamMemory:
         pairs_flagged = 0
         conflicts_resolved = 0
         invalidated = 0
+        llm_validations = 0
+        llm_cap_reached = False
         # IDs superseded, or used as a replacement/target, during THIS run.
         # Rows are SELECTed once, so in-memory state is authoritative here.
         # The sets guard chained detector pairs such as (A,B),(B,C): without
@@ -9664,20 +9698,29 @@ class BeamMemory:
                     continue
                 confirmed = True
                 if LLM_CONFLICT_DETECTION_ENABLED and not dry_run:
+                    if llm_validations >= max_llm_validations:
+                        llm_cap_reached = True
+                        break
                     is_conflict, _, _ = validate_conflict_pair(
                         content_map.get(older_id, ""),
                         content_map.get(newer_id, ""),
                         session_id=self.session_id,
                         db_path=self.db_path,
                     )
+                    llm_validations += 1
                     confirmed = is_conflict
                 if not confirmed:
                     continue
-                if not dry_run:
-                    if self.invalidate(older_id, replacement_id=newer_id):
-                        invalidated += 1
-                        superseded_now.add(older_id)
-                        replacement_now.add(newer_id)
+                # Track chained pairs in BOTH dry-run and apply so a dry run
+                # reports exactly what an apply would do. A dry run only
+                # simulates the supersession (it never calls invalidate()).
+                mutated = dry_run
+                if not dry_run and self.invalidate(older_id, replacement_id=newer_id):
+                    invalidated += 1
+                    mutated = True
+                if mutated:
+                    superseded_now.add(older_id)
+                    replacement_now.add(newer_id)
                 conflicts_resolved += 1
 
         if dry_run:
@@ -9695,6 +9738,8 @@ class BeamMemory:
             "conflicts_resolved": conflicts_resolved,
             "invalidated": invalidated,
             "rows_scanned": len(rows),
+            "llm_validations": llm_validations,
+            "llm_cap_reached": llm_cap_reached,
             "candidates_truncated": truncated,
         }
 

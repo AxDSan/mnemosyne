@@ -232,6 +232,7 @@ No required config. Everything defaults to `~/.mnemosyne/`. Optional overrides:
 | `MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION` | `0` | Enables the `mnemosyne_resolve_conflicts` tool for global-scope memories. It does **not** run automatically: supersession only happens on an explicit apply. `dry_run=True` reports candidate pairs without mutating; `dry_run=False` applies superseding changes (LLM-confirmed when `MNEMOSYNE_LLM_CONFLICT_DETECTION` is on). Automatic resolution during sleep is not yet enabled. |
 | `MNEMOSYNE_CROSS_SESSION_MIN_GAP_HOURS` | `0` | Minimum hour-gap between cross-session candidate pairs before they are flagged for contradiction (relaxed to 0 for independent threads) |
 | `MNEMOSYNE_CROSS_SESSION_MAX_CANDIDATES` | `10000` | Per-bank row cap for the cross-session candidate scan (bounds the pairwise comparison and embedding load); truncation is reported in the tool result |
+| `MNEMOSYNE_CROSS_SESSION_MAX_LLM_VALIDATIONS` | `20` | Per-run cap on LLM confirmation calls during an apply. Each call is a network round-trip that runs while the shared Beam access lock is held (it serializes auto-sleep and every other tool); the cap bounds that work and leaves any candidate pairs beyond it pending for a later explicit run |
 
 Or in `~/.hermes/config.yaml`:
 
