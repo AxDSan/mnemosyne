@@ -4571,15 +4571,21 @@ class BeamMemory:
             owns_transaction = not self.conn.in_transaction
 
             def validate_and_invalidate() -> bool:
+                now = datetime.now().isoformat()
+                # Both the replacement and the target must still be ACTIVE
+                # (not superseded, not expired): a concurrent resolver may have
+                # superseded either between our scan and this write, and we must
+                # not overwrite an existing successor.
+                active = "AND superseded_by IS NULL AND (valid_until IS NULL OR valid_until > ?)"
                 replacement_found = False
                 for table in ("working_memory", "episodic_memory"):
                     cursor.execute(
                         f"""
                         SELECT 1 FROM {table}
-                        WHERE id = ? AND (session_id = ? OR scope = 'global')
+                        WHERE id = ? AND (session_id = ? OR scope = 'global') {active}
                         LIMIT 1
                         """,
-                        (replacement_id, self.session_id),
+                        (replacement_id, self.session_id, now),
                     )
                     if cursor.fetchone() is not None:
                         replacement_found = True
@@ -4587,26 +4593,27 @@ class BeamMemory:
                 if not replacement_found:
                     return False
 
-                now = datetime.now(timezone.utc).isoformat()
                 if bank is not None:
                     cursor.execute(
                         f"UPDATE {bank} "
                         f"SET valid_until = ?, superseded_by = ? "
-                        f"WHERE id = ? AND (session_id = ? OR scope = 'global')",
-                        (now, replacement_id, memory_id, self.session_id),
+                        f"WHERE id = ? AND (session_id = ? OR scope = 'global') {active}",
+                        (now, replacement_id, memory_id, self.session_id, now),
                     )
                     return cursor.rowcount > 0
-                cursor.execute("""
-                    UPDATE working_memory
-                    SET valid_until = ?, superseded_by = ?
-                    WHERE id = ? AND (session_id = ? OR scope = 'global')
-                """, (now, replacement_id, memory_id, self.session_id))
+                cursor.execute(
+                    f"UPDATE working_memory "
+                    f"SET valid_until = ?, superseded_by = ? "
+                    f"WHERE id = ? AND (session_id = ? OR scope = 'global') {active}",
+                    (now, replacement_id, memory_id, self.session_id, now),
+                )
                 if cursor.rowcount == 0:
-                    cursor.execute("""
-                        UPDATE episodic_memory
-                        SET valid_until = ?, superseded_by = ?
-                        WHERE id = ? AND (session_id = ? OR scope = 'global')
-                    """, (now, replacement_id, memory_id, self.session_id))
+                    cursor.execute(
+                        f"UPDATE episodic_memory "
+                        f"SET valid_until = ?, superseded_by = ? "
+                        f"WHERE id = ? AND (session_id = ? OR scope = 'global') {active}",
+                        (now, replacement_id, memory_id, self.session_id, now),
+                    )
                 return cursor.rowcount > 0
 
             if owns_transaction:
@@ -9689,6 +9696,15 @@ class BeamMemory:
                 "candidates_truncated": truncated,
             }
 
+        # An id is only unique per bank, so the same id can legitimately appear in
+        # both working_memory and episodic_memory (or with different sources).
+        # Build the ambiguous set across ALL scanned rows before grouping so a
+        # duplicate anywhere makes every pair touching that id unactionable.
+        id_counts: Dict[str, int] = {}
+        for row in rows:
+            id_counts[row["id"]] = id_counts.get(row["id"], 0) + 1
+        ambiguous_ids = {mid for mid, count in id_counts.items() if count > 1}
+
         grouped: Dict[str, List[Dict]] = {}
         for row in rows:
             grouped.setdefault(row.get("source") or "unknown", []).append(row)
@@ -9725,6 +9741,11 @@ class BeamMemory:
                     continue
                 if older_id in superseded_now or newer_id in superseded_now:
                     continue
+                # A duplicate id anywhere in the scanned rows is ambiguous —
+                # the detector's id-only pair can't tell which copy it means, so
+                # skip (never cross-supersede another bank's row).
+                if older_id in ambiguous_ids or newer_id in ambiguous_ids:
+                    continue
                 older = next((i for i in items if i["id"] == older_id), None)
                 newer = next((i for i in items if i["id"] == newer_id), None)
                 if older is None or newer is None:
@@ -9756,7 +9777,10 @@ class BeamMemory:
                 if mutated:
                     superseded_now.add(older_id)
                     replacement_now.add(newer_id)
-                conflicts_resolved += 1
+                    # Count only pairs that were actually resolved (or, for a
+                    # dry run, that would be): an invalidate() that returned
+                    # False is not a resolved conflict.
+                    conflicts_resolved += 1
 
         if dry_run:
             status = "dry_run"

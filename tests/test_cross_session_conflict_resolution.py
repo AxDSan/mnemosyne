@@ -354,7 +354,7 @@ def test_max_candidates_exact_not_truncated(temp_db, monkeypatch, disable_llm):
     assert res["candidates_truncated"] is False
 
 
-def _insert_episodic_dup(A, mem_id, content):
+def _insert_episodic_dup(A, mem_id, content, source="conversation"):
     """Insert an episodic row that reuses a working-memory id (id collision
     across banks: `id` is only unique per bank)."""
     now = datetime.now().isoformat()
@@ -363,7 +363,7 @@ def _insert_episodic_dup(A, mem_id, content):
         "(id, content, source, timestamp, session_id, importance, metadata_json,"
         " summary_of, valid_until, superseded_by, scope, recall_count,"
         " last_recalled, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (mem_id, content, "conversation", now, "tA", 0.7, "{}", None,
+        (mem_id, content, source, now, "tA", 0.7, "{}", None,
          None, None, "global", 0, None, now),
     )
     A.conn.commit()
@@ -438,3 +438,49 @@ def test_duplicate_id_across_banks_not_cross_resolved(temp_db, monkeypatch, disa
         "SELECT superseded_by FROM episodic_memory WHERE id = ?", (blue,)
     ).fetchone()
     assert w[0] is None and e[0] is None, "ambiguous duplicate id must not cross-supersede"
+
+
+def test_duplicate_id_across_sources_skipped(temp_db, monkeypatch, disable_llm):
+    """Ambiguity is computed across ALL scanned rows (before grouping): a
+    duplicate id in another bank with a *different* source still makes every
+    pair touching that id unactionable."""
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    A = BeamMemory(session_id="tA", db_path=temp_db)
+    blue = A.remember("[USER] favorite color is blue", source="conversation",
+                      importance=0.7, scope="global")
+    green = A.remember("[USER] favorite color is green now", source="conversation",
+                       importance=0.7, scope="global")
+    # Episodic duplicate of blue with a different source (separate group, but
+    # 'blue' must still be treated as ambiguous globally).
+    _insert_episodic_dup(A, blue, "[USER] favorite color is blue", source="import")
+    A._detect_conflicts = _stub_detect_pair(blue, green)
+
+    res = A.resolve_cross_session_conflicts()
+    assert res["invalidated"] == 0 and res["conflicts_resolved"] == 0
+    w = A.conn.execute(
+        "SELECT superseded_by FROM working_memory WHERE id = ?", (blue,)
+    ).fetchone()
+    e = A.conn.execute(
+        "SELECT superseded_by FROM episodic_memory WHERE id = ?", (blue,)
+    ).fetchone()
+    assert w[0] is None and e[0] is None, "cross-source duplicate id must not resolve"
+
+
+def test_invalidate_preserves_existing_successor(temp_db, disable_llm):
+    """Supersession is atomic on an active target: once a row already has a
+    successor (e.g. a concurrent resolver won the race), a later invalidate()
+    must not overwrite it, and returns False."""
+    A = BeamMemory(session_id="tA", db_path=temp_db)
+    old = A.remember("[USER] favorite color is blue", source="conversation",
+                     importance=0.7, scope="global")
+    new = A.remember("[USER] favorite color is green now", source="conversation",
+                     importance=0.7, scope="global")
+    other = A.remember("[USER] favorite color is magenta", source="conversation",
+                       importance=0.7, scope="global")
+    assert A.invalidate(old, replacement_id=other) is True
+    # A later attempt must not overwrite the existing successor.
+    assert A.invalidate(old, replacement_id=new) is False
+    row = A.conn.execute(
+        "SELECT superseded_by FROM working_memory WHERE id = ?", (old,)
+    ).fetchone()
+    assert row[0] == other, "existing successor must be preserved"
