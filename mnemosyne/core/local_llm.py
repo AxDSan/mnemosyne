@@ -9,16 +9,27 @@ Model cache: ~/.hermes/mnemosyne/models/
 Default model: openbmb/MiniCPM5-1B-GGUF (Q4_K_M, ~656MB)
 """
 
+import logging
 import os
 import sys
 import re
 from pathlib import Path
 from typing import List, Optional
 
+logger = logging.getLogger(__name__)
+
 # --- Config ------------------------------------------------------------------
 DEFAULT_MODEL_REPO = "openbmb/MiniCPM5-1B-GGUF"
 DEFAULT_MODEL_FILE = "MiniCPM5-1B-Q4_K_M.gguf"
 MODEL_CACHE_DIR = Path.home() / ".hermes" / "mnemosyne" / "models"
+# Quoted in the pre-download notice. Only meaningful for the built-in model: an
+# override names a file whose size we cannot know without asking the Hub, and
+# guessing there would be worse than saying nothing. The built-in identity is
+# kept so the notice can check the values it is about to print rather than a
+# flag set once at import, which would go stale if either is reassigned later.
+DEFAULT_MODEL_APPROX_SIZE = "656 MB"
+_BUILTIN_MODEL_REPO = DEFAULT_MODEL_REPO
+_BUILTIN_MODEL_FILE = DEFAULT_MODEL_FILE
 
 LLM_ENABLED = os.environ.get("MNEMOSYNE_LLM_ENABLED", "true").lower() in ("1", "true", "yes")
 LLM_MAX_TOKENS=int(os.environ.get("MNEMOSYNE_LLM_MAX_TOKENS", "2048") or "2048")
@@ -113,6 +124,27 @@ def _download_model() -> Path:
         raise RuntimeError(
             "huggingface_hub not installed. Run: pip install huggingface-hub"
         )
+
+    # Announced only on the uncached path, immediately before the fetch, so a
+    # warm cache stays silent. Without this the caller simply blocks for the
+    # length of a 656 MB transfer with nothing said. The caller is deliberately
+    # not named: this is reached from sleep() via _call_local_llm, but also from
+    # llm_available(), which callers do not expect to download anything.
+    # A logger keeps it off stdout, which the CLI and the MCP server both use
+    # for their own output.
+    logger.warning(
+        "Downloading the local consolidation model %s from %s (%s) into %s. "
+        "The current operation blocks until the download finishes. To avoid it, "
+        "set MNEMOSYNE_LLM_ENABLED=false for AAAK-only consolidation, or "
+        "pre-cache the file.",
+        DEFAULT_MODEL_FILE,
+        DEFAULT_MODEL_REPO,
+        f"approximately {DEFAULT_MODEL_APPROX_SIZE}"
+        if (DEFAULT_MODEL_REPO, DEFAULT_MODEL_FILE)
+        == (_BUILTIN_MODEL_REPO, _BUILTIN_MODEL_FILE)
+        else "size unknown for an overridden model",
+        MODEL_CACHE_DIR,
+    )
 
     downloaded = hf_hub_download(
         repo_id=DEFAULT_MODEL_REPO,

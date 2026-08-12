@@ -595,3 +595,114 @@ class TestRemoteLLMFallback:
             fb_call = m.call_args_list[1]
             assert fb_call.kwargs["base_url"] == "http://primary/v1"
             assert fb_call.kwargs["api_key"] == "primary-key"
+
+
+# Captured at import, before conftest's autouse `_disable_local_llm_inference`
+# replaces the module attribute with `lambda: None`. The fallback test below
+# needs the real loader: against the stub it would pass without exercising
+# anything, since the stub also returns None.
+_REAL_LOAD_LLM = local_llm._load_llm
+
+
+class TestModelDownloadNotice:
+    """The 656 MB fetch must announce itself before it starts (#703).
+
+    `sleep()` is synchronous, so an unannounced download presents to the user as
+    a hang. The notice is a logger warning rather than a print: this module is
+    reached from the CLI and the MCP server, which both own stdout.
+    """
+
+    def _cache(self, tmp_path, monkeypatch, *, cached: bool):
+        monkeypatch.setattr(local_llm, "MODEL_CACHE_DIR", tmp_path)
+        monkeypatch.setattr(local_llm, "DEFAULT_MODEL_FILE", "model.gguf")
+        monkeypatch.setattr(local_llm, "DEFAULT_MODEL_REPO", "acme/model-GGUF")
+        monkeypatch.setattr(local_llm, "_BUILTIN_MODEL_REPO", "acme/model-GGUF", raising=False)
+        monkeypatch.setattr(local_llm, "_BUILTIN_MODEL_FILE", "model.gguf", raising=False)
+        if cached:
+            (tmp_path / "model.gguf").write_bytes(b"gguf")
+        return tmp_path / "model.gguf"
+
+    def test_uncached_download_is_announced_before_it_starts(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        target = self._cache(tmp_path, monkeypatch, cached=False)
+        order = []
+
+        def _fake_download(**kwargs):
+            order.append("download")
+            target.write_bytes(b"gguf")
+            return str(target)
+
+        monkeypatch.setitem(
+            sys.modules,
+            "huggingface_hub",
+            MagicMock(hf_hub_download=_fake_download),
+        )
+
+        with caplog.at_level("WARNING", logger=local_llm.__name__):
+            assert local_llm._download_model() == target
+
+        assert order == ["download"]
+        assert len(caplog.records) == 1
+        message = caplog.records[0].getMessage()
+        # The notice has to be actionable on its own: what is being fetched,
+        # from where, how big, where it lands, and how to opt out.
+        assert "model.gguf" in message
+        assert "acme/model-GGUF" in message
+        assert local_llm.DEFAULT_MODEL_APPROX_SIZE in message
+        assert str(tmp_path) in message
+        assert "MNEMOSYNE_LLM_ENABLED=false" in message
+
+    def test_cached_model_neither_downloads_nor_warns(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        target = self._cache(tmp_path, monkeypatch, cached=True)
+
+        def _must_not_download(**kwargs):
+            raise AssertionError("a cached model must not be re-downloaded")
+
+        monkeypatch.setitem(
+            sys.modules,
+            "huggingface_hub",
+            MagicMock(hf_hub_download=_must_not_download),
+        )
+
+        with caplog.at_level("WARNING", logger=local_llm.__name__):
+            assert local_llm._download_model() == target
+
+        assert caplog.records == []
+
+    def test_overridden_model_does_not_claim_the_default_size(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """An override names a file whose size we cannot know, so we must not guess."""
+        target = self._cache(tmp_path, monkeypatch, cached=False)
+        monkeypatch.setattr(local_llm, "DEFAULT_MODEL_FILE", "other.gguf")
+        monkeypatch.setitem(
+            sys.modules,
+            "huggingface_hub",
+            MagicMock(hf_hub_download=lambda **kw: str(target)),
+        )
+
+        with caplog.at_level("WARNING", logger=local_llm.__name__):
+            local_llm._download_model()
+
+        message = caplog.records[0].getMessage()
+        assert local_llm.DEFAULT_MODEL_APPROX_SIZE not in message
+        assert "unknown" in message.lower()
+
+    def test_failed_download_still_falls_back_to_aaak(self, tmp_path, monkeypatch):
+        """The notice must not change what happens when the fetch fails."""
+        self._cache(tmp_path, monkeypatch, cached=False)
+        monkeypatch.setattr(local_llm, "_load_llm", _REAL_LOAD_LLM)
+        monkeypatch.setattr(local_llm, "_llm_instance", None)
+        monkeypatch.setattr(local_llm, "_llm_available", None)
+        monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
+        download = MagicMock(side_effect=RuntimeError("network unreachable"))
+        monkeypatch.setattr(local_llm, "_download_model", download)
+
+        assert local_llm._load_llm() is None
+        # The download was attempted and its failure swallowed, which is the
+        # pre-existing AAAK fallback this change must not disturb.
+        assert download.call_count == 1
+        assert local_llm._llm_available is False
