@@ -9626,6 +9626,9 @@ class BeamMemory:
             min_gap_hours = _cross_session_min_gap_hours()
         if max_candidates is None:
             max_candidates = _cross_session_max_candidates()
+        # Normalize direct overrides too: a negative/zero value would otherwise
+        # make LIMIT return an unbounded result set.
+        max_candidates = max(1, int(max_candidates))
         if max_llm_validations is None:
             max_llm_validations = _cross_session_max_llm_validations()
 
@@ -9634,25 +9637,43 @@ class BeamMemory:
 
         rows = []
         truncated = False
+        scan_error = None
         for table in ("working_memory", "episodic_memory"):
             try:
+                # Fetch one extra row to detect truncation accurately: the flag
+                # is set only when the cap is actually hit (an exactly-full bank
+                # is not truncated).
                 cursor.execute(
                     f"SELECT id, content, source, timestamp, scope, session_id, superseded_by "
                     f"FROM {table} WHERE scope = 'global' "
                     f"AND superseded_by IS NULL "
                     f"AND (valid_until IS NULL OR valid_until > ?) "
                     f"ORDER BY timestamp ASC LIMIT ?",
-                    (now, max_candidates),
+                    (now, max_candidates + 1),
                 )
                 fetched = cursor.fetchall()
-                if len(fetched) >= max_candidates:
+                if len(fetched) > max_candidates:
                     truncated = True
+                    fetched = fetched[:max_candidates]
                 for r in fetched:
                     d = dict(r)
                     d["_table"] = table
                     rows.append(d)
-            except Exception:
-                continue
+            except Exception as exc:
+                scan_error = (table, repr(exc))
+                break
+
+        if scan_error is not None:
+            # A bank query failed: abort before any resolution so we never
+            # mutate on a partial cross-bank scan, and surface the failure.
+            return {
+                "status": "failed",
+                "message": f"could not scan bank {scan_error[0]}: {scan_error[1]}",
+                "rows_scanned": len(rows),
+                "pairs_flagged": 0, "conflicts_resolved": 0, "invalidated": 0,
+                "llm_validations": 0, "llm_cap_reached": False,
+                "candidates_truncated": truncated,
+            }
 
         grouped: Dict[str, List[Dict]] = {}
         for row in rows:

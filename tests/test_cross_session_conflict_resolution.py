@@ -309,3 +309,46 @@ def test_llm_validation_cap_bounds_calls(temp_db, monkeypatch, disable_llm):
     assert res["llm_validations"] == 1
     assert res["invalidated"] == 1
     assert res["llm_cap_reached"] is True
+
+
+def test_bank_scan_failure_returns_failed(temp_db, monkeypatch, disable_llm):
+    """If a bank query fails, resolution is aborted with an explicit status and
+    nothing is mutated (no silent single-bank resolution)."""
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    A = BeamMemory(session_id="tA", db_path=temp_db)
+    A.remember("[USER] favorite color is blue", source="conversation",
+               importance=0.7, scope="global")
+    A.conn.execute("DROP TABLE episodic_memory")
+    A.conn.commit()
+    A._detect_conflicts = _stub_detect_pair("x", "y")
+    res = A.resolve_cross_session_conflicts()
+    assert res["status"] == "failed"
+    assert res["invalidated"] == 0 and res["conflicts_resolved"] == 0
+    row = A.conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()
+    assert row[0] == 1, "nothing may be mutated on a failed scan"
+
+
+def test_max_candidates_negative_normalized(temp_db, monkeypatch, disable_llm):
+    """A negative `max_candidates` override is normalized to a positive bound
+    (never an unbounded LIMIT) and truncation is reported."""
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    A = BeamMemory(session_id="tA", db_path=temp_db)
+    for i in range(3):
+        A.remember(f"[USER] favorite color variant {i}", source="conversation",
+                   importance=0.7, scope="global")
+    A._detect_conflicts = lambda items, similarity_threshold=0.88, min_gap_hours=1.0: []
+    res = A.resolve_cross_session_conflicts(max_candidates=-5)
+    assert res["rows_scanned"] == 1, "negative cap must clamp to a positive bound"
+    assert res["candidates_truncated"] is True
+
+
+def test_max_candidates_exact_not_truncated(temp_db, monkeypatch, disable_llm):
+    """An exactly-full bank (rows == max_candidates) is not flagged as truncated."""
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    A = BeamMemory(session_id="tA", db_path=temp_db)
+    A.remember("[USER] favorite color is green", source="conversation",
+               importance=0.7, scope="global")
+    A._detect_conflicts = lambda items, similarity_threshold=0.88, min_gap_hours=1.0: []
+    res = A.resolve_cross_session_conflicts(max_candidates=1)
+    assert res["rows_scanned"] == 1
+    assert res["candidates_truncated"] is False
