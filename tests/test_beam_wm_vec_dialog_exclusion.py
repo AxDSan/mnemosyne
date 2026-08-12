@@ -1,7 +1,7 @@
 """
 Regression tests for the working-memory vector pool dialog flood (#696).
 
-Pre-fix: raw dialog rows (source='conversation', legacy honcho imports)
+Pre-fix: raw dialog rows (source='conversation', source='honcho_message')
 dominate the nearest-N vector pool for conversational queries. A distilled
 fact that is semantically close but lexically weak can rank beyond the pool
 (and beyond the k slice of the compatibility scan) and never receive a dense
@@ -169,8 +169,10 @@ def test_dialog_flood_pure_vector_case_recall_first_mode(temp_db, monkeypatch):
 
 
 def test_wm_vec_search_excludes_dialog_sources(temp_db):
-    """The vec-search WHERE clause used by recall drops conversation and
-    honcho rows while keeping NULL-source and distilled rows."""
+    """The vec-search WHERE clause used by recall drops raw dialog sources
+    (conversation, honcho_message) while keeping NULL-source, distilled and
+    DURABLE honcho rows (honcho_summary = deliberate session summary,
+    honcho_import = generic import default) eligible."""
     beam = BeamMemory(session_id="unit-session", db_path=temp_db)
     now = datetime.now().isoformat()
     conn = beam.conn
@@ -180,7 +182,9 @@ def test_wm_vec_search_excludes_dialog_sources(temp_db):
         [
             ("fact-1", "fact content", "fact", now, "unit-session", "session"),
             ("conv-1", "conversation content", "conversation", now, "unit-session", "session"),
-            ("honcho-1", "honcho import content", "honcho_message", now, "unit-session", "session"),
+            ("honcho-1", "honcho raw message", "honcho_message", now, "unit-session", "session"),
+            ("honcho-summary-1", "honcho session summary", "honcho_summary", now, "unit-session", "session"),
+            ("honcho-import-1", "honcho generic import", "honcho_import", now, "unit-session", "session"),
             ("null-src", "no source content", None, now, "unit-session", "session"),
         ],
     )
@@ -190,6 +194,8 @@ def test_wm_vec_search_excludes_dialog_sources(temp_db):
             ("fact-1", "[1.0, 0.0, 0.0]", "test"),
             ("conv-1", "[1.0, 0.0, 0.0]", "test"),
             ("honcho-1", "[1.0, 0.0, 0.0]", "test"),
+            ("honcho-summary-1", "[1.0, 0.0, 0.0]", "test"),
+            ("honcho-import-1", "[1.0, 0.0, 0.0]", "test"),
             ("null-src", "[1.0, 0.0, 0.0]", "test"),
         ],
     )
@@ -198,7 +204,7 @@ def test_wm_vec_search_excludes_dialog_sources(temp_db):
     where = (
         "(valid_until IS NULL OR valid_until > ?) AND superseded_by IS NULL "
         "AND (source IS NULL OR "
-        "(source <> 'conversation' AND source NOT LIKE 'honcho%'))"
+        "(source <> 'conversation' AND source <> 'honcho_message'))"
     )
     results = _wm_vec_search(
         conn,
@@ -207,7 +213,56 @@ def test_wm_vec_search_excludes_dialog_sources(temp_db):
         where_sql=where,
         where_params=(now,),
     )
-    assert {r["id"] for r in results} == {"fact-1", "null-src"}
+    assert {r["id"] for r in results} == {
+        "fact-1", "null-src", "honcho-summary-1", "honcho-import-1",
+    }
+
+
+def test_default_dense_recall_keeps_durable_honcho_rows_eligible(temp_db, monkeypatch):
+    """dplush review (#696): honcho_summary / honcho_import are durable
+    records, not raw dialog. The default dense exclusion must be narrowed to
+    raw dialog sources (conversation, honcho_message) so durable honcho rows
+    keep a dense voice in DEFAULT recall (recall-first mode isolates the
+    dense voice from the lexical gate)."""
+    monkeypatch.setenv("MNEMOSYNE_LEXICAL_GATE_MIN", "0.0")
+    beam = BeamMemory(session_id="flood-session", db_path=temp_db)
+    now = datetime.now().isoformat()
+    query = _unit_query_vec()
+    conn = beam.conn
+    rows = [
+        ("hsum-1", "Сводка сессии по настройке мониторинга", "honcho_summary", now),
+        ("himp-1", "Импортированная заметка про kuma", "honcho_import", now),
+        ("hmsg-1", "сырое сообщение чата", "honcho_message", now),
+        ("conv-1", "разговор про погоду", "conversation", now),
+        ("fact-1", "Создание мониторов Uptime Kuma только через CLI скрипт", "fact", now),
+    ]
+    conn.executemany(
+        "INSERT INTO working_memory "
+        "(id, content, source, timestamp, session_id, scope) VALUES (?, ?, ?, ?, ?, ?)",
+        [(r[0], r[1], r[2], r[3], "flood-session", "session") for r in rows],
+    )
+    for i, (mem_id, *_rest) in enumerate(rows):
+        conn.execute(
+            "INSERT INTO memory_embeddings (memory_id, embedding_json, model) "
+            "VALUES (?, ?, ?)",
+            (mem_id, json_dumps(_near_vec(query, seed=100 + i)), "test-model"),
+        )
+    conn.commit()
+    _enable_embeddings(monkeypatch, query)
+
+    results = beam.recall(QUERY, top_k=10)
+    ids = [r["id"] for r in results]
+    assert "hsum-1" in ids, (
+        "honcho_summary must stay eligible for the dense voice in default recall"
+    )
+    assert "himp-1" in ids, (
+        "honcho_import must stay eligible for the dense voice in default recall"
+    )
+    assert "fact-1" in ids, "distilled fact must stay eligible"
+    assert "hmsg-1" not in ids and "conv-1" not in ids, (
+        "raw dialog sources (honcho_message, conversation) stay excluded "
+        "from the default dense pool"
+    )
 
 
 def test_explicit_conversation_source_filter_still_returns_dialog(temp_db, monkeypatch):
@@ -407,4 +462,90 @@ def test_polyphonic_path_applies_default_dense_source_filter(temp_db, monkeypatc
     assert FACT_ID in ids, (
         "polyphonic vector voice must exclude dialog rows before top-K "
         "selection; recall returned %s" % (ids[:5],)
+    )
+
+
+def test_polyphonic_default_dense_keeps_durable_honcho_rows_eligible(temp_db, monkeypatch):
+    """dplush review: the polyphonic vector voice must narrow the default
+    exclusion to raw dialog sources too — honcho_summary / honcho_import
+    stay eligible for a dense score; honcho_message / conversation do not.
+    QUERY has no temporal keywords, so the temporal voice is inert and the
+    vector voice alone decides."""
+    _enable_polyphonic(monkeypatch, _unit_query_vec())
+    beam = BeamMemory(session_id="flood-session", db_path=temp_db)
+    now = datetime.now().isoformat()
+    query = _unit_query_vec()
+    conn = beam.conn
+    rows = [
+        ("hsum-1", "Сводка сессии по настройке мониторинга", "honcho_summary", now),
+        ("himp-1", "Импортированная заметка про kuma", "honcho_import", now),
+        ("hmsg-1", "сырое сообщение чата", "honcho_message", now),
+        ("conv-1", "разговор про погоду", "conversation", now),
+        ("fact-1", "Создание мониторов Uptime Kuma только через CLI скрипт", "fact", now),
+    ]
+    conn.executemany(
+        "INSERT INTO working_memory "
+        "(id, content, source, timestamp, session_id, scope) VALUES (?, ?, ?, ?, ?, ?)",
+        [(r[0], r[1], r[2], r[3], "flood-session", "session") for r in rows],
+    )
+    for i, (mem_id, *_rest) in enumerate(rows):
+        conn.execute(
+            "INSERT INTO memory_embeddings (memory_id, embedding_json, model) "
+            "VALUES (?, ?, ?)",
+            (mem_id, json_dumps(_near_vec(query, seed=200 + i)), "test-model"),
+        )
+    conn.commit()
+
+    results = beam.recall(QUERY, top_k=10)
+    ids = [r["id"] for r in results]
+    assert "hsum-1" in ids, (
+        "polyphonic default recall must keep honcho_summary dense-eligible"
+    )
+    assert "himp-1" in ids, (
+        "polyphonic default recall must keep honcho_import dense-eligible"
+    )
+    assert "fact-1" in ids
+    assert "hmsg-1" not in ids and "conv-1" not in ids, (
+        "polyphonic default recall must exclude raw dialog "
+        "(honcho_message, conversation)"
+    )
+
+
+def test_polyphonic_topic_filter_exact_equality(temp_db, monkeypatch):
+    """dplush review: topic= must match source EXACTLY, like the linear
+    path's `source = ?`. A non-vector voice returning a row with source
+    'conversation_archive' must NOT pass topic='conversation' (pre-fix this
+    was a substring check)."""
+    from mnemosyne.core.polyphonic_recall import PolyphonicResult
+
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
+    monkeypatch.setattr(
+        "mnemosyne.core.local_llm.llm_available", lambda: False
+    )
+    beam = BeamMemory(session_id="flood-session", db_path=temp_db)
+    now = datetime.now().isoformat()
+    beam.conn.execute(
+        "INSERT INTO working_memory "
+        "(id, content, source, timestamp, session_id, scope) VALUES (?, ?, ?, ?, ?, ?)",
+        ("arch-1", "архивный разговор", "conversation_archive",
+         now, "flood-session", "session"),
+    )
+    beam.conn.commit()
+
+    class _FakeEngine:
+        def recall(self, *, query, query_embedding, top_k,
+                   default_dense_source_filter=True, source=None, topic=None):
+            return [PolyphonicResult(
+                memory_id="arch-1", combined_score=0.9,
+                voice_scores={"vector": 0.9}, metadata={},
+            )]
+
+    monkeypatch.setattr(beam, "_get_polyphonic_engine", lambda: _FakeEngine())
+
+    results = beam.recall(QUERY, top_k=10, topic="conversation")
+    ids = [r["id"] for r in results]
+    assert "arch-1" not in ids, (
+        "topic='conversation' must match source exactly; a row with source "
+        "'conversation_archive' must be excluded (pre-fix substring match "
+        "admitted it)"
     )

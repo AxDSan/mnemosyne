@@ -117,6 +117,13 @@ def test_legacy_v2_opaque_entry_not_reused_after_dense_predicate_schema_bump(
     memory._query_cache.put_opaque(
         legacy_key, [{"id": "stale-v2", "content": "old predicate result"}]
     )
+    # Prove the stale entry survives a full SQLite reload (opaque entries
+    # are persisted, not just in-memory) and is still never reused.
+    memory._query_cache.close()
+    memory._query_cache = QueryCache(db_path=tmp_path / "query_cache.db")
+    assert legacy_key in memory._query_cache._opaque, (
+        "legacy v2 entry must be restored from SQLite on reload"
+    )
 
     results = _call(memory, "alpha query")
     assert len(calls) == 1, (
@@ -126,10 +133,23 @@ def test_legacy_v2_opaque_entry_not_reused_after_dense_predicate_schema_bump(
         "pre-change v2 cache entry must never surface"
     )
 
-    # And the current v3 entry IS a hit on the next identical call.
+    # And the current v3 entry IS a hit on the next identical call — even
+    # after another full SQLite reload, so the hit is not in-memory-only.
+    memory._query_cache.close()
+    memory._query_cache = QueryCache(db_path=tmp_path / "query_cache.db")
     again = _call(memory, "alpha query")
-    assert len(calls) == 1, "identical request must hit the v3 opaque entry"
+    assert len(calls) == 1, (
+        "identical request must hit the persisted v3 opaque entry"
+    )
     assert again == results
+
+    # Opaque request digests route to get_opaque() and never touch the
+    # fuzzy semantic tiers.
+    assert memory._query_cache.get(key) == results
+    assert memory._query_cache.get_opaque(key) == results
+    assert memory._query_cache.tier2_hits == 0
+    assert memory._query_cache.tier3_hits == 0
+    assert memory._query_cache.tier4_hits == 0
 
 
 def test_successful_invalidate_clears_persisted_enhanced_recall_cache(monkeypatch, tmp_path: Path):

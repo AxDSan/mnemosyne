@@ -483,9 +483,14 @@ class PolyphonicRecallEngine:
                 wm_dense_predicate = " AND wm.source = ?"
                 wm_dense_params.append(topic)
             elif default_dense_source_filter:
+                # Raw dialog sources only (mirrors beam's linear wm_vec_where):
+                # conversation + honcho_message. Durable honcho rows
+                # (honcho_summary = deliberate session summary with higher
+                # importance, honcho_import = generic import default) are not
+                # raw dialog and must remain eligible for a dense score.
                 wm_dense_predicate = (
                     " AND (wm.source IS NULL OR (wm.source <> 'conversation'"
-                    " AND wm.source NOT LIKE 'honcho%'))"
+                    " AND wm.source <> 'honcho_message'))"
                     " AND wm.consolidated_at IS NULL"
                 )
             try:

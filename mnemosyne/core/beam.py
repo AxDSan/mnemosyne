@@ -6243,14 +6243,17 @@ class BeamMemory:
         wm_where = " AND ".join(wm_where_clauses)
 
         # Vector pool isolation (#696): raw dialog capture (source='conversation',
-        # legacy honcho imports) stays fully FTS-reachable but is excluded from
+        # source='honcho_message') stays fully FTS-reachable but is excluded from
         # the working-memory DENSE candidate pool. Conversational queries are
         # topically identical to their own dialog rows, so the nearest-N pool
         # saturates with them and starves distilled facts out of the dense
         # voice (facts semantically matching a query can rank beyond the pool
-        # and surface with dense_score=0.0 or not at all). Consolidated rows
-        # (consolidated_at IS NOT NULL) are likewise kept out of the default
-        # dense candidates: per #427 they must not compete with hot
+        # and surface with dense_score=0.0 or not at all). Durable honcho rows
+        # are NOT raw dialog and stay eligible for a dense score:
+        # honcho_summary is a deliberate session summary with higher
+        # importance, honcho_import is a generic import default. Consolidated
+        # rows (consolidated_at IS NOT NULL) are likewise kept out of the
+        # default dense candidates: per #427 they must not compete with hot
         # unconsolidated memories (mirrors get_context). An explicit
         # source=/topic= filter keeps the caller in control — asking for
         # conversation rows directly still works.
@@ -6258,7 +6261,7 @@ class BeamMemory:
         if not (source or topic):
             wm_vec_where = (
                 f"{wm_where} AND (source IS NULL OR "
-                f"(source <> 'conversation' AND source NOT LIKE 'honcho%'))"
+                f"(source <> 'conversation' AND source <> 'honcho_message'))"
                 f" AND consolidated_at IS NULL"
             )
 
@@ -8141,7 +8144,11 @@ class BeamMemory:
             return False
         if source and row_dict.get("source") != source:
             return False
-        if topic and topic not in (row_dict.get("source") or ""):
+        # topic is stored in the source field (pending a dedicated topic
+        # column) — match EXACTLY like the linear path's `source = ?`, so a
+        # non-vector voice returning source='conversation_archive' cannot
+        # pass topic='conversation'.
+        if topic and row_dict.get("source") != topic:
             return False
         if author_id and row_dict.get("author_id") != author_id:
             return False
