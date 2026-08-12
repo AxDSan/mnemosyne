@@ -2,7 +2,6 @@ import builtins
 import os
 import subprocess
 import sys
-import pytest
 from unittest.mock import patch, MagicMock
 
 from mnemosyne.core import local_llm
@@ -270,7 +269,7 @@ class TestHostLLMBackend:
         monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://remote/v1")
         set_host_llm_backend(CallableLLMBackend("test", lambda *a, **k: "Host summary."))
         with patch.object(local_llm, "_call_remote_llm", return_value="Remote summary.") as mock_remote, \
-             patch.object(local_llm, "_call_local_llm", return_value=None) as mock_local:
+             patch.object(local_llm, "_call_local_llm", return_value=None):
             # Host gated by LLM_ENABLED → not attempted; remote also gated → not called;
             # local: _call_local_llm internally checks via _load_llm() which itself
             # gates on LLM_ENABLED (preserving prior behavior). End result: None.
@@ -354,15 +353,15 @@ class TestThinkTagStripping:
     """
 
     def test_clean_output_strips_closed_think_tags(self):
-        raw = f"<think>let me reason</think> The answer is 42."
+        raw = "<think>let me reason</think> The answer is 42."
         assert local_llm._clean_output(raw) == "The answer is 42."
 
     def test_clean_output_strips_multiline_closed_think_tags(self):
-        raw = f"<think>step 1\nstep 2</think>\nFinal answer."
+        raw = "<think>step 1\nstep 2</think>\nFinal answer."
         assert local_llm._clean_output(raw) == "Final answer."
 
     def test_clean_output_strips_multiple_think_blocks(self):
-        raw = f"<think>first</think>middle<think>second</think>end"
+        raw = "<think>first</think>middle<think>second</think>end"
         assert local_llm._clean_output(raw) == "middleend"
 
     def test_clean_output_preserves_text_without_think_tags(self):
@@ -370,13 +369,13 @@ class TestThinkTagStripping:
         assert local_llm._clean_output(raw) == "Just a normal summary with no thinking."
 
     def test_clean_output_empty_after_stripping(self):
-        raw = f"<think>only thinking, no output</think>"
+        raw = "<think>only thinking, no output</think>"
         assert local_llm._clean_output(raw) == ""
 
     def test_clean_output_does_not_strip_unclosed_think_tag(self):
         """Unclosed think tags are left as-is since we cannot determine
         where thinking ends and the response begins."""
-        raw = f"middle<think>reasoning that never closes"
+        raw = "middle<think>reasoning that never closes"
         assert local_llm._clean_output(raw) == raw
 
     def test_try_host_llm_strips_think_tags(self, monkeypatch):
@@ -386,7 +385,7 @@ class TestThinkTagStripping:
         monkeypatch.setattr(local_llm, "HOST_LLM_TIMEOUT", 5.0)
         monkeypatch.setattr(local_llm, "HOST_LLM_PROVIDER", None)
         monkeypatch.setattr(local_llm, "HOST_LLM_MODEL", None)
-        set_host_llm_backend(CallableLLMBackend("test", lambda prompt, **kw: f"<think>reasoning</think>Summary of memories."))
+        set_host_llm_backend(CallableLLMBackend("test", lambda prompt, **kw: "<think>reasoning</think>Summary of memories."))
 
         attempted, text = local_llm._try_host_llm("test prompt", max_tokens=128, temperature=0.3)
         assert attempted is True
@@ -399,7 +398,7 @@ class TestThinkTagStripping:
         monkeypatch.setattr(local_llm, "HOST_LLM_TIMEOUT", 5.0)
         monkeypatch.setattr(local_llm, "HOST_LLM_PROVIDER", None)
         monkeypatch.setattr(local_llm, "HOST_LLM_MODEL", None)
-        set_host_llm_backend(CallableLLMBackend("test", lambda prompt, **kw: f"<think>reasoning\nActual output"))
+        set_host_llm_backend(CallableLLMBackend("test", lambda prompt, **kw: "<think>reasoning\nActual output"))
 
         attempted, text = local_llm._try_host_llm("test prompt", max_tokens=128, temperature=0.3)
         assert attempted is True
