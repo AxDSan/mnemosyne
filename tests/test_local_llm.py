@@ -1,10 +1,14 @@
 import builtins
+import importlib
 import logging
 import os
 import subprocess
 import sys
 import types
+from pathlib import Path
 from unittest.mock import patch, MagicMock
+
+import pytest
 
 from mnemosyne.core import local_llm
 from mnemosyne.core.llm_backends import (
@@ -683,3 +687,150 @@ class TestRemoteLLMFallback:
             fb_call = m.call_args_list[1]
             assert fb_call.kwargs["base_url"] == "http://primary/v1"
             assert fb_call.kwargs["api_key"] == "primary-key"
+
+
+class TestModelCacheDirOverride:
+    """MNEMOSYNE_MODEL_CACHE_DIR relocates the GGUF cache (#708).
+
+    The override is authoritative when set: an unusable directory fails rather
+    than falling back to `~/.hermes/mnemosyne/models`, since silently
+    reinstating the location the user moved away from is the substitution the
+    setting exists to prevent.
+    """
+
+    def _select(self, monkeypatch, path, *, from_env=True):
+        monkeypatch.setattr(local_llm, "MODEL_CACHE_DIR", Path(path))
+        monkeypatch.setattr(local_llm, "MODEL_CACHE_DIR_FROM_ENV", from_env, raising=False)
+
+    def test_unset_keeps_the_historical_location(self, monkeypatch):
+        """Import-time behaviour, exercised by re-reading the module's own rule."""
+        monkeypatch.delenv("MNEMOSYNE_MODEL_CACHE_DIR", raising=False)
+        module = importlib.reload(local_llm)
+        try:
+            assert module.MODEL_CACHE_DIR == Path.home() / ".hermes" / "mnemosyne" / "models"
+            assert module.MODEL_CACHE_DIR_FROM_ENV is False
+        finally:
+            importlib.reload(local_llm)
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\t"])
+    def test_blank_value_keeps_the_historical_location(self, monkeypatch, blank):
+        """Per spec, unset and empty behave identically."""
+        monkeypatch.setenv("MNEMOSYNE_MODEL_CACHE_DIR", blank)
+        module = importlib.reload(local_llm)
+        try:
+            assert module.MODEL_CACHE_DIR == Path.home() / ".hermes" / "mnemosyne" / "models"
+            assert module.MODEL_CACHE_DIR_FROM_ENV is False
+        finally:
+            importlib.reload(local_llm)
+
+    def test_set_value_relocates_and_expands_tilde(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("MNEMOSYNE_MODEL_CACHE_DIR", "~/relocated-models")
+        module = importlib.reload(local_llm)
+        try:
+            assert module.MODEL_CACHE_DIR == Path.home() / "relocated-models"
+            assert module.MODEL_CACHE_DIR_FROM_ENV is True
+        finally:
+            importlib.reload(local_llm)
+
+    def test_trailing_whitespace_in_the_path_is_preserved(self, monkeypatch):
+        """A directory name may end in a space; stripping would select another."""
+        monkeypatch.setenv("MNEMOSYNE_MODEL_CACHE_DIR", "/tmp/models ")
+        module = importlib.reload(local_llm)
+        try:
+            assert str(module.MODEL_CACHE_DIR) == "/tmp/models "
+        finally:
+            importlib.reload(local_llm)
+
+    def test_lookup_and_download_both_use_the_override(self, monkeypatch, tmp_path):
+        """One directory for the cached-file check, the mkdir and hf_hub_download."""
+        relocated = tmp_path / "elsewhere"
+        self._select(monkeypatch, relocated)
+        recorded = {}
+
+        def fake_download(**kwargs):
+            recorded.update(kwargs)
+            target = Path(kwargs["local_dir"]) / kwargs["filename"]
+            target.write_bytes(b"gguf")
+            return str(target)
+
+        monkeypatch.setitem(
+            sys.modules, "huggingface_hub", MagicMock(hf_hub_download=fake_download)
+        )
+
+        got = local_llm._download_model()
+
+        assert recorded["local_dir"] == str(relocated)
+        assert got.parent == relocated
+        assert relocated.is_dir()
+        # And the lookup agrees, so a second call short-circuits.
+        assert local_llm._model_path() == relocated / local_llm.DEFAULT_MODEL_FILE
+
+    def test_uncreatable_override_fails_naming_the_variable_and_path(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """A file where the directory should be: cannot be created."""
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("i am a file", encoding="utf-8")
+        self._select(monkeypatch, blocker / "models")
+
+        with caplog.at_level("ERROR", logger=local_llm.__name__):
+            with pytest.raises(RuntimeError) as excinfo:
+                local_llm._ensure_model_cache_dir()
+
+        for expected in ("MNEMOSYNE_MODEL_CACHE_DIR", str(blocker / "models")):
+            assert expected in str(excinfo.value)
+        # Logged as well as raised: _load_llm swallows the exception, so the
+        # raise alone would never reach the user.
+        assert any("MNEMOSYNE_MODEL_CACHE_DIR" in r.getMessage() for r in caplog.records)
+
+    def test_unwritable_override_fails_naming_the_variable_and_path(
+        self, monkeypatch, tmp_path
+    ):
+        """Creatable is not the same as usable."""
+        readonly = tmp_path / "readonly"
+        readonly.mkdir()
+        readonly.chmod(0o500)
+        self._select(monkeypatch, readonly)
+
+        if os.access(readonly, os.W_OK):  # pragma: no cover - root ignores the bit
+            pytest.skip("running as root; the unwritable case cannot be modelled")
+
+        with pytest.raises(RuntimeError) as excinfo:
+            local_llm._ensure_model_cache_dir()
+
+        assert "MNEMOSYNE_MODEL_CACHE_DIR" in str(excinfo.value)
+        assert str(readonly) in str(excinfo.value)
+
+    def test_failure_never_falls_back_to_the_default_location(
+        self, monkeypatch, tmp_path
+    ):
+        """The whole point: no silent return to ~/.hermes/mnemosyne/models."""
+        blocker = tmp_path / "blocked"
+        blocker.write_text("file", encoding="utf-8")
+        self._select(monkeypatch, blocker / "models")
+        default = Path.home() / ".hermes" / "mnemosyne" / "models"
+
+        def _must_not_download(**kwargs):
+            raise AssertionError("must not download after a cache-dir failure")
+
+        monkeypatch.setitem(
+            sys.modules, "huggingface_hub", MagicMock(hf_hub_download=_must_not_download)
+        )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            local_llm._download_model()
+
+        assert str(default) not in str(excinfo.value)
+
+    def test_unset_default_failure_suggests_the_variable(self, monkeypatch, tmp_path):
+        """With no override set, the error offers one instead of blaming it."""
+        blocker = tmp_path / "plain"
+        blocker.write_text("file", encoding="utf-8")
+        self._select(monkeypatch, blocker / "models", from_env=False)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            local_llm._ensure_model_cache_dir()
+
+        message = str(excinfo.value)
+        assert "Set MNEMOSYNE_MODEL_CACHE_DIR to relocate it." in message
+        assert "is set to" not in message

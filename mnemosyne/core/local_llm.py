@@ -35,6 +35,20 @@ if _env_repo and _env_file:
     DEFAULT_MODEL_REPO = _env_repo
     DEFAULT_MODEL_FILE = _env_file
 
+# Override the cache location via env. Environment-only and read at import, like
+# the repo/file overrides above. Unset or blank keeps the historical path.
+#
+# `strip()` decides only whether anything was named; the raw value is what
+# becomes the path, because a POSIX directory name may legitimately begin or end
+# with whitespace and stripping it would silently select a different one.
+_env_cache_dir = os.environ.get("MNEMOSYNE_MODEL_CACHE_DIR", "")
+# Provenance, not a derived fact: the user may set the variable to exactly the
+# default path, so the value alone cannot say whether it was chosen explicitly.
+# The error message below reads differently in each case.
+MODEL_CACHE_DIR_FROM_ENV = bool(_env_cache_dir.strip())
+if MODEL_CACHE_DIR_FROM_ENV:
+    MODEL_CACHE_DIR = Path(_env_cache_dir).expanduser()
+
 # Remote API config
 LLM_BASE_URL = os.environ.get("MNEMOSYNE_LLM_BASE_URL", "").rstrip("/")
 LLM_API_KEY = os.environ.get("MNEMOSYNE_LLM_API_KEY", "")
@@ -103,9 +117,44 @@ def _model_path() -> Optional[Path]:
     return candidate if candidate.exists() else None
 
 
+def _ensure_model_cache_dir() -> Path:
+    """Create the model cache directory, or fail naming it and why.
+
+    An explicitly set ``MNEMOSYNE_MODEL_CACHE_DIR`` is authoritative. Falling
+    back to the default on failure would reinstate the very location the user
+    moved away from, quietly, which is the substitution this override exists to
+    prevent.
+
+    The error is logged as well as raised. ``_load_llm()`` catches every
+    exception from the download path and degrades to AAAK, so a raised message
+    alone would never reach the user; logging is what makes "fail clearly"
+    actually clear.
+    """
+    if MODEL_CACHE_DIR_FROM_ENV:
+        source = f"MNEMOSYNE_MODEL_CACHE_DIR is set to {MODEL_CACHE_DIR}"
+        remedy = "Point it at a writable directory, or unset it to use the default."
+    else:
+        source = f"The model cache directory {MODEL_CACHE_DIR}"
+        remedy = "Set MNEMOSYNE_MODEL_CACHE_DIR to relocate it."
+
+    try:
+        MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        message = f"{source}, which could not be created ({exc}). {remedy}"
+        logger.error("%s", message)
+        raise RuntimeError(message) from exc
+
+    if not os.access(MODEL_CACHE_DIR, os.W_OK):
+        message = f"{source}, which is not writable. {remedy}"
+        logger.error("%s", message)
+        raise RuntimeError(message)
+
+    return MODEL_CACHE_DIR
+
+
 def _download_model() -> Path:
     """Download the GGUF model from HuggingFace if not present."""
-    MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_model_cache_dir()
     local_path = MODEL_CACHE_DIR / DEFAULT_MODEL_FILE
     if local_path.exists():
         return local_path
