@@ -229,8 +229,9 @@ No required config. Everything defaults to `~/.mnemosyne/`. Optional overrides:
 | `MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS` | path-specific built-in canonical set | Complete replacement for the canonical generic-token set used by automatic and explicit canonical lookup; does not affect working/episodic prefetch |
 | `MNEMOSYNE_PREFETCH_CANONICAL_EXTRA_GENERIC_TOKENS` | _(empty)_ | Extra owner/deployment terms added to automatic canonical prefetch only |
 | `MNEMOSYNE_DEFAULT_SCOPE` | `session` | Default scope for remember (`global` enables cross-session immediate recall) |
-| `MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION` | `0` | Resolve factual contradictions among global-scope memories across sessions (marks the stale copy superseded so recall/prefetch stop presenting outdated+current together) |
+| `MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION` | `0` | Enables the `mnemosyne_resolve_conflicts` tool for global-scope memories. It does **not** run automatically: supersession only happens on an explicit apply. `dry_run=True` reports candidate pairs without mutating; `dry_run=False` applies superseding changes (LLM-confirmed when `MNEMOSYNE_LLM_CONFLICT_DETECTION` is on). Automatic resolution during sleep is not yet enabled. |
 | `MNEMOSYNE_CROSS_SESSION_MIN_GAP_HOURS` | `0` | Minimum hour-gap between cross-session candidate pairs before they are flagged for contradiction (relaxed to 0 for independent threads) |
+| `MNEMOSYNE_CROSS_SESSION_MAX_CANDIDATES` | `10000` | Per-bank row cap for the cross-session candidate scan (bounds the pairwise comparison and embedding load); truncation is reported in the tool result |
 
 Or in `~/.hermes/config.yaml`:
 
@@ -244,9 +245,9 @@ memory:
 
 ## Tools
 
-23 tools. All surfaced through Hermes' tool system.
+24 tools. All surfaced through Hermes' tool system.
 
-**Core memory:** `remember`, `recall`, `sleep`, `stats`, `get`, `update`, `forget`, `invalidate`, `validate`
+**Core memory:** `remember`, `recall`, `sleep`, `stats`, `get`, `update`, `forget`, `invalidate`, `validate`, `resolve_conflicts`
 
 **Knowledge graph:** `triple_add`, `triple_query`, `graph_query`, `graph_link`
 

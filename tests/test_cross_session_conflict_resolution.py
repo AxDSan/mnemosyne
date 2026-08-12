@@ -11,8 +11,10 @@ session `invalidate` + recall filtering) is real and non-vacuous.
 from __future__ import annotations
 
 import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from mnemosyne.core.beam import BeamMemory
@@ -170,3 +172,85 @@ def test_sleep_retirement_guard_excludes_superseded(temp_db, monkeypatch, disabl
     ).fetchone()
     assert c_normal[0] is not None, "normal row should be consolidated"
     assert c_stale[0] is None, "superseded row must not be consolidated"
+
+
+def test_dry_run_reports_and_does_not_mutate(temp_db, monkeypatch, disable_llm):
+    """Dry run — the default reporting mode of the tool — lists candidates with
+    zero mutation (and, being deterministic, no LLM calls)."""
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    A = BeamMemory(session_id="tA", db_path=temp_db)
+    B = BeamMemory(session_id="tB", db_path=temp_db)
+    C = BeamMemory(session_id="tC", db_path=temp_db)
+    blue = A.remember("[USER] favorite color is blue", source="conversation",
+                      importance=0.7, scope="global")
+    green = B.remember("[USER] favorite color is green now", source="conversation",
+                       importance=0.7, scope="global")
+    C._detect_conflicts = _stub_detect_pair(blue, green)
+    res = C.resolve_cross_session_conflicts(dry_run=True)
+    assert res["status"] == "dry_run"
+    assert res["pairs_flagged"] >= 1
+    assert res["invalidated"] == 0
+    row = C.conn.execute(
+        "SELECT superseded_by FROM working_memory WHERE id = ?", (blue,)
+    ).fetchone()
+    assert row[0] is None, "dry run must not supersede"
+
+
+def test_source_grouping_excludes_different_sources(temp_db, monkeypatch, disable_llm):
+    """Contradictory global rows carrying different `source` values land in
+    separate groups, so no pair is flagged (the grouping contract the resolver
+    relies on)."""
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    A = BeamMemory(session_id="tA", db_path=temp_db)
+    a1 = A.remember("[USER] favorite color is blue", source="conversation",
+                    importance=0.7, scope="global")
+    a2 = A.remember("[USER] favorite color is green now", source="notes",
+                    importance=0.7, scope="global")
+    A._detect_conflicts = _stub_detect_pair(a1, a2)
+    res = A.resolve_cross_session_conflicts()
+    assert res["pairs_flagged"] == 0
+    assert res["invalidated"] == 0
+    assert res["status"] == "no_op"
+
+
+def test_episodic_global_rows_are_scanned(temp_db, monkeypatch, disable_llm):
+    """`scope='global'` episodic rows are included in the candidate scan (the
+    `_embedding_map` episodic branch has real coverage here)."""
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    A = BeamMemory(session_id="tA", db_path=temp_db)
+    wm = A.remember("[USER] favorite color is blue", source="conversation",
+                    importance=0.7, scope="global")
+    ep = A.consolidate_to_episodic(
+        "[USER] favorite color is green now", source_wm_ids=[wm],
+        source="conversation", importance=0.7, scope="global",
+    )
+    A._detect_conflicts = _stub_detect_pair(wm, ep)
+    assert A.resolve_cross_session_conflicts(dry_run=True)["rows_scanned"] == 2
+    assert A.resolve_cross_session_conflicts(dry_run=True)["invalidated"] == 0
+
+
+def test_detect_conflicts_min_gap_threshold(temp_db, disable_llm):
+    """Direct (non-stubbed) test of `_detect_conflicts` gap logic: a pair closer
+    than `min_gap_hours` is rejected while the same content separated by more
+    than `min_gap_hours` is flagged."""
+    A = BeamMemory(session_id="tA", db_path=temp_db)
+
+    def rows_with_gap(gap_hours):
+        older_ts = (datetime.now() - timedelta(hours=gap_hours)).isoformat()
+        return [
+            {"id": "older", "content": "favorite color is blue for the car",
+             "timestamp": older_ts, "superseded_by": None},
+            {"id": "newer", "content": "my favorite color choice is green grass everywhere",
+             "timestamp": datetime.now().isoformat(), "superseded_by": None},
+        ]
+
+    # Inject embeddings directly (CI has no embedder).
+    A._embedding_map = lambda ids: {
+        "older": np.array([0.0, 1.0], dtype=np.float32),
+        "newer": np.array([0.0, 1.0], dtype=np.float32),
+    }
+    close = rows_with_gap(0.4)   # < 1h apart
+    far = rows_with_gap(3.0)     # > 1h apart
+    assert A._detect_conflicts(close, min_gap_hours=1.0) == []
+    conflicts = A._detect_conflicts(far, min_gap_hours=1.0)
+    assert len(conflicts) == 1 and conflicts[0] == ("older", "newer")

@@ -3405,6 +3405,42 @@ def _cross_session_min_gap_hours() -> float:
         return 0.0
 
 
+_CROSS_SESSION_MAX_CANDIDATES_DEFAULT = 10000
+
+
+def _cross_session_max_candidates() -> int:
+    """Candidate-row cap for the cross-session SELECT, applied per bank.
+
+    Bounds both the O(n^2) pairwise scan in `_detect_conflicts` (most global
+    rows share ``source='conversation'``, so one large group is the common
+    case) and the memory footprint of loading global rows plus their
+    embeddings. Default 10000; override with
+    ``MNEMOSYNE_CROSS_SESSION_MAX_CANDIDATES``.
+    """
+    raw = os.environ.get("MNEMOSYNE_CROSS_SESSION_MAX_CANDIDATES", "").strip()
+    try:
+        return max(1, int(raw)) if raw else _CROSS_SESSION_MAX_CANDIDATES_DEFAULT
+    except ValueError:
+        return _CROSS_SESSION_MAX_CANDIDATES_DEFAULT
+
+
+def _decode_sqlite_vec_binary(blob: bytes, vec_type: str) -> np.ndarray:
+    """Decode a raw sqlite-vec embedding BLOB into a float32 ndarray for cosine
+    comparison (storage types from ``_effective_vec_type``).
+
+    float32 BLOBs are stored byte-for-byte. int8 and bit are quantized forms of
+    a unit-normalized vector; their global scale/sign factors cancel in cosine
+    similarity, so returning a vector proportional to the stored one is
+    sufficient for `_detect_conflicts`. Falls back to float32 for unknown types.
+    """
+    if vec_type == "int8":
+        return np.frombuffer(blob, dtype=np.int8).astype(np.float32)
+    if vec_type == "bit":
+        bits = np.unpackbits(np.frombuffer(blob, dtype=np.uint8))
+        return (bits.astype(np.float32) * 2.0) - 1.0
+    return np.frombuffer(blob, dtype=np.float32).copy()
+
+
 class BeamMemory:
     """
     BEAM memory interface.
@@ -4600,16 +4636,18 @@ class BeamMemory:
 
         missing = [i for i in memory_ids if i not in emb_map]
         if missing and _vec_available(self.conn):
-            # Episodic rows are stored rowid-keyed in vec_episodes.
+            # Episodic rows are stored rowid-keyed in vec_episodes, possibly
+            # quantized (float32/int8/bit) — decode per the stored vector type.
+            vec_type = _effective_vec_type(self.conn, "vec_episodes")
             try:
-                mph = ",".join("?" * len(missing))
+                mph = ", ".join("?" * len(missing))
                 cursor.execute(
                     f"SELECT id, rowid FROM episodic_memory WHERE id IN ({mph})",
                     missing,
                 )
                 rowid_by_id = {r["id"]: r["rowid"] for r in cursor.fetchall()}
                 if rowid_by_id:
-                    rph = ",".join("?" * len(rowid_by_id))
+                    rph = ", ".join("?" * len(rowid_by_id))
                     cursor.execute(
                         f"SELECT rowid, embedding FROM vec_episodes WHERE rowid IN ({rph})",
                         list(rowid_by_id.values()),
@@ -4617,7 +4655,7 @@ class BeamMemory:
                     id_by_rid = {rid: mid for mid, rid in rowid_by_id.items()}
                     for r in cursor.fetchall():
                         try:
-                            vec = np.frombuffer(r["embedding"], dtype=np.float32).copy()
+                            vec = _decode_sqlite_vec_binary(r["embedding"], vec_type)
                             emb_map[id_by_rid[r["rowid"]]] = vec
                         except Exception:
                             continue
@@ -9508,24 +9546,32 @@ class BeamMemory:
         self,
         dry_run: bool = False,
         min_gap_hours: Optional[float] = None,
+        max_candidates: Optional[int] = None,
     ) -> Dict:
         """Resolve factual contradictions among global-scope memories across
         sessions, exposed as an on-demand, operator-invoked tool.
 
         Selects not-superseded `scope='global'` rows from BOTH working_memory
-        and episodic_memory across all sessions, groups them by source, runs the
-        existing heuristic `_detect_conflicts` (with a relaxed `min_gap_hours`,
-        since the intra-conversation back-to-back heuristic does not apply to
-        independent threads), optionally confirms each pair with
-        `validate_conflict_pair` when LLM conflict detection is enabled, and
-        marks the older row superseded via
-        ``invalidate(older_id, replacement_id=newer_id)`` (cross-session-safe
-        for `scope='global'` rows; recall already filters `superseded_by IS
-        NULL`, so the loser vanishes from every surface while its history is
-        preserved).
+        and episodic_memory across all sessions, groups them by `source`, then
+        runs the existing heuristic `_detect_conflicts` over each group (sorted
+        ascending). For each confirmed pair the older row is superseded via the
+        cross-session-safe ``invalidate(older_id, replacement_id=newer_id)``
+        (recall already filters `superseded_by IS NULL`, so the loser vanishes
+        from every surface while its history is preserved).
+
+        Confirmation is LLM-backed via `validate_conflict_pair` only when
+        `MNEMOSYNE_LLM_CONFLICT_DETECTION` is on *and* this is an explicit apply
+        (`dry_run=False`); a dry run is deliberately deterministic — no LLM
+        calls and no mutation — so it only reports detector candidates.
+        `min_gap_hours` relaxes the intra-conversation back-to-back heuristic
+        for independent threads (default 0).
 
         Session-private rows are never considered (they cannot be seen
-        cross-thread), so session isolation is preserved.
+        cross-thread), so session isolation is preserved. The candidate scan is
+        bounded per bank by `max_candidates` (default from
+        `MNEMOSYNE_CROSS_SESSION_MAX_CANDIDATES`, else 10000) to keep the
+        pairwise scan and embedding load bounded; truncation is reported in the
+        result payload.
 
         This is phase one of the cross-session resolution work: candidate
         reporting (`dry_run=True`) and explicit apply (`dry_run=False`). An
@@ -9543,25 +9589,33 @@ class BeamMemory:
                            "(set MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION=1)",
                 "rows_scanned": 0, "pairs_flagged": 0,
                 "conflicts_resolved": 0, "invalidated": 0,
+                "candidates_truncated": False,
             }
 
         if min_gap_hours is None:
             min_gap_hours = _cross_session_min_gap_hours()
+        if max_candidates is None:
+            max_candidates = _cross_session_max_candidates()
 
         cursor = self.conn.cursor()
         now = datetime.now().isoformat()
 
         rows = []
+        truncated = False
         for table in ("working_memory", "episodic_memory"):
             try:
                 cursor.execute(
-                    f"SELECT id, content, source, timestamp, scope, session_id "
+                    f"SELECT id, content, source, timestamp, scope, session_id, superseded_by "
                     f"FROM {table} WHERE scope = 'global' "
                     f"AND superseded_by IS NULL "
-                    f"AND (valid_until IS NULL OR valid_until > ?)",
-                    (now,),
+                    f"AND (valid_until IS NULL OR valid_until > ?) "
+                    f"ORDER BY timestamp ASC LIMIT ?",
+                    (now, max_candidates),
                 )
-                for r in cursor.fetchall():
+                fetched = cursor.fetchall()
+                if len(fetched) >= max_candidates:
+                    truncated = True
+                for r in fetched:
                     d = dict(r)
                     d["_table"] = table
                     rows.append(d)
@@ -9582,6 +9636,13 @@ class BeamMemory:
         pairs_flagged = 0
         conflicts_resolved = 0
         invalidated = 0
+        # IDs superseded, or used as a replacement/target, during THIS run.
+        # Rows are SELECTed once, so in-memory state is authoritative here.
+        # The sets guard chained detector pairs such as (A,B),(B,C): without
+        # them we would supersede A by B and then B by C, leaving A pointing at
+        # a row (B) that is itself hidden.
+        superseded_now: Set[str] = set()
+        replacement_now: Set[str] = set()
         for source, items in grouped.items():
             if len(items) < 2:
                 continue
@@ -9591,6 +9652,10 @@ class BeamMemory:
                 continue
             content_map = {i["id"]: i.get("content", "") for i in items}
             for older_id, newer_id in conflicts:
+                if older_id in replacement_now or newer_id in replacement_now:
+                    continue
+                if older_id in superseded_now or newer_id in superseded_now:
+                    continue
                 older = next((i for i in items if i["id"] == older_id), None)
                 newer = next((i for i in items if i["id"] == newer_id), None)
                 if older is None or newer is None:
@@ -9598,7 +9663,7 @@ class BeamMemory:
                 if older.get("superseded_by") or newer.get("superseded_by"):
                     continue
                 confirmed = True
-                if LLM_CONFLICT_DETECTION_ENABLED:
+                if LLM_CONFLICT_DETECTION_ENABLED and not dry_run:
                     is_conflict, _, _ = validate_conflict_pair(
                         content_map.get(older_id, ""),
                         content_map.get(newer_id, ""),
@@ -9611,14 +9676,26 @@ class BeamMemory:
                 if not dry_run:
                     if self.invalidate(older_id, replacement_id=newer_id):
                         invalidated += 1
+                        superseded_now.add(older_id)
+                        replacement_now.add(newer_id)
                 conflicts_resolved += 1
 
+        if dry_run:
+            status = "dry_run"
+        elif invalidated:
+            status = "resolved"
+        elif conflicts_resolved:
+            status = "partial"
+        else:
+            status = "no_op"
+
         return {
-            "status": "dry_run" if dry_run else ("resolved" if invalidated else "no_op"),
+            "status": status,
             "pairs_flagged": pairs_flagged,
             "conflicts_resolved": conflicts_resolved,
             "invalidated": invalidated,
             "rows_scanned": len(rows),
+            "candidates_truncated": truncated,
         }
 
     def get_consolidation_log(self, limit: int = 10) -> List[Dict]:
