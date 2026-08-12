@@ -4550,14 +4550,74 @@ class BeamMemory:
             self._invalidate_query_cache()
         return invalidated
 
-    def _detect_conflicts(self, rows: List[Dict], similarity_threshold: float = 0.88) -> List[tuple]:
+    def _embedding_map(self, memory_ids: List[str]) -> Dict[str, np.ndarray]:
+        """Load float32 embeddings for memory ids.
+
+        Covers working-memory rows (and episodic rows that fell back to
+        `memory_embeddings`) from `memory_embeddings`; fills any remaining gaps
+        from `vec_episodes` (rowid-keyed, used when sqlite-vec is present) so
+        conflict detection works uniformly over both working and episodic rows.
+        Returns {memory_id: np.ndarray} for ids with a usable embedding.
+        """
+        cursor = self.conn.cursor()
+        emb_map: Dict[str, np.ndarray] = {}
+        if not memory_ids:
+            return emb_map
+
+        ph = ",".join("?" * len(memory_ids))
+        try:
+            cursor.execute(
+                f"SELECT memory_id, embedding_json FROM memory_embeddings "
+                f"WHERE memory_id IN ({ph})",
+                memory_ids,
+            )
+            for row in cursor.fetchall():
+                try:
+                    emb_map[row["memory_id"]] = np.array(
+                        json.loads(row["embedding_json"]), dtype=np.float32
+                    )
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        missing = [i for i in memory_ids if i not in emb_map]
+        if missing and _vec_available(self.conn):
+            # Episodic rows are stored rowid-keyed in vec_episodes.
+            try:
+                mph = ",".join("?" * len(missing))
+                cursor.execute(
+                    f"SELECT id, rowid FROM episodic_memory WHERE id IN ({mph})",
+                    missing,
+                )
+                rowid_by_id = {r["id"]: r["rowid"] for r in cursor.fetchall()}
+                if rowid_by_id:
+                    rph = ",".join("?" * len(rowid_by_id))
+                    cursor.execute(
+                        f"SELECT rowid, embedding FROM vec_episodes WHERE rowid IN ({rph})",
+                        list(rowid_by_id.values()),
+                    )
+                    id_by_rid = {rid: mid for mid, rid in rowid_by_id.items()}
+                    for r in cursor.fetchall():
+                        try:
+                            vec = np.frombuffer(r["embedding"], dtype=np.float32).copy()
+                            emb_map[id_by_rid[r["rowid"]]] = vec
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+        return emb_map
+
+    def _detect_conflicts(self, rows: List[Dict], similarity_threshold: float = 0.88,
+                          min_gap_hours: float = 1.0) -> List[tuple]:
         """
         Heuristic-only conflict detection for consolidation time.
 
         For each pair of memories in rows (already sorted by timestamp ASC):
-        1. Get their embeddings from memory_embeddings table
+        1. Get their embeddings (memory_embeddings, plus vec_episodes for
+           episodic rows)
         2. Compute cosine similarity
-        3. If similarity > threshold AND timestamps differ >1h AND
+        3. If similarity > threshold AND timestamps differ >min_gap_hours AND
            they share overlapping tokens AND they're not duplicates...
            flag the older as potentially superseded
 
@@ -4567,27 +4627,12 @@ class BeamMemory:
         if len(rows) < 2:
             return []
 
-        # Collect embeddings for all memory IDs in one query
+        # Collect embeddings for all memory IDs in one pass (working via
+        # memory_embeddings, episodic via vec_episodes when sqlite-vec present).
         memory_ids = [r["id"] for r in rows]
-        cursor = self.conn.cursor()
-        placeholders = ",".join("?" * len(memory_ids))
-        try:
-            cursor.execute(f"""
-                SELECT memory_id, embedding_json
-                FROM memory_embeddings
-                WHERE memory_id IN ({placeholders})
-            """, memory_ids)
-        except Exception:
+        emb_map = self._embedding_map(memory_ids)
+        if not emb_map:
             return []
-
-        emb_map = {}
-        for row in cursor.fetchall():
-            try:
-                emb_map[row["memory_id"]] = np.array(
-                    json.loads(row["embedding_json"]), dtype=np.float32
-                )
-            except Exception:
-                continue
 
         # Skip rows that are already superseded
         superseded_ids = {r["id"] for r in rows if r.get("superseded_by")}
@@ -4639,7 +4684,7 @@ class BeamMemory:
                     ts_a = datetime.fromisoformat(a["timestamp"])
                     ts_b = datetime.fromisoformat(b["timestamp"])
                     hours_diff = abs((ts_b - ts_a).total_seconds()) / 3600.0
-                    if hours_diff < 1.0:
+                    if hours_diff < min_gap_hours:
                         continue
                 except (ValueError, TypeError):
                     continue
