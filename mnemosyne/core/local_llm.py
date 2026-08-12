@@ -144,7 +144,10 @@ def _ensure_model_cache_dir() -> Path:
         logger.error("%s", message)
         raise RuntimeError(message) from exc
 
-    if not os.access(MODEL_CACHE_DIR, os.W_OK):
+    # Write *and* search: a directory can be mode 0o200, which passes W_OK while
+    # creating anything inside it still fails with PermissionError, because
+    # traversing into a directory needs the execute bit.
+    if not os.access(MODEL_CACHE_DIR, os.W_OK | os.X_OK):
         message = f"{source}, which is not writable. {remedy}"
         logger.error("%s", message)
         raise RuntimeError(message)

@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import types
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -689,6 +690,41 @@ class TestRemoteLLMFallback:
             assert fb_call.kwargs["api_key"] == "primary-key"
 
 
+
+@pytest.fixture
+def restore_modes():
+    """Undo restrictive chmods so pytest can clean up tmp_path.
+
+    A 0o500 or 0o200 directory cannot be removed by the tmp_path teardown, which
+    leaves garbage behind and emits a cleanup warning on every run.
+    """
+    touched = []
+    yield touched
+    for path in touched:
+        try:
+            path.chmod(0o700)
+        except OSError:  # pragma: no cover - already gone
+            pass
+
+
+@contextmanager
+def _model_cache_env(monkeypatch, value):
+    """Reload local_llm under a patched MNEMOSYNE_MODEL_CACHE_DIR, then restore it.
+
+    The first reload has to happen while the variable is set; the restoring
+    reload has to happen after monkeypatch has unset it. Reloading inside a
+    `finally` instead would run before fixture teardown and leave the module
+    describing an environment that no longer exists.
+    """
+    with monkeypatch.context() as patched:
+        if value is None:
+            patched.delenv("MNEMOSYNE_MODEL_CACHE_DIR", raising=False)
+        else:
+            patched.setenv("MNEMOSYNE_MODEL_CACHE_DIR", value)
+        yield importlib.reload(local_llm)
+    importlib.reload(local_llm)
+
+
 class TestModelCacheDirOverride:
     """MNEMOSYNE_MODEL_CACHE_DIR relocates the GGUF cache (#708).
 
@@ -702,44 +738,36 @@ class TestModelCacheDirOverride:
         monkeypatch.setattr(local_llm, "MODEL_CACHE_DIR", Path(path))
         monkeypatch.setattr(local_llm, "MODEL_CACHE_DIR_FROM_ENV", from_env, raising=False)
 
+    _DEFAULT = Path.home() / ".hermes" / "mnemosyne" / "models"
+
     def test_unset_keeps_the_historical_location(self, monkeypatch):
-        """Import-time behaviour, exercised by re-reading the module's own rule."""
-        monkeypatch.delenv("MNEMOSYNE_MODEL_CACHE_DIR", raising=False)
-        module = importlib.reload(local_llm)
-        try:
-            assert module.MODEL_CACHE_DIR == Path.home() / ".hermes" / "mnemosyne" / "models"
+        with _model_cache_env(monkeypatch, None) as module:
+            assert module.MODEL_CACHE_DIR == self._DEFAULT
             assert module.MODEL_CACHE_DIR_FROM_ENV is False
-        finally:
-            importlib.reload(local_llm)
 
     @pytest.mark.parametrize("blank", ["", "   ", "\t"])
     def test_blank_value_keeps_the_historical_location(self, monkeypatch, blank):
         """Per spec, unset and empty behave identically."""
-        monkeypatch.setenv("MNEMOSYNE_MODEL_CACHE_DIR", blank)
-        module = importlib.reload(local_llm)
-        try:
-            assert module.MODEL_CACHE_DIR == Path.home() / ".hermes" / "mnemosyne" / "models"
+        with _model_cache_env(monkeypatch, blank) as module:
+            assert module.MODEL_CACHE_DIR == self._DEFAULT
             assert module.MODEL_CACHE_DIR_FROM_ENV is False
-        finally:
-            importlib.reload(local_llm)
 
-    def test_set_value_relocates_and_expands_tilde(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("MNEMOSYNE_MODEL_CACHE_DIR", "~/relocated-models")
-        module = importlib.reload(local_llm)
-        try:
+    def test_set_value_relocates_and_expands_tilde(self, monkeypatch):
+        with _model_cache_env(monkeypatch, "~/relocated-models") as module:
             assert module.MODEL_CACHE_DIR == Path.home() / "relocated-models"
             assert module.MODEL_CACHE_DIR_FROM_ENV is True
-        finally:
-            importlib.reload(local_llm)
 
     def test_trailing_whitespace_in_the_path_is_preserved(self, monkeypatch):
         """A directory name may end in a space; stripping would select another."""
-        monkeypatch.setenv("MNEMOSYNE_MODEL_CACHE_DIR", "/tmp/models ")
-        module = importlib.reload(local_llm)
-        try:
+        with _model_cache_env(monkeypatch, "/tmp/models ") as module:
             assert str(module.MODEL_CACHE_DIR) == "/tmp/models "
-        finally:
-            importlib.reload(local_llm)
+
+    def test_module_state_is_restored_after_the_override_is_unset(self, monkeypatch):
+        """The reload dance must not leak a stale path into later tests."""
+        with _model_cache_env(monkeypatch, "/tmp/leak-check") as module:
+            assert module.MODEL_CACHE_DIR == Path("/tmp/leak-check")
+        assert local_llm.MODEL_CACHE_DIR == self._DEFAULT
+        assert local_llm.MODEL_CACHE_DIR_FROM_ENV is False
 
     def test_lookup_and_download_both_use_the_override(self, monkeypatch, tmp_path):
         """One directory for the cached-file check, the mkdir and hf_hub_download."""
@@ -784,12 +812,13 @@ class TestModelCacheDirOverride:
         assert any("MNEMOSYNE_MODEL_CACHE_DIR" in r.getMessage() for r in caplog.records)
 
     def test_unwritable_override_fails_naming_the_variable_and_path(
-        self, monkeypatch, tmp_path
+        self, monkeypatch, tmp_path, restore_modes
     ):
         """Creatable is not the same as usable."""
         readonly = tmp_path / "readonly"
         readonly.mkdir()
         readonly.chmod(0o500)
+        restore_modes.append(readonly)
         self._select(monkeypatch, readonly)
 
         if os.access(readonly, os.W_OK):  # pragma: no cover - root ignores the bit
@@ -800,6 +829,39 @@ class TestModelCacheDirOverride:
 
         assert "MNEMOSYNE_MODEL_CACHE_DIR" in str(excinfo.value)
         assert str(readonly) in str(excinfo.value)
+
+    def test_writable_but_unsearchable_override_is_rejected(
+        self, monkeypatch, tmp_path, restore_modes
+    ):
+        """Mode 0o200 passes W_OK, yet creating anything inside still fails.
+
+        Traversing into a directory needs the execute bit, so W_OK alone would
+        accept a directory the download cannot actually write into, and
+        `_load_llm()` would swallow the resulting PermissionError.
+        """
+        unsearchable = tmp_path / "write-only"
+        unsearchable.mkdir()
+        unsearchable.chmod(0o200)
+        restore_modes.append(unsearchable)
+
+        if os.access(unsearchable, os.X_OK):  # pragma: no cover - root ignores the bit
+            pytest.skip("running as root; the unsearchable case cannot be modelled")
+        assert os.access(unsearchable, os.W_OK), "premise: W_OK alone would accept this"
+
+        self._select(monkeypatch, unsearchable)
+
+        def _must_not_download(**kwargs):
+            raise AssertionError("must not download into an unusable directory")
+
+        monkeypatch.setitem(
+            sys.modules, "huggingface_hub", MagicMock(hf_hub_download=_must_not_download)
+        )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            local_llm._download_model()
+
+        assert "MNEMOSYNE_MODEL_CACHE_DIR" in str(excinfo.value)
+        assert str(unsearchable) in str(excinfo.value)
 
     def test_failure_never_falls_back_to_the_default_location(
         self, monkeypatch, tmp_path
