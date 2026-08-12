@@ -1944,6 +1944,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return self._handle_shared_stats(args)
         elif tool_name == "mnemosyne_sleep":
             return self._handle_sleep(args)
+        elif tool_name == "mnemosyne_resolve_conflicts":
+            return self._handle_resolve_conflicts(args)
         elif tool_name == "mnemosyne_stats":
             return self._handle_stats(args)
         elif tool_name == "mnemosyne_invalidate":
@@ -2365,6 +2367,30 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 metadata={"all_sessions": all_sessions, "status": result.get("status")},
             )
         return json.dumps({"status": result.get("status", "consolidated"), "result": result, "working": working, "episodic": episodic})
+
+    def _handle_resolve_conflicts(self, args: Dict[str, Any]) -> str:
+        dry_run = bool(args.get("dry_run", False))
+        if not hasattr(self._beam, "resolve_cross_session_conflicts"):
+            return json.dumps({
+                "status": "unavailable",
+                "message": "resolve_cross_session_conflicts is not available on this beam",
+            })
+        result = self._beam.resolve_cross_session_conflicts(dry_run=dry_run)
+        if not dry_run and int(result.get("invalidated", 0)):
+            try:
+                self._audit_event(
+                    "resolve_conflicts",
+                    bank="private",
+                    source_tool="mnemosyne_resolve_conflicts",
+                    metadata={
+                        "pairs_flagged": int(result.get("pairs_flagged", 0)),
+                        "conflicts_resolved": int(result.get("conflicts_resolved", 0)),
+                        "invalidated": int(result.get("invalidated", 0)),
+                    },
+                )
+            except Exception:
+                pass
+        return json.dumps(result)
 
     def _handle_stats(self, args: Dict[str, Any]) -> str:
         working = self._beam.get_working_stats()
