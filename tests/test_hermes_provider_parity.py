@@ -426,7 +426,13 @@ def test_tool_whitelist_without_yaml_matches_pyyaml(
             normal[name] = "error"
         else:
             assert _schema_names(provider) == expected
-            normal[name] = _json_stable(provider.get_tool_schemas())
+            if expected:
+                normal[name] = _json_stable(provider.get_tool_schemas())
+            else:
+                assert provider.has_tool("mnemosyne_remember") is False
+                normal[name] = json.loads(
+                    provider.handle_tool_call("mnemosyne_remember", {"content": "x"})
+                )
 
     monkeypatch.setitem(sys.modules, "yaml", None)
     for name, module in provider_modules.items():
@@ -437,11 +443,14 @@ def test_tool_whitelist_without_yaml_matches_pyyaml(
             assert normal[name] == "error"
         else:
             assert _schema_names(provider) == expected
-            assert _json_stable(provider.get_tool_schemas()) == normal[name]
             if expected:
+                assert _json_stable(provider.get_tool_schemas()) == normal[name]
                 assert provider.has_tool(expected[0]) is True
                 rejected = json.loads(provider.handle_tool_call("mnemosyne_forget", {"memory_id": "x"}))
                 assert rejected == {"error": "Unknown Mnemosyne tool: mnemosyne_forget"}
+            else:
+                assert provider.has_tool("mnemosyne_remember") is False
+                assert json.loads(provider.handle_tool_call("mnemosyne_remember", {"content": "x"})) == normal[name]
 
 
 def test_tool_whitelist_re_resolves_after_initialize_home_changes(
