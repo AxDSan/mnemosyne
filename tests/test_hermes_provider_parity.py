@@ -406,6 +406,7 @@ def test_tool_whitelist_null_without_yaml_exposes_all_tools(
 @pytest.mark.parametrize(
     ("tools", "expected", "unknown"),
     [
+        (None, PROVIDER_TOOL_NAMES, False),
         (["mnemosyne_remember", "mnemosyne_recall"], ["mnemosyne_remember", "mnemosyne_recall"], False),
         ([], [], False),
         (["mnemosyne_not_real"], None, True),
@@ -423,7 +424,12 @@ def test_tool_whitelist_without_yaml_matches_pyyaml(
         if unknown:
             with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real") as exc_info:
                 provider.get_tool_schemas()
-            normal[name] = str(exc_info.value)
+            normal[name] = {
+                "exception": str(exc_info.value),
+                "dispatch": json.loads(
+                    provider.handle_tool_call("mnemosyne_remember", {"content": "x"})
+                ),
+            }
         else:
             assert _schema_names(provider) == expected
             if expected:
@@ -446,7 +452,10 @@ def test_tool_whitelist_without_yaml_matches_pyyaml(
         if unknown:
             with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real") as exc_info:
                 provider.get_tool_schemas()
-            assert str(exc_info.value) == normal[name]
+            assert str(exc_info.value) == normal[name]["exception"]
+            assert json.loads(
+                provider.handle_tool_call("mnemosyne_remember", {"content": "x"})
+            ) == normal[name]["dispatch"]
         else:
             assert _schema_names(provider) == expected
             if expected:
