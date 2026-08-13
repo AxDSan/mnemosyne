@@ -70,11 +70,11 @@ def test_primary_session_and_duplicate_candidate_ids_are_not_repeated():
 
 def test_custom_group_key_and_numeric_timestamp_are_supported():
     rows = [
-        {"id": "later", "source": "same", "timestamp": 10},
-        {"id": "first", "source": "same", "timestamp": 9},
-        {"id": "other", "source": "other", "timestamp": 8},
+        {"id": "later", "source": "same", "***": "same", "timestamp": 10},
+        {"id": "first", "source": "same", "***": "same", "timestamp": 9},
+        {"id": "other", "source": "other", "***": "other", "timestamp": 8},
     ]
-    packed = build_evidence_pack([], rows, group_key="source")
+    packed = build_evidence_pack([], rows, group_key="***")
 
     assert [row["id"] for row in packed["evidence_pack"]] == ["other", "later"]
 
