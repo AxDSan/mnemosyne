@@ -410,8 +410,18 @@ def test_tool_whitelist_re_resolves_after_initialize_home_changes(
     for module in provider_modules.values():
         provider = module.MnemosyneMemoryProvider()
         assert _schema_names(provider) == ["mnemosyne_remember"]
-        provider._hermes_home = str(initialized_home)
+        assert provider.has_tool("mnemosyne_remember") is True
+        assert provider.has_tool("mnemosyne_recall") is False
+
+        provider.initialize(
+            "allowlist-home-change",
+            hermes_home=str(initialized_home),
+            agent_context="subagent",
+        )
+
         assert _schema_names(provider) == ["mnemosyne_recall"]
+        assert provider.has_tool("mnemosyne_remember") is False
+        assert provider.has_tool("mnemosyne_recall") is True
 
 
 def test_tool_whitelist_filters_schemas_before_routing(tmp_path, provider_modules):
