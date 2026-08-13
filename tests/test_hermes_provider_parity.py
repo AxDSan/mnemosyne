@@ -77,6 +77,8 @@ def _config_schema(module):
 def _write_mnemosyne_config(hermes_home: Path, tools) -> None:
     if tools is None:
         body = "memory:\n  provider: mnemosyne\n  mnemosyne: {}\n"
+    elif not tools:
+        body = "memory:\n  provider: mnemosyne\n  mnemosyne:\n    tools: []\n"
     else:
         rendered_tools = "\n".join(f"      - {tool}" for tool in tools)
         body = (
@@ -327,13 +329,19 @@ def test_tool_whitelist_uses_hermes_home_before_initialize(tmp_path, monkeypatch
         assert provider.has_tool("mnemosyne_forget") is False
 
 
-def test_tool_whitelist_without_home_preserves_full_surface(tmp_path, monkeypatch, provider_modules):
+@pytest.mark.parametrize("hermes_home", [None, ""])
+def test_tool_whitelist_without_home_preserves_full_surface(
+    tmp_path, monkeypatch, provider_modules, hermes_home
+):
     default_home = tmp_path / "home"
     default_hermes_home = default_home / ".hermes"
     default_hermes_home.mkdir(parents=True)
     _write_mnemosyne_config(default_hermes_home, ["mnemosyne_remember"])
     monkeypatch.setenv("HOME", str(default_home))
-    monkeypatch.delenv("HERMES_HOME", raising=False)
+    if hermes_home is None:
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_HOME", hermes_home)
 
     expected = PROVIDER_TOOL_NAMES
     for module in provider_modules.values():
@@ -393,6 +401,47 @@ def test_tool_whitelist_null_without_yaml_exposes_all_tools(
         assert _json_stable(provider.get_tool_schemas()) == _json_stable(
             _filtered_schemas(module, PROVIDER_TOOL_NAMES)
         )
+
+
+@pytest.mark.parametrize(
+    ("tools", "expected", "unknown"),
+    [
+        (["mnemosyne_remember", "mnemosyne_recall"], ["mnemosyne_remember", "mnemosyne_recall"], False),
+        ([], [], False),
+        (["mnemosyne_not_real"], None, True),
+    ],
+)
+def test_tool_whitelist_without_yaml_matches_pyyaml(
+    tmp_path, monkeypatch, provider_modules, tools, expected, unknown
+):
+    """The fallback parser must preserve PyYAML allowlist semantics."""
+    _write_mnemosyne_config(tmp_path, tools)
+
+    normal = {}
+    for name, module in provider_modules.items():
+        provider = _provider_for_config(module, tmp_path)
+        if unknown:
+            with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
+                provider.get_tool_schemas()
+            normal[name] = "error"
+        else:
+            assert _schema_names(provider) == expected
+            normal[name] = _json_stable(provider.get_tool_schemas())
+
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    for name, module in provider_modules.items():
+        provider = _provider_for_config(module, tmp_path)
+        if unknown:
+            with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
+                provider.get_tool_schemas()
+            assert normal[name] == "error"
+        else:
+            assert _schema_names(provider) == expected
+            assert _json_stable(provider.get_tool_schemas()) == normal[name]
+            if expected:
+                assert provider.has_tool(expected[0]) is True
+                rejected = json.loads(provider.handle_tool_call("mnemosyne_forget", {"memory_id": "x"}))
+                assert rejected == {"error": "Unknown Mnemosyne tool: mnemosyne_forget"}
 
 
 def test_tool_whitelist_re_resolves_after_initialize_home_changes(
