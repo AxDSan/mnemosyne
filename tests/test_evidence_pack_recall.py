@@ -244,6 +244,17 @@ def test_vector_only_candidate_is_opt_in(tmp_path: Path, monkeypatch):
     )
     assert memory_id not in [row["id"] for row in low_similarity]
 
+    monkeypatch.setattr(
+        beam_module, "_wm_vec_search",
+        lambda conn, emb, k=20, **kwargs: [{"id": memory_id, "sim": 0.84}],
+    )
+    at_threshold = beam.recall(
+        "unrelated lexical query", top_k=5,
+        _track_recall=False, _include_vector_only_candidates=True,
+    )
+    # The evidence-only vector-similarity floor is inclusive.
+    assert memory_id in [row["id"] for row in at_threshold]
+
 
 def test_vector_only_candidate_obeys_session_scope(tmp_path: Path, monkeypatch):
     np = pytest.importorskip("numpy")
