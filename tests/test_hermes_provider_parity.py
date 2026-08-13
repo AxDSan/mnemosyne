@@ -93,6 +93,11 @@ def _schema_names(provider) -> list[str]:
     return [schema["name"] for schema in provider.get_tool_schemas()]
 
 
+def _filtered_schemas(module, names: list[str]):
+    schemas = _tool_schemas(module)
+    return [schemas[name] for name in names]
+
+
 PROVIDER_TOOL_NAMES = [
     "mnemosyne_remember", "mnemosyne_recall", "mnemosyne_shared_remember",
     "mnemosyne_shared_recall", "mnemosyne_shared_forget", "mnemosyne_shared_stats",
@@ -315,6 +320,9 @@ def test_tool_whitelist_uses_hermes_home_before_initialize(tmp_path, monkeypatch
     for module in provider_modules.values():
         provider = module.MnemosyneMemoryProvider()
         assert _schema_names(provider) == allowed
+        assert _json_stable(provider.get_tool_schemas()) == _json_stable(
+            _filtered_schemas(module, allowed)
+        )
         assert provider.has_tool("mnemosyne_remember") is True
         assert provider.has_tool("mnemosyne_forget") is False
 
@@ -360,7 +368,25 @@ def test_tool_whitelist_null_exposes_all_tools(tmp_path, monkeypatch, provider_m
     monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
     expected = PROVIDER_TOOL_NAMES
     for module in provider_modules.values():
-        assert _schema_names(_provider_for_config(module, tmp_path)) == expected
+        provider = _provider_for_config(module, tmp_path)
+        assert _schema_names(provider) == expected
+        assert _json_stable(provider.get_tool_schemas()) == _json_stable(
+            _filtered_schemas(module, expected)
+        )
+
+
+def test_tool_whitelist_null_without_yaml_exposes_all_tools(tmp_path, monkeypatch, provider_modules):
+    """The minimal config parser must preserve YAML null as no whitelist."""
+    (tmp_path / "config.yaml").write_text(
+        "memory:\n"
+        "  mnemosyne:\n"
+        "    tools: null\n"
+    )
+    monkeypatch.setitem(sys.modules, "yaml", None)
+
+    for module in provider_modules.values():
+        provider = _provider_for_config(module, tmp_path)
+        assert _schema_names(provider) == PROVIDER_TOOL_NAMES
 
 
 def test_tool_whitelist_filters_schemas_before_routing(tmp_path, provider_modules):
