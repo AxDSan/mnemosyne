@@ -93,6 +93,24 @@ def _schema_names(provider) -> list[str]:
     return [schema["name"] for schema in provider.get_tool_schemas()]
 
 
+PROVIDER_TOOL_NAMES = [
+    "mnemosyne_remember", "mnemosyne_recall", "mnemosyne_shared_remember",
+    "mnemosyne_shared_recall", "mnemosyne_shared_forget", "mnemosyne_shared_stats",
+    "mnemosyne_sleep", "mnemosyne_stats", "mnemosyne_invalidate", "mnemosyne_validate",
+    "mnemosyne_get", "mnemosyne_triple_add", "mnemosyne_triple_query",
+    "mnemosyne_triple_end", "mnemosyne_remember_canonical",
+    "mnemosyne_recall_canonical", "mnemosyne_forget_canonical",
+    "mnemosyne_apply_pending", "mnemosyne_model_card", "mnemosyne_model_refresh",
+    "mnemosyne_scratchpad_write", "mnemosyne_scratchpad_read",
+    "mnemosyne_scratchpad_clear", "mnemosyne_export", "mnemosyne_update",
+    "mnemosyne_forget", "mnemosyne_batch", "mnemosyne_import", "mnemosyne_diagnose",
+    "mnemosyne_recall_diagnostics", "mnemosyne_task_progress",
+    "mnemosyne_graph_query", "mnemosyne_graph_link", "mnemosyne_sync_push",
+    "mnemosyne_sync_pull", "mnemosyne_sync_status", "mnemosyne_persona_promote",
+    "mnemosyne_persona_demote", "mnemosyne_persona_list", "mnemosyne_persona_reinforce",
+]
+
+
 def _provider_for_config(module, hermes_home: Path):
     provider = module.MnemosyneMemoryProvider()
     provider._hermes_home = str(hermes_home)
@@ -309,7 +327,7 @@ def test_tool_whitelist_without_home_preserves_full_surface(tmp_path, monkeypatc
     monkeypatch.setenv("HOME", str(default_home))
     monkeypatch.delenv("HERMES_HOME", raising=False)
 
-    expected = list(_tool_schemas(provider_modules["hermes_memory_provider"]))
+    expected = PROVIDER_TOOL_NAMES
     for module in provider_modules.values():
         assert _schema_names(module.MnemosyneMemoryProvider()) == expected
 
@@ -330,7 +348,7 @@ def test_explicit_hermes_home_overrides_environment(tmp_path, monkeypatch):
     assert read_hermes_config_key("", "tools") == ["mnemosyne_recall"]
 
 
-def test_tool_whitelist_null_exposes_all_tools(tmp_path, provider_modules):
+def test_tool_whitelist_null_exposes_all_tools(tmp_path, monkeypatch, provider_modules):
     (tmp_path / "config.yaml").write_text(
         "memory:\n"
         "  provider: mnemosyne\n"
@@ -338,7 +356,9 @@ def test_tool_whitelist_null_exposes_all_tools(tmp_path, provider_modules):
         "    tools: null\n"
     )
 
-    expected = list(_tool_schemas(provider_modules["hermes_memory_provider"]))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
+    expected = PROVIDER_TOOL_NAMES
     for module in provider_modules.values():
         assert _schema_names(_provider_for_config(module, tmp_path)) == expected
 
