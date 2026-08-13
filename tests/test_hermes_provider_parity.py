@@ -375,7 +375,7 @@ def test_tool_whitelist_null_exposes_all_tools(tmp_path, monkeypatch, provider_m
         )
 
 
-@pytest.mark.parametrize("null_value", ["null", "~"])
+@pytest.mark.parametrize("null_value", ["null", "Null", "NULL", "~", ""])
 def test_tool_whitelist_null_without_yaml_exposes_all_tools(
     tmp_path, monkeypatch, provider_modules, null_value
 ):
@@ -393,6 +393,25 @@ def test_tool_whitelist_null_without_yaml_exposes_all_tools(
         assert _json_stable(provider.get_tool_schemas()) == _json_stable(
             _filtered_schemas(module, PROVIDER_TOOL_NAMES)
         )
+
+
+def test_tool_whitelist_re_resolves_after_initialize_home_changes(
+    tmp_path, monkeypatch, provider_modules
+):
+    """initialize() must supersede pre-discovery HERMES_HOME tool selection."""
+    env_home = tmp_path / "environment"
+    initialized_home = tmp_path / "initialized"
+    env_home.mkdir()
+    initialized_home.mkdir()
+    _write_mnemosyne_config(env_home, ["mnemosyne_remember"])
+    _write_mnemosyne_config(initialized_home, ["mnemosyne_recall"])
+    monkeypatch.setenv("HERMES_HOME", str(env_home))
+
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        assert _schema_names(provider) == ["mnemosyne_remember"]
+        provider._hermes_home = str(initialized_home)
+        assert _schema_names(provider) == ["mnemosyne_recall"]
 
 
 def test_tool_whitelist_filters_schemas_before_routing(tmp_path, provider_modules):

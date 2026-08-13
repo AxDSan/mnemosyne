@@ -72,3 +72,14 @@ def test_plugin_registration_honors_tool_allowlist_before_initialize(tmp_path, m
     plugin.register(context)
 
     assert list(context.tools) == ["mnemosyne_remember", "mnemosyne_recall"]
+
+
+def test_plugin_registration_without_allowlist_exposes_full_surface(monkeypatch):
+    """Standalone PluginManager preserves the complete historical tool surface."""
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setattr(plugin, "_provider", None)
+
+    context = _Context()
+    plugin.register(context)
+
+    assert list(context.tools) == [schema["name"] for schema in plugin.ALL_TOOL_SCHEMAS]

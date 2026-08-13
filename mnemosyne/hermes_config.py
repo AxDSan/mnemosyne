@@ -72,7 +72,7 @@ def read_config_key_without_yaml(config_path: str, key: str) -> Any:
         value = stripped.split(":", 1)[1].strip()
         if value == "[]":
             return []
-        if value in {"null", "~"}:
+        if value.lower() == "null" or value == "~":
             return None
         if value:
             return value.strip('"\'')
