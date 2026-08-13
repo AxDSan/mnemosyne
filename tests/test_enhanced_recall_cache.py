@@ -1432,7 +1432,8 @@ def test_reclaim_orphans_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
         )
         memory.conn.commit()
 
-        warm = _call(memory, "orphan reclaim cache sentinel beta", top_k=3)
+        # Warm the enhanced-recall cache for this query.
+        _call(memory, "orphan reclaim cache sentinel beta", top_k=3)
         assert memory._query_cache is not None
         cache_version = memory._query_cache.stats()["version"]
 
@@ -1463,7 +1464,8 @@ def test_sleep_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
         )
         memory.conn.commit()
 
-        warm = _call(memory, "sleep cache sentinel gamma", top_k=3)
+        # Warm the enhanced-recall cache for this query.
+        _call(memory, "sleep cache sentinel gamma", top_k=3)
         assert memory._query_cache is not None
         cache_version = memory._query_cache.stats()["version"]
 
