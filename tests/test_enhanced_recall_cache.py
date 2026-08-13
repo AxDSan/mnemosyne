@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1360,3 +1360,115 @@ def test_legacy_entries_and_every_opaque_access_path_are_exact_only(enhanced):
     assert cache.tier2_hits == 0
     assert cache.tier3_hits == 0
     assert cache.tier4_hits == 0
+
+
+def test_consolidate_to_episodic_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
+    """#427 regression: consolidation changes dense-pool eligibility, so a
+    warmed enhanced-recall entry must not be served after it."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    memory = None
+    try:
+        memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+        wm_id = memory.remember("consolidation cache sentinel alpha", source="fact")
+
+        warm = _call(memory, "consolidation cache sentinel alpha", top_k=3)
+        assert any(r["id"] == wm_id for r in warm)
+        assert memory._query_cache is not None
+
+        # Prove the warmed entry is actually a cache hit: a second identical
+        # call must NOT recompute (recall call count stays flat).
+        recall_calls = []
+        orig_recall = memory.recall
+        memory.recall = lambda query, top_k=40, **kwargs: (
+            recall_calls.append(1), orig_recall(query, top_k=top_k, **kwargs))[1]
+        again = _call(memory, "consolidation cache sentinel alpha", top_k=3)
+        assert again == warm
+        assert len(recall_calls) == 0  # served from cache, no recompute
+
+        cache_version = memory._query_cache.stats()["version"]
+        episodic_id = memory.consolidate_to_episodic(
+            "consolidation cache sentinel alpha (summary)",
+            source_wm_ids=[wm_id],
+            source="test",
+            importance=0.6,
+        )
+        assert episodic_id
+
+        # Consolidation must have invalidated the warmed entry.
+        assert memory._query_cache.stats()["version"] == cache_version + 1
+
+        # The next request recomputes instead of serving the stale entry.
+        refreshed = _call(memory, "consolidation cache sentinel alpha", top_k=3)
+        assert refreshed is not None
+        assert len(recall_calls) == 1  # recomputed, not served from cache
+    finally:
+        _close_memory(memory)
+
+
+def test_reclaim_orphans_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
+    """reclaim_orphans clears consolidated_at, re-admitting rows to the
+    default dense pool; warmed entries must be dropped."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    memory = None
+    try:
+        memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+        wm_id = memory.remember("orphan reclaim cache sentinel beta", source="fact")
+
+        # Plant a stale claim (consolidated but no episodic summary).
+        from datetime import datetime, timedelta
+        stale = (datetime.now() - timedelta(hours=48)).isoformat()
+        memory.conn.execute(
+            "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ? "
+            "WHERE id = ?",
+            (stale, stale, wm_id),
+        )
+        memory.conn.commit()
+
+        warm = _call(memory, "orphan reclaim cache sentinel beta", top_k=3)
+        assert memory._query_cache is not None
+        cache_version = memory._query_cache.stats()["version"]
+
+        result = memory.reclaim_orphans(stale_after_seconds=3600)
+        assert result["status"] == "reclaimed"
+        assert memory._query_cache.stats()["version"] == cache_version + 1
+    finally:
+        _close_memory(memory)
+
+
+def test_sleep_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
+    """sleep() flips consolidated_at and writes summaries — both change
+    dense-pool eligibility; a warmed entry must be invalidated."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    memory = None
+    try:
+        memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+        # sleep() only consolidates rows older than WORKING_MEMORY_TTL_HOURS//2.
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
+        memory.conn.execute(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("old-sleep-row", "sleep cache sentinel gamma", "conversation", old_ts, "session-a"),
+        )
+        memory.conn.commit()
+
+        warm = _call(memory, "sleep cache sentinel gamma", top_k=3)
+        assert memory._query_cache is not None
+        cache_version = memory._query_cache.stats()["version"]
+
+        result = memory.sleep(dry_run=False)
+        assert result["status"] == "consolidated"
+        assert memory._query_cache.stats()["version"] >= cache_version + 1
+    finally:
+        _close_memory(memory)

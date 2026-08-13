@@ -4448,6 +4448,22 @@ class BeamMemory:
                 exc,
             )
 
+    def _invalidate_query_cache_after_commit(self, operation: str) -> None:
+        """Best-effort query-cache invalidation after a mutating commit.
+
+        Consolidation / reclaim / sleep change dense-pool eligibility
+        (``consolidated_at`` transitions, new episodic summaries, episodic
+        degradation), so warmed enhanced-recall v3 entries must not be served
+        stale after those mutations.
+        """
+        try:
+            self._invalidate_query_cache()
+        except Exception as exc:
+            logger.warning(
+                "%s: query-cache invalidation failed after commit (%s): %s",
+                operation, type(exc).__name__, exc,
+            )
+
     def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
         """
         Mark a memory as invalid/superseded.
@@ -4949,6 +4965,9 @@ class BeamMemory:
                     pass  # Non-blocking
 
         self.conn.commit()
+        # The new episodic row and its embeddings change dense-pool
+        # eligibility for enhanced recall; drop warmed cache entries.
+        self._invalidate_query_cache_after_commit("consolidate_to_episodic")
 
         # Phase 3-4: Graph + veracity for consolidated episodic memory
         # E4.a.1 review fix (H2): thread the aggregated row_veracity into
@@ -8921,6 +8940,9 @@ class BeamMemory:
         )
         reclaimed = cursor.rowcount
         self.conn.commit()
+        # Clearing consolidated_at re-admits rows to the default dense
+        # pool; warmed enhanced-recall entries are no longer accurate.
+        self._invalidate_query_cache_after_commit("reclaim_orphans")
         logger.info("reclaim_orphans: reclaimed=%d candidates=%d", reclaimed, len(candidate_ids))
         return {
             "status": "reclaimed" if reclaimed else "no_op",
@@ -9028,6 +9050,11 @@ class BeamMemory:
             # Filter rows to only those we successfully claimed.
             rows = [r for r in rows if r["id"] in claimed_ids]
             self.conn.commit()
+            # The claim flips consolidated_at on live working rows, which
+            # changes default dense-pool eligibility (#427 predicate);
+            # drop warmed enhanced-recall entries immediately so a stale
+            # result set is never served while summaries are being written.
+            self._invalidate_query_cache_after_commit("sleep.claim")
 
         grouped: Dict[str, List[Dict]] = {}
         for row in rows:
@@ -9258,6 +9285,9 @@ class BeamMemory:
 
         # Run tiered degradation after consolidation
         degrade_result = self.degrade_episodic(dry_run=dry_run)
+        if not dry_run:
+            # Summaries + degradation both changed recallable content.
+            self._invalidate_query_cache_after_commit("sleep")
 
         logger.info(
             "sleep: consolidated=%d summaries=%d conflicts=%d llm=%s method=%s",
