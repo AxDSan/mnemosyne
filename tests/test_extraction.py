@@ -278,9 +278,9 @@ if __name__ == "__main__":
 # Host LLM backend integration (decisions A1, A3, C2)
 # ---------------------------------------------------------------------------
 
-from unittest.mock import patch  # noqa: E402
+from unittest.mock import MagicMock, patch  # noqa: E402
 
-from mnemosyne.core import local_llm  # noqa: E402
+from mnemosyne.core import extraction as _extraction_mod, local_llm  # noqa: E402
 from mnemosyne.core.llm_backends import (  # noqa: E402
     CallableLLMBackend,
     set_host_llm_backend,
@@ -387,9 +387,17 @@ def test_remote_extract_facts_rejects_token_truncated_reasoning(monkeypatch):
     monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
     monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", False)
     monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://remote/v1")
-    monkeypatch.setattr(local_llm, "_call_remote_llm", lambda *_args, **_kwargs: "<think>truncated")
+    remote = MagicMock(return_value="<think>truncated")
+    local = MagicMock()
+    parse = MagicMock()
+    monkeypatch.setattr(local_llm, "_call_remote_llm", remote)
+    monkeypatch.setattr(local_llm, "_load_llm", local)
+    monkeypatch.setattr(_extraction_mod, "_parse_facts", parse)
 
     assert extract_facts("Denis prefers dark mode.") == []
+    remote.assert_called_once()
+    local.assert_not_called()
+    parse.assert_not_called()
     samples = get_diagnostics().snapshot()["by_tier"]["remote"]["error_samples"]
     assert samples[-1]["reason"] == "malformed_reasoning_trace"
 
@@ -401,9 +409,14 @@ def test_local_extract_facts_rejects_token_truncated_reasoning(monkeypatch):
     monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", False)
     monkeypatch.setattr(local_llm, "LLM_BASE_URL", "")
     monkeypatch.setattr(local_llm, "llm_available", lambda: True)
-    monkeypatch.setattr(local_llm, "_load_llm", lambda: lambda *_args, **_kwargs: "<think>truncated")
+    local = MagicMock(return_value="<think>truncated")
+    parse = MagicMock()
+    monkeypatch.setattr(local_llm, "_load_llm", lambda: local)
+    monkeypatch.setattr(_extraction_mod, "_parse_facts", parse)
 
     assert extract_facts("Denis prefers dark mode.") == []
+    local.assert_called_once()
+    parse.assert_not_called()
     samples = get_diagnostics().snapshot()["by_tier"]["local"]["error_samples"]
     assert samples[-1]["reason"] == "malformed_reasoning_trace"
 

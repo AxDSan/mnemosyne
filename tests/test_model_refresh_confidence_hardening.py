@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timedelta
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -32,20 +33,29 @@ from mnemosyne.core import model_refresh
 def test_model_refresh_rejects_malformed_host_reasoning(monkeypatch):
     from mnemosyne.core import local_llm
 
-    monkeypatch.setattr(local_llm, "_try_host_llm", lambda *_args, **_kwargs: (True, local_llm._INVALID_REASONING_OUTPUT))
+    host = MagicMock(return_value=(True, local_llm._INVALID_REASONING_OUTPUT))
+    remote = MagicMock()
+    monkeypatch.setattr(local_llm, "_try_host_llm", host)
+    monkeypatch.setattr(local_llm, "_call_remote_llm", remote)
     monkeypatch.setattr(model_refresh, "parse_model_update_proposals", lambda *_args, **_kwargs: pytest.fail("must not parse"))
 
     assert model_refresh.infer_model_update_proposals([{"id": "wm1", "content": "x"}]) == []
+    host.assert_called_once()
+    remote.assert_not_called()
 
 
 def test_model_refresh_rejects_malformed_remote_reasoning(monkeypatch):
     from mnemosyne.core import local_llm
 
-    monkeypatch.setattr(local_llm, "_try_host_llm", lambda *_args, **_kwargs: (False, None))
-    monkeypatch.setattr(local_llm, "_call_remote_llm", lambda *_args, **_kwargs: "<think>truncated")
+    host = MagicMock(return_value=(False, None))
+    remote = MagicMock(return_value="<think>truncated")
+    monkeypatch.setattr(local_llm, "_try_host_llm", host)
+    monkeypatch.setattr(local_llm, "_call_remote_llm", remote)
     monkeypatch.setattr(model_refresh, "parse_model_update_proposals", lambda *_args, **_kwargs: pytest.fail("must not parse"))
 
     assert model_refresh.infer_model_update_proposals([{"id": "wm1", "content": "x"}]) == []
+    host.assert_called_once()
+    remote.assert_called_once()
 
 
 def _proposal(**overrides):
