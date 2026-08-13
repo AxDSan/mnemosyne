@@ -4,8 +4,6 @@ Tests for Mnemosyne Structured Fact Extraction (Phase 2)
 
 import os
 import sys
-import json
-import sqlite3
 import tempfile
 from pathlib import Path
 
@@ -18,9 +16,9 @@ from mnemosyne.core.extraction import (
     _build_extraction_prompt,
     _call_local_extraction_llm,
     _parse_facts,
-    EXTRACTION_PROMPT_TEMPLATE,
 )
 from mnemosyne.core.triples import init_triples
+from mnemosyne.extraction.diagnostics import get_diagnostics, reset_extraction_stats
 
 
 class MockLLM:
@@ -219,7 +217,6 @@ def test_extraction_prompt_configurable():
         
         # Re-import to pick up new env var
         # (In real usage, you'd restart; here we test the constant directly)
-        from mnemosyne.core.extraction import EXTRACTION_PROMPT_TEMPLATE as ep
         # Note: module-level constants are set at import time, so this tests
         # that the code structure supports it. The actual override requires
         # re-import or setting before import.
@@ -283,7 +280,7 @@ if __name__ == "__main__":
 
 from unittest.mock import patch  # noqa: E402
 
-from mnemosyne.core import extraction as _extraction_mod, local_llm  # noqa: E402
+from mnemosyne.core import local_llm  # noqa: E402
 from mnemosyne.core.llm_backends import (  # noqa: E402
     CallableLLMBackend,
     set_host_llm_backend,
@@ -382,6 +379,33 @@ def test_host_extract_facts_rejects_token_truncated_reasoning(monkeypatch):
         assert extract_facts("Denis prefers dark mode.") == []
     remote.assert_not_called()
     local.assert_not_called()
+
+
+def test_remote_extract_facts_rejects_token_truncated_reasoning(monkeypatch):
+    """Malformed remote output records its tier and returns no facts."""
+    reset_extraction_stats()
+    monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
+    monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", False)
+    monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://remote/v1")
+    monkeypatch.setattr(local_llm, "_call_remote_llm", lambda *_args, **_kwargs: "<think>truncated")
+
+    assert extract_facts("Denis prefers dark mode.") == []
+    samples = get_diagnostics().snapshot()["by_tier"]["remote"]["error_samples"]
+    assert samples[-1]["reason"] == "malformed_reasoning_trace"
+
+
+def test_local_extract_facts_rejects_token_truncated_reasoning(monkeypatch):
+    """Malformed local output records its tier and returns no facts."""
+    reset_extraction_stats()
+    monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
+    monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", False)
+    monkeypatch.setattr(local_llm, "LLM_BASE_URL", "")
+    monkeypatch.setattr(local_llm, "llm_available", lambda: True)
+    monkeypatch.setattr(local_llm, "_load_llm", lambda: lambda *_args, **_kwargs: "<think>truncated")
+
+    assert extract_facts("Denis prefers dark mode.") == []
+    samples = get_diagnostics().snapshot()["by_tier"]["local"]["error_samples"]
+    assert samples[-1]["reason"] == "malformed_reasoning_trace"
 
 
 def test_host_extract_facts_remote_path_uses_temperature_zero(monkeypatch):

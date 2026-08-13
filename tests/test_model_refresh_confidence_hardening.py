@@ -29,6 +29,25 @@ from mnemosyne.core.canonical import CanonicalStore
 from mnemosyne.core import model_refresh
 
 
+def test_model_refresh_rejects_malformed_host_reasoning(monkeypatch):
+    from mnemosyne.core import local_llm
+
+    monkeypatch.setattr(local_llm, "_try_host_llm", lambda *_args, **_kwargs: (True, local_llm._INVALID_REASONING_OUTPUT))
+    monkeypatch.setattr(model_refresh, "parse_model_update_proposals", lambda *_args, **_kwargs: pytest.fail("must not parse"))
+
+    assert model_refresh.infer_model_update_proposals([{"id": "wm1", "content": "x"}]) == []
+
+
+def test_model_refresh_rejects_malformed_remote_reasoning(monkeypatch):
+    from mnemosyne.core import local_llm
+
+    monkeypatch.setattr(local_llm, "_try_host_llm", lambda *_args, **_kwargs: (False, None))
+    monkeypatch.setattr(local_llm, "_call_remote_llm", lambda *_args, **_kwargs: "<think>truncated")
+    monkeypatch.setattr(model_refresh, "parse_model_update_proposals", lambda *_args, **_kwargs: pytest.fail("must not parse"))
+
+    assert model_refresh.infer_model_update_proposals([{"id": "wm1", "content": "x"}]) == []
+
+
 def _proposal(**overrides):
     base = {
         "category": "model:user",
