@@ -31,6 +31,7 @@ class TestToolSchemas:
         assert len(names) >= 25
         assert "mnemosyne_remember_canonical" in names
         assert "mnemosyne_recall_canonical" in names
+        assert "mnemosyne_forget_canonical" in names
         assert "mnemosyne_remember" in names
         assert "mnemosyne_batch" in names
         assert "mnemosyne_recall" in names
@@ -192,6 +193,42 @@ class TestToolHandlers:
         ).fetchone()
         assert row is not None
         assert row[0] == "tool"
+
+    def test_forget_canonical_retires_only_the_current_owner_slot(self, tmp_path, monkeypatch):
+        """MCP canonical retirement preserves history and owner isolation."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("MNEMOSYNE_DEFAULT_OWNER", "owner-a")
+        args = {"category": "identity", "name": "name", "body": "Owner A"}
+
+        remembered = handle_tool_call("mnemosyne_remember_canonical", args)
+        assert remembered["status"] == "created"
+        retired = handle_tool_call("mnemosyne_forget_canonical", {
+            "category": "identity", "name": "name",
+        })
+        assert retired == {
+            "retired": True, "owner_id": "owner-a", "category": "identity",
+            "name": "name", "store": "canonical",
+        }
+        assert handle_tool_call("mnemosyne_recall_canonical", {
+            "category": "identity", "name": "name",
+        })["found"] is False
+        history = handle_tool_call("mnemosyne_recall_canonical", {
+            "category": "identity", "name": "name", "include_history": True,
+        })
+        assert history["results_count"] == 1
+        assert history["results"][0]["body"] == "Owner A"
+        assert history["results"][0]["valid_until"] is not None
+
+        monkeypatch.setenv("MNEMOSYNE_DEFAULT_OWNER", "owner-b")
+        assert handle_tool_call("mnemosyne_forget_canonical", {
+            "category": "identity", "name": "name",
+        })["retired"] is False
+
+    def test_forget_canonical_requires_category_and_name(self):
+        assert handle_tool_call("mnemosyne_forget_canonical", {}) == {
+            "error": "category and name are required",
+        }
 
     def test_handle_remember_uses_mcp_bank_env_default(self, mock_mnemosyne, monkeypatch):
         """MCP server bank default applies when tool call omits bank."""

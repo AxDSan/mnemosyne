@@ -825,6 +825,28 @@ def _handle_recall_canonical(arguments: Dict[str, Any]) -> Dict[str, Any]:
             "results_count": len(results), "results": results, "store": "canonical"}
 
 
+def _handle_forget_canonical(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_forget_canonical tool call."""
+    from mnemosyne.core.canonical import CanonicalStore
+
+    category = (arguments.get("category") or "").strip()
+    name = (arguments.get("name") or "").strip()
+    if not category or not name:
+        return {"error": "category and name are required"}
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    store = getattr(mem.beam, "canonical", None)
+    if store is None:
+        db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
+        store = CanonicalStore(db_path=db_path, conn=mem.beam.conn)
+
+    owner_id = _canonical_owner(arguments)
+    retired = store.forget(owner_id, category, name)
+    return {"retired": retired, "owner_id": owner_id, "category": category,
+            "name": name, "store": "canonical"}
+
+
 def _handle_scratchpad_write(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_scratchpad_write tool call."""
     content = arguments.get("content", "").strip()
@@ -1119,6 +1141,7 @@ _TOOL_HANDLERS = {
     "mnemosyne_triple_query": _handle_triple_query,
     "mnemosyne_remember_canonical": _handle_remember_canonical,
     "mnemosyne_recall_canonical": _handle_recall_canonical,
+    "mnemosyne_forget_canonical": _handle_forget_canonical,
     "mnemosyne_scratchpad_write": _handle_scratchpad_write,
     "mnemosyne_scratchpad_read": _handle_scratchpad_read,
     "mnemosyne_scratchpad_clear": _handle_scratchpad_clear,
