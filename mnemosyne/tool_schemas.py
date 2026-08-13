@@ -369,8 +369,9 @@ RECALL_CANONICAL_SCHEMA = {
 FORGET_CANONICAL_SCHEMA = {
     "name": "mnemosyne_forget_canonical",
     "description": (
-        "Retire a CANONICAL self-fact slot for the current profile. "
-        "Stamps valid_until on the current row, preserving it as history. "
+        "Retire a CANONICAL self-fact slot for the resolved owner in the selected "
+        "local bank. This operation is private to that owner. Stamps valid_until "
+        "on the current row, preserving it as local SQLite history. "
         "Returns whether a current row was retired. Nothing is deleted. "
         "Use this to remove a canonical fact (e.g. a stale preference or identity)."
     ),

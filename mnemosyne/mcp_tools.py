@@ -829,8 +829,12 @@ def _handle_forget_canonical(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_forget_canonical tool call."""
     from mnemosyne.core.canonical import CanonicalStore
 
-    category = (arguments.get("category") or "").strip()
-    name = (arguments.get("name") or "").strip()
+    category = arguments.get("category")
+    name = arguments.get("name")
+    if not isinstance(category, str) or not isinstance(name, str):
+        return {"error": "category and name are required"}
+    category = category.strip()
+    name = name.strip()
     if not category or not name:
         return {"error": "category and name are required"}
 
