@@ -421,13 +421,19 @@ def test_tool_whitelist_without_yaml_matches_pyyaml(
     for name, module in provider_modules.items():
         provider = _provider_for_config(module, tmp_path)
         if unknown:
-            with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
+            with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real") as exc_info:
                 provider.get_tool_schemas()
-            normal[name] = "error"
+            normal[name] = str(exc_info.value)
         else:
             assert _schema_names(provider) == expected
             if expected:
-                normal[name] = _json_stable(provider.get_tool_schemas())
+                normal[name] = {
+                    "schemas": _json_stable(provider.get_tool_schemas()),
+                    "has_tool": {tool_name: provider.has_tool(tool_name) for tool_name in expected},
+                    "rejected": json.loads(
+                        provider.handle_tool_call("mnemosyne_forget", {"memory_id": "x"})
+                    ),
+                }
             else:
                 assert provider.has_tool("mnemosyne_remember") is False
                 normal[name] = json.loads(
@@ -438,16 +444,17 @@ def test_tool_whitelist_without_yaml_matches_pyyaml(
     for name, module in provider_modules.items():
         provider = _provider_for_config(module, tmp_path)
         if unknown:
-            with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
+            with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real") as exc_info:
                 provider.get_tool_schemas()
-            assert normal[name] == "error"
+            assert str(exc_info.value) == normal[name]
         else:
             assert _schema_names(provider) == expected
             if expected:
-                assert _json_stable(provider.get_tool_schemas()) == normal[name]
-                assert provider.has_tool(expected[0]) is True
-                rejected = json.loads(provider.handle_tool_call("mnemosyne_forget", {"memory_id": "x"}))
-                assert rejected == {"error": "Unknown Mnemosyne tool: mnemosyne_forget"}
+                assert _json_stable(provider.get_tool_schemas()) == normal[name]["schemas"]
+                assert {tool_name: provider.has_tool(tool_name) for tool_name in expected} == normal[name]["has_tool"]
+                assert json.loads(
+                    provider.handle_tool_call("mnemosyne_forget", {"memory_id": "x"})
+                ) == normal[name]["rejected"]
             else:
                 assert provider.has_tool("mnemosyne_remember") is False
                 assert json.loads(provider.handle_tool_call("mnemosyne_remember", {"content": "x"})) == normal[name]
