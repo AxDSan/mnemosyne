@@ -160,7 +160,7 @@ def test_embed_api_invalid_port_stays_fail_soft(monkeypatch, caplog):
 
 def test_safe_api_endpoint_redacts_userinfo_and_preserves_ipv6_port():
     assert embeddings._safe_api_endpoint(
-        "http://user:pw@[::1]:11435/v1?token=secret"
+        "http://user:pw@[::1]:11435/v1?token=secret#access_token=secret"
     ) == "http://[::1]:11435/v1"
 
 
