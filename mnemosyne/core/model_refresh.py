@@ -219,6 +219,9 @@ def infer_model_update_proposals(
         attempted_host = False
         raw = None
 
+    if local_llm._is_invalid_reasoning_output(raw):
+        return []
+
     if raw is None and not attempted_host:
         try:
             raw = local_llm._call_remote_llm(prompt, temperature=0.1)

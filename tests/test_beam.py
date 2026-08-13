@@ -817,6 +817,18 @@ class TestWorkingMemory:
 
 
 class TestEpisodicMemory:
+    def test_consolidate_rejects_malformed_reasoning_before_insert(self, temp_db):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+
+        with pytest.raises(ValueError, match="malformed reasoning"):
+            beam.consolidate_to_episodic(
+                summary="<think>truncated at the token limit",
+                source_wm_ids=["wm1"],
+            )
+
+        count = beam.conn.execute("SELECT COUNT(*) FROM episodic_memory").fetchone()[0]
+        assert count == 0
+
     def test_consolidate_and_recall(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         eid = beam.consolidate_to_episodic(
@@ -852,6 +864,30 @@ class TestScratchpad:
 
 
 class TestSleepCycle:
+    def test_sleep_falls_back_to_aaak_for_token_truncated_reasoning(self, temp_db, monkeypatch):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
+        beam.conn.execute(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("old-think", "User prefers dark mode", "conversation", old_ts, "s1"),
+        )
+        beam.conn.commit()
+
+        from mnemosyne.core import local_llm
+        truncated_generation = "<think>reasoning cut off at max_tokens"
+        monkeypatch.setattr(local_llm, "llm_available", lambda: True)
+        monkeypatch.setattr(local_llm, "_try_host_llm", lambda *_args, **_kwargs: (False, None))
+        monkeypatch.setattr(local_llm, "_call_local_llm", lambda *_args, **_kwargs: truncated_generation)
+
+        result = beam.sleep()
+        content = beam.conn.execute("SELECT content FROM episodic_memory").fetchone()[0]
+        assert result["status"] == "consolidated"
+        assert result["llm_used"] == 0
+        assert content.startswith("[conversation] ")
+        assert "<think>" not in content
+        assert "truncated" not in content
+
     def test_sleep_consolidates_old_memories(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         # Inject old working memories

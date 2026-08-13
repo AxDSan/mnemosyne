@@ -4635,6 +4635,11 @@ class BeamMemory:
         values and pass it here. `None` falls back to 'unknown' (matches
         legacy behavior + schema default).
         """
+        from mnemosyne.core import local_llm
+
+        summary = local_llm._sanitize_reasoning_output(summary)
+        if local_llm._is_invalid_reasoning_output(summary):
+            raise ValueError("Cannot consolidate malformed reasoning output")
         memory_id = _generate_id(summary)
         timestamp = datetime.now().isoformat()
         # Typed memory classification
@@ -8775,28 +8780,42 @@ class BeamMemory:
 
                 chunks = local_llm.chunk_memories_by_budget(lines, source=source)
                 if chunks:
+                    invalid_reasoning = False
                     if len(chunks) == 1:
-                        # All memories fit in one prompt
-                        summary = local_llm.summarize_memories(chunks[0], source=source)
+                        # All memories fit in one prompt.
+                        summary = local_llm.summarize_memories(
+                            chunks[0], source=source, preserve_invalid=True
+                        )
+                        invalid_reasoning = local_llm._is_invalid_reasoning_output(summary)
                     else:
-                        # Multi-chunk: summarize each chunk, then summarize the summaries
+                        # Multi-chunk: any malformed trace invalidates the
+                        # complete LLM result instead of silently dropping it.
                         chunk_summaries = []
                         for chunk in chunks:
-                            chunk_summary = local_llm.summarize_memories(chunk, source=source)
+                            chunk_summary = local_llm.summarize_memories(
+                                chunk, source=source, preserve_invalid=True
+                            )
+                            if local_llm._is_invalid_reasoning_output(chunk_summary):
+                                invalid_reasoning = True
+                                break
                             if chunk_summary:
                                 chunk_summaries.append(chunk_summary)
-                        if chunk_summaries:
-                            # Second-pass: summarize the chunk summaries
+                        if not invalid_reasoning and chunk_summaries:
+                            # Second-pass: summarize the chunk summaries.
                             if len(chunk_summaries) == 1:
                                 summary = chunk_summaries[0]
                             else:
                                 summary = local_llm.summarize_memories(
                                     chunk_summaries,
-                                    source=f"{source} (consolidated)"
+                                    source=f"{source} (consolidated)",
+                                    preserve_invalid=True,
                                 )
-                                # If second-pass also overflows, concatenate
-                                if not summary:
+                                invalid_reasoning = local_llm._is_invalid_reasoning_output(summary)
+                                # Preserve the existing non-reasoning fallback.
+                                if not invalid_reasoning and not summary:
                                     summary = " | ".join(chunk_summaries)
+                    if invalid_reasoning:
+                        summary = None
                     if summary:
                         llm_used_count += 1
                         llm_succeeded = True

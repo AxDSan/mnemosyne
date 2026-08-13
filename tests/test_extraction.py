@@ -370,6 +370,20 @@ def test_host_extract_facts_preserves_bulleted_output(monkeypatch):
     assert not any(f.startswith("-") for f in facts)
 
 
+def test_host_extract_facts_rejects_token_truncated_reasoning(monkeypatch):
+    """Malformed reasoning must not fall through to another extraction tier."""
+    _enable_host(monkeypatch)
+    set_host_llm_backend(CallableLLMBackend(
+        "test", lambda *a, **k: "<think>reasoning truncated by max_tokens"
+    ))
+
+    with patch.object(local_llm, "_call_remote_llm") as remote, \
+         patch.object(local_llm, "_load_llm") as local:
+        assert extract_facts("Denis prefers dark mode.") == []
+    remote.assert_not_called()
+    local.assert_not_called()
+
+
 def test_host_extract_facts_remote_path_uses_temperature_zero(monkeypatch):
     """REGRESSION (codex finding 2): extract_facts must pass temperature=0.0
     even on the standalone remote path, not just the host path."""
