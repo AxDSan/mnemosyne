@@ -1,5 +1,6 @@
-"""Regression coverage for the installable Core wheel payload."""
+"""Regression coverage for the installable wheel payloads."""
 
+import configparser
 import re
 import shutil
 import subprocess
@@ -75,15 +76,35 @@ def _runtime_version_from_wheel(archive: zipfile.ZipFile, path: str) -> str:
     return match.group(1)
 
 
-def test_core_wheel_excludes_repository_only_hermes_sources(tmp_path):
+def _entry_points_from_wheel(
+    archive: zipfile.ZipFile, members: list[str]
+) -> configparser.ConfigParser:
+    entry_point_files = [
+        path for path in members if path.endswith(".dist-info/entry_points.txt")
+    ]
+    assert len(entry_point_files) == 1, (
+        f"expected one entry_points.txt, found {entry_point_files}"
+    )
+    entry_points = configparser.ConfigParser()
+    entry_points.read_string(archive.read(entry_point_files[0]).decode("utf-8"))
+    return entry_points
+
+
+def test_core_wheel_excludes_repository_only_integrations_tree(tmp_path):
     wheel = _build_core_wheel(tmp_path)
 
     with zipfile.ZipFile(wheel) as archive:
         members = archive.namelist()
 
     assert "mnemosyne/__init__.py" in members
-    leaked = [path for path in members if path.startswith("integrations/hermes/")]
-    assert not leaked, f"Core wheel contains repository-only Hermes payload: {leaked}"
+    leaked = [
+        path
+        for path in members
+        if path == "integrations" or path.startswith("integrations/")
+    ]
+    assert not leaked, (
+        f"Core wheel contains repository-only integrations payload: {leaked}"
+    )
 
 
 def test_standalone_hermes_wheel_keeps_plugin_manifest(tmp_path):
@@ -97,6 +118,13 @@ def test_standalone_hermes_wheel_keeps_plugin_manifest(tmp_path):
         runtime_version = _runtime_version_from_wheel(
             archive, "mnemosyne_hermes/__init__.py"
         )
+        entry_points = _entry_points_from_wheel(archive, members)
 
     assert "mnemosyne_hermes/plugin.yaml" in members
     assert manifest_version == runtime_version
+    assert entry_points["hermes_agent.plugins"]["mnemosyne"] == (
+        "mnemosyne_hermes:register"
+    )
+    assert (
+        entry_points["hermes_agent.memory_providers"]["mnemosyne"] == "mnemosyne_hermes"
+    )
