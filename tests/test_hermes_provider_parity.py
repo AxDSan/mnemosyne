@@ -375,18 +375,24 @@ def test_tool_whitelist_null_exposes_all_tools(tmp_path, monkeypatch, provider_m
         )
 
 
-def test_tool_whitelist_null_without_yaml_exposes_all_tools(tmp_path, monkeypatch, provider_modules):
+@pytest.mark.parametrize("null_value", ["null", "~"])
+def test_tool_whitelist_null_without_yaml_exposes_all_tools(
+    tmp_path, monkeypatch, provider_modules, null_value
+):
     """The minimal config parser must preserve YAML null as no whitelist."""
     (tmp_path / "config.yaml").write_text(
         "memory:\n"
         "  mnemosyne:\n"
-        "    tools: null\n"
+        f"    tools: {null_value}\n"
     )
     monkeypatch.setitem(sys.modules, "yaml", None)
 
     for module in provider_modules.values():
         provider = _provider_for_config(module, tmp_path)
         assert _schema_names(provider) == PROVIDER_TOOL_NAMES
+        assert _json_stable(provider.get_tool_schemas()) == _json_stable(
+            _filtered_schemas(module, PROVIDER_TOOL_NAMES)
+        )
 
 
 def test_tool_whitelist_filters_schemas_before_routing(tmp_path, provider_modules):
