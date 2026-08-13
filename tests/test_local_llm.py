@@ -465,6 +465,11 @@ class TestThinkTagStripping:
         raw = "<think>only thinking, no output</think>"
         assert local_llm._clean_output(raw) == ""
 
+    def test_clean_output_rejects_nested_think_tags(self):
+        assert local_llm._is_invalid_reasoning_output(
+            local_llm._clean_output("<think>outer<think>inner</think>outer</think>")
+        )
+
     def test_clean_output_rejects_unclosed_think_tag(self):
         raw = "middle<think>reasoning truncated at the token limit"
         assert local_llm._is_invalid_reasoning_output(local_llm._clean_output(raw))

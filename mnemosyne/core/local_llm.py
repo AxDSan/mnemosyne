@@ -431,31 +431,44 @@ def _try_host_llm(
     return (True, text)
 
 
-_INVALID_REASONING_OUTPUT = "\x00mnemosyne-invalid-reasoning-output\x00"
+class _InvalidReasoningOutput:
+    """Private marker for a model response that must never be persisted."""
+
+    def __bool__(self) -> bool:
+        return False
+
+
+_INVALID_REASONING_OUTPUT = _InvalidReasoningOutput()
 
 
 def _is_invalid_reasoning_output(value: object) -> bool:
     """Return whether *value* is an unsafe, malformed reasoning response."""
-    return value == _INVALID_REASONING_OUTPUT
+    return value is _INVALID_REASONING_OUTPUT
 
 
-def _sanitize_reasoning_output(text: str) -> str:
+def _sanitize_reasoning_output(text: str):
     """Remove balanced think traces and reject malformed traces fail-closed."""
-    tags = list(re.finditer(r"</?think\s*>", text, flags=re.IGNORECASE))
+    if not isinstance(text, str):
+        return _INVALID_REASONING_OUTPUT
+    tags = list(re.finditer(r"<(/?)think\b[^>]*>", text, flags=re.IGNORECASE))
     depth = 0
     for tag in tags:
-        if tag.group(0).lstrip().startswith("</"):
+        if tag.group(1):
             depth -= 1
             if depth < 0:
                 return _INVALID_REASONING_OUTPUT
         else:
             depth += 1
+            if depth > 1:
+                return _INVALID_REASONING_OUTPUT
     if depth:
         return _INVALID_REASONING_OUTPUT
-    return re.sub(r"<think\s*>.*?</think\s*>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+    return re.sub(
+        r"<think\b[^>]*>.*?</think\b[^>]*>", "", text, flags=re.DOTALL | re.IGNORECASE
+    ).strip()
 
 
-def _clean_output(text: str) -> str:
+def _clean_output(text: str):
     """Strip assistant tokens and extra whitespace from model output."""
     text = _sanitize_reasoning_output(text)
     if _is_invalid_reasoning_output(text):
@@ -691,9 +704,9 @@ def _call_remote_llm(prompt: str, temperature: float = 0.3) -> Optional[str]:
     return None
 
 
-def summarize_memories(
-    memories: List[str], source: str = "", *, preserve_invalid: bool = False
-) -> Optional[str]:
+def _summarize_memories(
+    memories: List[str], source: str = ""
+):
     """Summarize a batch of working-memory items into a single episodic string.
 
     Fallback chain:
@@ -717,7 +730,7 @@ def summarize_memories(
     # chunk_memories_by_budget() respects LLM_N_CTX and safety margins.
     chunks = chunk_memories_by_budget(memories, source=source)
 
-    def _summarize_chunk(chunk_memories: List[str], chunk_source: str = "") -> Optional[str]:
+    def _summarize_chunk(chunk_memories: List[str], chunk_source: str = ""):
         """Summarize a single chunk of memories via the fallback chain."""
         host_prompt = _build_host_prompt(chunk_memories, source=chunk_source)
         prompt = _build_prompt(chunk_memories, source=chunk_source)
@@ -726,7 +739,7 @@ def summarize_memories(
         attempted, text = _try_host_llm(host_prompt, max_tokens=LLM_MAX_TOKENS, temperature=0.3)
         if attempted:
             if _is_invalid_reasoning_output(text):
-                return _INVALID_REASONING_OUTPUT if preserve_invalid else None
+                return _INVALID_REASONING_OUTPUT
             if text:
                 return text
             raw = _call_local_llm(prompt)
@@ -760,7 +773,7 @@ def summarize_memories(
     for chunk in chunks:
         summary = _summarize_chunk(chunk, chunk_source=source)
         if _is_invalid_reasoning_output(summary):
-            return _INVALID_REASONING_OUTPUT if preserve_invalid else None
+            return _INVALID_REASONING_OUTPUT
         if summary:
             chunk_summaries.append(summary)
 
@@ -771,7 +784,13 @@ def summarize_memories(
     if len(chunk_summaries) > 1:
         final = _summarize_chunk(chunk_summaries, chunk_source=f"{source} [chunked {len(chunks)} parts]")
         if _is_invalid_reasoning_output(final):
-            return _INVALID_REASONING_OUTPUT if preserve_invalid else None
+            return _INVALID_REASONING_OUTPUT
         return final if final else chunk_summaries[0]
 
     return chunk_summaries[0]
+
+
+def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
+    """Public summary API; malformed reasoning degrades to no LLM output."""
+    summary = _summarize_memories(memories, source=source)
+    return summary if isinstance(summary, str) else None

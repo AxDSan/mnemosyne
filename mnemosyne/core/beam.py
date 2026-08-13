@@ -4635,11 +4635,6 @@ class BeamMemory:
         values and pass it here. `None` falls back to 'unknown' (matches
         legacy behavior + schema default).
         """
-        from mnemosyne.core import local_llm
-
-        summary = local_llm._sanitize_reasoning_output(summary)
-        if local_llm._is_invalid_reasoning_output(summary):
-            raise ValueError("Cannot consolidate malformed reasoning output")
         memory_id = _generate_id(summary)
         timestamp = datetime.now().isoformat()
         # Typed memory classification
@@ -4658,9 +4653,7 @@ class BeamMemory:
             row_veracity = clamp_veracity(
                 veracity, context="consolidate_to_episodic.veracity"
             )
-        # Strip closed <think>...</think> blocks that some LLMs emit
-        import re as _re
-        summary = _re.sub(r"<think>.*?</think>", "", summary, flags=_re.DOTALL).strip()
+
         # Compute the embedding BEFORE the INSERT opens the write transaction.
         # embed() can be a network call (API embeddings, 30s timeout) or a
         # heavy CPU call; running it after the INSERT held the SQLite write
@@ -8783,18 +8776,14 @@ class BeamMemory:
                     invalid_reasoning = False
                     if len(chunks) == 1:
                         # All memories fit in one prompt.
-                        summary = local_llm.summarize_memories(
-                            chunks[0], source=source, preserve_invalid=True
-                        )
+                        summary = local_llm._summarize_memories(chunks[0], source=source)
                         invalid_reasoning = local_llm._is_invalid_reasoning_output(summary)
                     else:
                         # Multi-chunk: any malformed trace invalidates the
                         # complete LLM result instead of silently dropping it.
                         chunk_summaries = []
                         for chunk in chunks:
-                            chunk_summary = local_llm.summarize_memories(
-                                chunk, source=source, preserve_invalid=True
-                            )
+                            chunk_summary = local_llm._summarize_memories(chunk, source=source)
                             if local_llm._is_invalid_reasoning_output(chunk_summary):
                                 invalid_reasoning = True
                                 break
@@ -8805,16 +8794,21 @@ class BeamMemory:
                             if len(chunk_summaries) == 1:
                                 summary = chunk_summaries[0]
                             else:
-                                summary = local_llm.summarize_memories(
+                                summary = local_llm._summarize_memories(
                                     chunk_summaries,
                                     source=f"{source} (consolidated)",
-                                    preserve_invalid=True,
                                 )
                                 invalid_reasoning = local_llm._is_invalid_reasoning_output(summary)
                                 # Preserve the existing non-reasoning fallback.
                                 if not invalid_reasoning and not summary:
                                     summary = " | ".join(chunk_summaries)
                     if invalid_reasoning:
+                        logger.warning(
+                            "sleep: malformed reasoning trace for source=%r (items=%d) "
+                            "— falling back to AAAK compression",
+                            source,
+                            len(items),
+                        )
                         summary = None
                     if summary:
                         llm_used_count += 1

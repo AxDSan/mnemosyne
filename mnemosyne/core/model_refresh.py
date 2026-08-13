@@ -227,7 +227,9 @@ def infer_model_update_proposals(
             raw = local_llm._call_remote_llm(prompt, temperature=0.1)
         except Exception:
             raw = None
-    if not raw:
+    if isinstance(raw, str):
+        raw = local_llm._sanitize_reasoning_output(raw)
+    if not isinstance(raw, str) or not raw or local_llm._is_invalid_reasoning_output(raw):
         return []
     return parse_model_update_proposals(raw, allowed_categories=allowed)
 

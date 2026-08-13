@@ -817,17 +817,14 @@ class TestWorkingMemory:
 
 
 class TestEpisodicMemory:
-    def test_consolidate_rejects_malformed_reasoning_before_insert(self, temp_db):
+    def test_consolidate_preserves_literal_think_markup(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
+        summary = "User wrote </think> in a literal example"
 
-        with pytest.raises(ValueError, match="malformed reasoning"):
-            beam.consolidate_to_episodic(
-                summary="<think>truncated at the token limit",
-                source_wm_ids=["wm1"],
-            )
+        beam.consolidate_to_episodic(summary=summary, source_wm_ids=["wm1"])
 
-        count = beam.conn.execute("SELECT COUNT(*) FROM episodic_memory").fetchone()[0]
-        assert count == 0
+        content = beam.conn.execute("SELECT content FROM episodic_memory").fetchone()[0]
+        assert content == summary
 
     def test_consolidate_and_recall(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
@@ -864,6 +861,53 @@ class TestScratchpad:
 
 
 class TestSleepCycle:
+    def test_sleep_discards_all_chunk_summaries_after_malformed_chunk(self, temp_db, monkeypatch):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
+        beam.conn.executemany(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
+            [
+                ("chunk-a", "first source memory", "conversation", old_ts, "s1"),
+                ("chunk-b", "second source memory", "conversation", old_ts, "s1"),
+            ],
+        )
+        beam.conn.commit()
+
+        from mnemosyne.core import local_llm
+        monkeypatch.setattr(local_llm, "llm_available", lambda: True)
+        monkeypatch.setattr(local_llm, "chunk_memories_by_budget", lambda *_args, **_kwargs: [["a"], ["b"]])
+        results = iter(["first LLM chunk", local_llm._INVALID_REASONING_OUTPUT])
+        monkeypatch.setattr(local_llm, "_summarize_memories", lambda *_args, **_kwargs: next(results))
+
+        beam.sleep()
+        content = beam.conn.execute("SELECT content FROM episodic_memory").fetchone()[0]
+        assert "first LLM chunk" not in content
+        assert content.startswith("[conversation] ")
+
+    def test_sleep_discards_chunk_summaries_after_invalid_second_pass(self, temp_db, monkeypatch):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
+        beam.conn.executemany(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
+            [
+                ("chunk-a", "first source memory", "conversation", old_ts, "s1"),
+                ("chunk-b", "second source memory", "conversation", old_ts, "s1"),
+            ],
+        )
+        beam.conn.commit()
+
+        from mnemosyne.core import local_llm
+        monkeypatch.setattr(local_llm, "llm_available", lambda: True)
+        monkeypatch.setattr(local_llm, "chunk_memories_by_budget", lambda *_args, **_kwargs: [["a"], ["b"]])
+        results = iter(["first LLM chunk", "second LLM chunk", local_llm._INVALID_REASONING_OUTPUT])
+        monkeypatch.setattr(local_llm, "_summarize_memories", lambda *_args, **_kwargs: next(results))
+
+        beam.sleep()
+        content = beam.conn.execute("SELECT content FROM episodic_memory").fetchone()[0]
+        assert "first LLM chunk" not in content
+        assert "second LLM chunk" not in content
+        assert content.startswith("[conversation] ")
+
     def test_sleep_falls_back_to_aaak_for_token_truncated_reasoning(self, temp_db, monkeypatch):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
