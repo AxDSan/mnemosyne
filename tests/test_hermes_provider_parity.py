@@ -302,7 +302,11 @@ def test_tool_whitelist_uses_hermes_home_before_initialize(tmp_path, monkeypatch
 
 
 def test_tool_whitelist_without_home_preserves_full_surface(tmp_path, monkeypatch, provider_modules):
-    _write_mnemosyne_config(tmp_path, ["mnemosyne_remember"])
+    default_home = tmp_path / "home"
+    default_hermes_home = default_home / ".hermes"
+    default_hermes_home.mkdir(parents=True)
+    _write_mnemosyne_config(default_hermes_home, ["mnemosyne_remember"])
+    monkeypatch.setenv("HOME", str(default_home))
     monkeypatch.delenv("HERMES_HOME", raising=False)
 
     expected = list(_tool_schemas(provider_modules["hermes_memory_provider"]))
@@ -323,6 +327,20 @@ def test_explicit_hermes_home_overrides_environment(tmp_path, monkeypatch):
 
     assert read_hermes_config_key(str(explicit_home), "tools") == ["mnemosyne_remember"]
     assert read_hermes_config_key(None, "tools") == ["mnemosyne_recall"]
+    assert read_hermes_config_key("", "tools") == ["mnemosyne_recall"]
+
+
+def test_tool_whitelist_null_exposes_all_tools(tmp_path, provider_modules):
+    (tmp_path / "config.yaml").write_text(
+        "memory:\n"
+        "  provider: mnemosyne\n"
+        "  mnemosyne:\n"
+        "    tools: null\n"
+    )
+
+    expected = list(_tool_schemas(provider_modules["hermes_memory_provider"]))
+    for module in provider_modules.values():
+        assert _schema_names(_provider_for_config(module, tmp_path)) == expected
 
 
 def test_tool_whitelist_filters_schemas_before_routing(tmp_path, provider_modules):
