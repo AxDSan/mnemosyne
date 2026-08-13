@@ -401,6 +401,15 @@ def test_tool_whitelist_null_without_yaml_exposes_all_tools(
         assert _json_stable(provider.get_tool_schemas()) == _json_stable(
             _filtered_schemas(module, PROVIDER_TOOL_NAMES)
         )
+        assert provider.has_tool("mnemosyne_remember") is True
+        assert json.loads(
+            provider.handle_tool_call("mnemosyne_remember", {"content": "x"})
+        ) == {
+            "status": "memory_unavailable",
+            "tool": "mnemosyne_remember",
+            "reason": "Mnemosyne not initialized",
+            "error": "Mnemosyne unavailable: Mnemosyne not initialized",
+        }
 
 
 @pytest.mark.parametrize(
