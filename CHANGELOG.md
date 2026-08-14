@@ -24,6 +24,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **MCP SSE authentication rejects malformed non-ASCII bearer tokens with `401` instead of returning a server error (#739).**
 - **API embedding failures now leave a redacted diagnostic trace (#735).** Final HTTP, network, and invalid-response failures still degrade to keyword-only retrieval, but now log the endpoint and safe error class or status without request content, API keys, URL userinfo, query strings, or fragments.
 - **Hermes tool discovery now honors `memory.mnemosyne.tools` (#725).** Tools outside the configured allowlist are no longer advertised through Hermes provider schemas before provider initialization.
 - **Truncated LLM reasoning traces no longer reach memory persistence (#734).** Malformed or unbalanced `<think>` output is rejected before fact extraction, model-refresh parsing, or sleep consolidation; sleep falls back to AAAK rather than persisting a partial LLM summary.
