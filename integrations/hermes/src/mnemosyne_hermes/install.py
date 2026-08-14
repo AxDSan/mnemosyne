@@ -2253,8 +2253,8 @@ def main(argv: list[str] | None = None) -> int:
                     _ver = _r.stdout.strip() or _r.stderr.strip()
                     print(f"  Hermes' Python: {hermes_python} ({_ver})")
                     if state.mode == "symlink" and hermes_python.resolve() != Path(sys.executable).resolve():
-                        print("  ⚠ Python version MISMATCH! Install and Hermes use different Python versions.")
-                        print(f"  → Run: {_ver.split()[1]}" if " " in _ver else "")
+                        print("  ⚠ Different Python interpreters! Install and Hermes are not the same environment.")
+                        print(f"  → Run: {hermes_python} -m pip install -U 'mnemosyne-hermes[all]'")
                 except Exception:
                     print(f"  Hermes' Python: {hermes_python} (unable to check version)")
             else:
