@@ -200,8 +200,8 @@ MNEMOSYNE_EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
 # Low-resource local multilingual embeddings
 MNEMOSYNE_EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 
-# Or any fastembed-supported model
-MNEMOSYNE_EMBEDDING_MODEL=intfloat/multilingual-e5-base
+# Larger FastEmbed E5 multilingual embeddings
+MNEMOSYNE_EMBEDDING_MODEL=intfloat/multilingual-e5-large
 ```
 
 The embedding dimension resolves in this order: a non-empty explicit `MNEMOSYNE_EMBEDDING_DIM` (positive integer) takes precedence for every model; otherwise Mnemosyne uses its built-in mappings, including the examples below; an unknown model with no explicit dimension **fails loudly at startup** rather than silently assuming 384. Blank/whitespace-only `MNEMOSYNE_EMBEDDING_DIM` is treated as unset (common in Docker Compose and `.env` files).
@@ -216,8 +216,6 @@ Examples of models with built-in dimension mappings (not an exhaustive model cat
 | `BAAI/bge-base-zh-v1.5` | 768 | Chinese |
 | `BAAI/bge-large-zh-v1.5` | 1,024 | Chinese |
 | `BAAI/bge-m3` | 1,024 | Multilingual |
-| `intfloat/multilingual-e5-small` | 384 | Multilingual |
-| `intfloat/multilingual-e5-base` | 768 | Multilingual |
 | `intfloat/multilingual-e5-large` | 1,024 | Multilingual |
 | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | 384 | Multilingual |
 | `sentence-transformers/all-MiniLM-L6-v2` | 384 | Multilingual |
