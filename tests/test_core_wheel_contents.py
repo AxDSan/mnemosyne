@@ -1,6 +1,7 @@
 """Regression coverage for the installable wheel payloads."""
 
 import configparser
+import email.parser
 import re
 import shutil
 import subprocess
@@ -76,6 +77,17 @@ def _runtime_version_from_wheel(archive: zipfile.ZipFile, path: str) -> str:
     return match.group(1)
 
 
+def _metadata_version_from_wheel(archive: zipfile.ZipFile, members: list[str]) -> str:
+    metadata_files = [path for path in members if path.endswith(".dist-info/METADATA")]
+    assert len(metadata_files) == 1, (
+        f"expected one METADATA file, found {metadata_files}"
+    )
+    metadata = email.parser.BytesParser().parsebytes(archive.read(metadata_files[0]))
+    version = metadata["Version"]
+    assert isinstance(version, str), f"missing Version in {metadata_files[0]}"
+    return version
+
+
 def _entry_points_from_wheel(
     archive: zipfile.ZipFile, members: list[str]
 ) -> configparser.ConfigParser:
@@ -131,10 +143,12 @@ def test_standalone_hermes_wheel_keeps_plugin_manifest(tmp_path):
         runtime_version = _runtime_version_from_wheel(
             archive, "mnemosyne_hermes/__init__.py"
         )
+        metadata_version = _metadata_version_from_wheel(archive, members)
         entry_points = _entry_points_from_wheel(archive, members)
 
     assert "mnemosyne_hermes/plugin.yaml" in members
     assert manifest_version == runtime_version
+    assert manifest_version == metadata_version
     assert entry_points["hermes_agent.plugins"]["mnemosyne"] == (
         "mnemosyne_hermes:register"
     )
