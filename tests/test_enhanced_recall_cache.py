@@ -1435,11 +1435,26 @@ def test_reclaim_orphans_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
         # Warm the enhanced-recall cache for this query.
         _call(memory, "orphan reclaim cache sentinel beta", top_k=3)
         assert memory._query_cache is not None
+
+        # Prove the warmed entry is a real cache hit (no recompute on an
+        # identical call), then instrument recall for the post-mutation check.
+        recall_calls = []
+        orig_recall = memory.recall
+        memory.recall = lambda query, top_k=40, **kwargs: (
+            recall_calls.append(1), orig_recall(query, top_k=top_k, **kwargs))[1]
+        again = _call(memory, "orphan reclaim cache sentinel beta", top_k=3)
+        assert again is not None
+        assert len(recall_calls) == 0  # served from cache, no recompute
+
         cache_version = memory._query_cache.stats()["version"]
 
         result = memory.reclaim_orphans(stale_after_seconds=3600)
         assert result["status"] == "reclaimed"
         assert memory._query_cache.stats()["version"] == cache_version + 1
+
+        # The next request must recompute, not serve the stale entry.
+        _call(memory, "orphan reclaim cache sentinel beta", top_k=3)
+        assert len(recall_calls) == 1  # recomputed, not served from cache
     finally:
         _close_memory(memory)
 
@@ -1467,10 +1482,25 @@ def test_sleep_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
         # Warm the enhanced-recall cache for this query.
         _call(memory, "sleep cache sentinel gamma", top_k=3)
         assert memory._query_cache is not None
+
+        # Prove the warmed entry is a real cache hit (no recompute on an
+        # identical call), then instrument recall for the post-mutation check.
+        recall_calls = []
+        orig_recall = memory.recall
+        memory.recall = lambda query, top_k=40, **kwargs: (
+            recall_calls.append(1), orig_recall(query, top_k=top_k, **kwargs))[1]
+        again = _call(memory, "sleep cache sentinel gamma", top_k=3)
+        assert again is not None
+        assert len(recall_calls) == 0  # served from cache, no recompute
+
         cache_version = memory._query_cache.stats()["version"]
 
         result = memory.sleep(dry_run=False)
         assert result["status"] == "consolidated"
         assert memory._query_cache.stats()["version"] >= cache_version + 1
+
+        # The next request must recompute, not serve the stale entry.
+        _call(memory, "sleep cache sentinel gamma", top_k=3)
+        assert len(recall_calls) == 1  # recomputed, not served from cache
     finally:
         _close_memory(memory)

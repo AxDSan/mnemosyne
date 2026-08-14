@@ -4964,24 +4964,29 @@ class BeamMemory:
                 except Exception:
                     pass  # Non-blocking
 
-        self.conn.commit()
-        # The new episodic row and its embeddings change dense-pool
-        # eligibility for enhanced recall; drop warmed cache entries.
-        self._invalidate_query_cache_after_commit("consolidate_to_episodic")
+        try:
+            self.conn.commit()
 
-        # Phase 3-4: Graph + veracity for consolidated episodic memory
-        # E4.a.1 review fix (H2): thread the aggregated row_veracity into
-        # graph + fact extraction so Bayesian compounding on consolidated
-        # facts uses the source-aggregated signal, not a hardcoded
-        # 'inferred'. Pre-fix this line passed 'inferred' regardless, which
-        # the consolidator's `consolidate_fact` then used as the veracity
-        # weight in its confidence update -- undermining the very signal
-        # we just preserved in the episodic INSERT.
-        self._ingest_graph_and_veracity(memory_id, summary, source, veracity=row_veracity)
+            # Phase 3-4: Graph + veracity for consolidated episodic memory
+            # E4.a.1 review fix (H2): thread the aggregated row_veracity into
+            # graph + fact extraction so Bayesian compounding on consolidated
+            # facts uses the source-aggregated signal, not a hardcoded
+            # 'inferred'. Pre-fix this line passed 'inferred' regardless, which
+            # the consolidator's `consolidate_fact` then used as the veracity
+            # weight in its confidence update -- undermining the very signal
+            # we just preserved in the episodic INSERT.
+            self._ingest_graph_and_veracity(memory_id, summary, source, veracity=row_veracity)
 
-        self._emit_event("MEMORY_CONSOLIDATED", memory_id, content=summary,
-                         source=source, importance=importance,
-                         metadata={"summary_of": source_wm_ids, **(metadata or {})})
+            self._emit_event("MEMORY_CONSOLIDATED", memory_id, content=summary,
+                             source=source, importance=importance,
+                             metadata={"summary_of": source_wm_ids, **(metadata or {})})
+        finally:
+            # The new episodic row, its embeddings, and the graph/fact
+            # mutations all change dense-pool eligibility for enhanced recall;
+            # drop warmed cache entries after every write path, even if the
+            # enrichment step fails (another worker could otherwise refill the
+            # cache between the commit and the graph writes).
+            self._invalidate_query_cache_after_commit("consolidate_to_episodic")
         return memory_id
 
     # ------------------------------------------------------------------
