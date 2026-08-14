@@ -1911,8 +1911,10 @@ def _hyphen_components(token: str) -> List[str]:
 # fragments must also never reach MATCH verbatim. Components may be shorter
 # than the 3-char meaningful gate (e.g. 'rf', or the 'v' in '-v'); they only
 # widen FTS candidate generation and lexical units, while precision is still
-# enforced downstream by the lexical abstention gates.
-_HYPHEN_FRAGMENT_RE = re.compile(r"(?u)(?<!\w)-+[^\W_][\w]*")
+# enforced downstream by the lexical abstention gates. The lookbehind rejects
+# both word characters and '-' so embedded sequences like 'git--rebase' cannot
+# start a fragment at the second hyphen.
+_HYPHEN_FRAGMENT_RE = re.compile(r"(?u)(?<![-\w])-+[^\W_][\w]*")
 
 
 def _hyphen_fragment_tokens(text: str) -> List[str]:

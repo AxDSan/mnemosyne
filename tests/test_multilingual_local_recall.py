@@ -171,6 +171,7 @@ def test_hyphen_fragment_tokens_extract_leading_hyphen_components():
     assert _hyphen_fragment_tokens("python -v") == ["v"]
     assert _hyphen_fragment_tokens("run -a") == []  # one-char stopword
     assert _hyphen_fragment_tokens("flag -1") == []  # numeric flag
+    assert _hyphen_fragment_tokens("git--rebase") == []  # embedded, not a fragment
     assert _hyphen_fragment_tokens("git-rebase") == []
     assert _hyphen_fragment_tokens("") == []
 
