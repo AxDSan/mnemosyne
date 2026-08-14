@@ -4,6 +4,8 @@ from mnemosyne.core import embeddings
 from mnemosyne.core.beam import (
     _expanded_query_tokens,
     _expand_hyphenated_tokens,
+    _fts_query_terms,
+    _hyphen_fragment_tokens,
     _lexical_relevance,
     _recall_tokens,
     BeamMemory,
@@ -158,6 +160,47 @@ def test_hyphenated_query_recalls_split_components_via_public_api(tmp_path):
     )
 
     results = beam.recall("orion-telemetrie", top_k=5)
+
+    assert results[0]["id"] == expected_id
+    assert all(result["id"] != distractor_id for result in results)
+
+
+def test_hyphen_fragment_tokens_extract_leading_hyphen_components():
+    assert _hyphen_fragment_tokens("rm -rf") == ["rf"]
+    assert _hyphen_fragment_tokens("install --force -rf") == ["force", "rf"]
+    assert _hyphen_fragment_tokens("git-rebase") == []
+    assert _hyphen_fragment_tokens("") == []
+
+
+def test_fts_query_terms_never_emit_hyphen_leading_terms():
+    terms = _fts_query_terms("rm -rf")
+    assert terms == ['"rf"']
+    assert all(not term.startswith('"-') for term in terms)
+
+    terms = _fts_query_terms("--force install")
+    assert terms == ['"force"', '"install"']
+
+    terms = _fts_query_terms("git-rebase")
+    assert terms == ['"git-rebase"', '"git"', '"rebase"']
+    assert all(not term.startswith('"-') for term in terms)
+
+
+def test_hyphen_fragments_score_lexically_without_admitting_distractors():
+    query_lower = "rm -rf"
+    assert _lexical_relevance([], "The user does not like rm -rf.", query_lower) == 1.0
+    assert _lexical_relevance([], "Coffee before noon is fine.", query_lower) == 0.0
+
+
+def test_leading_hyphen_fragments_recall_via_public_api(tmp_path):
+    beam = BeamMemory(session_id="hyphen-fragments", db_path=tmp_path / "memory.db")
+    expected_id = beam.remember(
+        "The user does not like the use of `rm -rf`.", source="test", importance=0.5
+    )
+    distractor_id = beam.remember(
+        "The user prefers git rebase over merge commits.", source="test", importance=0.5
+    )
+
+    results = beam.recall("rm -rf", top_k=5)
 
     assert results[0]["id"] == expected_id
     assert all(result["id"] != distractor_id for result in results)

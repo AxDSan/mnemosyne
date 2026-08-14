@@ -1905,6 +1905,35 @@ def _hyphen_components(token: str) -> List[str]:
     ))
 
 
+# Tokens may not start with '-', so _recall_tokens() never captures
+# leading-hyphen fragments (e.g. the '-rf' in 'rm -rf'). FTS5 treats a
+# leading '-' in a term as the NOT / column-exclusion operator, so those
+# fragments must also never reach MATCH verbatim. Components may be shorter
+# than the 3-char meaningful gate (e.g. 'rf'); they only widen FTS candidate
+# generation and lexical units, while precision is still enforced downstream
+# by the lexical abstention gates.
+_HYPHEN_FRAGMENT_RE = re.compile(r"(?u)(?<!\w)-+[^\W_][\w]*")
+
+
+def _hyphen_fragment_tokens(text: str) -> List[str]:
+    """Return unique components of leading-hyphen fragments in ``text``.
+
+    ``rm -rf`` yields ``['rf']`` and ``--force`` yields ``['force']``.
+    Fragments embedded in a word (``git-rebase``) are already covered by
+    ``_recall_tokens()`` and are intentionally not matched here.
+    """
+    tokens: List[str] = []
+    for fragment in _HYPHEN_FRAGMENT_RE.findall(text.lower()):
+        for part in fragment.split("-"):
+            if (
+                len(part) >= 2
+                and part not in _FACT_MATCH_STOPWORDS
+                and not part.isdigit()
+            ):
+                tokens.append(part)
+    return list(dict.fromkeys(tokens))
+
+
 def _component_unit_weight(components: List[str]) -> int:
     """Return the lexical-unit weight for a token's hyphen components."""
     return len(components) if len(components) >= 2 else 1
@@ -2055,6 +2084,8 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
         or "\u3040" <= ch <= "\u30ff"
         or "\uac00" <= ch <= "\ud7af"
     }
+    if query_lower:
+        query_tokens = [*query_tokens, *_hyphen_fragment_tokens(query_lower)]
     if not query_tokens and not query_cjk:
         return 0.0
     # Callers pass raw _recall_tokens() output. Count each compound's
@@ -2065,6 +2096,10 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
         _component_unit_weight(components) for components in component_groups
     )
     content_tokens = set(_recall_tokens(content_lower))
+    # Leading-hyphen fragments are invisible to _recall_tokens() (a token
+    # must start with a word character); admit their components on both
+    # sides so shell-style queries like "rm -rf" are not silently missed.
+    content_tokens.update(_hyphen_fragment_tokens(content_lower))
     # Structured MEMORIA contexts often encode keys as snake_case
     # (telemetry_api_latency_ms). Split separators so natural-language
     # queries get full lexical credit for the same fact.
@@ -2779,12 +2814,31 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
 
 
 def _fts_query_terms(query: str) -> List[str]:
-    """FTS-safe meaningful terms for natural-language recall queries."""
-    terms = []
+    """FTS-safe meaningful terms for natural-language recall queries.
+
+    Terms are quoted so FTS5 treats them as literal phrases. A term must
+    never start with ``-``: FTS5 parses a leading hyphen as the NOT /
+    column-exclusion operator, so e.g. ``'"rm" OR "-rf"'`` raises
+    ``no such column: rf`` and recall fails silently. Leading-hyphen
+    fragments are therefore split into their components (``rm -rf`` ->
+    ``"rf"``) and any hyphen-leading token is dropped.
+    """
+    terms: List[str] = []
+    seen: Set[str] = set()
     for term in _expanded_query_tokens(_recall_tokens(query)):
+        if term.startswith("-"):
+            # FTS5-only terms never reach MATCH verbatim. The fragment's
+            # components are added below via _hyphen_fragment_tokens().
+            continue
         term = term.replace('"', '""').strip()
-        if term:
+        if term and term not in seen:
+            seen.add(term)
             terms.append(f'"{term}"')
+    for component in _hyphen_fragment_tokens(query):
+        component = component.replace('"', '""').strip()
+        if component and component not in seen:
+            seen.add(component)
+            terms.append(f'"{component}"')
     return terms
 
 
