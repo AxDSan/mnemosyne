@@ -1909,16 +1909,18 @@ def _hyphen_components(token: str) -> List[str]:
 # leading-hyphen fragments (e.g. the '-rf' in 'rm -rf'). FTS5 treats a
 # leading '-' in a term as the NOT / column-exclusion operator, so those
 # fragments must also never reach MATCH verbatim. Components may be shorter
-# than the 3-char meaningful gate (e.g. 'rf'); they only widen FTS candidate
-# generation and lexical units, while precision is still enforced downstream
-# by the lexical abstention gates.
+# than the 3-char meaningful gate (e.g. 'rf', or the 'v' in '-v'); they only
+# widen FTS candidate generation and lexical units, while precision is still
+# enforced downstream by the lexical abstention gates.
 _HYPHEN_FRAGMENT_RE = re.compile(r"(?u)(?<!\w)-+[^\W_][\w]*")
 
 
 def _hyphen_fragment_tokens(text: str) -> List[str]:
     """Return unique components of leading-hyphen fragments in ``text``.
 
-    ``rm -rf`` yields ``['rf']`` and ``--force`` yields ``['force']``.
+    ``rm -rf`` yields ``['rf']``, ``--force`` yields ``['force']`` and
+    ``python -v`` yields ``['v']``. One-character components are kept when
+    they are not stopwords or digits so single-letter flags stay recallable.
     Fragments embedded in a word (``git-rebase``) are already covered by
     ``_recall_tokens()`` and are intentionally not matched here.
     """
@@ -1926,7 +1928,7 @@ def _hyphen_fragment_tokens(text: str) -> List[str]:
     for fragment in _HYPHEN_FRAGMENT_RE.findall(text.lower()):
         for part in fragment.split("-"):
             if (
-                len(part) >= 2
+                len(part) >= 1
                 and part not in _FACT_MATCH_STOPWORDS
                 and not part.isdigit()
             ):

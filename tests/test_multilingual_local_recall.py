@@ -168,6 +168,9 @@ def test_hyphenated_query_recalls_split_components_via_public_api(tmp_path):
 def test_hyphen_fragment_tokens_extract_leading_hyphen_components():
     assert _hyphen_fragment_tokens("rm -rf") == ["rf"]
     assert _hyphen_fragment_tokens("install --force -rf") == ["force", "rf"]
+    assert _hyphen_fragment_tokens("python -v") == ["v"]
+    assert _hyphen_fragment_tokens("run -a") == []  # one-char stopword
+    assert _hyphen_fragment_tokens("flag -1") == []  # numeric flag
     assert _hyphen_fragment_tokens("git-rebase") == []
     assert _hyphen_fragment_tokens("") == []
 
@@ -179,6 +182,10 @@ def test_fts_query_terms_never_emit_hyphen_leading_terms():
 
     terms = _fts_query_terms("--force install")
     assert terms == ['"force"', '"install"']
+
+    terms = _fts_query_terms("python -v")
+    assert terms == ['"python"', '"v"']
+    assert all(not term.startswith('"-') for term in terms)
 
     terms = _fts_query_terms("git-rebase")
     assert terms == ['"git-rebase"', '"git"', '"rebase"']
@@ -201,6 +208,21 @@ def test_leading_hyphen_fragments_recall_via_public_api(tmp_path):
     )
 
     results = beam.recall("rm -rf", top_k=5)
+
+    assert results[0]["id"] == expected_id
+    assert all(result["id"] != distractor_id for result in results)
+
+
+def test_single_char_flag_recalls_via_public_api(tmp_path):
+    beam = BeamMemory(session_id="single-char-flag", db_path=tmp_path / "memory.db")
+    expected_id = beam.remember(
+        "The user runs python with -v for verbose output.", source="test", importance=0.5
+    )
+    distractor_id = beam.remember(
+        "The user prefers git rebase over merge commits.", source="test", importance=0.5
+    )
+
+    results = beam.recall("python -v", top_k=5)
 
     assert results[0]["id"] == expected_id
     assert all(result["id"] != distractor_id for result in results)
