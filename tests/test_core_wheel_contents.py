@@ -127,8 +127,17 @@ def test_core_wheel_keeps_package_integrations_and_excludes_repository_tree(tmp_
         for path in members
         if path == "integrations" or path.startswith("integrations/")
     ]
+    leaked_hermes_namespace = [
+        path
+        for path in members
+        if path == "mnemosyne_hermes" or path.startswith("mnemosyne_hermes/")
+    ]
     assert not leaked, (
         f"Core wheel contains repository-only integrations payload: {leaked}"
+    )
+    assert not leaked_hermes_namespace, (
+        "Core wheel contains standalone Hermes payload: "
+        f"{leaked_hermes_namespace}"
     )
 
 
