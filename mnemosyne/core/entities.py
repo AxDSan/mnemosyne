@@ -45,7 +45,7 @@ ENTITY_EXTRACTION_STOP_WORDS: Set[str] = {
     "having", "however", "if", "into", "just", "keep", "know", "last",
     "like", "look", "looking", "made", "make", "makes", "many", "maybe",
     "might", "more", "most", "much", "must", "need", "needs", "negative",
-    "never", "new", "next", "nothing", "off", "once", "one", "only",
+    "never", "next", "nothing", "off", "once", "one", "only",
     "onto", "other", "others", "otherwise", "out", "over", "part",
     "please", "possible", "rather", "really", "right", "same", "say",
     "see", "seen", "several", "should", "show", "shows", "since", "so",
@@ -239,10 +239,15 @@ def extract_entities_regex(text: str) -> List[str]:
             # Filter out stop words (single word only); case-insensitive
             words = entity.split()
             if len(words) == 1 and entity.lower() in _STOP_WORDS:
-                continue
-            # Multi-word entities: drop only when EVERY word is a stopword
-            # (upstream dropped when ANY word was, killing "New York").
-            if len(words) > 1 and all(w.lower() in _STOP_WORDS for w in words):
+                # @mentions / hashtags are explicit entity signals — bypass
+                # the stopword filter (mirrors the lowercase check below)
+                match_start = match.start(1)
+                prefix_char = text[match_start - 1] if match_start > 0 else ''
+                if prefix_char not in ('@', '#'):
+                    continue
+            # Multi-word entities: drop when ANY word is a stopword
+            # (upstream contract — "The Quick Brown Fox" drops on "the").
+            if len(words) > 1 and any(w.lower() in _STOP_WORDS for w in words):
                 continue
             # Multi-word entities must be proper-noun shaped: every word starts
             # uppercase, is a digit, or is a stopword. Keeps "PMO City",
