@@ -1409,6 +1409,60 @@ def test_consolidate_to_episodic_invalidates_warmed_v3_cache(monkeypatch, tmp_pa
         _close_memory(memory)
 
 
+@pytest.mark.parametrize("fail_method", ["_ingest_graph_and_veracity", "_emit_event"])
+def test_consolidate_enrichment_failure_still_invalidates_warmed_v3_cache(
+    monkeypatch, tmp_path, fail_method
+):
+    """The finally-block invalidation must also fire when consolidation
+    enrichment (graph/veracity or event emission) raises."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    memory = None
+    try:
+        memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+        wm_id = memory.remember("consolidation failure sentinel delta", source="fact")
+
+        # Warm the enhanced-recall cache, then prove it is a real hit.
+        _call(memory, "consolidation failure sentinel delta", top_k=3)
+        assert memory._query_cache is not None
+        recall_calls = []
+        orig_recall = memory.recall
+        memory.recall = lambda query, top_k=40, **kwargs: (
+            recall_calls.append(1), orig_recall(query, top_k=top_k, **kwargs))[1]
+        again = _call(memory, "consolidation failure sentinel delta", top_k=3)
+        assert again is not None
+        assert len(recall_calls) == 0  # served from cache, no recompute
+
+        cache_version = memory._query_cache.stats()["version"]
+
+        # Make the enrichment step raise; the finally block must still
+        # invalidate the cache before the exception propagates.
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError(f"{fail_method} exploded (test)")
+
+        monkeypatch.setattr(memory, fail_method, _boom)
+        with pytest.raises(RuntimeError, match="exploded"):
+            memory.consolidate_to_episodic(
+                "consolidation failure sentinel delta (summary)",
+                source_wm_ids=[wm_id],
+                source="test",
+                importance=0.6,
+            )
+
+        # finally-block invalidation ran despite the failure.
+        assert memory._query_cache.stats()["version"] == cache_version + 1
+
+        # The next request recomputes instead of serving the stale entry.
+        refreshed = _call(memory, "consolidation failure sentinel delta", top_k=3)
+        assert refreshed is not None
+        assert len(recall_calls) == 1  # recomputed, not served from cache
+    finally:
+        _close_memory(memory)
+
+
 def test_reclaim_orphans_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
     """reclaim_orphans clears consolidated_at, re-admitting rows to the
     default dense pool; warmed entries must be dropped."""
