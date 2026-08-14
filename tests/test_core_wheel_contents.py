@@ -90,13 +90,26 @@ def _entry_points_from_wheel(
     return entry_points
 
 
-def test_core_wheel_excludes_repository_only_integrations_tree(tmp_path):
+def test_core_wheel_keeps_package_integrations_and_excludes_repository_tree(tmp_path):
     wheel = _build_core_wheel(tmp_path)
 
     with zipfile.ZipFile(wheel) as archive:
         members = archive.namelist()
+        entry_points = _entry_points_from_wheel(archive, members)
 
     assert "mnemosyne/__init__.py" in members
+    expected_integrations = {
+        "mnemosyne/integrations/memory_browser.py",
+        "mnemosyne/integrations/auto_save_openwebui.py",
+    }
+    missing = expected_integrations.difference(members)
+    assert not missing, f"Core wheel is missing package integrations: {sorted(missing)}"
+    assert entry_points["console_scripts"]["mnemosyne-browser"] == (
+        "mnemosyne.integrations.memory_browser:main"
+    )
+    assert entry_points["console_scripts"]["mnemosyne-auto-save"] == (
+        "mnemosyne.integrations.auto_save_openwebui:main"
+    )
     leaked = [
         path
         for path in members
