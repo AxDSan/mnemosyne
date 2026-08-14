@@ -155,3 +155,6 @@ def test_standalone_hermes_wheel_keeps_plugin_manifest(tmp_path):
     assert (
         entry_points["hermes_agent.memory_providers"]["mnemosyne"] == "mnemosyne_hermes"
     )
+    assert entry_points["console_scripts"]["mnemosyne-hermes"] == (
+        "mnemosyne_hermes.install:main"
+    )
