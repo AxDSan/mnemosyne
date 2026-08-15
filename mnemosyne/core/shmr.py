@@ -74,7 +74,10 @@ def _init_schema(conn):
 
 def _embed(text: str) -> np.ndarray:
     """Embed text using Mnemosyne's embedding pipeline (BAAI/bge-small)."""
-    emb = _embeddings.embed(text)
+    emb = _embeddings.embed([text])
+    if emb is None or len(emb) == 0:
+        return np.zeros(EMBEDDING_DIM, dtype=np.float32)
+    emb = emb[0]
     if emb.ndim > 1:
         emb = emb.flatten()
     return emb.astype(np.float32)
@@ -406,11 +409,10 @@ def harmonize(beam, batch_size: int = None, max_iterations: int = None,
     # Prioritize: recent facts + high-confidence episodic memories
     candidates = []
 
-    # Facts (status = active or NULL)
+    # Facts (beam's `facts` table has no `status` column; all facts are active)
     fact_rows = cursor.execute("""
         SELECT fact_id, subject, predicate, object, confidence, timestamp
         FROM facts
-        WHERE status = 'active' OR status IS NULL
         ORDER BY created_at DESC
         LIMIT ?
     """, (batch_size,)).fetchall()
