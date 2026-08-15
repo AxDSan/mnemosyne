@@ -5,8 +5,9 @@ Tests for Mnemosyne BEAM architecture
 import pytest
 import tempfile
 import sqlite3
+import time
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from mnemosyne.core import beam as beam_module
 from mnemosyne.core.beam import BeamMemory, init_beam, _find_memories_by_fact, _wm_vec_search
@@ -814,6 +815,103 @@ class TestWorkingMemory:
         beam._trim_working_memory()
         stats = beam.get_working_stats()
         assert stats["total"] == 0
+
+    def test_invalidate_stamps_aware_utc_valid_until(self, temp_db, monkeypatch):
+        """#525: invalidate() writes an aware-UTC valid_until, not naive local.
+
+        A naive local timestamp compared against SQLite UTC surfaces
+        (julianday('now') / CURRENT_TIMESTAMP) drifts by the host offset.
+        The write path must produce an aware UTC instant so recall/context
+        filtering agrees with doctor/repair.
+        """
+        monkeypatch.setenv("TZ", "Europe/Copenhagen")
+        time.tzset()
+        try:
+            beam = BeamMemory(session_id="s1", db_path=temp_db)
+            mid = beam.remember("expiring memory", source="test", importance=0.9)
+
+            assert beam.invalidate(mid) is True
+            row = beam.conn.execute(
+                "SELECT valid_until FROM working_memory WHERE id = ?", (mid,)
+            ).fetchone()
+            assert row is not None
+            valid_until = datetime.fromisoformat(row[0])
+            assert valid_until.tzinfo is not None
+            assert valid_until.utcoffset() == timedelta(0)
+        finally:
+            monkeypatch.delenv("TZ", raising=False)
+            time.tzset()
+
+    def test_invalidated_memory_excluded_across_utc_surfaces(self, temp_db, monkeypatch):
+        """#525: after invalidate(), recall/context and SQLite UTC agree.
+
+        The Python-side filters compare against aware-UTC now, matching the
+        julianday('now') comparison used by doctor/repair, so both surfaces
+        agree on a non-UTC host.
+        """
+        monkeypatch.setenv("TZ", "Europe/Copenhagen")
+        time.tzset()
+        try:
+            beam = BeamMemory(session_id="s1", db_path=temp_db)
+            mid = beam.remember("expiring memory", source="test", importance=0.9)
+            assert beam.invalidate(mid) is True
+
+            assert mid not in {r["id"] for r in beam.get_context(limit=10)}
+            row = beam.conn.execute(
+                "SELECT CASE WHEN valid_until IS NULL OR "
+                "julianday(valid_until) > julianday('now') "
+                "THEN 1 ELSE 0 END AS active "
+                "FROM working_memory WHERE id = ?",
+                (mid,),
+            ).fetchone()
+            assert row["active"] == 0
+        finally:
+            monkeypatch.delenv("TZ", raising=False)
+            time.tzset()
+
+    def test_legacy_naive_valid_until_interpreted_as_utc(self, temp_db, monkeypatch):
+        """#525: legacy naive valid_until rows follow the documented rule.
+
+        Values written before the fix have no offset suffix; they are
+        interpreted as UTC, matching what SQLite julianday already does,
+        so both surfaces agree.
+        """
+        monkeypatch.setenv("TZ", "Europe/Copenhagen")
+        time.tzset()
+        try:
+            beam = BeamMemory(session_id="s1", db_path=temp_db)
+            mid = beam.remember("legacy expiry memory", source="test", importance=0.9)
+            # Simulate a pre-fix write: naive local wall-clock, no offset.
+            past_naive = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+            beam.conn.execute(
+                "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+                (past_naive, mid),
+            )
+            beam.conn.commit()
+
+            # Python-side filter excludes it (interpreted as UTC past).
+            assert mid not in {r["id"] for r in beam.get_context(limit=10)}
+            # SQLite UTC surface agrees.
+            row = beam.conn.execute(
+                "SELECT CASE WHEN valid_until IS NULL OR "
+                "julianday(valid_until) > julianday('now') "
+                "THEN 1 ELSE 0 END AS active "
+                "FROM working_memory WHERE id = ?",
+                (mid,),
+            ).fetchone()
+            assert row["active"] == 0
+        finally:
+            monkeypatch.delenv("TZ", raising=False)
+            time.tzset()
+
+    def test_date_only_valid_until_keeps_api_semantics(self, temp_db):
+        """#525: date-only valid_until inputs remain pass-through."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        mid = beam.remember(
+            "date expiry memory", source="test", importance=0.9,
+            valid_until="2099-12-31",
+        )
+        assert mid in {r["id"] for r in beam.get_context(limit=10)}
 
 
 class TestEpisodicMemory:

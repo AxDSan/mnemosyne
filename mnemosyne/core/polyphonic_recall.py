@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List
 from dataclasses import dataclass
 from pathlib import Path
@@ -234,7 +234,7 @@ class PolyphonicRecallEngine:
             conn.row_factory = sqlite3.Row
             own_conn = True
         try:
-            now_iso = datetime.now().isoformat()
+            now_iso = datetime.now(timezone.utc).isoformat()
             by_id: Dict[str, RecallResult] = {}
 
             # --- EM tier -- prefer sqlite-vec ANN, fall back to numpy ---

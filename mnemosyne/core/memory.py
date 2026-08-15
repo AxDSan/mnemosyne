@@ -17,7 +17,7 @@ import hashlib
 import logging
 import threading
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Optional, Any
 from pathlib import Path
 
@@ -323,7 +323,7 @@ class Mnemosyne:
         and expired memories are excluded so retracted notes do not skew
         pattern detection.
         """
-        now = datetime.now().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         cursor = self.beam.conn.cursor()
         cursor.execute("""
             SELECT id, content, source, timestamp, session_id, importance

@@ -3042,7 +3042,7 @@ def _wm_vec_search(conn: sqlite3.Connection, query_embedding, k: int = 20,
         return []
     if where_sql is None:
         where_sql = "wm.superseded_by IS NULL AND (wm.valid_until IS NULL OR wm.valid_until > ?)"
-        where_params = (datetime.now().isoformat(),)
+        where_params = (datetime.now(timezone.utc).isoformat(),)
 
     sqlite_results = _wm_vec_search_sqlite(conn, query_embedding, k=k,
                                            where_sql=where_sql,
@@ -4118,7 +4118,7 @@ class BeamMemory:
         while keeping hot items visible."""
 
         cursor = self.conn.cursor()
-        now = datetime.now().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         # Keep the original ordering contract (global memories first, then
         # session-local memories; each group by importance and recency) while
         # avoiding the previous ``session_id = ? OR scope = 'global'`` query.
@@ -4269,7 +4269,7 @@ class BeamMemory:
                 if not replacement_found:
                     return False
 
-                now = datetime.now().isoformat()
+                now = datetime.now(timezone.utc).isoformat()
                 cursor.execute("""
                     UPDATE working_memory
                     SET valid_until = ?, superseded_by = ?
@@ -4293,7 +4293,7 @@ class BeamMemory:
                 self._invalidate_query_cache()
             return invalidated
 
-        now = datetime.now().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         # Try working_memory first
         cursor.execute("""
             UPDATE working_memory
@@ -5975,7 +5975,7 @@ class BeamMemory:
             "(valid_until IS NULL OR valid_until > ?)",
             "superseded_by IS NULL"
         ]
-        wm_params = [datetime.now().isoformat()]
+        wm_params = [datetime.now(timezone.utc).isoformat()]
         
         # Session scope: channel filter only when explicitly specified.
         # Author-only searches have no session/channel restriction.
@@ -6243,7 +6243,7 @@ class BeamMemory:
             else:
                 em_entity_scope = _session_scope_filter(cross_session=cross_session)
                 em_entity_params = [*tuple(entity_memory_ids), *_session_scope_params(self.session_id, cross_session=cross_session)]
-            em_entity_params.extend([datetime.now().isoformat()])
+            em_entity_params.extend([datetime.now(timezone.utc).isoformat()])
             cursor.execute(f"""
                 SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope, author_id, author_type, channel_id, veracity, memory_type
                 FROM episodic_memory
@@ -6365,7 +6365,7 @@ class BeamMemory:
             else:
                 fact_em_scope = _session_scope_filter(cross_session=cross_session)
                 fact_em_params = [*tuple(fact_memory_ids), *_session_scope_params(self.session_id, cross_session=cross_session)]
-            fact_em_params.extend([datetime.now().isoformat()])
+            fact_em_params.extend([datetime.now(timezone.utc).isoformat()])
             cursor.execute(f"""
                 SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope, author_id, author_type, channel_id, veracity, memory_type
                 FROM episodic_memory
@@ -6473,7 +6473,7 @@ class BeamMemory:
             "(valid_until IS NULL OR valid_until > ?)",
             "superseded_by IS NULL"
         ]
-        em_params = [datetime.now().isoformat()]
+        em_params = [datetime.now(timezone.utc).isoformat()]
         
         # Session scope: channel filter only when explicitly specified.
         # Author-only searches have no session/channel restriction.
