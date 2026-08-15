@@ -333,3 +333,55 @@ def test_owner_forget_removes_legacy_only_row_but_foreign_caller_cannot(tmp_path
     assert _row_count(caller.conn, "memories", memory_id) == 1
     assert owner.forget(memory_id) is False
     assert _row_count(owner.conn, "memories", memory_id) == 0
+
+
+def test_owner_legacy_only_forget_keeps_caller_transaction_rollbackable(
+    tmp_path, monkeypatch
+):
+    path = Path(tmp_path) / "legacy-only-caller-transaction.db"
+    owner = Mnemosyne(session_id="owner", db_path=path)
+    memory_id = owner.remember("#764 legacy-only owner row")
+
+    # Simulate BEAM trimming: the legacy mirror remains after working_memory
+    # has been removed, so the public fallback takes its owner-only path.
+    owner.conn.execute("DELETE FROM working_memory WHERE id = ?", (memory_id,))
+    owner.conn.commit()
+    assert _row_count(owner.conn, "working_memory", memory_id) == 0
+    assert _row_count(owner.conn, "memories", memory_id) == 1
+
+    owner.conn.execute("CREATE TABLE caller_marker (value TEXT NOT NULL)")
+    owner.conn.commit()
+    owner.conn.execute("INSERT INTO caller_marker VALUES ('caller owns rollback')")
+
+    real_commits = []
+
+    def fail_if_real_commit(self):
+        real_commits.append(True)
+        raise AssertionError("forget must not commit a caller-owned transaction")
+
+    monkeypatch.setattr(beam_module._BeamConnection, "_real_commit", fail_if_real_commit)
+
+    # The documented legacy-only fallback return remains False even when its
+    # owner-only legacy delete succeeds.
+    assert owner.forget(memory_id) is False
+    assert owner.conn.in_transaction is True
+    assert _row_count(owner.conn, "working_memory", memory_id) == 0
+    assert _row_count(owner.conn, "memories", memory_id) == 0
+
+    # A distinct file-backed connection proves neither the marker nor delete
+    # escaped the caller-owned outer transaction.
+    with sqlite3.connect(str(path)) as outside:
+        assert outside.execute("SELECT COUNT(*) FROM caller_marker").fetchone()[0] == 0
+        assert _row_count(outside, "working_memory", memory_id) == 0
+        assert _row_count(outside, "memories", memory_id) == 1
+
+    owner.conn.rollback()
+
+    with sqlite3.connect(str(path)) as outside:
+        assert outside.execute("SELECT COUNT(*) FROM caller_marker").fetchone()[0] == 0
+        assert _row_count(outside, "working_memory", memory_id) == 0
+        assert _row_count(outside, "memories", memory_id) == 1
+    assert owner.conn.execute("SELECT COUNT(*) FROM caller_marker").fetchone()[0] == 0
+    assert _row_count(owner.conn, "working_memory", memory_id) == 0
+    assert _row_count(owner.conn, "memories", memory_id) == 1
+    assert real_commits == []
