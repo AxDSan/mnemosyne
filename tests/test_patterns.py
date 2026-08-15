@@ -338,8 +338,24 @@ class TestMnemosynePatternMethods:
             "Date-only expiry", source="user", importance=0.5,
             valid_until="2099-12-31",
         )
+        # Genuinely naive legacy value, written directly to bypass the
+        # write boundary's UTC normalization, is interpreted as UTC and
+        # therefore expired.
+        naive_id = mem.remember(
+            "Naive legacy expiry", source="user", importance=0.5,
+        )
+        past_naive = (
+            datetime.now(timezone.utc) - timedelta(hours=2)
+        ).replace(tzinfo=None).isoformat()
+        assert "+" not in past_naive
+        mem.beam.conn.execute(
+            "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+            (past_naive, naive_id),
+        )
+        mem.beam.conn.commit()
 
         contents = [r["content"] for r in mem.get_all_memories()]
         assert "Future offset expiry" in contents
         assert "Past offset expiry" not in contents
         assert "Date-only expiry" in contents
+        assert "Naive legacy expiry" not in contents

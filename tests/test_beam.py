@@ -870,6 +870,7 @@ class TestWorkingMemory:
         assert beam.invalidate(mid) is True
 
         assert mid not in {r["id"] for r in beam.get_context(limit=10)}
+        assert mid not in {r["id"] for r in beam.recall("expiring memory", top_k=10)}
         row = beam.conn.execute(
             "SELECT CASE WHEN valid_until IS NULL OR "
             "julianday(valid_until) > julianday('now') "
