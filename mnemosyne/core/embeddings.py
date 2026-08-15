@@ -344,6 +344,7 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
         "Content-Type": "application/json",
         "HTTP-Referer": "https://mnemosyne.site",
         "X-Title": "Mnemosyne Embedding",
+        "User-Agent": "Mnemosyne/3.16.0",
     }
     if _OPENAI_API_KEY:
         headers["Authorization"] = f"Bearer {_OPENAI_API_KEY}"

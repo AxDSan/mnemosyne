@@ -617,7 +617,7 @@ def _call_remote_llm_with_model(
         has_httpx = False
 
     url = f"{base_url}/chat/completions"
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "User-Agent": "Mnemosyne/3.16.0"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 

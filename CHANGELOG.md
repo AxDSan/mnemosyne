@@ -24,6 +24,10 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **Explicit User-Agent for OpenAI-compatible embedding and remote LLM requests.**
+  Embedding providers and remote consolidation endpoints that reject Python's
+  default HTTP User-Agent now receive `Mnemosyne/3.16.0` on both the `httpx` and
+  urllib request paths.
 - **`mnemosyne-hermes status` now reports the real interpreter mismatch (#736).** The warning compared interpreter paths but claimed a Python version mismatch and printed a bare version number instead of a runnable fix; it now compares the Hermes and installer environments and emits a shell-quoted `→ Run: <python> -m pip install -U 'mnemosyne-hermes[all]'` command.
 - **MCP SSE authentication rejects malformed non-ASCII bearer tokens with `401` instead of returning a server error (#739).**
 - **API embedding failures now leave a redacted diagnostic trace (#735).** Final HTTP, network, and invalid-response failures still degrade to keyword-only retrieval, but now log the endpoint and safe error class or status without request content, API keys, URL userinfo, query strings, or fragments.
