@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -514,3 +515,66 @@ def test_install_help_describes_required_wrapper_migration_flags(capsys):
 
     help_text = capsys.readouterr().out
     assert "With --mode symlink and --force" in help_text
+
+
+def _fake_python(root: Path, version: str = "Python 3.12.13") -> Path:
+    bin_dir = root / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    python = bin_dir / "python"
+    python.write_text(f"#!/bin/sh\necho '{version}'\n", encoding="utf-8")
+    python.chmod(python.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return python
+
+
+def test_status_mismatch_names_interpreters_and_emits_a_runnable_command(
+    tmp_path, monkeypatch, capsys
+):
+    """#736: status compared interpreter paths but claimed a version mismatch,
+    and printed a bare version number instead of a command to run.
+
+    Two separate venvs over one base interpreter resolve to the same binary,
+    so the check must compare environment roots, not resolved paths.
+    """
+    if sys.platform.startswith("win32"):
+        pytest.skip("POSIX symlink test")
+    base = _fake_python(tmp_path / "base")
+    hermes_venv = tmp_path / "hermes env" / "venv"  # spaces: quoting matters
+    this_venv = tmp_path / "this-env" / "venv"
+    for venv in (hermes_venv, this_venv):
+        (venv / "bin").mkdir(parents=True, exist_ok=True)
+        (venv / "pyvenv.cfg").write_text("home = /base\n", encoding="utf-8")
+        (venv / "bin" / "python").symlink_to(base)
+    hermes_python = hermes_venv / "bin" / "python"
+    this_python = this_venv / "bin" / "python"
+    assert hermes_python.resolve() == this_python.resolve() == base
+
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kw: hermes_python)
+    monkeypatch.setattr(sys, "executable", str(this_python))
+    monkeypatch.setattr(sys, "prefix", str(this_venv))
+    monkeypatch.setattr(sys, "version", "3.12.13 (fake interpreter for test)")
+    monkeypatch.setattr(
+        install,
+        "plugin_state",
+        lambda hermes_home_path=None: install.PluginState(
+            status="installed",
+            installed=True,
+            target=tmp_path / "plugin",
+            link_target=tmp_path / "plugin-target",
+            mode="symlink",
+            message="ok",
+        ),
+    )
+
+    rc = install.main(["--hermes-home", str(tmp_path), "status"])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Different Python interpreters" in out
+    assert "version MISMATCH" not in out
+    assert f"  This Python: {this_python} (3.12.13)" in out
+    assert f"  Hermes' Python: {hermes_python} (Python 3.12.13)" in out
+    assert (
+        f"→ Run: {shlex.quote(str(hermes_python))} -m pip install -U 'mnemosyne-hermes[all]'"
+        in out
+    )
+    assert "→ Run: 3.12.13" not in out

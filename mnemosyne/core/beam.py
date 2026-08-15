@@ -1258,7 +1258,13 @@ class _BeamConnection(sqlite3.Connection):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._defer_commit = False
+        self._savepoint_counter = 0
         self._vec_working_count_cache: Optional[Tuple[int, int, int]] = None
+
+    def _next_savepoint_name(self, purpose: str) -> str:
+        """Return a connection-local, SQLite-safe savepoint identifier."""
+        self._savepoint_counter += 1
+        return f"mnemosyne_{purpose}_{self._savepoint_counter}"
 
     def commit(self) -> None:
         if self._defer_commit:
@@ -1287,17 +1293,30 @@ def _guarded_transaction(conn: sqlite3.Connection):
     itself guarded so a dead connection cannot mask the original
     exception.
 
-    Not used by ``_deferred_commits()``: that context manager implements
-    commit-DEFERRAL semantics (suppressing nested commits behind a
-    per-connection flag), which is a different mechanism from a plain
-    guarded transaction.
+    For an already-open ``_BeamConnection`` transaction, guarded operations
+    take a local savepoint instead: a connection-wide commit or rollback would
+    otherwise steal or erase caller-owned writes.
     """
+    # An active _BeamConnection transaction can be caller-owned even when
+    # commit deferral is inactive. Never commit or roll back that outer
+    # transaction; isolate this guarded operation in its own savepoint.
+    savepoint = None
+    if isinstance(conn, _BeamConnection) and conn.in_transaction:
+        savepoint = conn._next_savepoint_name("guarded_transaction")
+        conn.execute(f"SAVEPOINT {savepoint}")
     try:
         yield
-        conn.commit()
+        if savepoint is None:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
     except Exception:
         try:
-            conn.rollback()
+            if savepoint is None:
+                conn.rollback()
+            else:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
         except sqlite3.Error:
             pass  # rollback of a dead connection must not mask the cause
         raise
@@ -1305,58 +1324,61 @@ def _guarded_transaction(conn: sqlite3.Connection):
 
 @contextlib.contextmanager
 def _deferred_commits(conn: sqlite3.Connection):
-    """Suppress nested commit() calls so the caller can wrap many
-    sub-helpers in a single transaction.
+    """Defer nested commits without stealing a caller-owned transaction.
 
-    Pairs with `_BeamConnection`'s `_defer_commit` flag. If the
-    passed connection isn't a `_BeamConnection` (e.g., a test
-    constructed `BeamMemory` with a raw sqlite3 connection, or a
-    legacy caller built its own conn), the context manager degrades
-    to a no-op -- inner commits still fire, performance regression
-    isn't fixed for that code path but correctness is preserved.
-
-    Threading: `_BeamConnection._defer_commit` is per-connection.
-    BeamMemory uses thread-local connections (see _get_connection),
-    so the flag is visible only to the calling thread. A future
-    refactor that shares the connection across threads would need
-    a lock here.
+    A BEAM-owned batch starts and commits its own transaction.  When a caller
+    already has a transaction open, the batch is isolated in a savepoint: it
+    releases on success and rolls back only its own writes on failure.  In
+    particular, neither path may commit or roll back the caller's marker rows.
     """
-    is_beam_conn = isinstance(conn, _BeamConnection)
-    if not is_beam_conn:
-        # Degrade gracefully: inner commits fire as before. This
-        # keeps the path callable from tests that build conns
-        # manually but loses the batching perf win on that code path.
+    if not isinstance(conn, _BeamConnection):
+        # Raw sqlite connections cannot suppress C-level commit calls. Retain
+        # the established compatibility behavior for legacy/manual callers.
         yield
         return
 
+    owns_transaction = not conn.in_transaction
+    savepoint = conn._next_savepoint_name("deferred_commits")
+    previously_deferred = conn._defer_commit
+    if owns_transaction:
+        conn.execute("BEGIN")
+    else:
+        conn.execute(f"SAVEPOINT {savepoint}")
     conn._defer_commit = True
     try:
         yield
     except Exception:
-        conn._defer_commit = False
+        conn._defer_commit = previously_deferred
         try:
-            conn.rollback()
+            if owns_transaction:
+                conn.rollback()
+            else:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
         except sqlite3.Error:
             pass
         raise
     else:
-        conn._defer_commit = False
+        conn._defer_commit = previously_deferred
         try:
-            conn._real_commit()
+            if owns_transaction:
+                conn._real_commit()
+            else:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
         except sqlite3.Error as exc:
-            logger.error(
-                "_deferred_commits: final commit failed: %s; "
-                "rolling back the buffered transaction",
-                exc,
-            )
+            logger.error("_deferred_commits: finalization failed: %s", exc)
             try:
-                conn.rollback()
+                if owns_transaction:
+                    conn.rollback()
+                else:
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
             except sqlite3.Error:
                 pass
             raise
     finally:
-        # Defense in depth: clear the flag on any control-flow path.
-        conn._defer_commit = False
+        # Preserve an enclosing deferral scope if this context was nested.
+        conn._defer_commit = previously_deferred
 
 
 def _generate_id(content: str) -> str:
@@ -2263,15 +2285,12 @@ def _vec_table_insert(conn: sqlite3.Connection, table: str, rowid: int, embeddin
             f"INSERT INTO {table}(rowid, embedding) VALUES (?, ?)",
             (rowid, emb_json)
         )
-    # Ensure the insert is committed even when the caller's connection
-    # has _defer_commit=True (_BeamConnection). Without this, inserts
-    # sit in the deferred transaction and disappear if the caller
-    # later rolls back or the connection is reused in a different context.
+    # Respect the caller's transaction boundary.  `_BeamConnection.commit()`
+    # intentionally becomes a no-op while `_deferred_commits()` is active, so
+    # vector rows remain atomic with their working-memory row instead of
+    # prematurely committing an enclosing batch/caller transaction.
     if commit:
-        if isinstance(conn, _BeamConnection):
-            conn._real_commit()
-        else:
-            conn.commit()
+        conn.commit()
 
 
 def _wm_rowid(conn: sqlite3.Connection, memory_id: str) -> Optional[int]:
@@ -4171,8 +4190,10 @@ class BeamMemory:
         # consolidation pass is writing) must roll back rather than abandon
         # the thread-local connection inside an open, stale transaction --
         # see _guarded_transaction.
+        owns_transaction = not self.conn.in_transaction
         with _guarded_transaction(self.conn):
-            cursor.execute("BEGIN TRANSACTION")
+            if owns_transaction:
+                cursor.execute("BEGIN TRANSACTION")
             for ts, ids in updates.items():
                 placeholders = ",".join("?" for _ in ids)
                 cursor.execute(
@@ -4653,9 +4674,7 @@ class BeamMemory:
             row_veracity = clamp_veracity(
                 veracity, context="consolidate_to_episodic.veracity"
             )
-        # Strip closed <think>...</think> blocks that some LLMs emit
-        import re as _re
-        summary = _re.sub(r"<think>.*?</think>", "", summary, flags=_re.DOTALL).strip()
+
         # Compute the embedding BEFORE the INSERT opens the write transaction.
         # embed() can be a network call (API embeddings, 30s timeout) or a
         # heavy CPU call; running it after the INSERT held the SQLite write
@@ -8775,28 +8794,43 @@ class BeamMemory:
 
                 chunks = local_llm.chunk_memories_by_budget(lines, source=source)
                 if chunks:
+                    invalid_reasoning = False
                     if len(chunks) == 1:
-                        # All memories fit in one prompt
-                        summary = local_llm.summarize_memories(chunks[0], source=source)
+                        # All memories fit in one prompt.
+                        summary = local_llm._summarize_memories(chunks[0], source=source)
+                        invalid_reasoning = local_llm._is_invalid_reasoning_output(summary)
                     else:
-                        # Multi-chunk: summarize each chunk, then summarize the summaries
+                        # Multi-chunk: any malformed trace invalidates the
+                        # complete LLM result instead of silently dropping it.
                         chunk_summaries = []
                         for chunk in chunks:
-                            chunk_summary = local_llm.summarize_memories(chunk, source=source)
+                            chunk_summary = local_llm._summarize_memories(chunk, source=source)
+                            if local_llm._is_invalid_reasoning_output(chunk_summary):
+                                invalid_reasoning = True
+                                break
                             if chunk_summary:
                                 chunk_summaries.append(chunk_summary)
-                        if chunk_summaries:
-                            # Second-pass: summarize the chunk summaries
+                        if not invalid_reasoning and chunk_summaries:
+                            # Second-pass: summarize the chunk summaries.
                             if len(chunk_summaries) == 1:
                                 summary = chunk_summaries[0]
                             else:
-                                summary = local_llm.summarize_memories(
+                                summary = local_llm._summarize_memories(
                                     chunk_summaries,
-                                    source=f"{source} (consolidated)"
+                                    source=f"{source} (consolidated)",
                                 )
-                                # If second-pass also overflows, concatenate
-                                if not summary:
+                                invalid_reasoning = local_llm._is_invalid_reasoning_output(summary)
+                                # Preserve the existing non-reasoning fallback.
+                                if not invalid_reasoning and not summary:
                                     summary = " | ".join(chunk_summaries)
+                    if invalid_reasoning:
+                        logger.warning(
+                            "sleep: malformed reasoning trace for source=%r (items=%d) "
+                            "— falling back to AAAK compression",
+                            source,
+                            len(items),
+                        )
+                        summary = None
                     if summary:
                         llm_used_count += 1
                         llm_succeeded = True

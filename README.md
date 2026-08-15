@@ -350,7 +350,7 @@ When client-side encryption is enabled, the remote sync server sees **only metad
 | `MNEMOSYNE_CONTEXT_INCLUDE_CONSOLIDATED` | *(unset)* | Include consolidated working-memory rows in `get_context()` prompt injection. Default: excluded. Truthy values: `1`, `true`, `yes`, `on`. Does not affect `recall()`. |
 | `MNEMOSYNE_EMBEDDING_API_URL` | `${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}` | Preferred name for custom embedding API endpoint (OpenAI-compatible). Falls back to `OPENROUTER_BASE_URL`. |
 | `MNEMOSYNE_EMBEDDING_API_KEY` | `${OPENROUTER_API_KEY:-${OPENAI_API_KEY:-}}` | Preferred name for embedding API key. Falls back to `OPENROUTER_API_KEY`, then `OPENAI_API_KEY`. |
-| `MNEMOSYNE_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model. Low-resource multilingual: `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`; larger options: `intfloat/multilingual-e5-base`, `BAAI/bge-m3`. |
+| `MNEMOSYNE_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model. Low-resource multilingual: `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`; larger FastEmbed E5 option: `intfloat/multilingual-e5-large`; `BAAI/bge-m3` is another multilingual option. |
 | `MNEMOSYNE_EMBEDDING_DIM` | *(unset)* | Optional embedding dimension override (positive integer); takes precedence over the built-in model table. Blank/whitespace-only is treated as unset. |
 
 Full reference: [docs/configuration.md](docs/configuration.md)
@@ -363,8 +363,8 @@ Default embeddings are English-optimized (`bge-small-en-v1.5`). For **non-Englis
 # Low-resource local multilingual embeddings
 export MNEMOSYNE_EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 
-# Larger multilingual embeddings
-export MNEMOSYNE_EMBEDDING_MODEL=intfloat/multilingual-e5-base
+# Larger FastEmbed E5 multilingual embeddings
+export MNEMOSYNE_EMBEDDING_MODEL=intfloat/multilingual-e5-large
 
 # Or Chinese-specific embeddings
 export MNEMOSYNE_EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5

@@ -1028,6 +1028,17 @@ def _iter_mnemosyne_profiles(hermes_home_path: str | Path | None = None) -> list
     return selected
 
 
+def _hermes_python_mismatch(hermes_python: Path) -> bool:
+    """Return whether Hermes runs in a different environment from the installer.
+
+    Compares the environment roots (``sys.prefix`` vs the Hermes interpreter's
+    ``parent.parent``) instead of resolved interpreter paths: separate venvs
+    created over one base interpreter resolve to the same binary while keeping
+    different site-packages, so a resolved-path comparison misses the mismatch.
+    """
+    return Path(hermes_python).parent.parent != Path(sys.prefix)
+
+
 def _link_profile(profile_home: Path, source: Path, *, force: bool = False) -> Optional[Path]:
     """Symlink ``profile_home/plugins/mnemosyne`` to source. Idempotent.
 
@@ -2252,14 +2263,14 @@ def main(argv: list[str] | None = None) -> int:
                     _r = _sp.run([str(hermes_python), "--version"], capture_output=True, text=True, timeout=5)
                     _ver = _r.stdout.strip() or _r.stderr.strip()
                     print(f"  Hermes' Python: {hermes_python} ({_ver})")
-                    if state.mode == "symlink" and hermes_python.resolve() != Path(sys.executable).resolve():
-                        print("  ⚠ Python version MISMATCH! Install and Hermes use different Python versions.")
-                        print(f"  → Run: {_ver.split()[1]}" if " " in _ver else "")
+                    if state.mode == "symlink" and _hermes_python_mismatch(hermes_python):
+                        print("  ⚠ Different Python interpreters! Install and Hermes are not the same environment.")
+                        print(f"  → Run: {shlex.quote(str(hermes_python))} -m pip install -U 'mnemosyne-hermes[all]'")
                 except Exception:
                     print(f"  Hermes' Python: {hermes_python} (unable to check version)")
             else:
                 print("  Hermes' Python: not found")
-            if installed and state.mode == "symlink" and hermes_python and hermes_python.resolve() != Path(sys.executable).resolve():
+            if installed and state.mode == "symlink" and hermes_python and _hermes_python_mismatch(hermes_python):
                 print("  → Hermes Python vs install Python mismatch means the symlink exists but Hermes")
                 print("     may not be able to import mnemosyne core. Run with --dry-run to diagnose.")
             return 0 if installed else 1

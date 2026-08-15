@@ -2,7 +2,7 @@
 title: "Configuration"
 version: 3.16.0
 config_key_count: 106
-env_only_count: 43
+env_only_count: 44
 generated_at: "auto"
 ---
 
@@ -24,7 +24,7 @@ Keys marked **restart** are read once at startup. Changing them at runtime warns
 and does not take effect until the process restarts.
 
 There are **106 configuration keys**. A further
-**43 environment variables** are read directly from the
+**44 environment variables** are read directly from the
 environment and are **not** settable in `config.yaml`; they are listed separately below.
 
 ---
@@ -168,7 +168,7 @@ This list is derived by scanning the package for `os.environ.get("MNEMOSYNE_..."
 
 ---
 
-## Environment-only variables (43)
+## Environment-only variables (44)
 
 These are read with `os.environ` at their point of use and bypass
 `MnemosyneConfig` entirely. They cannot be set in `config.yaml`.
@@ -199,6 +199,7 @@ These are read with `os.environ` at their point of use and bypass
 | `MNEMOSYNE_LEXICAL_GATE_MIN` | Override the lexical admission gate (float 0.0–1.0, clamped; non-finite/invalid values fall back to the historical query-length thresholds 0.15/0.5/0.3). `0.0` admits purely-vector candidates (recall-first, at a precision cost). Read on every recall call; retrieval stays local (sqlite-vec + JSON/NumPy embeddings, or lexical-only FTS5 when embeddings are unavailable). |
 | `MNEMOSYNE_MCP_BANK` | Memory bank used by the MCP server. |
 | `MNEMOSYNE_MCP_TOKEN` | Bearer token for MCP SSE auth. Required for any non-loopback bind. |
+| `MNEMOSYNE_MODEL_CACHE_DIR` | Directory holding the local GGUF consolidation model. Unset or blank keeps `~/.hermes/mnemosyne/models`. Read at import; an explicitly set path is authoritative, so an unusable one fails rather than falling back to the default. |
 | `MNEMOSYNE_PERSONA_FILE` | Path to an external persona facts file. |
 | `MNEMOSYNE_PREFETCH_MODEL_SLOT_LIMIT` | Maximum canonical slots prefetched per turn. |
 | `MNEMOSYNE_PREFETCH_MODEL_SLOT_MIN_OVERLAP` | Minimum token overlap for a canonical slot to count as relevant. |

@@ -3311,17 +3311,17 @@ def register(ctx):
         handler_fn=mnemosyne_command,
     )
 
-    # Register all tools (29 memory + 3 sync + 4 persona) so the agent can call them.
+    # Register the configured tools so the PluginManager surface matches memory
+    # provider discovery. The provider resolves HERMES_HOME before initialize().
     # Note: when loaded via memory provider discovery (plugins/memory/),
     # the ctx is a _ProviderCollector whose register_tool() is a no-op --
     # tools are surfaced through get_tool_schemas() via the memory manager
     # instead. This registration covers the standalone PluginManager path.
-    from .tools import ALL_TOOL_SCHEMAS
     from functools import partial
 
     global _provider
     _provider = MnemosyneMemoryProvider()
-    for _schema in ALL_TOOL_SCHEMAS:
+    for _schema in _provider.get_tool_schemas():
         _name = _schema["name"]
         # Sync tools route through SyncAdapter, persona tools through PersonaAdapter,
         # memory tools through main provider.

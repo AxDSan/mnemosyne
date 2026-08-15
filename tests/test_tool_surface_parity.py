@@ -37,10 +37,7 @@ def test_every_defined_schema_is_exported():
     from mnemosyne import tool_schemas
 
     # Tools intentionally not advertised over MCP, with justification.
-    PROVIDER_ONLY = {
-        # Implemented in hermes_memory_provider only; no MCP handler exists.
-        "mnemosyne_forget_canonical",
-    }
+    PROVIDER_ONLY = set()
 
     exported = {s["name"] for s in tool_schemas.ALL_TOOL_SCHEMAS}
     defined = {
