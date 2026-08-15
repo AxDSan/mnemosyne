@@ -26,7 +26,7 @@ import os
 logger = logging.getLogger(__name__)
 
 from mnemosyne.core import embeddings as _embeddings
-from mnemosyne.core.beam import BeamMemory, init_beam
+from mnemosyne.core.beam import BeamMemory, _deferred_commits, init_beam
 _thread_local = threading.local()
 
 # Default data directory
@@ -218,6 +218,10 @@ class Mnemosyne:
                                author_id=author_id, author_type=author_type,
                                channel_id=channel_id,
                                event_emitter=self._stream_emit)
+        # Direct wrapper mutations dual-write legacy rows and BEAM rows. They
+        # must share BEAM's owner-aware connection so nested commits defer and
+        # caller-owned transactions use a savepoint.
+        self.conn = self.beam.conn
 
     # ─── Phase 8: Streaming ─────────────────────────────────────────
 
@@ -423,36 +427,37 @@ class Mnemosyne:
             if durations:
                 metadata["_durations"] = durations
 
-        memory_id = self.beam.remember(
-            _content, source=source,
-            importance=importance, metadata=metadata,
-            valid_until=valid_until, scope=scope,
-            extract_entities=extract_entities, extract=extract,
-            veracity=veracity,
-            trust_tier=trust_tier,
-        )
-        timestamp = datetime.now().isoformat()
+        with _deferred_commits(self.conn):
+            memory_id = self.beam.remember(
+                _content, source=source,
+                importance=importance, metadata=metadata,
+                valid_until=valid_until, scope=scope,
+                extract_entities=extract_entities, extract=extract,
+                veracity=veracity,
+                trust_tier=trust_tier,
+            )
+            timestamp = datetime.now().isoformat()
 
-        # Legacy dual-write with same ID (INSERT OR REPLACE for dedup safety)
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            INSERT OR REPLACE INTO memories (id, content, source, timestamp, session_id, importance, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            memory_id, _content, source, timestamp, self.session_id,
-            importance, json.dumps(metadata or {})
-        ))
+            # Legacy dual-write with same ID (INSERT OR REPLACE for dedup safety)
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO memories (id, content, source, timestamp, session_id, importance, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                memory_id, _content, source, timestamp, self.session_id,
+                importance, json.dumps(metadata or {})
+            ))
 
-        # Legacy embedding store
-        if _embeddings.available():
-            vec = _embeddings.embed([_content])
-            if vec is not None:
-                cursor.execute("""
-                    INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model)
-                    VALUES (?, ?, ?)
-                """, (memory_id, _embeddings.serialize(vec[0]), _embeddings._DEFAULT_MODEL))
+            # Legacy embedding store
+            if _embeddings.available():
+                vec = _embeddings.embed([_content])
+                if vec is not None:
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model)
+                        VALUES (?, ?, ?)
+                    """, (memory_id, _embeddings.serialize(vec[0]), _embeddings._DEFAULT_MODEL))
 
-        self.conn.commit()
+            self.conn.commit()
 
         # The first BEAM write already inserted the working_memory row with
         # the correct memory_id (we used it for the legacy dual-write above)
@@ -604,11 +609,12 @@ class Mnemosyne:
 
     def forget(self, memory_id: str) -> bool:
         """Delete a memory by ID from legacy table and working_memory."""
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM memories WHERE id = ? AND session_id = ?",
-                      (memory_id, self.session_id))
-        self.conn.commit()
-        result = self.beam.forget_working(memory_id)
+        with _deferred_commits(self.conn):
+            cursor = self.conn.cursor()
+            cursor.execute("DELETE FROM memories WHERE id = ? AND session_id = ?",
+                          (memory_id, self.session_id))
+            self.conn.commit()
+            result = self.beam.forget_working(memory_id)
         self._emit_wrapper("MEMORY_INVALIDATED", memory_id)
         return result
 
@@ -632,14 +638,15 @@ class Mnemosyne:
             return False
 
         params.extend([memory_id, self.session_id])
-        cursor.execute(
-            f"UPDATE memories SET {', '.join(updates)} WHERE id = ? AND session_id = ?",
-            params
-        )
-        self.conn.commit()
+        with _deferred_commits(self.conn):
+            cursor.execute(
+                f"UPDATE memories SET {', '.join(updates)} WHERE id = ? AND session_id = ?",
+                params
+            )
+            self.conn.commit()
 
-        # Sync BEAM working_memory
-        self.beam.update_working(memory_id, content=content, importance=importance)
+            # Sync BEAM working_memory
+            self.beam.update_working(memory_id, content=content, importance=importance)
 
         self._emit_wrapper("MEMORY_UPDATED", memory_id, content=content, importance=importance)
         return cursor.rowcount > 0

@@ -1,0 +1,208 @@
+"""Public durable-row atomicity coverage for #726 direct wrappers.
+
+This file deliberately does not assert streaming behavior.  Option 3 scopes
+#726 to durable BEAM/legacy rows; delivery for direct wrapper calls inside a
+caller-owned transaction remains a separate contract.
+"""
+
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+import mnemosyne.core.beam as beam_module
+from mnemosyne.core.memory import Mnemosyne
+
+
+def _memory(tmp_path):
+    return Mnemosyne(
+        session_id="direct-wrapper-726", db_path=Path(tmp_path) / "direct.db"
+    )
+
+
+def _row_count(conn, table, memory_id):
+    return conn.execute(
+        f"SELECT COUNT(*) FROM {table} WHERE id = ?", (memory_id,)
+    ).fetchone()[0]
+
+
+def _contents(conn, table, memory_id):
+    return conn.execute(
+        f"SELECT content FROM {table} WHERE id = ?", (memory_id,)
+    ).fetchone()[0]
+
+
+def test_direct_wrapper_dual_writes_share_beam_connection_and_commit_together(tmp_path):
+    memory = _memory(tmp_path)
+
+    assert memory.conn is memory.beam.conn
+    memory_id = memory.remember("#726 direct wrapper durable row")
+    assert _row_count(memory.conn, "working_memory", memory_id) == 1
+    assert _row_count(memory.conn, "memories", memory_id) == 1
+
+    assert memory.update(memory_id, content="#726 direct wrapper updated") is True
+    assert (
+        _contents(memory.conn, "working_memory", memory_id)
+        == "#726 direct wrapper updated"
+    )
+    assert (
+        _contents(memory.conn, "memories", memory_id) == "#726 direct wrapper updated"
+    )
+
+    assert memory.forget(memory_id) is True
+    assert _row_count(memory.conn, "working_memory", memory_id) == 0
+    assert _row_count(memory.conn, "memories", memory_id) == 0
+
+
+def test_direct_remember_failure_after_beam_write_rolls_back_both_durable_rows(
+    tmp_path, monkeypatch
+):
+    memory = _memory(tmp_path)
+    original_remember = memory.beam.remember
+
+    def fail_after_beam(*args, **kwargs):
+        original_remember(*args, **kwargs)
+        raise RuntimeError("forced failure after BEAM write")
+
+    monkeypatch.setattr(memory.beam, "remember", fail_after_beam)
+    with pytest.raises(RuntimeError, match="forced failure after BEAM write"):
+        memory.remember("#726 fail after beam")
+
+    assert memory.conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 0
+    assert memory.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+    assert memory.conn.in_transaction is False
+
+
+def test_direct_remember_failure_after_legacy_write_rolls_back_both_durable_rows(
+    tmp_path, monkeypatch
+):
+    memory = _memory(tmp_path)
+
+    def fail_finalization(self):
+        raise sqlite3.OperationalError("forced failure after legacy write")
+
+    monkeypatch.setattr(beam_module._BeamConnection, "_real_commit", fail_finalization)
+    with pytest.raises(
+        sqlite3.OperationalError, match="forced failure after legacy write"
+    ):
+        memory.remember("#726 fail after legacy")
+
+    assert memory.conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 0
+    assert memory.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+    assert memory.conn.in_transaction is False
+
+
+@pytest.mark.parametrize("decision", ["commit", "rollback"])
+def test_direct_wrapper_caller_owned_transaction_controls_both_durable_rows(
+    tmp_path, decision
+):
+    memory = _memory(tmp_path)
+    conn = memory.conn
+    conn.execute("CREATE TABLE caller_marker (value TEXT NOT NULL)")
+    conn.commit()
+    conn.execute("INSERT INTO caller_marker VALUES ('caller owns outcome')")
+
+    memory_id = memory.remember(f"#726 caller-owned {decision}")
+    assert conn.in_transaction is True
+    assert _row_count(conn, "working_memory", memory_id) == 1
+    assert _row_count(conn, "memories", memory_id) == 1
+    with sqlite3.connect(memory.db_path) as outside:
+        assert _row_count(outside, "working_memory", memory_id) == 0
+        assert _row_count(outside, "memories", memory_id) == 0
+
+    getattr(conn, decision)()
+    expected = 1 if decision == "commit" else 0
+    with sqlite3.connect(memory.db_path) as outside:
+        assert _row_count(outside, "working_memory", memory_id) == expected
+        assert _row_count(outside, "memories", memory_id) == expected
+
+
+@pytest.mark.parametrize("operation", ["update", "forget"])
+def test_direct_wrapper_failures_after_legacy_mutation_restore_both_rows(
+    tmp_path, monkeypatch, operation
+):
+    memory = _memory(tmp_path)
+    memory_id = memory.remember(f"#726 {operation} original")
+    target = "update_working" if operation == "update" else "forget_working"
+
+    def fail_after_legacy(*args, **kwargs):
+        raise RuntimeError(f"forced {operation} failure after legacy mutation")
+
+    monkeypatch.setattr(memory.beam, target, fail_after_legacy)
+    with pytest.raises(RuntimeError, match="after legacy mutation"):
+        if operation == "update":
+            memory.update(memory_id, content="#726 replacement")
+        else:
+            memory.forget(memory_id)
+
+    assert (
+        _contents(memory.conn, "working_memory", memory_id)
+        == f"#726 {operation} original"
+    )
+    assert _contents(memory.conn, "memories", memory_id) == f"#726 {operation} original"
+
+
+@pytest.mark.parametrize("operation", ["update", "forget"])
+@pytest.mark.parametrize("decision", ["commit", "rollback"])
+def test_direct_wrapper_caller_decides_update_and_forget_rows(
+    tmp_path, operation, decision
+):
+    memory = _memory(tmp_path)
+    memory_id = memory.remember(f"#726 caller {operation}")
+    memory.conn.execute(
+        "INSERT INTO memories (id, content, session_id) VALUES ('marker', 'marker', ?)",
+        (memory.session_id,),
+    )
+    if operation == "update":
+        memory.update(memory_id, content="#726 caller changed")
+    else:
+        memory.forget(memory_id)
+    getattr(memory.conn, decision)()
+    expected = 0 if operation == "forget" and decision == "commit" else 1
+    assert _row_count(memory.conn, "working_memory", memory_id) == expected
+    assert _row_count(memory.conn, "memories", memory_id) == expected
+
+
+def test_direct_wrapper_vector_path_does_not_commit_a_caller_transaction(
+    tmp_path, monkeypatch
+):
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("sqlite_vec")
+    memory = _memory(tmp_path)
+    if not beam_module._wm_vec_available(memory.conn):
+        pytest.skip("sqlite-vec vec_working table unavailable")
+
+    real_commits = []
+    original_real_commit = beam_module._BeamConnection._real_commit
+
+    def observing_real_commit(self):
+        real_commits.append(True)
+        return original_real_commit(self)
+
+    embedding = np.array(
+        [1.0] + [0.0] * (beam_module.EMBEDDING_DIM - 1), dtype=np.float32
+    )
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        beam_module._embeddings,
+        "embed",
+        lambda contents: [embedding.copy() for _ in contents],
+    )
+    monkeypatch.setattr(
+        beam_module._BeamConnection, "_real_commit", observing_real_commit
+    )
+
+    memory.conn.execute("CREATE TABLE caller_marker (value TEXT NOT NULL)")
+    memory.conn.commit()
+    memory.conn.execute("INSERT INTO caller_marker VALUES ('outer vector marker')")
+    memory_id = memory.remember("#726 direct active vec caller transaction")
+
+    assert real_commits == []
+    assert memory.conn.in_transaction is True
+    with sqlite3.connect(memory.db_path) as outside:
+        assert _row_count(outside, "working_memory", memory_id) == 0
+        assert _row_count(outside, "memories", memory_id) == 0
+
+    memory.conn.rollback()
+    assert _row_count(memory.conn, "working_memory", memory_id) == 0
+    assert _row_count(memory.conn, "memories", memory_id) == 0
