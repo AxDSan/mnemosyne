@@ -2474,6 +2474,62 @@ class TestUpdateRefreshesDerivedState:
         )
 
 
+class TestUpdateCrossSessionAuthorization:
+    """update_working()/Mnemosyne.update() must follow the same authorization
+    pattern as get()/invalidate(): (session_id = ? OR scope = 'global').
+
+    Before the fix, both were session-locked, so a global-scope memory
+    (e.g. a durable user fact) could never be updated from a later session
+    -- update() reported "not_found" even though get() and invalidate()
+    could reach the row.
+    """
+
+    def test_update_global_memory_from_another_session(self, temp_db):
+        """A global-scope memory must be updatable from any session."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        mid = beam.remember(
+            "The speed of light is 299,792,458 m/s",
+            source="test", scope="global",
+        )
+        assert mid is not None
+
+        other = BeamMemory(session_id="s2", db_path=temp_db)
+        ok = other.update_working(
+            mid, content="The speed of light is exactly 299,792,458 m/s"
+        )
+        assert ok is True
+
+        row = other.get(mid)
+        assert row is not None
+        assert "exactly" in row["content"]
+
+    def test_update_session_memory_from_another_session_denied(self, temp_db):
+        """A session-scoped memory must NOT be updatable from another session."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        mid = beam.remember("private note for s1", source="test")
+        assert mid is not None
+
+        other = BeamMemory(session_id="s2", db_path=temp_db)
+        ok = other.update_working(mid, importance=0.99)
+        assert ok is False
+
+    def test_mnemosyne_update_global_memory_from_another_session(self, temp_db):
+        """Mnemosyne.update() must also allow cross-session updates of global memories."""
+        from mnemosyne.core.memory import Mnemosyne
+
+        mnem = Mnemosyne(session_id="s1", db_path=temp_db)
+        mid = mnem.remember("Krakatoa erupted in 1883", source="test", scope="global")
+        assert mid is not None
+
+        other = Mnemosyne(session_id="s2", db_path=temp_db)
+        ok = other.update(mid, importance=0.95)
+        assert ok is True
+
+        row = other.get(mid)
+        assert row is not None
+        assert row["importance"] == 0.95
+
+
 class TestEmbeddingDimConfig:
     """Tests for MNEMOSYNE_EMBEDDING_DIM env var override.
 
