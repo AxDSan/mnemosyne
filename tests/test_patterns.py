@@ -2,7 +2,6 @@
 Tests for Mnemosyne memory compression + pattern detection.
 """
 
-import pytest
 from datetime import datetime, timedelta
 
 from mnemosyne.core.patterns import (
