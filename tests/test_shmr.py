@@ -52,10 +52,10 @@ def test_embed_fixed_dim_independent_of_text_length(monkeypatch):
     _fake_embed_module(monkeypatch)
 
     shapes = {
-        shmr._embed(t).shape[0]
+        shmr._embed(t).shape
         for t in ("a", "long text here", "finished")
     }
-    assert shapes == {shmr.EMBEDDING_DIM}
+    assert shapes == {(shmr.EMBEDDING_DIM,)}
 
 
 def test_embed_falls_back_to_zero_vector_for_missing_or_empty_results(monkeypatch):
