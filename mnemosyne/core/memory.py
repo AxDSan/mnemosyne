@@ -650,12 +650,12 @@ class Mnemosyne:
             self.conn.commit()
             legacy_ok = cursor.rowcount > 0
 
-        if beam_ok or legacy_ok:
+        if beam_ok:
             self._emit_wrapper(
                 "MEMORY_UPDATED", memory_id,
                 content=content, importance=importance,
             )
-        return beam_ok or legacy_ok
+        return beam_ok
 
     def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
         """Mark a memory as expired or superseded. Delegates to BEAM."""
