@@ -54,6 +54,20 @@ def test_direct_wrapper_dual_writes_share_beam_connection_and_commit_together(tm
     assert _row_count(memory.conn, "memories", memory_id) == 0
 
 
+def test_direct_wrapper_reopens_closed_shared_cache_for_same_path(tmp_path):
+    path = Path(tmp_path) / "closed-shared-cache.db"
+    first = Mnemosyne(session_id="first", db_path=path)
+    first.conn.close()
+
+    fresh = Mnemosyne(session_id="fresh", db_path=path)
+
+    assert fresh.conn is fresh.beam.conn
+    assert fresh.conn.execute("SELECT 1").fetchone()[0] == 1
+    memory_id = fresh.remember("#726 durable rows after shared-cache reopen")
+    assert _row_count(fresh.conn, "working_memory", memory_id) == 1
+    assert _row_count(fresh.conn, "memories", memory_id) == 1
+
+
 def test_direct_invalidate_is_beam_only_and_leaves_legacy_row_unchanged(tmp_path):
     memory = _memory(tmp_path)
     memory_id = memory.remember("#726 direct invalidate BEAM-only boundary")

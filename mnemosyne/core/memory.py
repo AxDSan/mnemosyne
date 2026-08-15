@@ -61,7 +61,21 @@ def _default_db_path() -> Path:
 def _get_connection(db_path = None) -> sqlite3.Connection:
     """Get thread-local database connection"""
     path = Path(db_path) if db_path else _default_db_path()
-    if not hasattr(_thread_local, 'conn') or _thread_local.conn is None or getattr(_thread_local, 'db_path', None) != str(path):
+    needs_reconnect = (
+        not hasattr(_thread_local, "conn")
+        or _thread_local.conn is None
+        or getattr(_thread_local, "db_path", None) != str(path)
+    )
+    if not needs_reconnect:
+        # Public callers can close Mnemosyne.conn. Do not return that stale
+        # core-cache handle; recreating it below also re-establishes BEAM's
+        # shared owner-aware _BeamConnection for this path.
+        try:
+            _thread_local.conn.execute("SELECT 1")
+        except Exception:
+            needs_reconnect = True
+
+    if needs_reconnect:
         path.parent.mkdir(parents=True, exist_ok=True)
         _thread_local.conn = sqlite3.connect(
             str(path), check_same_thread=False, factory=_BeamConnection
