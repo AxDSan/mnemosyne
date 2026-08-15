@@ -54,6 +54,40 @@ def test_direct_wrapper_dual_writes_share_beam_connection_and_commit_together(tm
     assert _row_count(memory.conn, "memories", memory_id) == 0
 
 
+def test_direct_invalidate_is_beam_only_and_leaves_legacy_row_unchanged(tmp_path):
+    memory = _memory(tmp_path)
+    memory_id = memory.remember("#726 direct invalidate BEAM-only boundary")
+    legacy_before = tuple(
+        memory.conn.execute(
+            """
+            SELECT id, content, source, timestamp, session_id, importance, metadata_json
+            FROM memories
+            WHERE id = ?
+            """,
+            (memory_id,),
+        ).fetchone()
+    )
+
+    assert memory.invalidate(memory_id) is True
+    assert memory.conn.in_transaction is False
+    working_row = memory.conn.execute(
+        "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?",
+        (memory_id,),
+    ).fetchone()
+    assert working_row[0] is not None
+    assert working_row[1] is None
+    legacy_after = memory.conn.execute(
+        """
+        SELECT id, content, source, timestamp, session_id, importance, metadata_json
+        FROM memories
+        WHERE id = ?
+        """,
+        (memory_id,),
+    ).fetchone()
+    assert legacy_after is not None
+    assert tuple(legacy_after) == legacy_before
+
+
 def test_direct_remember_failure_after_beam_write_rolls_back_both_durable_rows(
     tmp_path, monkeypatch
 ):
