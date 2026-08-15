@@ -1293,31 +1293,30 @@ def _guarded_transaction(conn: sqlite3.Connection):
     itself guarded so a dead connection cannot mask the original
     exception.
 
-    During ``_deferred_commits()``, guarded operations take a local savepoint
-    instead: a connection-wide rollback would otherwise erase caller-owned
-    writes and invalidate the enclosing batch savepoint.
+    For an already-open ``_BeamConnection`` transaction, guarded operations
+    take a local savepoint instead: a connection-wide commit or rollback would
+    otherwise steal or erase caller-owned writes.
     """
-    # A deferred batch may be nested in a caller-owned transaction. Its
-    # commit suppression does not make ``rollback()`` safe: a connection-wide
-    # rollback would erase the caller's writes and invalidate the batch's
-    # savepoint. Give each guarded operation its own savepoint instead.
-    deferred_savepoint = None
-    if isinstance(conn, _BeamConnection) and conn._defer_commit:
-        deferred_savepoint = conn._next_savepoint_name("guarded_transaction")
-        conn.execute(f"SAVEPOINT {deferred_savepoint}")
+    # An active _BeamConnection transaction can be caller-owned even when
+    # commit deferral is inactive. Never commit or roll back that outer
+    # transaction; isolate this guarded operation in its own savepoint.
+    savepoint = None
+    if isinstance(conn, _BeamConnection) and conn.in_transaction:
+        savepoint = conn._next_savepoint_name("guarded_transaction")
+        conn.execute(f"SAVEPOINT {savepoint}")
     try:
         yield
-        if deferred_savepoint is None:
+        if savepoint is None:
             conn.commit()
         else:
-            conn.execute(f"RELEASE SAVEPOINT {deferred_savepoint}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
     except Exception:
         try:
-            if deferred_savepoint is None:
+            if savepoint is None:
                 conn.rollback()
             else:
-                conn.execute(f"ROLLBACK TO SAVEPOINT {deferred_savepoint}")
-                conn.execute(f"RELEASE SAVEPOINT {deferred_savepoint}")
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
         except sqlite3.Error:
             pass  # rollback of a dead connection must not mask the cause
         raise
@@ -4191,8 +4190,10 @@ class BeamMemory:
         # consolidation pass is writing) must roll back rather than abandon
         # the thread-local connection inside an open, stale transaction --
         # see _guarded_transaction.
+        owns_transaction = not self.conn.in_transaction
         with _guarded_transaction(self.conn):
-            cursor.execute("BEGIN TRANSACTION")
+            if owns_transaction:
+                cursor.execute("BEGIN TRANSACTION")
             for ts, ids in updates.items():
                 placeholders = ",".join("?" for _ in ids)
                 cursor.execute(

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import mnemosyne.core.beam as beam_module
 from mnemosyne.batch_tool import apply_beam_batch, validate_batch_operations
-from mnemosyne.core.beam import BeamMemory, _deferred_commits
+from mnemosyne.core.beam import BeamMemory, _deferred_commits, _guarded_transaction
 
 
 def _beam(tmp_path):
@@ -235,6 +235,81 @@ def test_nested_deferred_failure_restores_outer_deferral_and_rolls_back_only_inn
     conn.rollback()
 
 
+def test_guarded_transaction_success_preserves_non_deferred_caller_transaction(
+    tmp_path,
+):
+    beam = _beam(tmp_path)
+    conn = beam.conn
+    conn.execute("CREATE TABLE caller_marker (value TEXT NOT NULL)")
+    conn.execute("CREATE TABLE guarded_probe (value TEXT NOT NULL)")
+    conn.commit()
+    conn.execute("INSERT INTO caller_marker VALUES ('caller')")
+
+    with _guarded_transaction(conn):
+        conn.execute("INSERT INTO guarded_probe VALUES ('guarded')")
+
+    assert conn.in_transaction is True
+    assert conn.execute("SELECT value FROM caller_marker").fetchone()[0] == "caller"
+    with sqlite3.connect(beam.db_path) as outside:
+        assert outside.execute("SELECT COUNT(*) FROM guarded_probe").fetchone()[0] == 0
+
+    conn.rollback()
+    assert conn.execute("SELECT COUNT(*) FROM caller_marker").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM guarded_probe").fetchone()[0] == 0
+
+
+def test_guarded_transaction_failure_preserves_non_deferred_caller_transaction(
+    tmp_path,
+):
+    beam = _beam(tmp_path)
+    conn = beam.conn
+    conn.execute("CREATE TABLE caller_marker (value TEXT NOT NULL)")
+    conn.execute("CREATE TABLE guarded_probe (value TEXT NOT NULL)")
+    conn.commit()
+    conn.execute("INSERT INTO caller_marker VALUES ('caller')")
+
+    try:
+        with _guarded_transaction(conn):
+            conn.execute("INSERT INTO guarded_probe VALUES ('discarded')")
+            raise RuntimeError("forced guarded failure")
+    except RuntimeError as exc:
+        assert str(exc) == "forced guarded failure"
+
+    assert conn.in_transaction is True
+    assert conn.execute("SELECT value FROM caller_marker").fetchone()[0] == "caller"
+    assert conn.execute("SELECT COUNT(*) FROM guarded_probe").fetchone()[0] == 0
+
+    conn.rollback()
+    assert conn.execute("SELECT COUNT(*) FROM caller_marker").fetchone()[0] == 0
+
+
+def test_get_context_preserves_caller_owned_transaction_without_nested_begin(tmp_path):
+    beam = _beam(tmp_path)
+    beam.remember("#726 context item")
+    conn = beam.conn
+    conn.execute("CREATE TABLE caller_marker (value TEXT NOT NULL)")
+    conn.commit()
+    conn.execute("INSERT INTO caller_marker VALUES ('before context')")
+    statements = []
+    conn.set_trace_callback(statements.append)
+    try:
+        rows = beam.get_context()
+    finally:
+        conn.set_trace_callback(None)
+
+    assert [row["content"] for row in rows] == ["#726 context item"]
+    assert "BEGIN TRANSACTION" not in statements
+    assert conn.in_transaction is True
+    assert (
+        conn.execute("SELECT value FROM caller_marker").fetchone()[0]
+        == "before context"
+    )
+    conn.execute("INSERT INTO caller_marker VALUES ('after context')")
+
+    conn.rollback()
+    assert conn.execute("SELECT COUNT(*) FROM caller_marker").fetchone()[0] == 0
+
+
 def test_forced_active_vec_path_defers_commit_inside_caller_owned_batch(
     tmp_path, monkeypatch
 ):
@@ -260,15 +335,23 @@ def test_forced_active_vec_path_defers_commit_inside_caller_owned_batch(
         real_commits.append(True)
         return original_real_commit(self)
 
-    class Vector:
+    class SyntheticEmbedding:
+        def __array__(self, dtype=None, copy=None):
+            # Some CI environments have NumPy, so support its conversion at
+            # the fallback-store boundary before vec_working is reached.
+            numpy = __import__("numpy")
+            return numpy.zeros(beam_module.EMBEDDING_DIM, dtype=dtype)
+
         def tolist(self):
+            # Other CI environments deliberately omit NumPy; serialize() then
+            # consumes this same real-vector-shaped interface directly.
             return [0.0] * beam_module.EMBEDDING_DIM
 
     monkeypatch.setattr(beam_module._embeddings, "available", lambda: True)
     monkeypatch.setattr(
         beam_module._embeddings,
         "embed",
-        lambda contents: [Vector() for _ in contents],
+        lambda contents: [SyntheticEmbedding() for _ in contents],
     )
     monkeypatch.setattr(beam_module, "_wm_vec_available", lambda conn: True)
     monkeypatch.setattr(beam_module, "_vec_table_insert", forced_vec_insert)
