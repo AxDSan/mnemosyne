@@ -1258,7 +1258,13 @@ class _BeamConnection(sqlite3.Connection):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._defer_commit = False
+        self._savepoint_counter = 0
         self._vec_working_count_cache: Optional[Tuple[int, int, int]] = None
+
+    def _next_savepoint_name(self, purpose: str) -> str:
+        """Return a connection-local, SQLite-safe savepoint identifier."""
+        self._savepoint_counter += 1
+        return f"mnemosyne_{purpose}_{self._savepoint_counter}"
 
     def commit(self) -> None:
         if self._defer_commit:
@@ -1287,17 +1293,31 @@ def _guarded_transaction(conn: sqlite3.Connection):
     itself guarded so a dead connection cannot mask the original
     exception.
 
-    Not used by ``_deferred_commits()``: that context manager implements
-    commit-DEFERRAL semantics (suppressing nested commits behind a
-    per-connection flag), which is a different mechanism from a plain
-    guarded transaction.
+    During ``_deferred_commits()``, guarded operations take a local savepoint
+    instead: a connection-wide rollback would otherwise erase caller-owned
+    writes and invalidate the enclosing batch savepoint.
     """
+    # A deferred batch may be nested in a caller-owned transaction. Its
+    # commit suppression does not make ``rollback()`` safe: a connection-wide
+    # rollback would erase the caller's writes and invalidate the batch's
+    # savepoint. Give each guarded operation its own savepoint instead.
+    deferred_savepoint = None
+    if isinstance(conn, _BeamConnection) and conn._defer_commit:
+        deferred_savepoint = conn._next_savepoint_name("guarded_transaction")
+        conn.execute(f"SAVEPOINT {deferred_savepoint}")
     try:
         yield
-        conn.commit()
+        if deferred_savepoint is None:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {deferred_savepoint}")
     except Exception:
         try:
-            conn.rollback()
+            if deferred_savepoint is None:
+                conn.rollback()
+            else:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {deferred_savepoint}")
+                conn.execute(f"RELEASE SAVEPOINT {deferred_savepoint}")
         except sqlite3.Error:
             pass  # rollback of a dead connection must not mask the cause
         raise
@@ -1319,7 +1339,7 @@ def _deferred_commits(conn: sqlite3.Connection):
         return
 
     owns_transaction = not conn.in_transaction
-    savepoint = "mnemosyne_deferred_commits"
+    savepoint = conn._next_savepoint_name("deferred_commits")
     previously_deferred = conn._defer_commit
     if owns_transaction:
         conn.execute("BEGIN")

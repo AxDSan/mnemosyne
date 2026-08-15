@@ -1,9 +1,12 @@
 """Public regression coverage for #726 batch transaction ownership."""
 
+import contextlib
+import sqlite3
 from pathlib import Path
 
+import mnemosyne.core.beam as beam_module
 from mnemosyne.batch_tool import apply_beam_batch, validate_batch_operations
-from mnemosyne.core.beam import BeamMemory
+from mnemosyne.core.beam import BeamMemory, _deferred_commits
 
 
 def _beam(tmp_path):
@@ -91,3 +94,208 @@ def test_failed_batch_rolls_back_its_savepoint_without_events_or_caller_data_los
 
     beam.conn.rollback()
     assert beam.conn.execute("SELECT COUNT(*) FROM caller_marker").fetchone()[0] == 0
+
+
+def test_forget_cascade_failure_after_guard_preserves_caller_transaction(
+    tmp_path, monkeypatch
+):
+    beam = _beam(tmp_path)
+    target_id = beam.remember("#726 cascade target")
+    beam.annotations.add(target_id, "test", "annotation")
+    annotation_count = beam.conn.execute(
+        "SELECT COUNT(*) FROM annotations WHERE memory_id = ?", (target_id,)
+    ).fetchone()[0]
+    beam.conn.execute(
+        f"""
+        CREATE TRIGGER forced_annotation_failure
+        BEFORE DELETE ON annotations
+        WHEN OLD.memory_id = '{target_id}'
+        BEGIN
+            SELECT RAISE(ABORT, 'forced cascade failure');
+        END
+        """
+    )
+    beam.conn.execute("CREATE TABLE caller_marker (value TEXT NOT NULL)")
+    beam.conn.commit()
+    beam.conn.execute("INSERT INTO caller_marker VALUES ('survives guarded rollback')")
+
+    entered_guard = []
+    original_guard = beam_module._guarded_transaction
+
+    @contextlib.contextmanager
+    def observing_guard(conn):
+        entered_guard.append(True)
+        with original_guard(conn):
+            yield
+
+    monkeypatch.setattr(beam_module, "_guarded_transaction", observing_guard)
+    events = []
+    result = apply_beam_batch(
+        beam,
+        validate_batch_operations(
+            [
+                {"action": "remember", "content": "#726 must roll back after guard"},
+                {"action": "forget", "memory_id": target_id},
+            ]
+        ),
+        audit_event=lambda name, **kwargs: events.append((name, kwargs)),
+    )
+
+    assert entered_guard == [True]  # Failure is downstream of forget_working's guard.
+    assert result["status"] == "error"
+    assert result["failed_index"] == 1
+    assert "forced cascade failure" in result["error"]
+    assert events == []
+    assert beam.conn.in_transaction is True
+    assert beam.conn.execute("SELECT value FROM caller_marker").fetchone()[0] == (
+        "survives guarded rollback"
+    )
+    assert _count_content(beam.conn, "#726 must roll back after guard") == 0
+    assert beam.get(target_id)["content"] == "#726 cascade target"
+    assert (
+        beam.conn.execute(
+            "SELECT COUNT(*) FROM annotations WHERE memory_id = ?", (target_id,)
+        ).fetchone()[0]
+        == annotation_count
+    )
+
+
+def test_nested_deferred_commits_use_distinct_savepoints_and_restore_deferral(tmp_path):
+    beam = _beam(tmp_path)
+    conn = beam.conn
+    conn.execute("CREATE TABLE deferred_probe (value TEXT NOT NULL)")
+    conn.commit()
+    conn.execute("INSERT INTO deferred_probe VALUES ('caller')")
+    statements = []
+    conn.set_trace_callback(statements.append)
+    try:
+        with _deferred_commits(conn):
+            assert conn._defer_commit is True
+            conn.execute("INSERT INTO deferred_probe VALUES ('outer')")
+            with _deferred_commits(conn):
+                assert conn._defer_commit is True
+                conn.execute("INSERT INTO deferred_probe VALUES ('inner')")
+            assert conn._defer_commit is True
+    finally:
+        conn.set_trace_callback(None)
+
+    savepoints = [
+        statement
+        for statement in statements
+        if statement.startswith("SAVEPOINT mnemosyne_deferred_commits_")
+    ]
+    assert len(savepoints) == 2
+    assert len(set(savepoints)) == 2
+    assert conn._defer_commit is False
+    assert [
+        row[0]
+        for row in conn.execute("SELECT value FROM deferred_probe ORDER BY rowid")
+    ] == [
+        "caller",
+        "outer",
+        "inner",
+    ]
+    conn.rollback()
+
+
+def test_nested_deferred_failure_restores_outer_deferral_and_rolls_back_only_inner(
+    tmp_path,
+):
+    beam = _beam(tmp_path)
+    conn = beam.conn
+    conn.execute("CREATE TABLE deferred_probe (value TEXT NOT NULL)")
+    conn.commit()
+    conn.execute("INSERT INTO deferred_probe VALUES ('caller')")
+
+    with _deferred_commits(conn):
+        conn.execute("INSERT INTO deferred_probe VALUES ('outer')")
+        try:
+            with _deferred_commits(conn):
+                conn.execute("INSERT INTO deferred_probe VALUES ('inner')")
+                raise RuntimeError("nested failure")
+        except RuntimeError:
+            pass
+        assert conn._defer_commit is True
+        assert [
+            row[0]
+            for row in conn.execute("SELECT value FROM deferred_probe ORDER BY rowid")
+        ] == [
+            "caller",
+            "outer",
+        ]
+
+    assert conn._defer_commit is False
+    assert [
+        row[0]
+        for row in conn.execute("SELECT value FROM deferred_probe ORDER BY rowid")
+    ] == [
+        "caller",
+        "outer",
+    ]
+    conn.rollback()
+
+
+def test_forced_active_vec_path_defers_commit_inside_caller_owned_batch(
+    tmp_path, monkeypatch
+):
+    beam = _beam(tmp_path)
+    beam.conn.execute("CREATE TABLE caller_marker (value TEXT NOT NULL)")
+    beam.conn.execute("CREATE TABLE vector_probe (memory_id TEXT NOT NULL)")
+    beam.conn.commit()
+
+    vec_calls = []
+    real_commits = []
+    original_real_commit = beam_module._BeamConnection._real_commit
+
+    def forced_vec_insert(conn, table, rowid, embedding, *, commit=True):
+        vec_calls.append((table, commit))
+        memory_id = conn.execute(
+            "SELECT id FROM working_memory WHERE rowid = ?", (rowid,)
+        ).fetchone()[0]
+        conn.execute("INSERT INTO vector_probe VALUES (?)", (memory_id,))
+        if commit:
+            conn.commit()
+
+    def observing_real_commit(self):
+        real_commits.append(True)
+        return original_real_commit(self)
+
+    class Vector:
+        def tolist(self):
+            return [0.0] * beam_module.EMBEDDING_DIM
+
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        beam_module._embeddings,
+        "embed",
+        lambda contents: [Vector() for _ in contents],
+    )
+    monkeypatch.setattr(beam_module, "_wm_vec_available", lambda conn: True)
+    monkeypatch.setattr(beam_module, "_vec_table_insert", forced_vec_insert)
+    monkeypatch.setattr(
+        beam_module._BeamConnection, "_real_commit", observing_real_commit
+    )
+
+    beam.conn.execute("INSERT INTO caller_marker VALUES ('outer vector marker')")
+    result = apply_beam_batch(
+        beam,
+        validate_batch_operations(
+            [{"action": "remember", "content": "#726 forced active vec batch"}]
+        ),
+    )
+
+    assert result["status"] == "ok"
+    assert vec_calls == [("vec_working", True)]
+    assert real_commits == []
+    assert beam.conn.in_transaction is True
+    with sqlite3.connect(beam.db_path) as outside:
+        assert outside.execute("SELECT COUNT(*) FROM caller_marker").fetchone()[0] == 0
+        assert outside.execute("SELECT COUNT(*) FROM vector_probe").fetchone()[0] == 0
+
+    beam.conn.rollback()
+    assert beam.conn.execute("SELECT COUNT(*) FROM vector_probe").fetchone()[0] == 0
+
+    beam.remember("#726 forced active vec direct")
+    assert vec_calls[-1] == ("vec_working", True)
+    with sqlite3.connect(beam.db_path) as outside:
+        assert outside.execute("SELECT COUNT(*) FROM vector_probe").fetchone()[0] == 1
