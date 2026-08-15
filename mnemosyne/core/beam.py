@@ -1305,58 +1305,61 @@ def _guarded_transaction(conn: sqlite3.Connection):
 
 @contextlib.contextmanager
 def _deferred_commits(conn: sqlite3.Connection):
-    """Suppress nested commit() calls so the caller can wrap many
-    sub-helpers in a single transaction.
+    """Defer nested commits without stealing a caller-owned transaction.
 
-    Pairs with `_BeamConnection`'s `_defer_commit` flag. If the
-    passed connection isn't a `_BeamConnection` (e.g., a test
-    constructed `BeamMemory` with a raw sqlite3 connection, or a
-    legacy caller built its own conn), the context manager degrades
-    to a no-op -- inner commits still fire, performance regression
-    isn't fixed for that code path but correctness is preserved.
-
-    Threading: `_BeamConnection._defer_commit` is per-connection.
-    BeamMemory uses thread-local connections (see _get_connection),
-    so the flag is visible only to the calling thread. A future
-    refactor that shares the connection across threads would need
-    a lock here.
+    A BEAM-owned batch starts and commits its own transaction.  When a caller
+    already has a transaction open, the batch is isolated in a savepoint: it
+    releases on success and rolls back only its own writes on failure.  In
+    particular, neither path may commit or roll back the caller's marker rows.
     """
-    is_beam_conn = isinstance(conn, _BeamConnection)
-    if not is_beam_conn:
-        # Degrade gracefully: inner commits fire as before. This
-        # keeps the path callable from tests that build conns
-        # manually but loses the batching perf win on that code path.
+    if not isinstance(conn, _BeamConnection):
+        # Raw sqlite connections cannot suppress C-level commit calls. Retain
+        # the established compatibility behavior for legacy/manual callers.
         yield
         return
 
+    owns_transaction = not conn.in_transaction
+    savepoint = "mnemosyne_deferred_commits"
+    previously_deferred = conn._defer_commit
+    if owns_transaction:
+        conn.execute("BEGIN")
+    else:
+        conn.execute(f"SAVEPOINT {savepoint}")
     conn._defer_commit = True
     try:
         yield
     except Exception:
-        conn._defer_commit = False
+        conn._defer_commit = previously_deferred
         try:
-            conn.rollback()
+            if owns_transaction:
+                conn.rollback()
+            else:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
         except sqlite3.Error:
             pass
         raise
     else:
-        conn._defer_commit = False
+        conn._defer_commit = previously_deferred
         try:
-            conn._real_commit()
+            if owns_transaction:
+                conn._real_commit()
+            else:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
         except sqlite3.Error as exc:
-            logger.error(
-                "_deferred_commits: final commit failed: %s; "
-                "rolling back the buffered transaction",
-                exc,
-            )
+            logger.error("_deferred_commits: finalization failed: %s", exc)
             try:
-                conn.rollback()
+                if owns_transaction:
+                    conn.rollback()
+                else:
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
             except sqlite3.Error:
                 pass
             raise
     finally:
-        # Defense in depth: clear the flag on any control-flow path.
-        conn._defer_commit = False
+        # Preserve an enclosing deferral scope if this context was nested.
+        conn._defer_commit = previously_deferred
 
 
 def _generate_id(content: str) -> str:
@@ -2263,15 +2266,12 @@ def _vec_table_insert(conn: sqlite3.Connection, table: str, rowid: int, embeddin
             f"INSERT INTO {table}(rowid, embedding) VALUES (?, ?)",
             (rowid, emb_json)
         )
-    # Ensure the insert is committed even when the caller's connection
-    # has _defer_commit=True (_BeamConnection). Without this, inserts
-    # sit in the deferred transaction and disappear if the caller
-    # later rolls back or the connection is reused in a different context.
+    # Respect the caller's transaction boundary.  `_BeamConnection.commit()`
+    # intentionally becomes a no-op while `_deferred_commits()` is active, so
+    # vector rows remain atomic with their working-memory row instead of
+    # prematurely committing an enclosing batch/caller transaction.
     if commit:
-        if isinstance(conn, _BeamConnection):
-            conn._real_commit()
-        else:
-            conn.commit()
+        conn.commit()
 
 
 def _wm_rowid(conn: sqlite3.Connection, memory_id: str) -> Optional[int]:
