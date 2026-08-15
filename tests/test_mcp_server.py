@@ -1350,7 +1350,19 @@ print(json.dumps({"result": result, "after": after}))
                         await client.initialize()
                         listed = await client.list_tools()
                         assert isinstance(listed, ListToolsResult)
-                        assert len(listed.tools) >= 25
+                        names = [tool.name for tool in listed.tools]
+                        # #728: every advertised tool must have a dispatch
+                        # handler, so the wire surface is exactly the handler
+                        # registry, with unique names.
+                        assert len(names) == len(set(names))
+                        assert set(names) == set(_TOOL_HANDLERS), (
+                            f"tools/list surface diverges from handler registry: "
+                            f"{sorted(set(names) - set(_TOOL_HANDLERS))} advertised "
+                            f"without handler; "
+                            f"{sorted(set(_TOOL_HANDLERS) - set(names))} handlers "
+                            f"not advertised"
+                        )
+                        assert "mnemosyne_remember" in names
                         with patch(
                             "mnemosyne.mcp_server.handle_tool_call",
                             return_value={"status": "ok"},
