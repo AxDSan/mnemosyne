@@ -309,3 +309,38 @@ class TestMnemosynePatternMethods:
         contents = [r["content"] for r in mem.get_all_memories()]
         assert "Keep me visible" in contents
         assert "Forget about this rule" not in contents
+
+    def test_get_all_memories_expiry_interpretation(self, tmp_path):
+        """#525: get_all_memories applies the documented validity forms.
+
+        Offset-bearing past values are expired, offset-bearing future
+        values are kept, naive values are interpreted as UTC, and
+        date-only values stay pass-through.
+        """
+        from datetime import datetime, timedelta, timezone
+        from mnemosyne.core.memory import Mnemosyne
+        mem = Mnemosyne(session_id="c26", db_path=tmp_path / "c26.db")
+
+        future_offset = (datetime.now(timezone.utc) + timedelta(hours=4)).astimezone(
+            timezone(timedelta(hours=-2))
+        )
+        past_offset = (datetime.now(timezone.utc) - timedelta(hours=4)).astimezone(
+            timezone(timedelta(hours=14))
+        )
+        mem.remember(
+            "Future offset expiry", source="user", importance=0.5,
+            valid_until=future_offset.isoformat(),
+        )
+        mem.remember(
+            "Past offset expiry", source="user", importance=0.5,
+            valid_until=past_offset.isoformat(),
+        )
+        mem.remember(
+            "Date-only expiry", source="user", importance=0.5,
+            valid_until="2099-12-31",
+        )
+
+        contents = [r["content"] for r in mem.get_all_memories()]
+        assert "Future offset expiry" in contents
+        assert "Past offset expiry" not in contents
+        assert "Date-only expiry" in contents

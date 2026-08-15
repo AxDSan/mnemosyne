@@ -407,18 +407,24 @@ class TestE5FilterEnforcement:
         _time.tzset()
         try:
             beam = BeamMemory(session_id="s1", db_path=temp_db)
-            beam.remember("Alice keeps her keys in the vault", source="conv", importance=0.9)
+            mid = beam.remember(
+                "Alice keeps her keys in the vault", source="conv", importance=0.9
+            )
             # Still valid in two hours (aware UTC): must survive the filter.
             future_utc = (
                 datetime.now(timezone.utc) + timedelta(hours=2)
             ).isoformat()
             beam.conn.execute(
-                "UPDATE working_memory SET valid_until = ?", (future_utc,)
+                "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+                (future_utc, mid),
             )
             beam.conn.commit()
 
             results = beam.recall("Alice vault keys", top_k=20)
-            assert results, "polyphonic recall rejected a still-valid aware-UTC row"
+            assert mid in {r["id"] for r in results}, (
+                "polyphonic recall rejected a still-valid aware-UTC row; "
+                f"got: {[r['id'] for r in results]}"
+            )
         finally:
             if original_tz is None:
                 monkeypatch.delenv("TZ", raising=False)

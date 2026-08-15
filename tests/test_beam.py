@@ -915,7 +915,8 @@ class TestWorkingMemory:
         """#525: offset-bearing valid_until is canonicalized to UTC on write.
 
         A future instant expressed with a non-UTC offset must not be
-        excluded by lexical comparison against aware-UTC now.
+        excluded by lexical comparison against aware-UTC now. Covers
+        context, linear recall, and the episodic write path.
         """
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         future_offset = (datetime.now(timezone.utc) + timedelta(hours=4)).astimezone(
@@ -933,6 +934,7 @@ class TestWorkingMemory:
         assert stored > datetime.now(timezone.utc)
         # Still valid: the filter must include it.
         assert mid in {r["id"] for r in beam.get_context(limit=10)}
+        assert mid in {r["id"] for r in beam.recall("offset expiry memory", top_k=10)}
 
     def test_offset_bearing_past_valid_until_is_expired(self, temp_db):
         """#525: a past instant expressed with +14:00 offset is expired."""
@@ -945,6 +947,60 @@ class TestWorkingMemory:
             valid_until=past_offset.isoformat(),
         )
         assert mid not in {r["id"] for r in beam.get_context(limit=10)}
+        assert mid not in {r["id"] for r in beam.recall("offset past memory", top_k=10)}
+
+    def test_offset_bearing_valid_until_episodic_write(self, temp_db, non_utc_tz):
+        """#525: consolidate_to_episodic canonicalizes offset-bearing
+        valid_until to UTC, and recall excludes an expired summary."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        future_offset = (datetime.now(timezone.utc) + timedelta(hours=4)).astimezone(
+            timezone(timedelta(hours=-2))
+        )
+        eid = beam.consolidate_to_episodic(
+            "Episodic summary with future offset expiry",
+            source_wm_ids=["wm1"],
+            importance=0.9,
+            valid_until=future_offset.isoformat(),
+        )
+        row = beam.conn.execute(
+            "SELECT valid_until FROM episodic_memory WHERE id = ?", (eid,)
+        ).fetchone()
+        stored = datetime.fromisoformat(row[0])
+        assert stored.utcoffset() == timedelta(0)
+        assert stored > datetime.now(timezone.utc)
+        assert eid in {r["id"] for r in beam.recall("episodic summary future expiry", top_k=20)}
+
+    def test_offset_bearing_valid_until_entity_recall(self, temp_db, non_utc_tz):
+        """#525: entity-matched recall honors offset-bearing valid_until.
+
+        Entity matches are re-filtered through the same working-memory
+        validity predicate, so a future offset-bearing valid_until must
+        survive and a past one must be dropped.
+        """
+        from mnemosyne.core.annotations import add_annotation
+
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        future_offset = (datetime.now(timezone.utc) + timedelta(hours=4)).astimezone(
+            timezone(timedelta(hours=-2))
+        )
+        mid = beam.remember(
+            "The staging gateway needs a reboot", source="test", importance=0.9,
+            valid_until=future_offset.isoformat(),
+        )
+        add_annotation(mid, "mentions", "staging", db_path=temp_db)
+
+        results = beam.recall("staging gateway", top_k=10)
+        assert mid in {r["id"] for r in results}
+
+        expired_mid = beam.remember(
+            "The prod gateway needs a reboot", source="test", importance=0.9,
+            valid_until=(
+                datetime.now(timezone.utc) - timedelta(hours=4)
+            ).astimezone(timezone(timedelta(hours=14))).isoformat(),
+        )
+        add_annotation(expired_mid, "mentions", "prod", db_path=temp_db)
+        results = beam.recall("prod gateway", top_k=10)
+        assert expired_mid not in {r["id"] for r in results}
 
     def test_date_only_valid_until_keeps_api_semantics(self, temp_db):
         """#525: date-only valid_until inputs remain pass-through."""
@@ -954,6 +1010,11 @@ class TestWorkingMemory:
             valid_until="2099-12-31",
         )
         assert mid in {r["id"] for r in beam.get_context(limit=10)}
+        row = beam.conn.execute(
+            "SELECT valid_until FROM working_memory WHERE id = ?", (mid,)
+        ).fetchone()
+        # Date-only stays a plain date: pass-through, no UTC suffix added.
+        assert row[0] == "2099-12-31"
 
 
 class TestEpisodicMemory:
