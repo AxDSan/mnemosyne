@@ -1518,6 +1518,41 @@ def _parse_iso_datetime_utc(value: str) -> datetime:
     return _normalize_datetime_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
 
 
+def _normalize_valid_until(value: Optional[str]) -> Optional[str]:
+    """Canonicalize a caller-supplied ``valid_until`` to aware UTC ISO.
+
+    Offset-bearing ISO timestamps are converted to UTC so the lexical
+    ``valid_until > ?`` comparisons against aware-UTC now stay
+    chronologically correct (e.g. ``2026-08-15T11:00:00-02:00`` is
+    13:00Z but sorts before ``12:30:00+00:00``). Date-only values
+    (``YYYY-MM-DD``) keep their documented pass-through API semantics;
+    unparseable values pass through unchanged.
+    """
+    if not value:
+        return value
+    if "T" not in value and " " not in value:
+        return value
+    try:
+        return _parse_iso_datetime_utc(value).isoformat()
+    except (ValueError, TypeError):
+        return value
+
+
+def _valid_until_active(valid_until: str, now_iso: str) -> bool:
+    """True when ``valid_until`` is strictly in the future of ``now_iso``.
+
+    Both operands are parsed chronologically so offset-bearing stored
+    values (e.g. ``2026-08-15T11:00:00-02:00`` = 13:00Z) are not
+    misjudged by lexical ordering against aware-UTC now. Naive values
+    are treated as UTC, matching ``_normalize_datetime_utc``. Falls back
+    to lexical comparison when either side cannot be parsed.
+    """
+    try:
+        return _parse_iso_datetime_utc(valid_until) > _parse_iso_datetime_utc(now_iso)
+    except (ValueError, TypeError):
+        return valid_until > now_iso
+
+
 def _recency_decay(timestamp_str: str, halflife_hours: float = RECENCY_HALFLIFE_HOURS) -> float:
     """Calculate recency decay factor. 1.0 = brand new, ~0.5 = one halflife old.
     
@@ -3448,6 +3483,7 @@ class BeamMemory:
         # the new recall multiplier means non-canonical labels would
         # silently fall through to UNKNOWN_WEIGHT at scoring time.
         veracity = clamp_veracity(veracity, context="remember")
+        valid_until = _normalize_valid_until(valid_until)
 
     # --- Content sanitization: extract binary payloads to blob storage ---
         from mnemosyne.core.content_sanitizer import sanitize_content as _sanitize
@@ -4683,6 +4719,7 @@ class BeamMemory:
         # An embed failure must not abort the insert: the summary row is the
         # payload, the vector is an index. Fall back to vec = None like the
         # other embed call sites (remember, remember_batch, update_working).
+        valid_until = _normalize_valid_until(valid_until)
         vec = None
         if _embeddings.available():
             try:
@@ -7653,7 +7690,7 @@ class BeamMemory:
 
         final = []
         cursor = self.conn.cursor()
-        now_iso = datetime.now().isoformat()
+        now_iso = datetime.now(timezone.utc).isoformat()
 
         for r in polyphonic_results:
             memory_id = r.memory_id
@@ -7826,7 +7863,7 @@ class BeamMemory:
 
         # Validity filters.
         valid_until = row_dict.get("valid_until")
-        if valid_until and valid_until <= now_iso:
+        if valid_until and not _valid_until_active(valid_until, now_iso):
             return False
         if row_dict.get("superseded_by"):
             return False
