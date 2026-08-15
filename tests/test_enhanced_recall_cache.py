@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 from datetime import datetime, timezone
 from pathlib import Path
@@ -115,6 +116,96 @@ def test_successful_invalidate_clears_persisted_enhanced_recall_cache(monkeypatc
             _close_memory(memory)
 
 
+def test_successful_forget_working_clears_persisted_enhanced_recall_cache(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    db_path = tmp_path / "memories.db"
+    memory = forgetter = fresh = None
+    try:
+        memory = BeamMemory(session_id="session-a", db_path=db_path)
+        memory_id = memory.remember("issue 553 forget cache sentinel", source="test")
+        warm = _call(memory, "issue 553 forget cache sentinel", top_k=3)
+        assert memory_id in {result["id"] for result in warm}
+        assert memory._query_cache is not None
+        warm_cache_stats = memory._query_cache.stats()
+        assert _call(memory, "issue 553 forget cache sentinel", top_k=3) == warm
+        assert memory._query_cache.stats()["hits"] == warm_cache_stats["hits"] + 1
+        cache_version = memory._query_cache.stats()["version"]
+
+        assert memory.forget_working("missing-memory") is False
+        assert memory._query_cache.stats()["version"] == cache_version
+
+        local_id = memory.remember("issue 553 local-cache forget sentinel", source="test")
+        local_warm = _call(memory, "issue 553 local-cache forget sentinel", top_k=3)
+        assert local_id in {result["id"] for result in local_warm}
+        local_version = memory._query_cache.stats()["version"]
+        assert memory.forget_working(local_id) is True
+        assert memory._query_cache.stats()["version"] == local_version + 1
+        assert local_id not in {
+            result["id"]
+            for result in _call(memory, "issue 553 local-cache forget sentinel", top_k=3)
+        }
+
+        forgetter = BeamMemory(session_id="session-a", db_path=db_path)
+        assert not hasattr(forgetter, "_query_cache")
+        assert forgetter.forget_working(memory_id) is True
+
+        fresh = BeamMemory(session_id="session-a", db_path=db_path)
+        assert memory_id not in {
+            result["id"] for result in _call(fresh, "issue 553 forget cache sentinel", top_k=3)
+        }
+    finally:
+        try:
+            _close_memory(fresh)
+        finally:
+            try:
+                _close_memory(forgetter)
+            finally:
+                _close_memory(memory)
+
+
+def test_failed_cross_session_forget_keeps_cache_and_memory(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    owner = other = None
+    try:
+        db_path = tmp_path / "memories.db"
+        owner = BeamMemory(session_id="session-a", db_path=db_path)
+        memory_id = owner.remember("issue 553 private forget sentinel", source="test")
+        assert memory_id in {
+            row["id"] for row in _call(owner, "issue 553 private forget sentinel", top_k=3)
+        }
+
+        other = BeamMemory(session_id="session-b", db_path=db_path)
+        other_warm = _call(other, "issue 553 private forget sentinel", top_k=3)
+        assert memory_id not in {result["id"] for result in other_warm}
+        assert other._query_cache is not None
+        cache_version = other._query_cache.stats()["version"]
+        assert other.forget_working(memory_id) is False
+        assert other._query_cache.stats()["version"] == cache_version
+        assert memory_id not in {
+            result["id"]
+            for result in _call(other, "issue 553 private forget sentinel", top_k=3)
+        }
+        assert owner.get(memory_id) is not None
+        assert memory_id in {
+            row["id"] for row in _call(owner, "issue 553 private forget sentinel", top_k=3)
+        }
+    finally:
+        _close_memory(other)
+        _close_memory(owner)
+
+
 def test_invalidate_without_local_query_cache_clears_persisted_enhanced_recall_cache(
     monkeypatch, tmp_path: Path
 ):
@@ -155,6 +246,427 @@ def test_invalidate_without_local_query_cache_clears_persisted_enhanced_recall_c
                 _close_memory(invalidator)
             finally:
                 _close_memory(source)
+
+
+def test_remember_without_local_query_cache_clears_persisted_enhanced_recall_cache(
+    monkeypatch, tmp_path: Path
+):
+    """A fresh writer must evict A's persisted result before fresh C recalls."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    db_path = tmp_path / "memories.db"
+    source = None
+    writer = None
+    fresh = None
+    try:
+        source = BeamMemory(session_id="session-a", db_path=db_path)
+        source_id = source.remember(
+            "issue 556 persisted remember cache sentinel baseline",
+            source="test",
+            importance=1.0,
+        )
+        warm = _call(source, "issue 556 persisted remember cache sentinel", top_k=3)
+        assert source_id in {result["id"] for result in warm}
+        assert source._query_cache is not None
+        assert (db_path.parent / "query_cache.db").is_file()
+
+        writer = BeamMemory(session_id="session-a", db_path=db_path)
+        assert not hasattr(writer, "_query_cache")
+        inserted_id = writer.remember(
+            "issue 556 persisted remember cache sentinel inserted",
+            source="test",
+            importance=1.0,
+        )
+
+        fresh = BeamMemory(session_id="session-a", db_path=db_path)
+        reloaded = _call(fresh, "issue 556 persisted remember cache sentinel", top_k=3)
+        assert inserted_id in {result["id"] for result in reloaded}
+    finally:
+        try:
+            _close_memory(fresh)
+        finally:
+            try:
+                _close_memory(writer)
+            finally:
+                _close_memory(source)
+
+
+def test_dedup_remember_without_local_query_cache_evicts_persisted_result(
+    monkeypatch, tmp_path: Path
+):
+    """A fresh dedup writer must refresh the persisted result that exposes its update."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    db_path = tmp_path / "memories.db"
+    source = None
+    writer = None
+    fresh = None
+    try:
+        source = BeamMemory(session_id="session-a", db_path=db_path)
+        memory_id = source.remember(
+            "issue 556 dedup persisted cache sentinel",
+            source="initial",
+            importance=0.1,
+        )
+        warm = _call(source, "issue 556 dedup persisted cache sentinel", top_k=3)
+        assert next(result for result in warm if result["id"] == memory_id)["source"] == "initial"
+        assert source._query_cache is not None
+        assert (db_path.parent / "query_cache.db").is_file()
+
+        writer = BeamMemory(session_id="session-a", db_path=db_path)
+        assert not hasattr(writer, "_query_cache")
+        assert writer.remember(
+            "issue 556 dedup persisted cache sentinel",
+            source="updated",
+            importance=1.0,
+        ) == memory_id
+
+        fresh = BeamMemory(session_id="session-a", db_path=db_path)
+        reloaded = _call(fresh, "issue 556 dedup persisted cache sentinel", top_k=3)
+        updated = next(result for result in reloaded if result["id"] == memory_id)
+        assert updated["source"] == "updated"
+        assert updated["importance"] == 1.0
+    finally:
+        try:
+            _close_memory(fresh)
+        finally:
+            try:
+                _close_memory(writer)
+            finally:
+                _close_memory(source)
+
+
+def test_remember_invalidates_persisted_cache_when_post_commit_trim_raises(
+    monkeypatch, tmp_path: Path
+):
+    """A trim failure must propagate only after the committed write evicts cache."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    db_path = tmp_path / "memories.db"
+    source = None
+    writer = None
+    fresh = None
+    query = "issue 556 trim failure persisted cache sentinel"
+    try:
+        source = BeamMemory(session_id="session-a", db_path=db_path)
+        source_id = source.remember(f"{query} baseline", source="test", importance=1.0)
+        warm = _call(source, query, top_k=3)
+        assert source_id in {result["id"] for result in warm}
+        assert source._query_cache is not None
+        assert (db_path.parent / "query_cache.db").is_file()
+
+        writer = BeamMemory(session_id="session-a", db_path=db_path)
+        assert not hasattr(writer, "_query_cache")
+
+        def fail_trim():
+            raise RuntimeError("trim failed after insert commit")
+
+        monkeypatch.setattr(writer, "_trim_working_memory", fail_trim)
+        with pytest.raises(RuntimeError, match="trim failed after insert commit"):
+            writer.remember(f"{query} inserted", source="test", importance=1.0)
+
+        fresh = BeamMemory(session_id="session-a", db_path=db_path)
+        reloaded = _call(fresh, query, top_k=3)
+        assert {result["content"] for result in reloaded} != {
+            result["content"] for result in warm
+        }
+        assert f"{query} inserted" in {result["content"] for result in reloaded}
+    finally:
+        try:
+            _close_memory(fresh)
+        finally:
+            try:
+                _close_memory(writer)
+            finally:
+                _close_memory(source)
+
+
+def test_dedup_invalidates_before_enrichment(monkeypatch, tmp_path: Path):
+    """Dedup writes evict cache before their post-commit enrichment begins."""
+    memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+    calls = []
+    try:
+        monkeypatch.setattr(
+            memory,
+            "_invalidate_query_cache_after_remember_commit",
+            lambda: calls.append("invalidate"),
+        )
+        monkeypatch.setattr(
+            memory,
+            "_ingest_graph_and_veracity",
+            lambda *args: calls.append("enrich"),
+        )
+        memory.remember("issue 556 dedup invalidation timing", source="test")
+        calls.clear()
+
+        memory.remember("issue 556 dedup invalidation timing", source="updated")
+
+        assert calls.index("invalidate") < calls.index("enrich")
+    finally:
+        _close_memory(memory)
+
+
+def test_remember_finally_invalidates_cache_refilled_during_enrichment(monkeypatch, tmp_path: Path):
+    """Post-commit enrichment cannot leave a newly warmed result behind."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    db_path = tmp_path / "memories.db"
+    memory = None
+    try:
+        memory = BeamMemory(session_id="session-a", db_path=db_path)
+        query = "issue 566 post commit enrichment cache refill"
+        baseline = f"{query} baseline"
+        memory.remember(baseline, source="initial", importance=0.1)
+        _call(memory, query, top_k=3)
+        assert memory._query_cache._conn.execute("SELECT COUNT(*) FROM query_cache").fetchone()[0] == 1
+
+        refilled_rows = []
+
+        def refill_during_enrichment(*args):
+            _call(memory, query, top_k=3)
+            refilled_rows.append(
+                memory._query_cache._conn.execute("SELECT COUNT(*) FROM query_cache").fetchone()[0]
+            )
+
+        monkeypatch.setattr(memory, "_ingest_graph_and_veracity", refill_during_enrichment)
+
+        assert memory.remember(baseline, source="updated", importance=1.0)
+        assert refilled_rows == [1]
+        assert memory._query_cache._conn.execute("SELECT COUNT(*) FROM query_cache").fetchone()[0] == 0
+    finally:
+        _close_memory(memory)
+
+
+def test_new_remember_finally_invalidates_cache_refilled_during_enrichment(monkeypatch, tmp_path: Path):
+    """New inserts receive the same final eviction after enrichment refills cache."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    db_path = tmp_path / "memories.db"
+    memory = None
+    try:
+        memory = BeamMemory(session_id="session-a", db_path=db_path)
+        query = "issue 566 new insert enrichment cache refill"
+        memory.remember(f"{query} baseline", source="initial", importance=0.1)
+        _call(memory, query, top_k=3)
+        assert memory._query_cache._conn.execute("SELECT COUNT(*) FROM query_cache").fetchone()[0] == 1
+
+        refilled_rows = []
+
+        def refill_during_enrichment(*args):
+            _call(memory, query, top_k=3)
+            refilled_rows.append(
+                memory._query_cache._conn.execute("SELECT COUNT(*) FROM query_cache").fetchone()[0]
+            )
+
+        monkeypatch.setattr(memory, "_ingest_graph_and_veracity", refill_during_enrichment)
+
+        memory.remember(f"{query} inserted", source="new", importance=1.0)
+        assert refilled_rows == [1]
+        assert memory._query_cache._conn.execute("SELECT COUNT(*) FROM query_cache").fetchone()[0] == 0
+    finally:
+        _close_memory(memory)
+
+
+def test_new_remember_finally_invalidates_cache_refilled_during_enrichment_exception(
+    monkeypatch, tmp_path: Path
+):
+    """A post-commit enrichment error must evict its real cache refill for fresh C."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    db_path = tmp_path / "memories.db"
+    writer = None
+    fresh = None
+    try:
+        writer = BeamMemory(session_id="session-a", db_path=db_path)
+        query = "issue 566 new insert enrichment exception cache refill"
+        inserted_id = "issue-566-new-enrichment-exception"
+        writer.remember(f"{query} baseline", source="initial", importance=0.1)
+        _call(writer, query, top_k=3)
+        assert writer._query_cache._conn.execute(
+            "SELECT COUNT(*) FROM query_cache"
+        ).fetchone()[0] == 1
+
+        refilled_rows = []
+
+        def refill_then_raise(memory_id, *args):
+            refilled = _call(writer, query, top_k=3)
+            assert memory_id in {result["id"] for result in refilled}
+            refilled_rows.append(
+                writer._query_cache._conn.execute(
+                    "SELECT COUNT(*) FROM query_cache"
+                ).fetchone()[0]
+            )
+            raise RuntimeError("new enrichment failed after cache refill")
+
+        monkeypatch.setattr(writer, "_ingest_graph_and_veracity", refill_then_raise)
+        with pytest.raises(RuntimeError, match="new enrichment failed after cache refill"):
+            writer.remember(
+                f"{query} inserted",
+                source="new",
+                importance=1.0,
+                memory_id=inserted_id,
+            )
+
+        assert refilled_rows == [1]
+        assert writer.conn.execute(
+            "SELECT content FROM working_memory WHERE id = ?", (inserted_id,)
+        ).fetchone()["content"] == f"{query} inserted"
+
+        fresh = BeamMemory(session_id="session-a", db_path=db_path)
+        assert not hasattr(fresh, "_query_cache")
+        fresh._query_cache = QueryCache(db_path=db_path.parent / "query_cache.db")
+        assert fresh._query_cache._conn.execute(
+            "SELECT COUNT(*) FROM query_cache"
+        ).fetchone()[0] == 0
+        reloaded = _call(fresh, query, top_k=3)
+        assert inserted_id in {result["id"] for result in reloaded}
+    finally:
+        try:
+            _close_memory(fresh)
+        finally:
+            _close_memory(writer)
+
+
+def test_dedup_remember_finally_invalidates_cache_refilled_during_enrichment_exception(
+    monkeypatch, tmp_path: Path
+):
+    """A dedup enrichment error must evict its real cache refill for fresh C."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    db_path = tmp_path / "memories.db"
+    writer = None
+    fresh = None
+    try:
+        writer = BeamMemory(session_id="session-a", db_path=db_path)
+        query = "issue 566 dedup enrichment exception cache refill"
+        memory_id = writer.remember(query, source="initial", importance=0.1)
+        _call(writer, query, top_k=3)
+        assert writer._query_cache._conn.execute(
+            "SELECT COUNT(*) FROM query_cache"
+        ).fetchone()[0] == 1
+
+        refilled_rows = []
+
+        def refill_then_raise(enriched_id, *args):
+            refilled = _call(writer, query, top_k=3)
+            assert enriched_id in {result["id"] for result in refilled}
+            refilled_rows.append(
+                writer._query_cache._conn.execute(
+                    "SELECT COUNT(*) FROM query_cache"
+                ).fetchone()[0]
+            )
+            raise RuntimeError("dedup enrichment failed after cache refill")
+
+        monkeypatch.setattr(writer, "_ingest_graph_and_veracity", refill_then_raise)
+        with pytest.raises(RuntimeError, match="dedup enrichment failed after cache refill"):
+            writer.remember(query, source="updated", importance=1.0)
+
+        assert refilled_rows == [1]
+        assert dict(
+            writer.conn.execute(
+                "SELECT source, importance FROM working_memory WHERE id = ?", (memory_id,)
+            ).fetchone()
+        ) == {"source": "updated", "importance": 1.0}
+
+        fresh = BeamMemory(session_id="session-a", db_path=db_path)
+        assert not hasattr(fresh, "_query_cache")
+        fresh._query_cache = QueryCache(db_path=db_path.parent / "query_cache.db")
+        assert fresh._query_cache._conn.execute(
+            "SELECT COUNT(*) FROM query_cache"
+        ).fetchone()[0] == 0
+        reloaded = _call(fresh, query, top_k=3)
+        updated = next(result for result in reloaded if result["id"] == memory_id)
+        assert updated["source"] == "updated"
+        assert updated["importance"] == 1.0
+    finally:
+        try:
+            _close_memory(fresh)
+        finally:
+            _close_memory(writer)
+
+
+def test_new_remember_write_survives_post_commit_cache_invalidation_failure(
+    monkeypatch, tmp_path: Path, caplog
+):
+    memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+
+    def fail_invalidation():
+        raise RuntimeError("cache unavailable")
+
+    try:
+        monkeypatch.setattr(memory, "_invalidate_query_cache", fail_invalidation)
+        with caplog.at_level(logging.WARNING, logger=beam_module.__name__):
+            memory_id = memory.remember(
+                "issue 556 new write survives cache invalidation failure",
+                source="test",
+                importance=1.0,
+            )
+
+        row = memory.conn.execute(
+            "SELECT content, source, importance FROM working_memory WHERE id = ?", (memory_id,)
+        ).fetchone()
+        assert row is not None
+        assert dict(row) == {
+            "content": "issue 556 new write survives cache invalidation failure",
+            "source": "test",
+            "importance": 1.0,
+        }
+        assert "query-cache invalidation failed after commit" in caplog.text
+    finally:
+        _close_memory(memory)
+
+
+def test_dedup_remember_write_survives_post_commit_cache_invalidation_failure(
+    monkeypatch, tmp_path: Path, caplog
+):
+    memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+
+    def fail_invalidation():
+        raise RuntimeError("cache unavailable")
+
+    try:
+        memory_id = memory.remember(
+            "issue 556 dedup write survives cache invalidation failure",
+            source="initial",
+            importance=0.1,
+        )
+        monkeypatch.setattr(memory, "_invalidate_query_cache", fail_invalidation)
+        with caplog.at_level(logging.WARNING, logger=beam_module.__name__):
+            assert memory.remember(
+                "issue 556 dedup write survives cache invalidation failure",
+                source="updated",
+                importance=1.0,
+            ) == memory_id
+
+        row = memory.conn.execute(
+            "SELECT source, importance FROM working_memory WHERE id = ?", (memory_id,)
+        ).fetchone()
+        assert row is not None
+        assert dict(row) == {"source": "updated", "importance": 1.0}
+        assert "query-cache invalidation failed after commit" in caplog.text
+    finally:
+        _close_memory(memory)
 
 
 def test_successful_invalidate_episodic_memory_invalidates_enhanced_recall_cache(

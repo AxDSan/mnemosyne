@@ -184,7 +184,9 @@ INVALIDATE_SCHEMA = {
     "name": "mnemosyne_invalidate",
     "description": (
         "Mark a memory as expired or superseded. Provide memory_id from recall results. "
-        "Optionally provide replacement_id to chain old to new."
+        "Optionally provide a replacement_id that must resolve to a working-memory or episodic-memory "
+        "record that is accessible in the current session or global scope to chain old to new. "
+        "An unknown or out-of-scope target or replacement returns status: memory_not_found."
     ),
     "parameters": {
         "type": "object",
@@ -367,8 +369,9 @@ RECALL_CANONICAL_SCHEMA = {
 FORGET_CANONICAL_SCHEMA = {
     "name": "mnemosyne_forget_canonical",
     "description": (
-        "Retire a CANONICAL self-fact slot for the current profile. "
-        "Stamps valid_until on the current row, preserving it as history. "
+        "Retire a CANONICAL self-fact slot for the resolved owner in the selected "
+        "local bank. This operation is private to that owner. Stamps valid_until "
+        "on the current row, preserving it as local SQLite history. "
         "Returns whether a current row was retired. Nothing is deleted. "
         "Use this to remove a canonical fact (e.g. a stale preference or identity)."
     ),
@@ -859,7 +862,7 @@ ALL_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     SLEEP_SCHEMA, STATS_SCHEMA,
     INVALIDATE_SCHEMA, VALIDATE_SCHEMA, GET_SCHEMA,
     TRIPLE_ADD_SCHEMA, TRIPLE_QUERY_SCHEMA, TRIPLE_END_SCHEMA,
-    REMEMBER_CANONICAL_SCHEMA, RECALL_CANONICAL_SCHEMA,
+    REMEMBER_CANONICAL_SCHEMA, RECALL_CANONICAL_SCHEMA, FORGET_CANONICAL_SCHEMA,
     SCRATCHPAD_WRITE_SCHEMA, SCRATCHPAD_READ_SCHEMA, SCRATCHPAD_CLEAR_SCHEMA,
     EXPORT_SCHEMA, UPDATE_SCHEMA, FORGET_SCHEMA, BATCH_SCHEMA, IMPORT_SCHEMA, DIAGNOSE_SCHEMA,
     GRAPH_QUERY_SCHEMA, GRAPH_LINK_SCHEMA,

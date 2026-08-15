@@ -817,6 +817,15 @@ class TestWorkingMemory:
 
 
 class TestEpisodicMemory:
+    def test_consolidate_preserves_literal_think_markup(self, temp_db):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        summary = "User wrote </think> in a literal example"
+
+        beam.consolidate_to_episodic(summary=summary, source_wm_ids=["wm1"])
+
+        content = beam.conn.execute("SELECT content FROM episodic_memory").fetchone()[0]
+        assert content == summary
+
     def test_consolidate_and_recall(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         eid = beam.consolidate_to_episodic(
@@ -852,6 +861,77 @@ class TestScratchpad:
 
 
 class TestSleepCycle:
+    def test_sleep_discards_all_chunk_summaries_after_malformed_chunk(self, temp_db, monkeypatch):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
+        beam.conn.executemany(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
+            [
+                ("chunk-a", "first source memory", "conversation", old_ts, "s1"),
+                ("chunk-b", "second source memory", "conversation", old_ts, "s1"),
+            ],
+        )
+        beam.conn.commit()
+
+        from mnemosyne.core import local_llm
+        monkeypatch.setattr(local_llm, "llm_available", lambda: True)
+        monkeypatch.setattr(local_llm, "chunk_memories_by_budget", lambda *_args, **_kwargs: [["a"], ["b"]])
+        results = iter(["first LLM chunk", local_llm._INVALID_REASONING_OUTPUT])
+        monkeypatch.setattr(local_llm, "_summarize_memories", lambda *_args, **_kwargs: next(results))
+
+        beam.sleep()
+        content = beam.conn.execute("SELECT content FROM episodic_memory").fetchone()[0]
+        assert "first LLM chunk" not in content
+        assert content.startswith("[conversation] ")
+
+    def test_sleep_discards_chunk_summaries_after_invalid_second_pass(self, temp_db, monkeypatch):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
+        beam.conn.executemany(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
+            [
+                ("chunk-a", "first source memory", "conversation", old_ts, "s1"),
+                ("chunk-b", "second source memory", "conversation", old_ts, "s1"),
+            ],
+        )
+        beam.conn.commit()
+
+        from mnemosyne.core import local_llm
+        monkeypatch.setattr(local_llm, "llm_available", lambda: True)
+        monkeypatch.setattr(local_llm, "chunk_memories_by_budget", lambda *_args, **_kwargs: [["a"], ["b"]])
+        results = iter(["first LLM chunk", "second LLM chunk", local_llm._INVALID_REASONING_OUTPUT])
+        monkeypatch.setattr(local_llm, "_summarize_memories", lambda *_args, **_kwargs: next(results))
+
+        beam.sleep()
+        content = beam.conn.execute("SELECT content FROM episodic_memory").fetchone()[0]
+        assert "first LLM chunk" not in content
+        assert "second LLM chunk" not in content
+        assert content.startswith("[conversation] ")
+
+    def test_sleep_falls_back_to_aaak_for_token_truncated_reasoning(self, temp_db, monkeypatch):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
+        beam.conn.execute(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("old-think", "User prefers dark mode", "conversation", old_ts, "s1"),
+        )
+        beam.conn.commit()
+
+        from mnemosyne.core import local_llm
+        truncated_generation = "<think>reasoning cut off at max_tokens"
+        monkeypatch.setattr(local_llm, "llm_available", lambda: True)
+        monkeypatch.setattr(local_llm, "_try_host_llm", lambda *_args, **_kwargs: (False, None))
+        monkeypatch.setattr(local_llm, "_call_local_llm", lambda *_args, **_kwargs: truncated_generation)
+
+        result = beam.sleep()
+        content = beam.conn.execute("SELECT content FROM episodic_memory").fetchone()[0]
+        assert result["status"] == "consolidated"
+        assert result["llm_used"] == 0
+        assert content.startswith("[conversation] ")
+        assert "<think>" not in content
+        assert "truncated" not in content
+
     def test_sleep_consolidates_old_memories(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         # Inject old working memories

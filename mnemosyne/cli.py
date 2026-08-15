@@ -9,7 +9,8 @@ All commands use the v2 BEAM architecture (Mnemosyne/BeamMemory).
 import os
 import sys
 import json
-from pathlib import Path
+import importlib.metadata
+from pathlib import Path, PureWindowsPath
 from typing import NoReturn
 
 def _default_data_dir() -> str:
@@ -27,6 +28,14 @@ def _default_data_dir() -> str:
 
 
 DATA_DIR = _default_data_dir()
+
+
+def _distribution_version(distribution: str) -> str:
+    """Return an installed distribution version without importing package globals."""
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return "unavailable"
 
 
 def _fail(message: str, exit_code: int = 2) -> NoReturn:
@@ -1004,11 +1013,52 @@ def cmd_sync_generate_key(args):
     print("\nStore this key securely. It is the only way to decrypt synced payloads.", file=sys.stderr)
 
 
+def _normalize_backup_output_dir_arg(value: str, *, windows: bool | None = None) -> str:
+    """Normalize an explicit backup directory at the CLI boundary.
+
+    Git Bash/MSYS passes Windows drive paths as ``/c/...``. Passing that raw
+    spelling to ``pathlib.Path`` on Windows creates a drive-relative ``\\c\\...``
+    path, so a successful backup can land somewhere other than the directory the
+    user named. Convert only the unambiguous MSYS drive form. Other POSIX-rooted
+    paths are rejected before the backup backend runs instead of being silently
+    redirected.
+    """
+    if windows is None:
+        windows = os.name == "nt"
+    if not windows or not value.startswith("/"):
+        return value
+
+    unc_parts = value[2:].split("/") if value.startswith("//") else []
+    if (
+        value.startswith("//")
+        and not value.startswith("///")
+        and len(unc_parts) >= 2
+        and unc_parts[0]
+        and unc_parts[1]
+        and PureWindowsPath(value).is_absolute()
+    ):
+        return value
+
+    if (
+        len(value) >= 2
+        and value[1].isascii()
+        and value[1].isalpha()
+        and (len(value) == 2 or value[2] in "/\\")
+    ):
+        remainder = value[2:].replace("\\", "/") if len(value) > 2 else "/"
+        return f"{value[1].upper()}:{remainder}"
+
+    raise ValueError(
+        "On Windows, backup paths beginning with '/' must use an MSYS drive path "
+        "such as /c/backups, or a native absolute path such as C:/backups."
+    )
+
+
 def cmd_backup(args):
     """Create a compressed backup of the database."""
     from mnemosyne.dr.recovery import create_backup
-    output_dir = Path(args[0]) if args else None
     try:
+        output_dir = Path(_normalize_backup_output_dir_arg(args[0])) if args else None
         result = create_backup(backup_dir=output_dir)
         print(f"Backup created: {result['backup_path']}")
         print(f"  Original size: {result['original_size']:,} bytes")
@@ -1206,6 +1256,7 @@ def cmd_hygiene(args):
         clean_noise,
         hygiene_status,
         restore_archived,
+        validate_hygiene_candidate,
     )
     from mnemosyne.doctor import open_readonly_doctor_db
 
@@ -1362,8 +1413,22 @@ def cmd_hygiene(args):
         except json.JSONDecodeError as e:
             _fail(f"Invalid JSON in candidates file: {e}")
 
+        # audit --json emits an envelope {"total_scanned": N, "candidates": [...]};
+        # clean expects the candidates array.
+        if isinstance(raw, dict):
+            if "candidates" not in raw:
+                _fail("Candidates envelope is missing the 'candidates' field")
+            raw = raw["candidates"]
+
+        if not isinstance(raw, list):
+            _fail("Candidates file must contain a JSON array or an audit envelope with a 'candidates' array")
+
         candidates = []
         for idx, c in enumerate(raw):
+            try:
+                validate_hygiene_candidate(c)
+            except ValueError as e:
+                _fail(f"Candidate #{idx}: {e}")
             try:
                 candidates.append(NoiseCandidate(
                     memory_id=c["memory_id"],
@@ -1673,6 +1738,10 @@ COMMANDS = {
 
 def run_cli():
     """Main CLI entry point."""
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--version", "version"):
+        print(f"Mnemosyne {_distribution_version('mnemosyne-memory')}")
+        return
+
     if len(sys.argv) < 2 or sys.argv[1] in ("--help", "-h", "help"):
         # Keep historical setup behavior for non-doctor CLI entry points while
         # leaving module import and the doctor path free of mkdir side effects.
@@ -1680,6 +1749,7 @@ def run_cli():
         print("Mnemosyne - Local AI Memory System\n")
         print("Usage: mnemosyne <command> [args]\n")
         print("Commands:")
+        print("  version                                Show installed version")
         print("  store <content> [source] [importance]  Store a memory")
         print("  recall <query> [top_k]                 Search memories")
         print("  update <id> <content> [importance]     Update a memory")

@@ -6,14 +6,19 @@ Falls back to keyword-only if neither is available.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import ssl
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import List, Optional
 from functools import lru_cache
+
+
+logger = logging.getLogger(__name__)
 
 try:
     import numpy as np
@@ -67,7 +72,13 @@ _OPENAI_API_KEY = os.environ.get("MNEMOSYNE_EMBEDDING_API_KEY", os.environ.get("
 _OPENAI_BASE_URL = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1")
 
 # --- Model selection ---
-_DEFAULT_MODEL = os.environ.get("MNEMOSYNE_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+# Normalize a blank (empty or whitespace-only) env var to the default. Such
+# values are routine in Docker Compose (`- MNEMOSYNE_EMBEDDING_MODEL=${X}` with
+# X unset) and .env files; without this, "" would be treated as a model named
+# empty-string, which is unknown and would raise at import under the fail-loud
+# rule even though the user set nothing meaningful. Uses .strip() to mirror the
+# blank handling for MNEMOSYNE_EMBEDDING_DIM in _get_embedding_dim.
+_DEFAULT_MODEL = (os.environ.get("MNEMOSYNE_EMBEDDING_MODEL") or "").strip() or "BAAI/bge-small-en-v1.5"
 _embedding_model = None
 _API_CALL_COUNT = 0
 
@@ -135,9 +146,13 @@ def _is_api_model(model_name: str) -> bool:
 def _get_embedding_dim(model_name: str) -> int:
     """Return the embedding dimension for a given model.
 
-    Supports English, Chinese, and multilingual embedding models.
-    Falls back to 384 (bge-small dimension) for unknown models.
-    Override with MNEMOSYNE_EMBEDDING_DIM env var for unsupported models.
+    Resolution order: an explicit MNEMOSYNE_EMBEDDING_DIM wins (and must be a
+    valid integer); otherwise a known model resolves via the table below; an
+    unknown model with no explicit dimension raises ValueError rather than
+    silently assuming 384 -- a vec0 table is dimensioned at creation, so a wrong
+    guess bakes the wrong dimension into a fresh database and corrupts vector
+    search. Embeddings-disabled invocations keep the 384 fallback (the dimension
+    is unused there).
     """
     dims = {
         # --- English BGE ---
@@ -158,6 +173,7 @@ def _get_embedding_dim(model_name: str) -> int:
         "sentence-transformers/paraphrase-multilingual-mpnet-base-v2": 768,
         # --- Multilingual BGE ---
         "BAAI/bge-m3": 1024,            # M3: multilingual (100+ langs), 1024-dim
+        "bge-m3": 1024,                 # Common remote/API alias
         "BAAI/bge-multilingual-gemma2": 3584,
         # --- OpenAI ---
         "openai/text-embedding-3-small": 1536,
@@ -176,14 +192,44 @@ def _get_embedding_dim(model_name: str) -> int:
         "jinaai/jina-embeddings-v2-base-zh": 768,
         "jinaai/jina-embeddings-v2-base-code": 768,
     }
-    # Check env override first
+    # Explicit override wins. An explicit-but-invalid value is a configuration
+    # error -- raise rather than silently fall through to a guess. A set-but-
+    # empty value (routine in Docker Compose / .env / CI matrices) is normalized
+    # to unset so it does not raise for a known model or with embeddings off.
     env_dim = os.environ.get("MNEMOSYNE_EMBEDDING_DIM")
-    if env_dim is not None:
+    if env_dim is not None and env_dim.strip():
         try:
-            return int(env_dim)
-        except (ValueError, TypeError):
-            pass
-    return dims.get(model_name, 384)
+            value = int(env_dim)
+        except ValueError:
+            raise ValueError(
+                f"MNEMOSYNE_EMBEDDING_DIM={env_dim!r} is not a valid integer; "
+                f"set it to the embedding model's output dimension."
+            ) from None
+        if value <= 0:
+            raise ValueError(
+                f"MNEMOSYNE_EMBEDDING_DIM={value} must be a positive integer; "
+                f"vector dimensions are >= 1."
+            )
+        return value
+    if model_name in dims:
+        return dims[model_name]
+    # Unknown model with no explicit dimension. Silently assuming 384 (bge-small's
+    # dimension) bakes the wrong dimension into a fresh vec0 table and corrupts
+    # every insert/recall when the model's true dimension differs -- the root
+    # cause behind the recurring per-model additions to this table. Refuse to
+    # guess and point at the override.
+    if _is_disabled():
+        # Embeddings turned off (CI / opt-out): the dimension is unused, so keep
+        # the 384 fallback rather than failing an unused code path.
+        return 384
+    raise ValueError(
+        f"Unknown embedding model {model_name!r}: not in the built-in dimension "
+        f"table and MNEMOSYNE_EMBEDDING_DIM is unset. A vec0 table is dimensioned "
+        f"at creation, so silently assuming 384 would bake in the wrong dimension "
+        f"and corrupt vector search. Set MNEMOSYNE_EMBEDDING_DIM=<N> to the "
+        f"model's output dimension (e.g. 1024 for mxbai-embed-large), or add the "
+        f"model to the table in _get_embedding_dim()."
+    )
 
 
 def _embedding_threads() -> int:
@@ -260,6 +306,25 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
     return False
 
 
+def _safe_api_endpoint(url: str) -> str:
+    """Return a credential-free API endpoint suitable for logs."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if not parsed.hostname:
+            return "<invalid-url>"
+        host = parsed.hostname
+        if ":" in host:
+            host = f"[{host}]"
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        authority = f"{host}:{port}" if port is not None else host
+        return urllib.parse.urlunsplit((parsed.scheme, authority, parsed.path, "", ""))
+    except ValueError:
+        return "<invalid-url>"
+
+
 def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     """Embed texts via OpenAI-compatible API (OpenRouter or custom endpoint)."""
     global _API_CALL_COUNT
@@ -308,13 +373,23 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
                 if attempt < 2:
                     time.sleep(retry_delay(attempt))
                     continue
+            logger.warning(
+                "embedding API request failed: endpoint=%s status=%s",
+                _safe_api_endpoint(url),
+                exc.code,
+            )
             return None
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
             # Network failures are transient often enough to warrant the same
             # bounded retry policy as HTTP 5xx responses.
             if attempt < 2:
                 time.sleep(retry_delay(attempt))
                 continue
+            logger.warning(
+                "embedding API request failed: endpoint=%s error=%s",
+                _safe_api_endpoint(url),
+                type(exc).__name__,
+            )
             return None
         except Exception as exc:
             # Preserve compatibility with mocked/custom transports that expose
@@ -325,6 +400,11 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
                 if attempt < 2:
                     time.sleep(retry_delay(attempt))
                     continue
+            logger.warning(
+                "embedding API call failed: endpoint=%s error=%s",
+                _safe_api_endpoint(url),
+                type(exc).__name__,
+            )
             return None
 
     return None

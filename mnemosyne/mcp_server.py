@@ -189,7 +189,8 @@ def _build_sse_app(host: str = "127.0.0.1"):
 
     middleware = []
     if require_auth:
-        expected = token
+        assert token is not None
+        expected = token.encode("utf-8")
 
         class _BearerTokenMiddleware:
             """Pure-ASGI bearer auth middleware.
@@ -212,12 +213,12 @@ def _build_sse_app(host: str = "127.0.0.1"):
                 if scope.get("type") != "http":
                     await self.app(scope, receive, send)
                     return
-                header = ""
+                header = b""
                 for k, v in scope.get("headers", []):
                     if k == b"authorization":
-                        header = v.decode("latin-1")
+                        header = v
                         break
-                if not header.startswith("Bearer "):
+                if not header.startswith(b"Bearer "):
                     resp = JSONResponse(
                         {"error": "missing bearer token"},
                         status_code=401,
@@ -225,7 +226,7 @@ def _build_sse_app(host: str = "127.0.0.1"):
                     )
                     await resp(scope, receive, send)
                     return
-                presented = header[len("Bearer "):].strip()
+                presented = header[len(b"Bearer "):].strip()
                 if not hmac.compare_digest(presented, expected):
                     resp = JSONResponse(
                         {"error": "invalid bearer token"},

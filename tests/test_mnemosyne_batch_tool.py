@@ -78,6 +78,37 @@ def test_batch_update_and_invalidate(tmp_path):
     assert invalidated[0]
 
 
+def test_batch_update_then_invalidate_with_replacement_preserves_outer_transaction(tmp_path):
+    provider = _provider(tmp_path)
+    target_id = provider._beam.remember("batch replacement target", importance=0.3)
+    replacement_id = provider._beam.remember("batch replacement", importance=0.3)
+
+    result = json.loads(provider.handle_tool_call("mnemosyne_batch", {
+        "operations": [
+            {
+                "action": "update",
+                "memory_id": target_id,
+                "content": "batch replacement target updated",
+            },
+            {
+                "action": "invalidate",
+                "memory_id": target_id,
+                "replacement_id": replacement_id,
+            },
+        ],
+    }))
+
+    assert result["status"] == "ok"
+    assert [item["status"] for item in result["results"]] == ["updated", "invalidated"]
+    target = provider._beam.get(target_id)
+    assert target["content"] == "batch replacement target updated"
+    row = provider._beam.conn.execute(
+        "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?", (target_id,)
+    ).fetchone()
+    assert row[0] is not None
+    assert row[1] == replacement_id
+
+
 def test_batch_extract_remember_uses_provider_default_scope(tmp_path):
     provider = _provider(tmp_path)
     provider._default_scope = "session"

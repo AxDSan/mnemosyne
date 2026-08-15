@@ -13,7 +13,7 @@ All imports are guarded — this module loads safely even if mcp is not installe
 
 from typing import TYPE_CHECKING, Dict, Any, List, TypeAlias
 import json
-import math
+import math  # noqa: F401
 import os
 import sqlite3
 from pathlib import Path
@@ -515,7 +515,8 @@ def _handle_invalidate(arguments: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": "memory_id is required"}
     bank = _resolve_bank(arguments)
     mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
-    mem.invalidate(memory_id, replacement_id=replacement_id)
+    if not mem.invalidate(memory_id, replacement_id=replacement_id):
+        return {"status": "memory_not_found", "memory_id": memory_id}
     return {"status": "invalidated", "memory_id": memory_id}
 
 
@@ -824,6 +825,32 @@ def _handle_recall_canonical(arguments: Dict[str, Any]) -> Dict[str, Any]:
             "results_count": len(results), "results": results, "store": "canonical"}
 
 
+def _handle_forget_canonical(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_forget_canonical tool call."""
+    from mnemosyne.core.canonical import CanonicalStore
+
+    category = arguments.get("category")
+    name = arguments.get("name")
+    if not isinstance(category, str) or not isinstance(name, str):
+        return {"error": "category and name are required"}
+    category = category.strip()
+    name = name.strip()
+    if not category or not name:
+        return {"error": "category and name are required"}
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    store = getattr(mem.beam, "canonical", None)
+    if store is None:
+        db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
+        store = CanonicalStore(db_path=db_path, conn=mem.beam.conn)
+
+    owner_id = _canonical_owner(arguments)
+    retired = store.forget(owner_id, category, name)
+    return {"retired": retired, "owner_id": owner_id, "category": category,
+            "name": name, "store": "canonical"}
+
+
 def _handle_scratchpad_write(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_scratchpad_write tool call."""
     content = arguments.get("content", "").strip()
@@ -1042,7 +1069,7 @@ def _handle_hygiene_audit(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_hygiene_clean tool call."""
-    from mnemosyne.core.hygiene import NoiseCandidate, clean_noise
+    from mnemosyne.core.hygiene import NoiseCandidate, clean_noise, validate_hygiene_candidate
 
     candidates_json = arguments.get("candidates_json", "[]")
     try:
@@ -1055,44 +1082,9 @@ def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
     candidates = []
     for candidate_data in raw_candidates:
-        if not isinstance(candidate_data, dict):
-            return {"error": "candidates_json must be a list of valid hygiene candidates"}
-        if not all(
-            isinstance(candidate_data.get(key), str) and candidate_data[key].strip()
-            for key in ("memory_id", "table_name")
-        ):
-            return {"error": "candidates_json must be a list of valid hygiene candidates"}
-        if candidate_data["table_name"] not in {"working_memory", "memories", "episodic_memory"}:
-            return {"error": "candidates_json must be a list of valid hygiene candidates"}
-        noise_score = candidate_data.get("noise_score", 0.0)
-        importance = candidate_data.get("importance", 0.5)
-        content_length = candidate_data.get("content_length", 0)
-        if (
-            not isinstance(noise_score, (int, float))
-            or isinstance(noise_score, bool)
-            or not 0 <= noise_score <= 1
-            or (isinstance(noise_score, float) and not math.isfinite(noise_score))
-            or not isinstance(importance, (int, float))
-            or isinstance(importance, bool)
-            or not 0 <= importance <= 1
-            or (isinstance(importance, float) and not math.isfinite(importance))
-            or not isinstance(content_length, int)
-            or isinstance(content_length, bool)
-            or content_length < 0
-        ):
-            return {"error": "candidates_json must be a list of valid hygiene candidates"}
-        if any(
-            key in candidate_data
-            and (not isinstance(candidate_data[key], list) or not all(isinstance(item, str) for item in candidate_data[key]))
-            for key in ("noise_reasons", "secret_flags")
-        ):
-            return {"error": "candidates_json must be a list of valid hygiene candidates"}
-        if any(
-            key in candidate_data and not isinstance(candidate_data[key], str)
-            for key in ("content_preview", "source", "timestamp", "suggested_action")
-        ):
-            return {"error": "candidates_json must be a list of valid hygiene candidates"}
-        if candidate_data.get("suggested_action", "keep") not in {"delete", "archive", "keep", "flag"}:
+        try:
+            validate_hygiene_candidate(candidate_data)
+        except ValueError:
             return {"error": "candidates_json must be a list of valid hygiene candidates"}
         candidates.append(
             NoiseCandidate(
@@ -1153,6 +1145,7 @@ _TOOL_HANDLERS = {
     "mnemosyne_triple_query": _handle_triple_query,
     "mnemosyne_remember_canonical": _handle_remember_canonical,
     "mnemosyne_recall_canonical": _handle_recall_canonical,
+    "mnemosyne_forget_canonical": _handle_forget_canonical,
     "mnemosyne_scratchpad_write": _handle_scratchpad_write,
     "mnemosyne_scratchpad_read": _handle_scratchpad_read,
     "mnemosyne_scratchpad_clear": _handle_scratchpad_clear,

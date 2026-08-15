@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import hashlib
 import importlib
 import json
+import logging
 import os
 import re
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,6 +25,9 @@ PLUGIN_NAME = "mnemosyne"
 SKILL_NAME = "mnemosyne-memory-override"
 SKILL_CATEGORY = "memory"
 BUNDLED_SKILL_RESOURCE = ("skills", SKILL_NAME, "SKILL.md")
+
+_MAX_HERMES_BIN_DEPTH = 10
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -46,6 +53,16 @@ class _WrapperMetadata:
     python: Path | None = None
     site_packages: Path | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class _ProfileLinkSnapshot:
+    """Identity of a recognized profile symlink at discovery time."""
+
+    path: Path
+    link_target: str
+    device: int
+    inode: int
 
 
 @dataclass(frozen=True)
@@ -252,6 +269,45 @@ def _provider_init_is_valid(init_file: Path) -> bool:
     try:
         source = init_file.read_text(errors="replace")
         return "register_memory_provider" in source or "MnemosyneMemoryProvider" in source
+    except Exception:
+        return False
+
+
+def _provider_init_is_mnemosyne(init_file: Path) -> bool:
+    """Return whether a plugin has installer-owned Mnemosyne identity markers."""
+    try:
+        plugin_yaml = init_file.with_name("plugin.yaml").read_text(errors="replace")
+        if not re.search(
+            r"^\s*name:\s*['\"]?hermes-mnemosyne['\"]?\s*$",
+            plugin_yaml,
+            flags=re.MULTILINE,
+        ):
+            return False
+
+        wrapper_manifest = init_file.with_name("mnemosyne-wrapper.json")
+        if wrapper_manifest.is_file():
+            metadata = _wrapper_metadata(init_file.parent, init_file)
+            return (
+                metadata.error is None
+                and metadata.python is not None
+                and metadata.site_packages is not None
+            )
+
+        source = init_file.read_text(errors="replace")
+        legacy_python, legacy_site = _extract_wrapper_metadata(init_file)
+        if (
+            legacy_python is not None
+            and legacy_python.is_absolute()
+            and legacy_site is not None
+            and legacy_site.is_absolute()
+            and re.search(
+                r"^from\s+mnemosyne_hermes\s+import\s+\*(?:\s+#.*)?$",
+                source,
+                flags=re.MULTILINE,
+            )
+        ):
+            return True
+        return False
     except Exception:
         return False
 
@@ -499,35 +555,336 @@ def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
         message="Plugin is installed and discoverable.",
     )
 
-def _find_hermes_python() -> Optional[Path]:
+_MAX_WRAPPER_READ_BYTES = 4096
+
+
+def _is_env_assignment(token: str) -> bool:
+    """True if the token is a plain ``NAME=value`` shell assignment."""
+    name, sep, value = token.partition("=")
+    if not sep or not name:
+        return False
+    if not (name[0].isalpha() or name[0] == "_"):
+        return False
+    if not all(char.isalnum() or char == "_" for char in name):
+        return False
+    # Reject command/parameter substitution we cannot evaluate.
+    return not value.startswith(("$", "`"))
+
+
+def _strip_env_prefix(tokens: list[str]) -> list[str] | None:
+    """Consume ``env`` assignments and no-arg flags, returning the command.
+
+    Returns None for any option that takes an argument (``-u NAME``, ``-C DIR``,
+    ``-S ...``) or is otherwise unrecognized, so an unfamiliar layout is rejected
+    rather than misread.
+    """
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            index += 1
+            break
+        if token in ("-", "-i", "--ignore-environment"):
+            index += 1
+            continue
+        if token.startswith("-"):
+            return None
+        if _is_env_assignment(token):
+            index += 1
+            continue
+        break
+    return tokens[index:]
+
+
+def _mentions_exec(tokens: list[str]) -> bool:
+    """True if any token is an ``exec`` we did not parse as the leading form.
+
+    Matches a bare ``exec`` token (``if true; then exec /x; fi``) and one nested
+    inside a quoted argument (``sh -c "exec /x"``), which arrives as a single
+    token. Deliberately exact on the first word rather than a substring search:
+    a Python console script containing ``os.execv(...)`` or ``exec(code)`` is a
+    direct launcher, and treating it as an unresolvable wrapper would break the
+    pipx layout the launcher branch exists to serve.
+    """
+    return any(token.split(maxsplit=1)[:1] == ["exec"] for token in tokens if token)
+
+
+def _wrapper_exec_target(path: Path) -> tuple[bool, str | None]:
+    """Inspect a launcher for an ``exec`` handoff to another program.
+
+    Returns ``(is_wrapper, target)``:
+      * ``(False, None)`` - read the launcher and it has no ``exec`` handoff;
+                             treat ``path`` as the binary.
+      * ``(True, target)`` - wrapper execs ``target`` (a path or command name).
+      * ``(True, None)``   - the handoff is unresolvable *or* undeterminable
+                             (unreadable, larger than the read bound, or
+                             unparseable); callers must not fall back to the
+                             wrapper itself.
+
+    Supported forms (trailing ``"$@"`` and arguments ignored)::
+
+        exec /path/to/hermes "$@"
+        exec "./hermes" "$@"
+        VAR=val exec /path/to/hermes "$@"
+        exec env [VAR=val ...] /path/to/hermes "$@"
+    """
+    # Every uncertain answer below is (True, None): "this may hand off, and we
+    # cannot say where". (False, None) is a positive finding -- we read the
+    # launcher and it is a binary -- because it licenses the caller to trust the
+    # interpreter sitting beside it. Confusing the two is how an unrelated
+    # sibling python gets bootstrapped (#618).
+    try:
+        with path.open("rb") as fh:
+            raw = fh.read(_MAX_WRAPPER_READ_BYTES + 1)
+    except OSError:
+        return True, None
+
+    if not raw.startswith(b"#!"):
+        # A compiled console script has no exec line to read, and reading it is
+        # how we know that. Binary mode keeps this decision independent of the
+        # bytes decoding cleanly.
+        return False, None
+
+    if len(raw) > _MAX_WRAPPER_READ_BYTES:
+        # A shebang script larger than the bound. Its handoff may sit past the
+        # part we read, so calling it a direct executable would trust whatever
+        # python happens to sit beside it.
+        return True, None
+
+    source = raw.decode("utf-8", errors="replace")
+
+    for raw_line in source.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            tokens = shlex.split(line, comments=True)
+        except ValueError:
+            # Unbalanced quoting. If the line could be the handoff, skipping it
+            # would let the file reach the "not a wrapper" return below.
+            if "exec" in line:
+                return True, None
+            continue
+
+        index = 0
+        while index < len(tokens) and _is_env_assignment(tokens[index]):
+            index += 1
+        tokens = tokens[index:]
+        if not tokens or tokens[0] != "exec":
+            # A handoff we cannot read as the supported leading form, such as
+            # `if true; then exec /opt/hermes/bin/hermes "$@"; fi`. Skipping the
+            # line lets the file reach the "no handoff" return and licenses the
+            # caller to trust the launcher's sibling interpreter.
+            if _mentions_exec(tokens):
+                return True, None
+            continue
+
+        # This line hands off with exec, so the wrapper is never the target.
+        rest = tokens[1:]
+        if not rest or rest[0].startswith("-"):
+            return True, None
+        if rest[0] == "env":
+            rest = _strip_env_prefix(rest[1:])
+            if not rest:
+                return True, None
+        return True, rest[0]
+
+    return False, None
+
+
+def _resolve_exec_target(raw_target: str, wrapper: Path) -> Path | None:
+    """Turn an ``exec`` target into a concrete executable path.
+
+    Absolute paths are used as-is, explicit relative paths (``./hermes``,
+    ``../bin/hermes``, ``bin/hermes``) resolve against the wrapper's own
+    directory, and bare command names go through PATH. The raw target is
+    classified before ``Path`` drops a leading ``./``, so a relative launcher is
+    never shadowed by a same-named file in the process working directory.
+    """
+    expanded = os.path.expanduser(raw_target)
+
+    if os.path.isabs(expanded):
+        candidate = Path(expanded)
+    elif os.sep in expanded or (os.altsep and os.altsep in expanded):
+        candidate = wrapper.parent / expanded
+    else:
+        found = shutil.which(expanded)
+        if not found:
+            return None
+        candidate = Path(found)
+
+    return candidate if candidate.is_file() else None
+
+
+def _resolve_hermes_bin(hermes_bin: str) -> Path | None:
+    """Resolve the real Hermes executable from a launcher on PATH.
+
+    Follows symlinks and shell wrappers that `exec` another binary (common for
+    PATH shims), tracking visited paths to avoid symlink loops. A direct
+    executable that is not a wrapper is returned as well, preserving discovery
+    for pipx / package entry points.
+
+    Returns None when resolution fails or the target is not executable.
+    """
+    path = Path(hermes_bin)
+    seen: set[Path] = set()
+
+    for _ in range(_MAX_HERMES_BIN_DEPTH):
+        try:
+            canonical = path.resolve()
+        except (OSError, RuntimeError) as exc:
+            LOGGER.debug(
+                "Failed to resolve Hermes launcher %r: %s", hermes_bin, exc
+            )
+            return None
+
+        if canonical in seen:
+            LOGGER.debug("Hermes launcher %r has a symlink loop", hermes_bin)
+            return None
+        seen.add(canonical)
+
+        if not canonical.is_file() or not os.access(canonical, os.X_OK):
+            LOGGER.debug(
+                "Hermes launcher %r resolves to non-executable %r",
+                hermes_bin,
+                canonical,
+            )
+            return None
+
+        is_wrapper, exec_target = _wrapper_exec_target(canonical)
+        if not is_wrapper:
+            return canonical
+        if exec_target is None:
+            LOGGER.debug(
+                "Hermes wrapper %r uses an unsupported exec form", hermes_bin
+            )
+            return None
+
+        next_path = _resolve_exec_target(exec_target, canonical)
+        if next_path is None:
+            LOGGER.debug(
+                "Hermes wrapper %r execs an invalid target %r",
+                hermes_bin,
+                exec_target,
+            )
+            return None
+
+        path = next_path
+
+    LOGGER.debug(
+        "Hermes launcher %r exceeded maximum resolution depth (%d)",
+        hermes_bin,
+        _MAX_HERMES_BIN_DEPTH,
+    )
+    return None
+
+
+def _is_venv_bin_dir(bin_dir: Path) -> bool:
+    """Return whether ``bin_dir`` is the ``bin/`` of a real virtual environment.
+
+    ``pyvenv.cfg`` is what separates a venv from a directory that merely holds
+    executables. It is the only cheap signal that discriminates the #618 case:
+    ``~/.local/bin`` holds both a ``hermes`` launcher and an unrelated
+    ``python``, so "the launcher sits next to a python" proves nothing on its
+    own.
+    """
+    return (bin_dir.parent / "pyvenv.cfg").is_file()
+
+
+def _is_validated_venv_python(candidate: Path) -> bool:
+    """Return whether ``candidate`` is usable as Hermes' runtime.
+
+    The single predicate every *implicitly discovered* candidate must satisfy,
+    so the launcher, the known install roots, ``sys.prefix`` and ``VIRTUAL_ENV``
+    cannot drift apart. Only ``--python`` bypasses it, deliberately: an
+    explicitly named interpreter is reported against by the caller rather than
+    silently swapped for another.
+
+    The candidate must exist as a file, be executable (everything downstream
+    runs it as ``<python> -m pip install ...``, so a file that cannot be
+    executed is not a runtime), and live in a real virtualenv.
+    """
+    return (
+        candidate.is_file()
+        and os.access(candidate, os.X_OK)
+        and _is_venv_bin_dir(candidate.parent)
+    )
+
+
+def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[Path]:
     """Try to find Hermes' python executable for dep validation.
 
-    Returns None when we can't find it (user runs manually).
+    Returns None when no *validated* Hermes runtime is found. A candidate is
+    never returned on the strength of sitting next to the launcher alone: the
+    caller bootstraps into whatever this returns, and an unvalidated sibling is
+    typically the user's Homebrew or system interpreter (#618). The caller is
+    expected to stop and point at ``--python`` rather than guess.
+
+    NOTE: none of the branches below resolve the python symlink they return. A
+    venv's bin/python is a symlink to the base interpreter; running the venv
+    path activates the venv site-packages, running the resolved base path does
+    NOT. Returning the resolved base interpreter silently drops the provider
+    deps into the wrong environment.
     """
+    # 0. An explicitly selected interpreter is authoritative. Return it as
+    #    given, including when it looks wrong: the caller validates it and
+    #    reports against the interpreter the user actually named, which beats
+    #    silently probing for a different one.
+    #
+    #    None is the only "not supplied" signal. An empty or blank --python is a
+    #    supplied value that names nothing, and falling through to discovery
+    #    would answer with a different interpreter than the one the user asked
+    #    for -- exactly the silent substitution this branch exists to prevent.
+    if explicit_python is not None:
+        selected = str(explicit_python)
+        # Strip only to decide whether anything was named. A POSIX path may
+        # legitimately begin or end with whitespace, so stripping the value we
+        # return would select a different interpreter than the one requested,
+        # or fail to find it at all.
+        if not selected.strip():
+            raise ValueError(
+                "--python was given an empty value. Pass the path to Hermes' "
+                "interpreter, or omit --python to let the installer find it."
+            )
+        return Path(selected).expanduser()
+
     hermes_home_path = hermes_home()
 
     # 1. Resolve the `hermes` launcher on PATH back to its venv Python.
-    #    This is the most reliable probe: a pip/pipx-installed Hermes puts its
-    #    console script next to the interpreter that runs it, so the Python is
-    #    always a sibling of the resolved binary. Covers the common
-    #    /usr/local/lib/hermes-agent/venv layout that the hardcoded roots below
-    #    miss entirely (the silent-no-op that left provider deps out of Hermes'
-    #    actual venv and produced "loaded but no provider instance found").
+    #    A pip/pipx-installed Hermes puts its console script next to the
+    #    interpreter that runs it, so the Python is a sibling of the resolved
+    #    binary. Covers the common /usr/local/lib/hermes-agent/venv layout that
+    #    the hardcoded roots below miss entirely (the silent-no-op that left
+    #    provider deps out of Hermes' actual venv and produced "loaded but no
+    #    provider instance found").
+    #
+    #    The sibling is only trusted when the directory it lives in is a real
+    #    venv. `_resolve_hermes_bin` follows symlinks and wrapper `exec` hops,
+    #    but a launcher that is neither -- a script that calls the real binary
+    #    as a subprocess, or a compiled shim with no `exec` line to read --
+    #    resolves to itself and leaves `bin_dir` as the shim directory. Without
+    #    this check `~/.local/bin/python` (commonly a Homebrew or system
+    #    symlink) gets `mnemosyne-hermes[all]` installed into it while the
+    #    installer reports success (#618). An unvalidated sibling is discarded
+    #    outright rather than kept as a fallback: the only layout it uniquely
+    #    covers is a non-venv system install, which is exactly where
+    #    bootstrapping does the most damage.
     hermes_bin = shutil.which("hermes")
     if hermes_bin:
-        # NOTE: resolve the *launcher* symlink (hermes -> venv/bin/hermes) to
-        # find the venv bin dir, but do NOT resolve the python symlink itself.
-        # A venv's bin/python is a symlink to the base interpreter; running the
-        # venv path activates the venv site-packages, running the resolved base
-        # path does NOT. Returning the resolved base interpreter would silently
-        # drop the provider deps again.
-        bin_dir = Path(hermes_bin).resolve().parent
-        for py_name in ("python", "python3"):
-            candidate = bin_dir / py_name
-            if candidate.is_file():
-                return candidate
+        resolved = _resolve_hermes_bin(hermes_bin)
+        if resolved:
+            bin_dir = resolved.parent
+            for py_name in ("python", "python3"):
+                candidate = bin_dir / py_name
+                if _is_validated_venv_python(candidate):
+                    return candidate
 
     # 2. Check known hermes-agent checkout / install roots with a venv.
+    #    Held to the same bar as the launcher sibling above: a directory named
+    #    `venv` is not evidence that it is one. A half-removed environment, or
+    #    one whose base interpreter is gone, leaves `bin/python` in place with
+    #    no pyvenv.cfg beside it, and bootstrapping into that is the failure
+    #    this function exists to prevent.
     for root in [
         hermes_home_path / "hermes-agent",
         Path.home() / "hermes-agent",
@@ -537,22 +894,31 @@ def _find_hermes_python() -> Optional[Path]:
     ]:
         for venv_name in ("venv", ".venv"):
             candidate = root / venv_name / "bin" / "python"
-            if candidate.is_file():
-                return candidate.resolve()
+            if _is_validated_venv_python(candidate):
+                return candidate
 
-    # 3. Check if we're running inside Hermes' venv ourselves
+    # 3. Check if we're running inside Hermes' venv ourselves.
+    #    `sys.prefix != sys.base_prefix` says the *running* interpreter is in a
+    #    venv; it says nothing about the bin/python being asked for here, which
+    #    can be absent or non-executable in a partially built environment.
     if sys.prefix != sys.base_prefix:
         venv_python = Path(sys.prefix) / "bin" / "python"
-        if venv_python.is_file():
-            return venv_python.resolve()
+        if _is_validated_venv_python(venv_python):
+            return venv_python
 
-    # 4. Check VIRTUAL_ENV env var (uv-managed or explicit)
+    # 4. Check VIRTUAL_ENV env var (uv-managed or explicit).
+    #    This is an ordinary environment variable, not an assertion that a venv
+    #    is live: a stale or hand-set `VIRTUAL_ENV=/usr` names `/usr/bin/python`
+    #    and would hand bootstrap the system interpreter, which is the outcome
+    #    this function exists to prevent.
     ve = os.environ.get("VIRTUAL_ENV")
     if ve:
         candidate = Path(ve) / "bin" / "python"
-        if candidate.is_file():
-            return candidate.resolve()
+        if _is_validated_venv_python(candidate):
+            return candidate
 
+    # Nothing validated. Better to stop and let the caller ask for --python
+    # than to bootstrap into an interpreter that only looked plausible.
     return None
 
 
@@ -725,6 +1091,82 @@ def _link_all_profiles(
     return linked
 
 
+def _profile_links_preference_path(hermes_home_path: str | Path | None = None) -> Path:
+    """Return the installer-managed profile-link preference for a Hermes home."""
+    base = Path(hermes_home_path).expanduser() if hermes_home_path else hermes_home()
+    return base / "plugins" / ".mnemosyne-profile-links.json"
+
+
+def _atomic_write_profile_links_preference(path: Path, payload: bytes) -> None:
+    """Replace the profile-link preference without truncating an existing file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.staging-", dir=path.parent
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        temporary.write_bytes(payload)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_profile_links_preference(
+    enabled: bool,
+    *,
+    hermes_home_path: str | Path | None = None,
+) -> None:
+    """Persist the selected profile-link behavior for later upgrades."""
+    path = _profile_links_preference_path(hermes_home_path)
+    payload = (json.dumps({"link_profiles": enabled}) + "\n").encode("utf-8")
+    _atomic_write_profile_links_preference(path, payload)
+
+
+def _restore_profile_links_preference(path: Path, previous: bytes | None) -> None:
+    """Restore a preference snapshot after a failed plugin replacement."""
+    if previous is None:
+        path.unlink(missing_ok=True)
+        return
+    _atomic_write_profile_links_preference(path, previous)
+
+
+def profile_links_enabled(*, hermes_home_path: str | Path | None = None) -> bool:
+    """Return the selected profile-link behavior for a Hermes home.
+
+    New installs persist the explicit selection, which lets upgrades distinguish
+    the default enabled behavior from an explicit root-only installation even
+    when no opted-in child profile exists yet. Existing installs without the
+    preference file retain the legacy observed-link fallback.
+    """
+    try:
+        preference = json.loads(
+            _profile_links_preference_path(hermes_home_path).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        preference = None
+    if isinstance(preference, dict) and isinstance(preference.get("link_profiles"), bool):
+        return preference["link_profiles"]
+
+    target = plugin_target_dir(hermes_home_path)
+    if not (target.is_symlink() or target.exists()):
+        return False
+    try:
+        expected = target.resolve()
+    except OSError:
+        return False
+    for profile_home in _iter_mnemosyne_profiles(hermes_home_path):
+        profile_target = profile_home / "plugins" / PLUGIN_NAME
+        if not profile_target.is_symlink():
+            continue
+        try:
+            if profile_target.resolve() == expected:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _verify_links(*, hermes_home_path: str | Path | None = None) -> bool:
     """Print PASS/FAIL for each home that should have a resolvable plugin link.
 
@@ -751,38 +1193,162 @@ def _verify_links(*, hermes_home_path: str | Path | None = None) -> bool:
     return all_ok
 
 
-def _unlink_all_profiles(
+def _snapshot_profile_link(path: Path) -> _ProfileLinkSnapshot | None:
+    """Capture one stable symlink identity, or None if it changes while read."""
+    try:
+        before = path.lstat()
+        if not stat.S_ISLNK(before.st_mode):
+            return None
+        link_target = os.readlink(path)
+        after = path.lstat()
+    except OSError:
+        return None
+    if (
+        not stat.S_ISLNK(after.st_mode)
+        or before.st_dev != after.st_dev
+        or before.st_ino != after.st_ino
+    ):
+        return None
+    return _ProfileLinkSnapshot(
+        path=path,
+        link_target=link_target,
+        device=after.st_dev,
+        inode=after.st_ino,
+    )
+
+
+def _same_profile_link_identity(
+    left: _ProfileLinkSnapshot, right: _ProfileLinkSnapshot
+) -> bool:
+    """Return whether two snapshots identify the same symlink object."""
+    return (
+        left.link_target == right.link_target
+        and left.device == right.device
+        and left.inode == right.inode
+    )
+
+
+def _recognized_profile_links(
     *,
     hermes_home_path: str | Path | None = None,
     recognized_targets: tuple[Path, ...] = (),
-) -> None:
-    """Remove profile links that resolve to a recognized Mnemosyne target.
+) -> list[_ProfileLinkSnapshot]:
+    """Return profile links that currently resolve to a recognized target.
 
-    Links are removed even if the profile no longer opts in, but unrelated
-    links and real directories are left untouched.
+    Profiles are considered even if they no longer opt in, but unrelated links
+    and real directories are ignored.
     """
     base = Path(hermes_home_path).expanduser() if hermes_home_path else hermes_home()
     profiles_dir = base / "profiles"
     if not profiles_dir.is_dir():
-        return
+        return []
     recognized = {_resolve_package_dir().resolve()}
     for target in recognized_targets:
         try:
             recognized.add(target.resolve())
         except OSError:
             continue
+    links: list[_ProfileLinkSnapshot] = []
     for child in sorted(profiles_dir.iterdir()):
         if child.is_symlink():
             continue
         target = child / "plugins" / PLUGIN_NAME
-        if not target.is_symlink():
+        before = _snapshot_profile_link(target)
+        if before is None:
             continue
         try:
-            if target.resolve() in recognized:
-                target.unlink()
-                print(f"  Removed profile link: {target}")
+            resolved = target.resolve()
         except OSError:
             continue
+        after = _snapshot_profile_link(target)
+        if (
+            after is not None
+            and _same_profile_link_identity(before, after)
+            and resolved in recognized
+        ):
+            links.append(after)
+    return links
+
+
+def _unlink_profile_links(links: list[_ProfileLinkSnapshot]) -> None:
+    """Quarantine each candidate, then remove only the snapshotted symlink."""
+    for snapshot in links:
+        target = snapshot.path
+        if _snapshot_profile_link(target) is None:
+            continue
+        quarantine_parent: Path | None = None
+        quarantined: Path | None = None
+        moved = False
+        try:
+            quarantine_parent = Path(
+                tempfile.mkdtemp(prefix=f".{target.name}.unlink-", dir=target.parent)
+            )
+            quarantined = quarantine_parent / target.name
+            target.replace(quarantined)
+            moved = True
+            quarantined_snapshot = _snapshot_profile_link(quarantined)
+            if quarantined_snapshot is not None and _same_profile_link_identity(
+                snapshot, quarantined_snapshot
+            ):
+                quarantined.unlink()
+                moved = False
+                print(f"  Removed profile link: {target}")
+            elif not target.is_symlink() and not target.exists():
+                quarantined.replace(target)
+                moved = False
+        except OSError:
+            raise
+        finally:
+            if moved and quarantined is not None:
+                try:
+                    if not target.is_symlink() and not target.exists():
+                        quarantined.replace(target)
+                        moved = False
+                except OSError:
+                    pass
+            if moved and quarantined is not None:
+                print(
+                    f"  Profile entry changed during cleanup; preserved at: {quarantined}",
+                    file=sys.stderr,
+                )
+            if quarantine_parent is not None:
+                try:
+                    quarantine_parent.rmdir()
+                except OSError:
+                    pass
+
+
+def _unlink_all_profiles(
+    *,
+    hermes_home_path: str | Path | None = None,
+    recognized_targets: tuple[Path, ...] = (),
+) -> None:
+    """Remove profile links that resolve to a recognized Mnemosyne target."""
+    _unlink_profile_links(
+        _recognized_profile_links(
+            hermes_home_path=hermes_home_path,
+            recognized_targets=recognized_targets,
+        )
+    )
+
+
+def _unlink_profile_links_or_restore_preference(
+    links: list[_ProfileLinkSnapshot],
+    preference_path: Path,
+    previous_preference: bytes | None,
+) -> None:
+    """Fail root-only cleanup and restore its preference when link removal fails."""
+    try:
+        _unlink_profile_links(links)
+    except OSError:
+        try:
+            _restore_profile_links_preference(preference_path, previous_preference)
+        except OSError:
+            print(
+                f"⚠ Profile-link preference rollback failed; inspect: {preference_path}",
+                file=sys.stderr,
+            )
+        raise
 
 
 def _prepare_plugin_target(
@@ -1078,6 +1644,7 @@ def install_plugin(
     mode: str = "symlink",
     python: str | Path | None = None,
     migrate_wrapper_to_symlink: bool = False,
+    link_profiles: bool = True,
 ) -> Path:
     """Install the Mnemosyne provider into Hermes' user plugin directory.
 
@@ -1085,6 +1652,9 @@ def install_plugin(
     creates a real persistent plugin directory containing a tiny shim that
     activates the selected interpreter's site-packages (including editable
     install ``.pth`` files) and imports ``mnemosyne_hermes`` from there.
+    ``link_profiles`` preserves the historical
+    opted-in profile fan-out by default; set it False to install only at the
+    selected Hermes home.
     """
     if mode not in {"symlink", "wrapper"}:
         raise ValueError("mode must be 'symlink' or 'wrapper'")
@@ -1108,15 +1678,63 @@ def install_plugin(
             "Re-run with --migrate-wrapper-to-symlink --force to migrate intentionally."
         )
 
+    recognized_profile_targets = [source]
+    # Preserve a validated previous provider target before --force replaces it.
+    if _provider_init_is_mnemosyne(target / "__init__.py"):
+        try:
+            recognized_profile_targets.append(target.resolve())
+        except OSError:
+            pass
+        wrapper_metadata = _wrapper_metadata(target, target / "__init__.py")
+        if wrapper_metadata.error is None and wrapper_metadata.site_packages is not None:
+            recognized_profile_targets.append(
+                wrapper_metadata.site_packages / "mnemosyne_hermes"
+            )
+    profile_links_to_unlink = (
+        _recognized_profile_links(
+            hermes_home_path=hermes_home_path,
+            recognized_targets=tuple(recognized_profile_targets),
+        )
+        if not link_profiles
+        else []
+    )
+    preference_path = _profile_links_preference_path(hermes_home_path)
+    try:
+        previous_preference = preference_path.read_bytes()
+    except FileNotFoundError:
+        previous_preference = None
+        if profile_links_enabled(hermes_home_path=hermes_home_path):
+            # Preserve an effective legacy opt-in even if replacing the root
+            # target changes the no-file fallback before cleanup can fail.
+            previous_preference = b'{"link_profiles": true}\n'
+
     if mode == "symlink":
         if migrate_wrapper_to_symlink and _is_wrapper_plugin_target(target):
             print(
                 "  ⚠ Migrating existing Mnemosyne wrapper to a symlink; "
                 "the wrapper's selected Python will no longer be used."
             )
-        _prepare_plugin_target(base, target, force=force)
-        os.symlink(str(source), str(target))
-        _link_all_profiles(source, hermes_home_path=hermes_home_path, force=force)
+        _write_profile_links_preference(link_profiles, hermes_home_path=hermes_home_path)
+        try:
+            _prepare_plugin_target(base, target, force=force)
+            os.symlink(str(source), str(target))
+        except Exception:
+            try:
+                _restore_profile_links_preference(preference_path, previous_preference)
+            except OSError:
+                print(
+                    f"⚠ Profile-link preference rollback failed; inspect: {preference_path}",
+                    file=sys.stderr,
+                )
+            raise
+        if link_profiles:
+            _link_all_profiles(source, hermes_home_path=hermes_home_path, force=force)
+        else:
+            _unlink_profile_links_or_restore_preference(
+                profile_links_to_unlink,
+                preference_path,
+                previous_preference,
+            )
         return target
 
     # Validate and fully write the replacement before removing a working wrapper.
@@ -1126,13 +1744,33 @@ def install_plugin(
     target.parent.mkdir(parents=True, exist_ok=True)
     staging_parent = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
     staged = staging_parent / target.name
+    preference_written = False
     try:
         _write_wrapper_plugin(staged, python=wrapper_python, site_packages=site_packages)
+        _write_profile_links_preference(link_profiles, hermes_home_path=hermes_home_path)
+        preference_written = True
         _prepare_plugin_target(base, target, force=force, remove_target=False)
         _replace_plugin_target_with_staged(target, staged)
+    except Exception:
+        if preference_written:
+            try:
+                _restore_profile_links_preference(preference_path, previous_preference)
+            except OSError:
+                print(
+                    f"⚠ Profile-link preference rollback failed; inspect: {preference_path}",
+                    file=sys.stderr,
+                )
+        raise
     finally:
         shutil.rmtree(staging_parent, ignore_errors=True)
-    _link_all_profiles(target, hermes_home_path=hermes_home_path, force=force)
+    if link_profiles:
+        _link_all_profiles(target, hermes_home_path=hermes_home_path, force=force)
+    else:
+        _unlink_profile_links_or_restore_preference(
+            profile_links_to_unlink,
+            preference_path,
+            previous_preference,
+        )
     return target
 
 
@@ -1147,6 +1785,7 @@ def uninstall_plugin(*, hermes_home_path: str | Path | None = None) -> Path:
         target.unlink()
     elif target.exists():
         shutil.rmtree(target)
+    _profile_links_preference_path(hermes_home_path).unlink(missing_ok=True)
     return target
 
 
@@ -1213,6 +1852,14 @@ def cleanup_plugin(
         except Exception:
             pass
 
+    preference_path = _profile_links_preference_path(hermes_home_path)
+    if preference_path.exists():
+        if dry_run:
+            actions.append(f"Would remove: {preference_path}")
+        else:
+            preference_path.unlink()
+            actions.append(f"Removed: {preference_path}")
+
     return actions
 
 
@@ -1260,6 +1907,14 @@ def is_installed(*, hermes_home_path: str | Path | None = None) -> bool:
     return plugin_state(hermes_home_path=hermes_home_path).installed
 
 
+def _distribution_version(distribution: str) -> str:
+    """Return an installed distribution version without importing package globals."""
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return "unavailable"
+
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -1270,6 +1925,7 @@ def _parser() -> argparse.ArgumentParser:
         "--hermes-home",
         help="Hermes home directory. Defaults to HERMES_HOME or ~/.hermes.",
     )
+    parser.add_argument("--version", action="store_true", help="Show installed package versions and exit.")
 
     subparsers = parser.add_subparsers(dest="command")
 
@@ -1304,7 +1960,11 @@ def _parser() -> argparse.ArgumentParser:
     install.add_argument(
         "--python",
         dest="python",
-        help="Python interpreter whose site-packages the wrapper should import from.",
+        help=(
+            "Hermes' Python interpreter. Authoritative when given: skips launcher "
+            "and install-root discovery. Also selects the site-packages a wrapper "
+            "install imports from."
+        ),
     )
     install.add_argument(
         "--migrate-wrapper-to-symlink",
@@ -1314,6 +1974,13 @@ def _parser() -> argparse.ArgumentParser:
             "wrapper with the default symlink install."
         ),
     )
+    install.add_argument(
+        "--no-profile-links",
+        dest="link_profiles",
+        action="store_false",
+        default=True,
+        help="Install only at the selected Hermes home; do not link opted-in child profiles.",
+    )
     subparsers.add_parser(
         "uninstall",
         help="Remove Mnemosyne from Hermes' memory provider plugin directory.",
@@ -1322,6 +1989,7 @@ def _parser() -> argparse.ArgumentParser:
         "status",
         help="Show whether Mnemosyne is installed for Hermes memory discovery.",
     )
+    subparsers.add_parser("version", help="Show installed package versions.")
     cleanup = subparsers.add_parser(
         "cleanup",
         help="Remove all traces of Mnemosyne from Hermes plugin directory (safe, never touches database).",
@@ -1351,6 +2019,7 @@ def run_install(
     mode: str = "symlink",
     python: str | Path | None = None,
     migrate_wrapper_to_symlink: bool = False,
+    link_profiles: bool = True,
 ) -> int:
     """Core install logic — check deps, bootstrap Hermes venv if needed, create symlink.
 
@@ -1370,8 +2039,33 @@ def run_install(
 
     # Symlink installs need Hermes' own Python to contain the package. Wrapper
     # installs validate the explicitly selected interpreter in install_plugin().
-    hermes_python = _find_hermes_python() if mode == "symlink" else None
-    if hermes_python and hermes_python.resolve() != Path(sys.executable).resolve():
+    hermes_python = _find_hermes_python(explicit_python=python) if mode == "symlink" else None
+    if mode == "symlink" and hermes_python is None:
+        # Discovery found no validated Hermes runtime, so there is nothing safe
+        # to bootstrap into. Before #618 this path guessed at the launcher's
+        # sibling, which is typically the user's Homebrew or system interpreter.
+        print(
+            "\n  ⚠ Could not identify Hermes' Python.\n"
+            "     No `hermes` launcher on PATH resolved into a virtual environment,\n"
+            "     and no Hermes install root contains one.\n\n"
+            "  Point the installer at it directly:\n"
+            "    mnemosyne-hermes install --python /path/to/hermes/venv/bin/python\n\n"
+            "  `mnemosyne-hermes install --dry-run` shows what discovery found.",
+            file=sys.stderr,
+        )
+        # --no-bootstrap already means "do not touch Hermes' venv", so there is
+        # no wrong-interpreter install to prevent and the run continues without
+        # dependency validation, as it did before. Failing here instead would
+        # also preempt the guard that refuses to replace an existing wrapper
+        # install, turning a data-safety message into a discovery message.
+        if not no_bootstrap:
+            return 1
+        print("     Continuing without dependency validation (--no-bootstrap).", file=sys.stderr)
+    # Compare the paths as selected, not resolved. A venv's bin/python resolves
+    # to its base interpreter, so resolving both sides reports a venv and the
+    # base install as the same runtime and skips the check that bootstraps
+    # Hermes' venv (#618).
+    if hermes_python and hermes_python != Path(sys.executable):
         hermes_core = check_mnemosyne_core_for_hermes_python(hermes_python)
         if hermes_core is None:
             print(f"\n  ⚠ Hermes' Python at {hermes_python} can't import mnemosyne core.")
@@ -1401,6 +2095,7 @@ def run_install(
         mode=mode,
         python=python,
         migrate_wrapper_to_symlink=migrate_wrapper_to_symlink,
+        link_profiles=link_profiles,
     )
     skill_result = install_bundled_skill(
         hermes_home_path=hermes_home_path,
@@ -1427,12 +2122,18 @@ def main(argv: list[str] | None = None) -> int:
     """Run the mnemosyne-hermes installer CLI."""
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.version or args.command == "version":
+        print(f"Mnemosyne {_distribution_version('mnemosyne-memory')}")
+        print(f"Mnemosyne Hermes {_distribution_version('mnemosyne-hermes')}")
+        return 0
     command = args.command or "install"
 
     try:
         if command == "install":
             # Dry-run: just show what would happen
-            hermes_python = _find_hermes_python()
+            hermes_python = _find_hermes_python(
+                explicit_python=getattr(args, "python", None)
+            )
             target = plugin_target_dir(args.hermes_home)
             if getattr(args, "dry_run", False):
                 invalid_wrapper_migration_args = (
@@ -1458,6 +2159,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  Hermes Python: {hermes_python or 'not found'}")
                 print(f"  Currently installed: {'yes' if is_installed(hermes_home_path=args.hermes_home) else 'no'}")
                 print(f"  Install mode: {getattr(args, 'mode', 'symlink')}")
+                print(f"  Will link opted-in profiles: {bool(getattr(args, 'link_profiles', True))}")
                 print(f"  Skill target file: {skill.target}")
                 print(f"  Skill state: {skill.status}")
                 print(f"  Skill action: {skill_plan.message}")
@@ -1479,7 +2181,12 @@ def main(argv: list[str] | None = None) -> int:
                         "  Will refuse to replace the existing wrapper without "
                         "--migrate-wrapper-to-symlink."
                     )
-                if hermes_python:
+                # Only a symlink install bootstraps Hermes' environment;
+                # run_install() does not even look for an interpreter in wrapper
+                # mode. Reporting a bootstrap here described something that
+                # would never run, and `--python` made it print for wrapper
+                # installs specifically.
+                if hermes_python and getattr(args, "mode", "symlink") == "symlink":
                     print(f"  Will bootstrap: {not getattr(args, 'no_bootstrap', False)}")
                 return 1 if invalid_wrapper_migration_args or refuses_wrapper_migration else 0
 
@@ -1490,6 +2197,7 @@ def main(argv: list[str] | None = None) -> int:
                 mode=getattr(args, "mode", "symlink"),
                 python=getattr(args, "python", None),
                 migrate_wrapper_to_symlink=getattr(args, "migrate_wrapper_to_symlink", False),
+                link_profiles=getattr(args, "link_profiles", True),
             )
 
         if command == "uninstall":

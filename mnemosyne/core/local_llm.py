@@ -9,6 +9,7 @@ Model cache: ~/.hermes/mnemosyne/models/
 Default model: openbmb/MiniCPM5-1B-GGUF (Q4_K_M, ~656MB)
 """
 
+import logging
 import os
 import sys
 import re
@@ -19,6 +20,8 @@ from typing import List, Optional
 DEFAULT_MODEL_REPO = "openbmb/MiniCPM5-1B-GGUF"
 DEFAULT_MODEL_FILE = "MiniCPM5-1B-Q4_K_M.gguf"
 MODEL_CACHE_DIR = Path.home() / ".hermes" / "mnemosyne" / "models"
+
+logger = logging.getLogger(__name__)
 
 LLM_ENABLED = os.environ.get("MNEMOSYNE_LLM_ENABLED", "true").lower() in ("1", "true", "yes")
 LLM_MAX_TOKENS=int(os.environ.get("MNEMOSYNE_LLM_MAX_TOKENS", "2048") or "2048")
@@ -32,10 +35,41 @@ if _env_repo and _env_file:
     DEFAULT_MODEL_REPO = _env_repo
     DEFAULT_MODEL_FILE = _env_file
 
+# Override the cache location via env. Environment-only and read at import, like
+# the repo/file overrides above. Unset or blank keeps the historical path.
+#
+# `strip()` decides only whether anything was named; the raw value is what
+# becomes the path, because a POSIX directory name may legitimately begin or end
+# with whitespace and stripping it would silently select a different one.
+_env_cache_dir = os.environ.get("MNEMOSYNE_MODEL_CACHE_DIR", "")
+# Provenance, not a derived fact: the user may set the variable to exactly the
+# default path, so the value alone cannot say whether it was chosen explicitly.
+# The error message below reads differently in each case.
+MODEL_CACHE_DIR_FROM_ENV = bool(_env_cache_dir.strip())
+if MODEL_CACHE_DIR_FROM_ENV:
+    MODEL_CACHE_DIR = Path(_env_cache_dir).expanduser()
+
 # Remote API config
 LLM_BASE_URL = os.environ.get("MNEMOSYNE_LLM_BASE_URL", "").rstrip("/")
 LLM_API_KEY = os.environ.get("MNEMOSYNE_LLM_API_KEY", "")
 LLM_REMOTE_MODEL = os.environ.get("MNEMOSYNE_LLM_MODEL", "")
+
+# Optional named provider preset. When MNEMOSYNE_LLM_PROVIDER names a known
+# preset (see mnemosyne.core.llm_providers), it fills in the OpenAI-compatible
+# base URL and a default model for the selected MNEMOSYNE_LLM_REGION. Explicit
+# MNEMOSYNE_LLM_BASE_URL / MNEMOSYNE_LLM_MODEL always win, so existing
+# raw-env-var configurations behave exactly as before.
+LLM_PROVIDER = os.environ.get("MNEMOSYNE_LLM_PROVIDER", "").strip()
+LLM_REGION = os.environ.get("MNEMOSYNE_LLM_REGION", "").strip()
+if LLM_PROVIDER:
+    from mnemosyne.core.llm_providers import resolve_provider_defaults
+
+    _preset_base_url, _preset_model = resolve_provider_defaults(LLM_PROVIDER, LLM_REGION)
+    if not LLM_BASE_URL and _preset_base_url:
+        LLM_BASE_URL = _preset_base_url.rstrip("/")
+    if not LLM_REMOTE_MODEL and _preset_model:
+        LLM_REMOTE_MODEL = _preset_model
+
 LLM_TIMEOUT = float(os.environ.get("MNEMOSYNE_LLM_TIMEOUT", "60"))
 
 # Retryable errors only: 404/400 (model-not-found), 5xx, connection. Not 401/403/429.
@@ -83,9 +117,47 @@ def _model_path() -> Optional[Path]:
     return candidate if candidate.exists() else None
 
 
+def _ensure_model_cache_dir() -> Path:
+    """Create the model cache directory, or fail naming it and why.
+
+    An explicitly set ``MNEMOSYNE_MODEL_CACHE_DIR`` is authoritative. Falling
+    back to the default on failure would reinstate the very location the user
+    moved away from, quietly, which is the substitution this override exists to
+    prevent.
+
+    The error is logged as well as raised. ``_load_llm()`` catches every
+    exception from the download path and degrades to AAAK, so a raised message
+    alone would never reach the user; logging is what makes "fail clearly"
+    actually clear.
+    """
+    if MODEL_CACHE_DIR_FROM_ENV:
+        source = f"MNEMOSYNE_MODEL_CACHE_DIR is set to {MODEL_CACHE_DIR}"
+        remedy = "Point it at a writable directory, or unset it to use the default."
+    else:
+        source = f"The model cache directory {MODEL_CACHE_DIR}"
+        remedy = "Set MNEMOSYNE_MODEL_CACHE_DIR to relocate it."
+
+    try:
+        MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        message = f"{source}, which could not be created ({exc}). {remedy}"
+        logger.error("%s", message)
+        raise RuntimeError(message) from exc
+
+    # Write *and* search: a directory can be mode 0o200, which passes W_OK while
+    # creating anything inside it still fails with PermissionError, because
+    # traversing into a directory needs the execute bit.
+    if not os.access(MODEL_CACHE_DIR, os.W_OK | os.X_OK):
+        message = f"{source}, which is not writable. {remedy}"
+        logger.error("%s", message)
+        raise RuntimeError(message)
+
+    return MODEL_CACHE_DIR
+
+
 def _download_model() -> Path:
     """Download the GGUF model from HuggingFace if not present."""
-    MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_model_cache_dir()
     local_path = MODEL_CACHE_DIR / DEFAULT_MODEL_FILE
     if local_path.exists():
         return local_path
@@ -97,6 +169,21 @@ def _download_model() -> Path:
             "huggingface_hub not installed. Run: pip install huggingface-hub"
         )
 
+    default_artifact = (
+        DEFAULT_MODEL_REPO == "openbmb/MiniCPM5-1B-GGUF"
+        and DEFAULT_MODEL_FILE == "MiniCPM5-1B-Q4_K_M.gguf"
+    )
+    size_notice = " (approximately 656 MB)" if default_artifact else ""
+    logger.warning(
+        "Downloading local LLM model %s from %s%s to %s. "
+        "The current operation will block until the download completes. "
+        "Set MNEMOSYNE_LLM_ENABLED=false for AAAK-only consolidation, "
+        "or pre-cache the GGUF to avoid this download.",
+        DEFAULT_MODEL_FILE,
+        DEFAULT_MODEL_REPO,
+        size_notice,
+        MODEL_CACHE_DIR,
+    )
     downloaded = hf_hub_download(
         repo_id=DEFAULT_MODEL_REPO,
         filename=DEFAULT_MODEL_FILE,
@@ -340,13 +427,52 @@ def _try_host_llm(
     # so _parse_facts() can consume them. Just trim whitespace.
     text = raw.strip() if isinstance(raw, str) and raw.strip() else None
     if text:
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        text = _sanitize_reasoning_output(text)
     return (True, text)
 
 
-def _clean_output(text: str) -> str:
+class _InvalidReasoningOutput:
+    """Private marker for a model response that must never be persisted."""
+
+    def __bool__(self) -> bool:
+        return False
+
+
+_INVALID_REASONING_OUTPUT = _InvalidReasoningOutput()
+
+
+def _is_invalid_reasoning_output(value: object) -> bool:
+    """Return whether *value* is an unsafe, malformed reasoning response."""
+    return value is _INVALID_REASONING_OUTPUT
+
+
+def _sanitize_reasoning_output(text: str):
+    """Remove balanced think traces and reject malformed traces fail-closed."""
+    if not isinstance(text, str):
+        return _INVALID_REASONING_OUTPUT
+    tags = list(re.finditer(r"<(/?)think\b[^>]*>", text, flags=re.IGNORECASE))
+    depth = 0
+    for tag in tags:
+        if tag.group(1):
+            depth -= 1
+            if depth < 0:
+                return _INVALID_REASONING_OUTPUT
+        else:
+            depth += 1
+            if depth > 1:
+                return _INVALID_REASONING_OUTPUT
+    if depth:
+        return _INVALID_REASONING_OUTPUT
+    return re.sub(
+        r"<think\b[^>]*>.*?</think\b[^>]*>", "", text, flags=re.DOTALL | re.IGNORECASE
+    ).strip()
+
+
+def _clean_output(text: str):
     """Strip assistant tokens and extra whitespace from model output."""
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = _sanitize_reasoning_output(text)
+    if _is_invalid_reasoning_output(text):
+        return text
     text = text.replace("<|assistant|>", "").replace("<|user|>", "")
     text = text.replace("</s>", "").strip()
     text = re.sub(r"^(Summarize the following memories.*?[.!?:]\s*)", "", text, flags=re.IGNORECASE | re.DOTALL)
@@ -578,7 +704,9 @@ def _call_remote_llm(prompt: str, temperature: float = 0.3) -> Optional[str]:
     return None
 
 
-def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
+def _summarize_memories(
+    memories: List[str], source: str = ""
+):
     """Summarize a batch of working-memory items into a single episodic string.
 
     Fallback chain:
@@ -602,7 +730,7 @@ def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
     # chunk_memories_by_budget() respects LLM_N_CTX and safety margins.
     chunks = chunk_memories_by_budget(memories, source=source)
 
-    def _summarize_chunk(chunk_memories: List[str], chunk_source: str = "") -> Optional[str]:
+    def _summarize_chunk(chunk_memories: List[str], chunk_source: str = ""):
         """Summarize a single chunk of memories via the fallback chain."""
         host_prompt = _build_host_prompt(chunk_memories, source=chunk_source)
         prompt = _build_prompt(chunk_memories, source=chunk_source)
@@ -610,11 +738,15 @@ def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
         # 0. Host backend.
         attempted, text = _try_host_llm(host_prompt, max_tokens=LLM_MAX_TOKENS, temperature=0.3)
         if attempted:
+            if _is_invalid_reasoning_output(text):
+                return _INVALID_REASONING_OUTPUT
             if text:
                 return text
             raw = _call_local_llm(prompt)
             if raw:
                 cleaned = _clean_output(raw)
+                if _is_invalid_reasoning_output(cleaned):
+                    return _INVALID_REASONING_OUTPUT
                 return cleaned if cleaned else None
             return None
 
@@ -623,12 +755,16 @@ def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
             raw = _call_remote_llm(prompt)
             if raw:
                 cleaned = _clean_output(raw)
+                if _is_invalid_reasoning_output(cleaned):
+                    return _INVALID_REASONING_OUTPUT
                 return cleaned if cleaned else None
 
         # 2. Local LLM (llama-cpp-python or ctransformers fallback).
         raw = _call_local_llm(prompt)
         if raw:
             cleaned = _clean_output(raw)
+            if _is_invalid_reasoning_output(cleaned):
+                return _INVALID_REASONING_OUTPUT
             return cleaned if cleaned else None
         return None
 
@@ -636,6 +772,8 @@ def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
     chunk_summaries = []
     for chunk in chunks:
         summary = _summarize_chunk(chunk, chunk_source=source)
+        if _is_invalid_reasoning_output(summary):
+            return _INVALID_REASONING_OUTPUT
         if summary:
             chunk_summaries.append(summary)
 
@@ -645,6 +783,14 @@ def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
     # If multiple chunks, do a second-pass summary to consolidate chunk summaries.
     if len(chunk_summaries) > 1:
         final = _summarize_chunk(chunk_summaries, chunk_source=f"{source} [chunked {len(chunks)} parts]")
+        if _is_invalid_reasoning_output(final):
+            return _INVALID_REASONING_OUTPUT
         return final if final else chunk_summaries[0]
 
     return chunk_summaries[0]
+
+
+def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
+    """Public summary API; malformed reasoning degrades to no LLM output."""
+    summary = _summarize_memories(memories, source=source)
+    return summary if isinstance(summary, str) else None

@@ -260,18 +260,11 @@ def _default_db_path() -> Path:
     """Return the current default DB path, honoring runtime env changes."""
     return _default_data_dir() / "mnemosyne.db"
 
-# Config
-# Priority: 1) MNEMOSYNE_EMBEDDING_DIM env var (explicit override)
-#           2) Auto-derive from embedding model via _embeddings module
-#           3) 384 (bge-small-en-v1.5 default)
-_emb_dim_env = os.environ.get("MNEMOSYNE_EMBEDDING_DIM")
-if _emb_dim_env is not None:
-    try:
-        EMBEDDING_DIM = int(_emb_dim_env)
-    except (ValueError, TypeError):
-        EMBEDDING_DIM = 384
-else:
-    EMBEDDING_DIM = _embeddings.EMBEDDING_DIM
+# Re-export the constant resolved at embeddings module load. The unknown-model
+# ValueError already fires there (binary_vectors imports EMBEDDING_DIM from
+# embeddings, at the import above), not at this line; this just re-exposes the
+# value so Beam cannot drift from embeddings.
+EMBEDDING_DIM = _embeddings.EMBEDDING_DIM
 WORKING_MEMORY_MAX_ITEMS = int(os.environ.get("MNEMOSYNE_WM_MAX_ITEMS", "10000"))
 WORKING_MEMORY_TTL_HOURS = int(os.environ.get("MNEMOSYNE_WM_TTL_HOURS", "168"))
 WM_BUMP_CAP_HOURS = int(os.environ.get("MNEMOSYNE_WM_BUMP_CAP_HOURS", "24"))
@@ -1897,7 +1890,23 @@ def _minimum_recall_relevance(query_tokens: List[str]) -> float:
 
     One matching real word is enough for short lookup-style queries, but not
     for broad nonsense strings like "purple bicycle quantum oatmeal".
+
+    ``MNEMOSYNE_LEXICAL_GATE_MIN`` (float 0.0–1.0) overrides the gate entirely,
+    defaulting to the historical thresholds when unset. Setting it to 0.0 admits
+    purely-vector candidates (recall-first); the default keeps today's behaviour
+    so existing users are unaffected unless they opt in. The env is read on every
+    call so operators can tune it without restarting.
     """
+    env = os.environ.get("MNEMOSYNE_LEXICAL_GATE_MIN")
+    if env is not None:
+        try:
+            value = float(env)
+        except ValueError:
+            pass  # fall through to the default thresholds
+        else:
+            if math.isfinite(value):
+                return min(max(value, 0.0), 1.0)
+            # NaN / +/-inf fall through to the default thresholds
     if len(query_tokens) >= 4:
         return 0.3
     if len(query_tokens) == 3:
@@ -2210,9 +2219,11 @@ def _effective_vec_type(conn: sqlite3.Connection, table: str = "vec_episodes") -
     return "float32"
 
 
-def _vec_insert(conn: sqlite3.Connection, rowid: int, embedding: List[float]):
+def _vec_insert(
+    conn: sqlite3.Connection, rowid: int, embedding: List[float], *, commit: bool = True
+):
     """Insert embedding into the episodic sqlite-vec table."""
-    _vec_table_insert(conn, "vec_episodes", rowid, embedding)
+    _vec_table_insert(conn, "vec_episodes", rowid, embedding, commit=commit)
 
 
 def _vec_table_insert(conn: sqlite3.Connection, table: str, rowid: int, embedding: List[float], *, commit: bool = True):
@@ -3484,34 +3495,36 @@ class BeamMemory:
                   trust_tier,
                   existing_id, self.session_id))
             self.conn.commit()
-            # Run the same entity/fact extraction the new-row path runs, so
-            # backfill calls -- `mem.remember(same_content, extract=True)` on
-            # an already-existing row -- actually populate the triples and
-            # facts tables. Without this the dedup early-return silently
-            # skips everything `extract=True` advertises, breaking the
-            # contract on duplicate-content writes (see C12.a /review note).
-            if extract_entities:
-                _extract_and_store_entities(self, existing_id, content)
-            if extract:
-                _extract_and_store_facts(self, existing_id, content, source)
-            # Phase 2: MEMORIA regex-based extraction (always-on, zero-LLM-cost).
-            # Populates memoria_facts, memoria_timelines, memoria_kg for the
-            # structured retrieval router. Runs silently on every remember()
-            # so the MEMORIA tables stay current regardless of extract=True.
+            # Cache failures must not turn a committed dedup update into a retry.
+            self._invalidate_query_cache_after_remember_commit()
             try:
-                self.extract_and_store_facts(content, message_idx=0, source_memory_id=existing_id)
-            except Exception:
-                pass  # regex extraction failures must not block memory storage
-            # Phase 3-4: Extract graph and consolidate veracity for dedup update
-            self._ingest_graph_and_veracity(existing_id, content, source, veracity)
-            self._emit_event("MEMORY_UPDATED", existing_id, content=content,
-                             source=source, importance=importance, metadata=metadata)
+                # Run the same entity/fact extraction the new-row path runs, so
+                # backfill calls -- `mem.remember(same_content, extract=True)` on
+                # an already-existing row -- actually populate the triples and
+                # facts tables. Without this the dedup early-return silently
+                # skips everything `extract=True` advertises, breaking the
+                # contract on duplicate-content writes (see C12.a /review note).
+                if extract_entities:
+                    _extract_and_store_entities(self, existing_id, content)
+                if extract:
+                    _extract_and_store_facts(self, existing_id, content, source)
+                # Phase 2: MEMORIA regex-based extraction (always-on, zero-LLM-cost).
+                # Populates memoria_facts, memoria_timelines, memoria_kg for the
+                # structured retrieval router. Runs silently on every remember()
+                # so the MEMORIA tables stay current regardless of extract=True.
+                try:
+                    self.extract_and_store_facts(content, message_idx=0, source_memory_id=existing_id)
+                except Exception:
+                    pass  # regex extraction failures must not block memory storage
+                # Phase 3-4: Extract graph and consolidate veracity for dedup update
+                self._ingest_graph_and_veracity(existing_id, content, source, veracity)
+                self._emit_event("MEMORY_UPDATED", existing_id, content=content,
+                                 source=source, importance=importance, metadata=metadata)
 
-            # Invalidate enhanced recall cache on memory update
-            if hasattr(self, "_query_cache") and self._query_cache is not None:
-                self._query_cache.invalidate()
-
-            return existing_id
+                return existing_id
+            finally:
+                # Enrichment can refill enhanced recall after the early post-commit eviction.
+                self._invalidate_query_cache_after_remember_commit()
 
         memory_id = memory_id or _generate_id(content)
         timestamp = datetime.now().isoformat()
@@ -3525,72 +3538,76 @@ class BeamMemory:
               json.dumps(metadata or {}), valid_until, scope,
               self.author_id, self.author_type, self.channel_id, veracity, memory_type, trust_tier))
         self.conn.commit()
-        self._trim_working_memory()
-
-        # --- Embedding storage for vector recall ---
-        # remember_batch() already does this; remember() was missing it,
-        # which meant the Hermes provider (which always calls remember())
-        # never populated memory_embeddings. This left _detect_conflicts
-        # with zero embeddings to compare, making Phase 1 conflict
-        # detection a no-op despite 3762+ working memories.
-        if _embeddings.available():
-            try:
-                vec = _embeddings.embed([content])
-                if vec is not None and len(vec) == 1:
-                    _store_working_embedding(self.conn, memory_id, vec[0])
-            except Exception as exc:
-                logger.warning(
-                    "remember: embedding storage failed for '%s' (%s): %s",
-                    memory_id, type(exc).__name__, exc,
-                )
-
-        # Auto-generate temporal triple
-        self._add_temporal_triple(memory_id, timestamp, source, content)
-
-        # --- Temporal extraction ---
-        if extract_temporal is not None:
-            try:
-                temporal_info = extract_temporal(content)
-                if temporal_info and temporal_info.get("event_date"):
-                    import json as _json_tmp
-                    cursor.execute(
-                        "UPDATE working_memory SET event_date=?, event_date_precision=?, temporal_tags=? WHERE id=?",
-                        (temporal_info["event_date"],
-                         temporal_info["event_date_precision"],
-                         _json_tmp.dumps(temporal_info["temporal_tags"]),
-                         memory_id)
-                    )
-                    self.conn.commit()
-            except Exception:
-                pass  # Temporal extraction is best-effort
-
-        # --- Entity extraction ---
-        if extract_entities:
-            _extract_and_store_entities(self, memory_id, content)
-
-        # --- Structured fact extraction ---
-        if extract:
-            _extract_and_store_facts(self, memory_id, content, source)
-
-        # Phase 2: MEMORIA regex-based extraction (always-on, zero-LLM-cost).
-        # Populates memoria_facts, memoria_timelines, memoria_kg for the
-        # structured retrieval router. Runs on every remember() call.
         try:
-            self.extract_and_store_facts(content, message_idx=0, source_memory_id=memory_id)
-        except Exception:
-            pass  # regex extraction failures must not block memory storage
+            self._trim_working_memory()
+        finally:
+            # Cache failures must not turn a committed new-memory write into a retry.
+            self._invalidate_query_cache_after_remember_commit()
 
-        # Phase 3-4: Extract graph and consolidate veracity for new memory
-        self._ingest_graph_and_veracity(memory_id, content, source, veracity)
+        try:
+            # --- Embedding storage for vector recall ---
+            # remember_batch() already does this; remember() was missing it,
+            # which meant the Hermes provider (which always calls remember())
+            # never populated memory_embeddings. This left _detect_conflicts
+            # with zero embeddings to compare, making Phase 1 conflict
+            # detection a no-op despite 3762+ working memories.
+            if _embeddings.available():
+                try:
+                    vec = _embeddings.embed([content])
+                    if vec is not None and len(vec) == 1:
+                        _store_working_embedding(self.conn, memory_id, vec[0])
+                except Exception as exc:
+                    logger.warning(
+                        "remember: embedding storage failed for '%s' (%s): %s",
+                        memory_id, type(exc).__name__, exc,
+                    )
 
-        self._emit_event("MEMORY_ADDED", memory_id, content=content,
-                         source=source, importance=importance, metadata=metadata)
+            # Auto-generate temporal triple
+            self._add_temporal_triple(memory_id, timestamp, source, content)
 
-        # Invalidate enhanced recall cache on new memory
-        if hasattr(self, "_query_cache") and self._query_cache is not None:
-            self._query_cache.invalidate()
+            # --- Temporal extraction ---
+            if extract_temporal is not None:
+                try:
+                    temporal_info = extract_temporal(content)
+                    if temporal_info and temporal_info.get("event_date"):
+                        import json as _json_tmp
+                        cursor.execute(
+                            "UPDATE working_memory SET event_date=?, event_date_precision=?, temporal_tags=? WHERE id=?",
+                            (temporal_info["event_date"],
+                             temporal_info["event_date_precision"],
+                             _json_tmp.dumps(temporal_info["temporal_tags"]),
+                             memory_id)
+                        )
+                        self.conn.commit()
+                except Exception:
+                    pass  # Temporal extraction is best-effort
 
-        return memory_id
+            # --- Entity extraction ---
+            if extract_entities:
+                _extract_and_store_entities(self, memory_id, content)
+
+            # --- Structured fact extraction ---
+            if extract:
+                _extract_and_store_facts(self, memory_id, content, source)
+
+            # Phase 2: MEMORIA regex-based extraction (always-on, zero-LLM-cost).
+            # Populates memoria_facts, memoria_timelines, memoria_kg for the
+            # structured retrieval router. Runs on every remember() call.
+            try:
+                self.extract_and_store_facts(content, message_idx=0, source_memory_id=memory_id)
+            except Exception:
+                pass  # regex extraction failures must not block memory storage
+
+            # Phase 3-4: Extract graph and consolidate veracity for new memory
+            self._ingest_graph_and_veracity(memory_id, content, source, veracity)
+
+            self._emit_event("MEMORY_ADDED", memory_id, content=content,
+                             source=source, importance=importance, metadata=metadata)
+
+            return memory_id
+        finally:
+            # Enrichment can refill enhanced recall after the early post-commit eviction.
+            self._invalidate_query_cache_after_remember_commit()
 
     def remember_batch(self, items: List[Dict],
                        *,
@@ -4183,6 +4200,17 @@ class BeamMemory:
         finally:
             cache.close()
 
+    def _invalidate_query_cache_after_remember_commit(self) -> None:
+        """Best-effort cache invalidation after ``remember()`` has committed."""
+        try:
+            self._invalidate_query_cache()
+        except Exception as exc:
+            logger.warning(
+                "remember: query-cache invalidation failed after commit (%s): %s",
+                type(exc).__name__,
+                exc,
+            )
+
     def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
         """
         Mark a memory as invalid/superseded.
@@ -4190,6 +4218,60 @@ class BeamMemory:
         Otherwise sets valid_until to now (immediate expiry).
         """
         cursor = self.conn.cursor()
+        if replacement_id:
+            if replacement_id == memory_id:
+                return False
+
+            # The replacement lookup and target update are one write
+            # transaction. For a direct call, BEGIN IMMEDIATE obtains
+            # SQLite's write lock before validation, so another connection
+            # cannot delete a replacement between validation and the link
+            # update. A batch may already own a transaction after earlier
+            # DML; do not begin, commit, or roll back that caller-owned
+            # transaction here.
+            owns_transaction = not self.conn.in_transaction
+
+            def validate_and_invalidate() -> bool:
+                replacement_found = False
+                for table in ("working_memory", "episodic_memory"):
+                    cursor.execute(
+                        f"""
+                        SELECT 1 FROM {table}
+                        WHERE id = ? AND (session_id = ? OR scope = 'global')
+                        LIMIT 1
+                        """,
+                        (replacement_id, self.session_id),
+                    )
+                    if cursor.fetchone() is not None:
+                        replacement_found = True
+                        break
+                if not replacement_found:
+                    return False
+
+                now = datetime.now().isoformat()
+                cursor.execute("""
+                    UPDATE working_memory
+                    SET valid_until = ?, superseded_by = ?
+                    WHERE id = ? AND (session_id = ? OR scope = 'global')
+                """, (now, replacement_id, memory_id, self.session_id))
+                if cursor.rowcount == 0:
+                    cursor.execute("""
+                        UPDATE episodic_memory
+                        SET valid_until = ?, superseded_by = ?
+                        WHERE id = ? AND (session_id = ? OR scope = 'global')
+                    """, (now, replacement_id, memory_id, self.session_id))
+                return cursor.rowcount > 0
+
+            if owns_transaction:
+                with _guarded_transaction(self.conn):
+                    cursor.execute("BEGIN IMMEDIATE")
+                    invalidated = validate_and_invalidate()
+            else:
+                invalidated = validate_and_invalidate()
+            if invalidated:
+                self._invalidate_query_cache()
+            return invalidated
+
         now = datetime.now().isoformat()
         # Try working_memory first
         cursor.execute("""
@@ -4528,7 +4610,10 @@ class BeamMemory:
                     "DELETE FROM annotations WHERE memory_id = ?", (memory_id,)
                 )
                 cursor.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
-        return wm_rows > 0
+        forgotten = wm_rows > 0
+        if forgotten:
+            self._invalidate_query_cache()
+        return forgotten
 
     # ------------------------------------------------------------------
     # Episodic Memory
@@ -4568,9 +4653,7 @@ class BeamMemory:
             row_veracity = clamp_veracity(
                 veracity, context="consolidate_to_episodic.veracity"
             )
-        # Strip closed <think>...</think> blocks that some LLMs emit
-        import re as _re
-        summary = _re.sub(r"<think>.*?</think>", "", summary, flags=_re.DOTALL).strip()
+
         # Compute the embedding BEFORE the INSERT opens the write transaction.
         # embed() can be a network call (API embeddings, 30s timeout) or a
         # heavy CPU call; running it after the INSERT held the SQLite write
@@ -5706,6 +5789,37 @@ class BeamMemory:
                 veracity=veracity, memory_type=memory_type,
                 cross_session=cross_session,
             )
+            # [C4] Polyphonic path diagnostics. The linear-path recording
+            # below (record_call / record_tier_hits at the end of recall())
+            # is unreachable when POLYPHONIC_RECALL=1 because this branch
+            # returns first, so every production recall under the polyphonic
+            # engine stayed invisible to mnemosyne_recall_diagnostics. Record
+            # here instead. Voice -> tier mapping is approximate: vector->
+            # wm_vec, graph->em_vec, fact->em_fts, temporal->wm_fts.
+            # Diagnostics are read-only signal; they never alter recall
+            # behavior.
+            from mnemosyne.core.recall_diagnostics import get_diagnostics as _get_recall_diag
+            _recall_diag = _get_recall_diag()
+            _voice_tier_map = {
+                "vector": "wm_vec",
+                "graph": "em_vec",
+                "fact": "em_fts",
+                "temporal": "wm_fts",
+            }
+            _tier_kept = {
+                "wm_fts": 0, "wm_vec": 0, "wm_fallback": 0,
+                "em_fts": 0, "em_vec": 0, "em_fallback": 0,
+            }
+            _kept = 0
+            for _r in poly_results:
+                _kept += 1
+                _vs = _r.get("voice_scores") or {}
+                for _v, _t in _voice_tier_map.items():
+                    if _vs.get(_v):
+                        _tier_kept[_t] += 1
+            for _t, _n in _tier_kept.items():
+                _recall_diag.record_tier_hits(_t, _n)
+            _recall_diag.record_call(truly_empty=(_kept == 0))
             if explain:
                 return {
                     "query": query,
@@ -8108,7 +8222,9 @@ class BeamMemory:
                 # DELETE+INSERT to refresh.
                 if vec_available_now:
                     cursor.execute("DELETE FROM vec_episodes WHERE rowid = ?", (rowid,))
-                    _vec_insert(self.conn, rowid, np.asarray(vec[0]).tolist())
+                    _vec_insert(
+                        self.conn, rowid, np.asarray(vec[0]).tolist(), commit=False
+                    )
                 else:
                     cursor.execute("""
                         INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model)
@@ -8245,7 +8361,7 @@ class BeamMemory:
                     cursor.execute("ROLLBACK TO degrade_row")
                     cursor.execute("RELEASE degrade_row")
                 except Exception:
-                    logger.info("Regex extraction failed, skipping", exc_info=True)
+                    logger.info("degrade_episodic: rollback failed", exc_info=True)
 
         # --- Degrade tier 2 → tier 3: smart extraction (keep key entities) ---
         for row in tier2_rows:
@@ -8271,7 +8387,7 @@ class BeamMemory:
                     cursor.execute("ROLLBACK TO degrade_row")
                     cursor.execute("RELEASE degrade_row")
                 except Exception:
-                    logger.info("Regex extraction failed, skipping", exc_info=True)
+                    logger.info("degrade_episodic: rollback failed", exc_info=True)
 
         self.conn.commit()
         return results
@@ -8657,28 +8773,43 @@ class BeamMemory:
 
                 chunks = local_llm.chunk_memories_by_budget(lines, source=source)
                 if chunks:
+                    invalid_reasoning = False
                     if len(chunks) == 1:
-                        # All memories fit in one prompt
-                        summary = local_llm.summarize_memories(chunks[0], source=source)
+                        # All memories fit in one prompt.
+                        summary = local_llm._summarize_memories(chunks[0], source=source)
+                        invalid_reasoning = local_llm._is_invalid_reasoning_output(summary)
                     else:
-                        # Multi-chunk: summarize each chunk, then summarize the summaries
+                        # Multi-chunk: any malformed trace invalidates the
+                        # complete LLM result instead of silently dropping it.
                         chunk_summaries = []
                         for chunk in chunks:
-                            chunk_summary = local_llm.summarize_memories(chunk, source=source)
+                            chunk_summary = local_llm._summarize_memories(chunk, source=source)
+                            if local_llm._is_invalid_reasoning_output(chunk_summary):
+                                invalid_reasoning = True
+                                break
                             if chunk_summary:
                                 chunk_summaries.append(chunk_summary)
-                        if chunk_summaries:
-                            # Second-pass: summarize the chunk summaries
+                        if not invalid_reasoning and chunk_summaries:
+                            # Second-pass: summarize the chunk summaries.
                             if len(chunk_summaries) == 1:
                                 summary = chunk_summaries[0]
                             else:
-                                summary = local_llm.summarize_memories(
+                                summary = local_llm._summarize_memories(
                                     chunk_summaries,
-                                    source=f"{source} (consolidated)"
+                                    source=f"{source} (consolidated)",
                                 )
-                                # If second-pass also overflows, concatenate
-                                if not summary:
+                                invalid_reasoning = local_llm._is_invalid_reasoning_output(summary)
+                                # Preserve the existing non-reasoning fallback.
+                                if not invalid_reasoning and not summary:
                                     summary = " | ".join(chunk_summaries)
+                    if invalid_reasoning:
+                        logger.warning(
+                            "sleep: malformed reasoning trace for source=%r (items=%d) "
+                            "— falling back to AAAK compression",
+                            source,
+                            len(items),
+                        )
+                        summary = None
                     if summary:
                         llm_used_count += 1
                         llm_succeeded = True

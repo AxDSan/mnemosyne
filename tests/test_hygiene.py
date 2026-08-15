@@ -20,8 +20,6 @@ from mnemosyne.cli import cmd_hygiene
 from mnemosyne.core.beam import BeamMemory, init_beam
 from mnemosyne.core.filters import SECRET_LABELED_PATTERNS
 from mnemosyne.core.hygiene import (
-    AuditReport,
-    CleanResult,
     NoiseCandidate,
     audit_noise,
     clean_noise,
@@ -464,6 +462,182 @@ class TestAuditNoise:
             cmd_hygiene(args)
 
         assert message in capsys.readouterr().err
+
+    def _prepare_clean_db(self, temp_db, monkeypatch):
+        """Insert a heartbeat row and point the CLI at a copy of the database."""
+        db_path, beam = temp_db
+        _insert_row(beam, "working_memory", "n1", "heartbeat", source="heartbeat")
+        cli_db = db_path.parent / "mnemosyne.db"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("VACUUM INTO ?", (str(cli_db),))
+        finally:
+            conn.close()
+        monkeypatch.setattr("mnemosyne.cli.DATA_DIR", str(db_path.parent))
+        return db_path, beam, cli_db
+
+    def test_cmd_hygiene_clean_unwraps_audit_envelope(self, temp_db, monkeypatch, capsys):
+        """Regression test for #606: clean must unwrap the audit JSON envelope."""
+        db_path, _beam, cli_db = self._prepare_clean_db(temp_db, monkeypatch)
+        report = audit_noise(db_path=db_path, min_score=0.0)
+
+        candidates_file = db_path.parent / "audit.json"
+        candidates_file.write_text(json.dumps(report.to_dict()))
+
+        cmd_hygiene(["clean", "--action", "delete", "--confirm", str(candidates_file)])
+
+        captured = capsys.readouterr()
+        assert "deleted=1" in captured.out
+        conn = sqlite3.connect(str(cli_db))
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM working_memory WHERE id = ?", ("n1",)
+            ).fetchone()
+            assert row is None
+        finally:
+            conn.close()
+
+    def test_cmd_hygiene_clean_accepts_raw_candidate_array(self, temp_db, monkeypatch, capsys):
+        """clean must also accept the candidates array without an envelope."""
+        db_path, _beam, _cli_db = self._prepare_clean_db(temp_db, monkeypatch)
+
+        candidates_file = db_path.parent / "candidates.json"
+        candidates_file.write_text(json.dumps([
+            {
+                "memory_id": "n1",
+                "table_name": "working_memory",
+                "content_preview": "heartbeat",
+                "noise_score": 0.8,
+                "noise_reasons": ["trivial_keyword"],
+                "suggested_action": "delete",
+            }
+        ]))
+
+        cmd_hygiene(["clean", "--action", "delete", "--confirm", str(candidates_file)])
+
+        assert "deleted=1" in capsys.readouterr().out
+
+    def test_cmd_hygiene_clean_fails_on_invalid_candidate_container(self, temp_db, monkeypatch, capsys):
+        """Non-list, non-envelope containers must route to _fail."""
+        db_path, _beam, _cli_db = self._prepare_clean_db(temp_db, monkeypatch)
+
+        candidates_file = db_path.parent / "bad.json"
+        candidates_file.write_text(json.dumps("not a list"))
+
+        with pytest.raises(SystemExit):
+            cmd_hygiene(["clean", "--action", "delete", "--confirm", str(candidates_file)])
+
+        assert "JSON array" in capsys.readouterr().err
+
+    def test_cmd_hygiene_clean_fails_on_missing_candidates_field(self, temp_db, monkeypatch, capsys):
+        """An envelope without 'candidates' must route to _fail."""
+        db_path, _beam, _cli_db = self._prepare_clean_db(temp_db, monkeypatch)
+
+        candidates_file = db_path.parent / "bad.json"
+        candidates_file.write_text(json.dumps({"total_scanned": 1}))
+
+        with pytest.raises(SystemExit):
+            cmd_hygiene(["clean", "--action", "delete", "--confirm", str(candidates_file)])
+
+        assert "'candidates'" in capsys.readouterr().err
+
+    def test_cmd_hygiene_clean_fails_on_non_object_candidate(self, temp_db, monkeypatch, capsys):
+        """A candidate entry that is not a JSON object must route to _fail."""
+        db_path, _beam, _cli_db = self._prepare_clean_db(temp_db, monkeypatch)
+
+        candidates_file = db_path.parent / "bad.json"
+        candidates_file.write_text(json.dumps(["not an object"]))
+
+        with pytest.raises(SystemExit):
+            cmd_hygiene(["clean", "--action", "delete", "--confirm", str(candidates_file)])
+
+        assert "JSON object" in capsys.readouterr().err
+
+    def test_cmd_hygiene_clean_fails_on_missing_required_field(self, temp_db, monkeypatch, capsys):
+        """A candidate missing a required field must route to _fail."""
+        db_path, _beam, _cli_db = self._prepare_clean_db(temp_db, monkeypatch)
+
+        candidates_file = db_path.parent / "bad.json"
+        candidates_file.write_text(json.dumps([{"table_name": "working_memory"}]))
+
+        with pytest.raises(SystemExit):
+            cmd_hygiene(["clean", "--action", "delete", "--confirm", str(candidates_file)])
+
+        assert "Missing required field" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "malformed_candidate",
+        [
+            {"noise_score": "high"},
+            {"table_name": "unknown_table"},
+            {"suggested_action": "destroy"},
+            {"noise_score": 1.1},
+            {"importance": float("inf")},
+            {"importance": float("nan")},
+            {"content_length": -1},
+            {"noise_reasons": "short"},
+        ],
+    )
+    def test_cmd_hygiene_clean_rejects_malformed_envelope_candidate(
+        self, temp_db, monkeypatch, capsys, malformed_candidate
+    ):
+        """Malformed envelope candidates abort through _fail, preserve the row, and do not write an audit log."""
+        db_path, _beam, cli_db = self._prepare_clean_db(temp_db, monkeypatch)
+        report = audit_noise(db_path=db_path, min_score=0.0)
+        candidate = report.candidates[0].to_dict()
+        candidate.update(malformed_candidate)
+
+        candidates_file = db_path.parent / "bad.json"
+        candidates_file.write_text(json.dumps({"candidates": [candidate]}))
+
+        with pytest.raises(SystemExit):
+            cmd_hygiene(["clean", "--action", "delete", "--confirm", str(candidates_file)])
+
+        assert "Candidate #0" in capsys.readouterr().err
+        conn = sqlite3.connect(str(cli_db))
+        try:
+            row = conn.execute("SELECT 1 FROM working_memory WHERE id = ?", ("n1",)).fetchone()
+            assert row is not None
+            audit_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='hygiene_audit_log'"
+            ).fetchone()
+            assert audit_table is None
+        finally:
+            conn.close()
+
+    def test_cmd_hygiene_clean_accepts_audit_output_with_out_of_range_importance(
+        self, temp_db, monkeypatch, capsys
+    ):
+        """Regression for the reported blocker: audit --json → clean --confirm must work
+        even when BeamMemory persisted an importance value outside [0, 1]."""
+        db_path, beam = temp_db
+        _insert_row(beam, "working_memory", "n1", "heartbeat", source="heartbeat", importance=2.0)
+
+        cli_db = db_path.parent / "mnemosyne.db"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("VACUUM INTO ?", (str(cli_db),))
+        finally:
+            conn.close()
+        monkeypatch.setattr("mnemosyne.cli.DATA_DIR", str(db_path.parent))
+
+        cmd_hygiene(["audit", "--json", "--min-score", "0.0"])
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope["candidates"]
+
+        candidates_file = db_path.parent / "audit.json"
+        candidates_file.write_text(json.dumps(envelope))
+
+        cmd_hygiene(["clean", "--action", "delete", "--confirm", str(candidates_file)])
+
+        captured = capsys.readouterr()
+        assert "deleted=1" in captured.out
+        conn = sqlite3.connect(str(cli_db))
+        try:
+            row = conn.execute("SELECT 1 FROM working_memory WHERE id = ?", ("n1",)).fetchone()
+            assert row is None
+        finally:
+            conn.close()
 
     def test_hygiene_status_without_audit_log(self, temp_db):
         db_path, _beam = temp_db

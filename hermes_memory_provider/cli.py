@@ -6,6 +6,7 @@ Available via: hermes mnemosyne <subcommand>
 from __future__ import annotations
 
 import json
+import importlib.metadata
 import re
 import sys
 from pathlib import Path
@@ -58,6 +59,14 @@ if _mnemosyne_root.name == "site-packages":
     _guard_selected_site_packages_python_compatibility(_mnemosyne_root)
 if str(_mnemosyne_root) not in sys.path:
     sys.path.insert(0, str(_mnemosyne_root))
+
+
+def _distribution_version(distribution: str) -> str:
+    """Return an installed distribution version without importing package globals."""
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return "unavailable"
 
 
 def register_cli(subparser):
@@ -115,6 +124,11 @@ def mnemosyne_command(args):
         print("Usage: hermes mnemosyne {stats|sleep|version|inspect|clear|export|import}")
         return 1
 
+    if cmd == "version":
+        print(f"Mnemosyne {_distribution_version('mnemosyne-memory')}")
+        print(f"Mnemosyne Hermes {_distribution_version('mnemosyne-hermes')}")
+        return 0
+
     # Register Hermes host LLM backend so sleep uses Hermes' provider.
     # Use a try/except fallback chain: the relative import works when loaded
     # as part of the hermes_memory_provider package; the absolute import is
@@ -145,10 +159,6 @@ def mnemosyne_command(args):
         episodic = beam.get_episodic_stats()
         memoria = beam.get_memoria_stats()
         print(json.dumps({"working": working, "episodic": episodic, "memoria": memoria}, indent=2))
-
-    elif cmd == "version":
-        from mnemosyne import __version__
-        print(f"Mnemosyne v{__version__}")
 
     elif cmd == "sleep":
         dry_run = bool(getattr(args, "dry_run", False))

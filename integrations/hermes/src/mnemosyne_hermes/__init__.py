@@ -16,8 +16,10 @@ Based on mnemosyne-memory core library. Zero cloud. Zero latency.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -134,7 +136,7 @@ except Exception as _persona_import_exc:  # pragma: no cover - graceful import f
         def _with_persona_block(self, base: str) -> str:
             return base
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 logger = logging.getLogger(__name__)
 
@@ -227,12 +229,51 @@ _PREFETCH_RAW_SOURCES = {"conversation"}
 _PREFETCH_DISTILLED_SOURCES = {
     "preference", "correction", "fact", "identity", "insight", "sleep_consolidation",
 }
-_PREFETCH_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_./:-]*", re.IGNORECASE)
+_PREFETCH_TOKEN_RE = re.compile(r"[^\W_][\w./:-]*", re.IGNORECASE | re.UNICODE)
 _PREFETCH_DEDUP_STOPWORDS = _PREFETCH_FRAGMENT_STOPWORDS | frozenset({
     "about", "after", "before", "because", "could", "from", "have", "into",
     "like", "more", "need", "needs", "than", "them", "they", "want", "wants",
     "when", "where", "which", "while", "would", "yourself",
 })
+
+
+def _parse_bounded_int_env(key: str, default: int, minimum: int) -> int:
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s", key, raw, default)
+        return default
+
+
+def _parse_unit_float_env(key: str, default: float) -> float:
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+        if not math.isfinite(value):
+            raise ValueError("value must be finite")
+        return min(1.0, max(0.0, value))
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s", key, raw, default)
+        return default
+
+
+def _prefetch_min_distinctive_tokens() -> int:
+    return _parse_bounded_int_env("MNEMOSYNE_PREFETCH_MIN_DISTINCTIVE_TOKENS", 2, 1)
+
+
+def _prefetch_min_query_coverage() -> float:
+    return _parse_unit_float_env("MNEMOSYNE_PREFETCH_MIN_QUERY_COVERAGE", 0.30)
+
+
+def _prefetch_canonical_rare_token_max_frequency() -> int:
+    return _parse_bounded_int_env("MNEMOSYNE_PREFETCH_CANONICAL_RARE_TOKEN_MAX_FREQUENCY", 1, 0)
+
+
 def _parse_token_set_env(key: str, default: Set[str]) -> Set[str]:
     """Read a comma/space-separated token set from env.
 
@@ -251,18 +292,47 @@ def _parse_token_set_env(key: str, default: Set[str]) -> Set[str]:
     return tokens or set(default)
 
 
-# Generic schema/system labels do not, by themselves, prove a canonical fact is
-# relevant to a turn. Deployments can extend this list with local owner/assistant
-# names using MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS.
-_PREFETCH_CANONICAL_GENERIC_TOKEN_DEFAULTS = {
-    "user", "owner", "assistant", "agent", "system", "profile", "identity", "default"
+# Generic schema/system labels do not, by themselves, prove a memory is
+# relevant to a turn. This fixed set governs ordinary working/episodic
+# automatic prefetch; canonical-specific deployment tuning must not alter that
+# established path.
+_PREFETCH_LEXICAL_GENERIC_TOKENS = {
+    "user", "owner", "assistant", "agent", "system", "profile", "identity", "default",
+    "preference", "preferences", "recommendation", "recommendations",
+}
+
+# Canonical automatic prefetch starts from the same conservative defaults, but
+# deployments can replace this list with
+# MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS or extend the effective list with
+# MNEMOSYNE_PREFETCH_CANONICAL_EXTRA_GENERIC_TOKENS.
+_PREFETCH_CANONICAL_GENERIC_TOKEN_DEFAULTS = set(_PREFETCH_LEXICAL_GENERIC_TOKENS)
+
+# Explicit recall keeps the pre-hardening default generic-token contract while
+# continuing to honor the established canonical replacement variable. The new
+# preference/recommendation defaults and additive tuning remain limited to
+# silent automatic context injection.
+_CANONICAL_RECALL_GENERIC_TOKENS = {
+    "user", "owner", "assistant", "agent", "system", "profile", "identity", "default",
 }
 
 
 def _prefetch_canonical_generic_tokens() -> Set[str]:
-    return _parse_token_set_env(
+    configured = _parse_token_set_env(
         "MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS",
         _PREFETCH_CANONICAL_GENERIC_TOKEN_DEFAULTS,
+    )
+    extras = _parse_token_set_env(
+        "MNEMOSYNE_PREFETCH_CANONICAL_EXTRA_GENERIC_TOKENS",
+        set(),
+    )
+    return configured | extras
+
+
+def _canonical_recall_generic_tokens() -> Set[str]:
+    """Return the historical configured token set for explicit canonical recall."""
+    return _parse_token_set_env(
+        "MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS",
+        _CANONICAL_RECALL_GENERIC_TOKENS,
     )
 
 
@@ -286,9 +356,21 @@ def _strip_prefetch_prefix(content: str) -> str:
     return c
 
 
+def _is_prefetch_cjk_char(char: str) -> bool:
+    """Match the CJK ranges supported by the core lexical recall path."""
+    return (
+        "\u4e00" <= char <= "\u9fff"
+        or "\u3040" <= char <= "\u30ff"
+        or "\uac00" <= char <= "\ud7af"
+    )
+
+
 def _prefetch_tokens(content: str) -> Set[str]:
     c = _strip_prefetch_prefix(content).lower()
-    tokens: Set[str] = set()
+    # Core recall scores spaceless CJK text by character overlap. Preserve that
+    # evidence in the stricter automatic-prefetch gate instead of discarding an
+    # already-relevant result merely because the adapter's word regex is ASCII.
+    tokens: Set[str] = {char for char in c if _is_prefetch_cjk_char(char)}
     for token in _PREFETCH_TOKEN_RE.findall(c):
         # Keep internal URL/path separators, but trim sentence punctuation so
         # canonical facts ending in "branding." still match query token
@@ -300,13 +382,8 @@ def _prefetch_tokens(content: str) -> Set[str]:
     return tokens
 
 
-def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: int = 3) -> List[Dict[str, Any]]:
-    """Return canonical facts relevant enough for automatic memory-context injection.
-
-    Canonical rows are small, owner-scoped, and single-source-of-truth, so a
-    lightweight lexical pass over current slots is enough and avoids LLM/reranker
-    cost. Importance cannot rescue a row here; it must share query terms.
-    """
+def _canonical_recall_rows(store: Any, owner_id: str, query: str, *, limit: int = 3) -> List[Dict[str, Any]]:
+    """Return canonical facts using the established explicit-recall contract."""
     query_tokens = _prefetch_tokens(query)
     if not query_tokens:
         return []
@@ -314,24 +391,17 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
         rows = store.list(owner_id)
     except Exception:
         return []
+    generic_tokens = _canonical_recall_generic_tokens()
     candidates: List[Dict[str, Any]] = []
     for row in rows:
         body = str(row.get("body") or "").strip()
         if not body:
             continue
-        # Score canonical relevance from the fact body itself. Category/name
-        # labels such as "identity" or "profile" are schema metadata; counting
-        # them as topical evidence made generic identity slots inject into
-        # unrelated professional-identity questions.
         row_tokens = _prefetch_tokens(body)
         overlap = query_tokens & row_tokens
-        generic_tokens = _prefetch_canonical_generic_tokens()
         distinctive_overlap = overlap - generic_tokens
         if not distinctive_overlap:
             continue
-        # One distinctive token can be enough for canonical slots such as
-        # profile URLs; broad queries need a little more coverage. Generic
-        # owner/system words do not count toward the minimum overlap.
         coverage = len(overlap) / max(len(query_tokens), 1)
         distinctive_coverage = len(distinctive_overlap) / max(len(query_tokens - generic_tokens), 1)
         if len(distinctive_overlap) < 2 and max(coverage, distinctive_coverage) < 0.30:
@@ -350,7 +420,96 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
             "canonical_category": row.get("category"),
             "canonical_name": row.get("name"),
         })
+    candidates.sort(
+        key=lambda r: (float(r.get("score") or 0.0), float(r.get("keyword_score") or 0.0)),
+        reverse=True,
+    )
+    return candidates[:limit]
+
+
+def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: int = 3) -> List[Dict[str, Any]]:
+    """Return canonical facts relevant enough for automatic memory-context injection.
+
+    Canonical rows are small, owner-scoped, and single-source-of-truth, so a
+    lightweight lexical pass over current slots is enough and avoids LLM/reranker
+    cost. Importance cannot rescue a row here; it must share query terms.
+    """
+    query_tokens = _prefetch_tokens(query)
+    if not query_tokens:
+        return []
+    try:
+        rows = store.list(owner_id)
+    except Exception:
+        return []
+    generic_tokens = _prefetch_canonical_generic_tokens()
+    tokenized_rows: List[tuple[Dict[str, Any], str, Set[str]]] = []
+    token_document_frequency: Dict[str, int] = {}
+    for row in rows:
+        body = str(row.get("body") or "").strip()
+        if not body:
+            continue
+        # Score canonical relevance from the fact body itself. Category/name
+        # labels such as "identity" or "profile" are schema metadata; counting
+        # them as topical evidence made generic identity slots inject into
+        # unrelated professional-identity questions.
+        row_tokens = _prefetch_tokens(body)
+        tokenized_rows.append((row, body, row_tokens))
+        for token in row_tokens - generic_tokens:
+            token_document_frequency[token] = token_document_frequency.get(token, 0) + 1
+
+    # A single lexical overlap is useful only when the token is genuinely rare
+    # across the owner's canonical surface. Otherwise broad words such as
+    # "approval", "family", or a local owner's name can inject several
+    # unrelated high-trust facts and crowd out precise episodic recall.
+    rare_document_frequency = _prefetch_canonical_rare_token_max_frequency()
+    minimum_overlap = _prefetch_min_distinctive_tokens()
+    minimum_coverage = _prefetch_min_query_coverage()
+    candidates: List[Dict[str, Any]] = []
+    for row, body, row_tokens in tokenized_rows:
+        overlap = query_tokens & row_tokens
+        distinctive_overlap = overlap - generic_tokens
+        if not distinctive_overlap:
+            continue
+        # One distinctive token can be enough for canonical slots such as
+        # profile URLs; broad queries need a little more coverage. Generic
+        # owner/system words do not count toward the minimum overlap.
+        coverage = len(overlap) / max(len(query_tokens), 1)
+        distinctive_coverage = len(distinctive_overlap) / max(len(query_tokens - generic_tokens), 1)
+        if len(distinctive_overlap) == 1:
+            only_token = next(iter(distinctive_overlap))
+            if (
+                max(coverage, distinctive_coverage) < minimum_coverage
+                or token_document_frequency.get(only_token, 0) > rare_document_frequency
+            ):
+                continue
+        elif len(distinctive_overlap) < minimum_overlap:
+            continue
+        score = min(1.0, 0.72 + coverage * 0.24 + min(len(overlap), 3) * 0.03)
+        candidates.append({
+            "content": body,
+            "source": f"canonical:{row.get('category') or 'fact'}",
+            "timestamp": row.get("valid_from") or row.get("created_at") or "",
+            "importance": 0.95,
+            "score": score,
+            "keyword_score": max(0.35, coverage),
+            "fact_match": True,
+            "trust_tier": "CANONICAL",
+            "tier": "canonical",
+            "canonical_category": row.get("category"),
+            "canonical_name": row.get("name"),
+            "_prefetch_overlap_count": len(distinctive_overlap),
+        })
+    # When one fact has materially stronger lexical evidence, do not let
+    # weaker one-token candidates ride alongside it merely because their lone
+    # token happens to be unique in a small canonical collection.
+    if any(int(r.get("_prefetch_overlap_count") or 0) >= minimum_overlap for r in candidates):
+        candidates = [
+            r for r in candidates
+            if int(r.get("_prefetch_overlap_count") or 0) >= minimum_overlap
+        ]
     candidates.sort(key=lambda r: (float(r.get("score") or 0.0), float(r.get("keyword_score") or 0.0)), reverse=True)
+    for candidate in candidates:
+        candidate.pop("_prefetch_overlap_count", None)
     return candidates[:limit]
 
 
@@ -396,6 +555,17 @@ def _prefetch_adjusted_score(row: Dict[str, Any]) -> float:
     signal = _prefetch_topic_signal(row)
     importance = min(max(float(row.get("importance") or 0.0), 0.0), 1.0)
     return (score * 0.65 + signal * 0.35 + importance * 0.05) * _prefetch_source_quality(row)
+
+
+def _prefetch_has_distinctive_lexical_evidence(query: str, content: str) -> bool:
+    """Require multiple shared topical terms with meaningful query coverage."""
+    generic_tokens = _PREFETCH_LEXICAL_GENERIC_TOKENS
+    query_tokens = _prefetch_tokens(query) - generic_tokens
+    overlap = query_tokens & _prefetch_tokens(content)
+    return (
+        len(overlap) >= _prefetch_min_distinctive_tokens()
+        and (len(overlap) / max(len(query_tokens), 1)) >= _prefetch_min_query_coverage()
+    )
 
 
 def _semantic_dedup_prefetch(rows: List[Dict[str, Any]], threshold: float = 0.72) -> List[Dict[str, Any]]:
@@ -563,7 +733,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._sync_turn_lock = threading.Lock()
         # Serialize Beam/SQLite access with the auto_sleep daemon. Separate
         # connections to the same WAL database must not run Beam work together.
-        self._beam_access_lock = threading.Lock()
+        # Tool dispatch holds this lock while handlers run. Some handlers
+        # (sleep and diagnose) reuse helpers that acquire the same lock, so it
+        # must be re-entrant while still excluding switches and other workers.
+        self._beam_access_lock = threading.RLock()
         self._sync_turn_telemetry: Dict[str, Any] = {
             "pending_queue_length": 0,
             "max_queue_length": 0,
@@ -588,7 +761,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._reflect_disabled_for_cron = _parse_env_bool("MNEMOSYNE_REFLECT_DISABLED_FOR_CRON", True)
         self._reflect_max_calls_per_session = _parse_env_optional_int("MNEMOSYNE_REFLECT_MAX_CALLS_PER_SESSION", 3)
         self._reflect_calls_this_session = 0
-        self._reflect_budget_lock = threading.Lock()
         self._ignore_patterns: List[str] = []  # Regex patterns to filter from memory
         self._sync_roles: Set[str] = {"user"}
         _sync_env = os.environ.get("MNEMOSYNE_SYNC_ROLES")
@@ -606,6 +778,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Profile memory isolation: when enabled, each Hermes profile gets its own
         # Mnemosyne bank (separate SQLite DB). Default OFF for backward compatibility.
         self._profile_isolation_enabled = False
+        self._memory: Optional[Any] = None
+        self._provider_sync_adapter: Optional[Any] = None
+        self._provider_persona_adapter: Optional[Any] = None
+        self._gateway_session_key = ""
+        self._channel_id_explicit = False
         # Default scope for remember() calls when not explicitly specified.
         # "session" (default) scopes to current session; "global" persists across sessions.
         self._default_scope = "session"
@@ -655,6 +832,23 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 logger.debug("Audit log initialized: %s", db_path)
         except Exception as exc:
             logger.debug("Audit log init skipped: %s", exc)
+
+    def _clear_provider_adapters(self) -> None:
+        """Drop adapters that retain the Beam being replaced or closed."""
+        for attr_name in ("_provider_sync_adapter", "_provider_persona_adapter"):
+            adapter = getattr(self, attr_name, None)
+            if adapter is not None:
+                shutdown = getattr(adapter, "shutdown", None)
+                if callable(shutdown):
+                    try:
+                        shutdown()
+                    except Exception:
+                        logger.debug(
+                            "Mnemosyne: could not close provider adapter %s",
+                            attr_name,
+                            exc_info=True,
+                        )
+            setattr(self, attr_name, None)
 
     def _audit_event(self, action: str, **kwargs) -> None:
         """Record an audit event. Never raises, never blocks."""
@@ -706,15 +900,19 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Observed live 2026-07-19: a ~2-minute lock storm at session start
         # left an agent memory-less for hours while the DB was healthy again
         # minutes later; a restart was the only recovery path.
-        if self._beam is not None or self._retry_init_args is None:
-            return
-        if time.monotonic() < self._retry_init_at:
-            return
-        session_id, kwargs = self._retry_init_args
-        logger.info(
-            "Mnemosyne retrying init after transient failure: %s", self._init_error
-        )
-        self.initialize(session_id, **kwargs)
+        with self._ensure_beam_access_lock():
+            if self._beam is not None or self._retry_init_args is None:
+                return
+            if time.monotonic() < self._retry_init_at:
+                return
+            session_id, kwargs = self._retry_init_args
+            logger.info(
+                "Mnemosyne retrying init after transient failure: %s", self._init_error
+            )
+            # Keep initialization serialized with on_session_switch(). This
+            # prevents a retry that already selected session A from publishing
+            # A after a concurrent switch to session B.
+            self.initialize(session_id, **kwargs)
 
     @property
     def name(self) -> str:
@@ -923,13 +1121,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def _reserve_reflection_budget(self, trigger: str) -> Optional[Dict[str, Any]]:
         """Return a structured skip payload, or reserve one reflection call."""
         context = (self._agent_context or "").strip().lower()
-        with self._reflect_budget_lock:
-            if self._reflect_disabled_for_cron and context == "cron":
-                return self._reflection_skip_response("reflect_disabled_for_cron", trigger)
-            max_calls = self._reflect_max_calls_per_session
-            if max_calls is not None and self._reflect_calls_this_session >= max_calls:
-                return self._reflection_skip_response("reflect_budget_exhausted", trigger)
-            self._reflect_calls_this_session += 1
+        with self._ensure_beam_access_lock():
+            return self._reserve_reflection_budget_locked(trigger, context)
+
+    def _reserve_reflection_budget_locked(self, trigger: str, context: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Reserve one reflection call while the Beam access lock is held."""
+        context = context or (self._agent_context or "").strip().lower()
+        if self._reflect_disabled_for_cron and context == "cron":
+            return self._reflection_skip_response("reflect_disabled_for_cron", trigger)
+        max_calls = self._reflect_max_calls_per_session
+        if max_calls is not None and self._reflect_calls_this_session >= max_calls:
+            return self._reflection_skip_response("reflect_budget_exhausted", trigger)
+        self._reflect_calls_this_session += 1
         return None
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
@@ -1032,6 +1235,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         """Initialize Mnemosyne beam for this session."""
+        with self._ensure_beam_access_lock():
+            self._initialize_locked(session_id, **kwargs)
+
+    def _initialize_locked(self, session_id: str, **kwargs) -> None:
+        """Rebuild provider state while the Beam access lock is held."""
         # C27: clear stale state from any prior init attempt so a re-init
         # returns the provider to a clean slate. _beam reset is critical
         # for the primary->skip-context re-init case (codex review finding
@@ -1040,6 +1248,19 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # _beam active, causing system_prompt_block() to report "Active"
         # and handle_tool_call() to silently write into the wrong session.
         # _init_error reset complements this for the failure-recovery case.
+        self._clear_provider_adapters()
+        if self._memory is not None:
+            try:
+                self._memory.close()
+            except Exception:
+                logger.debug("Mnemosyne: could not close prior wrapper", exc_info=True)
+        if self._audit is not None:
+            try:
+                self._audit.close()
+            except Exception:
+                logger.debug("Mnemosyne: could not close prior audit log", exc_info=True)
+        self._memory = None
+        self._audit = None
         self._beam = None
         self._surface_beam = None
         self._init_error = None
@@ -1051,6 +1272,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._platform = kwargs.get("platform", "cli")
         self._hermes_home = kwargs.get("hermes_home", "")
         self._agent_identity = kwargs.get("agent_identity", None) or ""
+        self._gateway_session_key = kwargs.get("gateway_session_key") or ""
+        self._channel_id_explicit = bool(kwargs.get("channel_id"))
 
         # Apply provider-specific config from kwargs (Hermes-passed) or config.yaml fallback
         self._apply_provider_config(kwargs)
@@ -1087,7 +1310,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # stay isolated per-thread while scope='global' memories still surface
         # everywhere.  Falls back to the Hermes agent session_id for CLI and
         # non-gateway use (no behavior change for those paths).
-        stable_scope = kwargs.get("gateway_session_key") or session_id
+        stable_scope = self._gateway_session_key or session_id
         self._session_id = f"hermes_{stable_scope}"
 
         try:
@@ -1102,6 +1325,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     bank=bank_name,
                     channel_id=kwargs.get("channel_id", ""),
                 )
+                self._memory = mem
                 self._beam = mem.beam
                 logger.info(
                     "Mnemosyne initialized (profile isolation ON): session=%s, bank=%s, db=%s",
@@ -1114,7 +1338,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     if self._hermes_home
                     else None
                 )
-                self._beam = BeamMemory(session_id=self._session_id, db_path=db_path)
+                beam_kwargs = {"session_id": self._session_id, "db_path": db_path}
+                if kwargs.get("channel_id"):
+                    beam_kwargs["channel_id"] = kwargs["channel_id"]
+                self._beam = BeamMemory(**beam_kwargs)
                 logger.info(
                     "Mnemosyne initialized: session=%s, db=%s",
                     self._session_id, db_path or "default",
@@ -1222,31 +1449,35 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return ""
         try:
             import os
-            author_id = self._beam.author_id or os.environ.get("MNEMOSYNE_AUTHOR_ID")
-            recall_kwargs: Dict[str, Any] = dict(
-                query=query, top_k=max(_PREFETCH_TOP_K * 2, 16),
-                temporal_weight=0.2, temporal_halflife=48,
-            )
-            # Only pass author_id when explicitly non-empty.  Passing an empty
-            # falsy author_id is harmless (no (1=1) bypass), but passing a real
-            # non-empty one triggers the (1=1) clause in beam.recall() that
-            # SKIPS session/channel filtering entirely -- which would defeat
-            # the gateway_session_key thread isolation above.  Multi-agent
-            # deployments that NEED author_id filtering can set it and accept
-            # the wider scope; the common case (single-user, per-thread
-            # sessions) should never bypass session scoping.
-            if author_id:
-                recall_kwargs["author_id"] = author_id
-            with self._ensure_beam_access_lock():
-                results = self._beam.recall(**recall_kwargs)
+            with self._beam_session_scope(session_id) as beam:
+                if beam is None:
+                    return ""
+                author_id = beam.author_id or os.environ.get("MNEMOSYNE_AUTHOR_ID")
+                recall_kwargs: Dict[str, Any] = dict(
+                    query=query,
+                    top_k=max(_PREFETCH_TOP_K * 2, 16),
+                    temporal_weight=0.2,
+                    temporal_halflife=48,
+                )
+                # Only pass author_id when explicitly non-empty.  Passing an empty
+                # falsy author_id is harmless (no (1=1) bypass), but passing a real
+                # non-empty one triggers the (1=1) clause in beam.recall() that
+                # SKIPS session/channel filtering entirely -- which would defeat
+                # the gateway_session_key thread isolation above.  Multi-agent
+                # deployments that NEED author_id filtering can set it and accept
+                # the wider scope; the common case (single-user, per-thread
+                # sessions) should never bypass session scoping.
+                if author_id:
+                    recall_kwargs["author_id"] = author_id
+                results = beam.recall(**recall_kwargs)
 
                 canonical_rows: List[Dict[str, Any]] = []
                 try:
-                    store = getattr(self._beam, "canonical", None)
+                    store = getattr(beam, "canonical", None)
                     if store is None:
                         from mnemosyne.core.canonical import CanonicalStore
-                        store = CanonicalStore(db_path=self._beam.db_path, conn=self._beam.conn)
-                        self._beam.canonical = store
+                        store = CanonicalStore(db_path=beam.db_path, conn=beam.conn)
+                        beam.canonical = store
                     canonical_rows = _canonical_prefetch_rows(store, self._canonical_owner(), query)
                 except Exception:
                     canonical_rows = []
@@ -1262,6 +1493,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 if _is_low_quality_prefetch(r.get("content", "")):
                     continue
                 if _prefetch_source_quality(r) <= 0:
+                    continue
+                # Silent context injection is deliberately more conservative
+                # than explicit recall. One broad shared word (for example
+                # "coffee", "light", or "preference") is not enough evidence
+                # to inject a high-importance but unrelated memory. Explicit
+                # mnemosyne_recall remains available for semantic exploration.
+                if not _prefetch_has_distinctive_lexical_evidence(query, r.get("content", "")):
                     continue
                 signal = _prefetch_topic_signal(r)
                 score = float(r.get("score") or 0.0)
@@ -1331,7 +1569,69 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         except AttributeError:
             # setdefault atomically publishes one per-instance lock when
             # concurrent __new__ callers both need lazy initialization.
-            return self.__dict__.setdefault("_beam_access_lock", threading.Lock())
+            lock_factory = getattr(threading, "RLock", threading.Lock)
+            return self.__dict__.setdefault("_beam_access_lock", lock_factory())
+
+    def _provider_session_id(self, session_id: str) -> str:
+        """Normalize a Hermes session ID without displacing gateway scope."""
+        stable_scope = getattr(self, "_gateway_session_key", "") or str(
+            session_id or ""
+        ).strip()
+        return f"hermes_{stable_scope}"
+
+    def _rebind_session_locked(self, session_id: str) -> tuple[str, str]:
+        """Persist a normalized session while the Beam access lock is held."""
+        previous_session_id = self._session_id
+        provider_session_id = self._provider_session_id(session_id)
+        beam = self._beam
+        if beam is not None:
+            beam.session_id = provider_session_id
+            if not self._channel_id_explicit:
+                beam.channel_id = provider_session_id
+
+        memory = getattr(self, "_memory", None)
+        if memory is not None:
+            memory.session_id = provider_session_id
+            if not self._channel_id_explicit:
+                memory.channel_id = provider_session_id
+
+        self._session_id = provider_session_id
+        return previous_session_id, provider_session_id
+
+    @contextmanager
+    def _beam_session_scope(self, session_id: str):
+        """Scope one Beam operation without replacing durable switch state."""
+        requested_session_id = str(session_id or "").strip()
+        with self._ensure_beam_access_lock():
+            beam = self._beam
+            if beam is None:
+                yield None
+                return
+
+            if not requested_session_id:
+                yield beam
+                return
+
+            had_session_id = hasattr(beam, "session_id")
+            had_channel_id = hasattr(beam, "channel_id")
+            previous_session_id = getattr(beam, "session_id", None)
+            previous_channel_id = getattr(beam, "channel_id", None)
+            beam.session_id = self._provider_session_id(requested_session_id)
+            channel_id_explicit = getattr(self, "_channel_id_explicit", False)
+            if not channel_id_explicit:
+                beam.channel_id = beam.session_id
+            try:
+                yield beam
+            finally:
+                if had_session_id:
+                    beam.session_id = previous_session_id
+                else:
+                    del beam.session_id
+                if not channel_id_explicit:
+                    if had_channel_id:
+                        beam.channel_id = previous_channel_id
+                    else:
+                        del beam.channel_id
 
     def _sync_turn_diagnostics(self) -> Dict[str, Any]:
         """Return a PII-safe snapshot of sync_turn telemetry."""
@@ -1362,12 +1662,21 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 int(self._sync_turn_telemetry.get("max_queue_length") or 0),
                 in_flight,
             )
+        should_auto_sleep = False
+        auto_sleep_session_id = ""
         try:
-            with self._ensure_beam_access_lock():
+            with self._beam_session_scope(session_id) as beam:
+                if beam is None:
+                    return
+                beam_session_id = getattr(beam, "session_id", None)
+                durable_session_id = getattr(
+                    self, "_session_id", beam_session_id
+                )
+                durable_operation = beam_session_id == durable_session_id
                 if "user" in self._sync_roles and user_content and len(user_content) > 5 and not self._should_filter(user_content):
                     user_limit = _sync_turn_user_limit()
                     uc = user_content[:user_limit] if user_limit > 0 else user_content
-                    self._beam.remember(
+                    beam.remember(
                         content=f"[USER] {uc}",
                         source="conversation",
                         importance=0.5,
@@ -1379,16 +1688,24 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10 and not self._should_filter(assistant_content):
                     assistant_limit = _sync_turn_assistant_limit()
                     ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
-                    self._beam.remember(
+                    beam.remember(
                         content=f"[ASSISTANT] {ac}",
                         source="conversation",
                         importance=0.15,
                         scope=self._default_scope,
                         extract_entities=True,
                     )
-            self._turn_count += 1
-            if self._auto_sleep_enabled and self._turn_count % 10 == 0:
-                self._maybe_auto_sleep()
+                if durable_operation:
+                    self._turn_count += 1
+                    should_auto_sleep = (
+                        self._auto_sleep_enabled and self._turn_count % 10 == 0
+                    )
+                    if should_auto_sleep:
+                        auto_sleep_session_id = beam.session_id
+            if should_auto_sleep:
+                self._maybe_auto_sleep(
+                    expected_session_id=auto_sleep_session_id,
+                )
             with self._sync_turn_lock:
                 self._sync_turn_telemetry["completed"] += 1
                 self._sync_turn_telemetry["last_error"] = None
@@ -1451,48 +1768,89 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 )
                 break  # One identity memory per turn
 
-    def _maybe_auto_sleep(self) -> None:
-        try:
-            stats = self._beam.get_working_stats()
-            working = stats.get("total", 0)
-            if working > self._auto_sleep_threshold:
-                # Cheap eligibility check: are there any unconsolidated
-                # working memories old enough to consolidate? Avoids
-                # spinning up a full sleep pass just to find nothing
-                # eligible (common with longer TTLs after a prior
-                # auto-sleep already consolidated everything).
-                cutoff = (datetime.now() - timedelta(hours=_get_working_memory_ttl_hours() // 2)).isoformat()
-                eligible = self._beam._count_unconsolidated_before(cutoff)
-                if eligible == 0:
-                    return
+    def _auto_sleep_snapshot_locked(self, expected_session_id: str = ""):
+        """Return one immutable auto-sleep snapshot while Beam is locked."""
+        beam_ref = self._beam
+        if beam_ref is None:
+            return None
+        if expected_session_id and beam_ref.session_id != expected_session_id:
+            return None
+        stats = beam_ref.get_working_stats()
+        working = stats.get("total", 0)
+        if working <= self._auto_sleep_threshold:
+            return None
 
-                skip = self._reserve_reflection_budget("auto_sleep")
-                if skip is not None:
-                    logger.info("Mnemosyne auto-sleep skipped: %s", json.dumps(skip))
-                    return
+        # Avoid spinning up a full sleep pass when no old unconsolidated rows
+        # remain. This read belongs to the same session snapshot as the stats.
+        cutoff = (
+            datetime.now()
+            - timedelta(hours=_get_working_memory_ttl_hours() // 2)
+        ).isoformat()
+        eligible = beam_ref._count_unconsolidated_before(cutoff)
+        if eligible == 0:
+            return None
+
+        skip = self._reserve_reflection_budget_locked("auto_sleep")
+        if skip is not None:
+            logger.info("Mnemosyne auto-sleep skipped: %s", json.dumps(skip))
+            return None
+        sleep_args = {
+            "session_id": beam_ref.session_id,
+            "db_path": beam_ref.db_path,
+            "author_id": beam_ref.author_id,
+            "author_type": beam_ref.author_type,
+            "channel_id": beam_ref.channel_id,
+        }
+        sleep_all_sessions = hasattr(beam_ref, "sleep_all_sessions")
+        canonical_owner_id = getattr(beam_ref, "canonical_owner_id", "default")
+        agent_context = getattr(
+            beam_ref,
+            "agent_context",
+            getattr(self, "_agent_context", "primary"),
+        )
+        return (
+            working,
+            eligible,
+            sleep_args,
+            sleep_all_sessions,
+            canonical_owner_id,
+            agent_context,
+        )
+
+    def _maybe_auto_sleep(self, *, expected_session_id: str = "") -> None:
+        try:
+            with self._ensure_beam_access_lock():
+                snapshot = self._auto_sleep_snapshot_locked(expected_session_id)
+            if snapshot is not None:
+                (
+                    working,
+                    eligible,
+                    sleep_args,
+                    sleep_all_sessions,
+                    canonical_owner_id,
+                    agent_context,
+                ) = snapshot
 
                 logger.info("Mnemosyne auto-sleep: working=%d, eligible=%d > threshold=%d", working, eligible, self._auto_sleep_threshold)
                 # The daemon must own a separate BeamMemory/SQLite connection.
                 # The source Beam selects the compatible sleep operation, but is
                 # never used from the worker thread (see root provider #498).
-                beam_ref = self._beam
-                if beam_ref is None:
-                    return
-                sleep_all_sessions = hasattr(beam_ref, "sleep_all_sessions")
                 beam_lock = self._ensure_beam_access_lock()
 
                 def _sleep_isolated():
                     try:
                         BeamClass = _get_beam_class()
-                        sleep_beam = BeamClass(
-                            session_id=beam_ref.session_id,
-                            db_path=beam_ref.db_path,
-                            author_id=beam_ref.author_id,
-                            author_type=beam_ref.author_type,
-                            channel_id=beam_ref.channel_id,
-                        )
                         with beam_lock:
-                            (sleep_beam.sleep_all_sessions if sleep_all_sessions else sleep_beam.sleep)()
+                            sleep_beam = BeamClass(
+                                **sleep_args,
+                            )
+                            sleep_beam.canonical_owner_id = canonical_owner_id
+                            sleep_beam.agent_context = agent_context
+                            (
+                                sleep_beam.sleep_all_sessions
+                                if sleep_all_sessions
+                                else sleep_beam.sleep
+                            )()
                     except Exception as inner:
                         logger.debug("Mnemosyne auto-sleep worker failed: %s", inner)
 
@@ -1517,97 +1875,105 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if tool_name == "mnemosyne_sleep" and self._reflect_disabled_for_cron and (self._agent_context or "").strip().lower() == "cron":
             return json.dumps(self._reflection_skip_response("reflect_disabled_for_cron", "tool"))
         self._maybe_retry_init()
-        if not self._beam:
-            # C27: structured response carries the actual failure reason
-            # instead of a generic "not initialized" string. Status field
-            # is parseable by tool consumers; `reason` is human-readable for
-            # the agent to relay to the user. The `error` field is kept
-            # alongside `status` so callers using the prior "if 'error' in
-            # payload" pattern (codex review finding #4) don't silently
-            # misclassify unavailable as success.
-            reason = self._init_error_reason()
-            return json.dumps({
-                "status": "memory_unavailable",
-                "tool": tool_name,
-                "reason": reason,
-                "error": f"Mnemosyne unavailable: {reason}",
-            })
         try:
-            if tool_name == "mnemosyne_remember":
-                return self._handle_remember(args)
-            elif tool_name == "mnemosyne_batch":
-                return self._handle_batch(args)
-            elif tool_name == "mnemosyne_recall":
-                return self._handle_recall(args)
-            elif tool_name == "mnemosyne_shared_remember":
-                return self._handle_shared_remember(args)
-            elif tool_name == "mnemosyne_shared_recall":
-                return self._handle_shared_recall(args)
-            elif tool_name == "mnemosyne_shared_forget":
-                return self._handle_shared_forget(args)
-            elif tool_name == "mnemosyne_shared_stats":
-                return self._handle_shared_stats(args)
-            elif tool_name == "mnemosyne_sleep":
-                return self._handle_sleep(args)
-            elif tool_name == "mnemosyne_stats":
-                return self._handle_stats(args)
-            elif tool_name == "mnemosyne_invalidate":
-                return self._handle_invalidate(args)
-            elif tool_name == "mnemosyne_validate":
-                return self._handle_validate(args)
-            elif tool_name == "mnemosyne_get":
-                return self._handle_get(args)
-            elif tool_name == "mnemosyne_triple_add":
-                return self._handle_triple_add(args)
-            elif tool_name == "mnemosyne_triple_query":
-                return self._handle_triple_query(args)
-            elif tool_name == "mnemosyne_triple_end":
-                return self._handle_triple_end(args)
-            elif tool_name == "mnemosyne_remember_canonical":
-                return self._handle_remember_canonical(args)
-            elif tool_name == "mnemosyne_recall_canonical":
-                return self._handle_recall_canonical(args)
-            elif tool_name == "mnemosyne_forget_canonical":
-                return self._handle_forget_canonical(args)
-            elif tool_name == "mnemosyne_apply_pending":
-                return self._handle_apply_pending(args)
-            elif tool_name == "mnemosyne_model_card":
-                return self._handle_model_card(args)
-            elif tool_name == "mnemosyne_model_refresh":
-                return self._handle_model_refresh(args)
-            elif tool_name == "mnemosyne_scratchpad_write":
-                return self._handle_scratchpad_write(args)
-            elif tool_name == "mnemosyne_scratchpad_read":
-                return self._handle_scratchpad_read(args)
-            elif tool_name == "mnemosyne_scratchpad_clear":
-                return self._handle_scratchpad_clear(args)
-            elif tool_name == "mnemosyne_export":
-                return self._handle_export(args)
-            elif tool_name == "mnemosyne_update":
-                return self._handle_update(args)
-            elif tool_name == "mnemosyne_forget":
-                return self._handle_forget(args)
-            elif tool_name == "mnemosyne_import":
-                return self._handle_import(args)
-            elif tool_name == "mnemosyne_diagnose":
-                return self._handle_diagnose(args)
-            elif tool_name == "mnemosyne_recall_diagnostics":
-                return self._handle_recall_diagnostics(args)
-            elif tool_name == "mnemosyne_task_progress":
-                return self._handle_task_progress(args)
-            elif tool_name == "mnemosyne_graph_query":
-                return self._handle_graph_query(args)
-            elif tool_name == "mnemosyne_graph_link":
-                return self._handle_graph_link(args)
-            elif tool_name.startswith("mnemosyne_sync_"):
-                return self._handle_sync_tool(tool_name, args)
-            elif tool_name.startswith("mnemosyne_persona_"):
-                return self._handle_persona_tool(tool_name, args)
-            else:
-                return json.dumps({"error": f"Unknown Mnemosyne tool: {tool_name}"})
+            # Tools use the durable session selected by on_session_switch().
+            # Hold the same session lock for the complete dispatch so a write,
+            # recall, or sleep cannot be re-attributed mid-operation.
+            with self._beam_session_scope("") as beam:
+                if beam is None:
+                    # C27: structured response carries the actual failure reason
+                    # instead of a generic "not initialized" string. Status field
+                    # is parseable by tool consumers; `reason` is human-readable for
+                    # the agent to relay to the user. The `error` field is kept
+                    # alongside `status` so callers using the prior "if 'error' in
+                    # payload" pattern (codex review finding #4) don't silently
+                    # misclassify unavailable as success.
+                    reason = self._init_error_reason()
+                    return json.dumps({
+                        "status": "memory_unavailable",
+                        "tool": tool_name,
+                        "reason": reason,
+                        "error": f"Mnemosyne unavailable: {reason}",
+                    })
+                return self._dispatch_tool_call_locked(tool_name, args)
         except Exception as e:
             logger.error("Mnemosyne tool %s failed: %s", tool_name, e)
             return json.dumps({"error": f"Mnemosyne tool '{tool_name}' failed: {e}"})
+
+    def _dispatch_tool_call_locked(self, tool_name: str, args: Dict[str, Any]) -> str:
+        """Dispatch one tool while the durable Beam session lock is held."""
+        if tool_name == "mnemosyne_remember":
+            return self._handle_remember(args)
+        elif tool_name == "mnemosyne_batch":
+            return self._handle_batch(args)
+        elif tool_name == "mnemosyne_recall":
+            return self._handle_recall(args)
+        elif tool_name == "mnemosyne_shared_remember":
+            return self._handle_shared_remember(args)
+        elif tool_name == "mnemosyne_shared_recall":
+            return self._handle_shared_recall(args)
+        elif tool_name == "mnemosyne_shared_forget":
+            return self._handle_shared_forget(args)
+        elif tool_name == "mnemosyne_shared_stats":
+            return self._handle_shared_stats(args)
+        elif tool_name == "mnemosyne_sleep":
+            return self._handle_sleep(args)
+        elif tool_name == "mnemosyne_stats":
+            return self._handle_stats(args)
+        elif tool_name == "mnemosyne_invalidate":
+            return self._handle_invalidate(args)
+        elif tool_name == "mnemosyne_validate":
+            return self._handle_validate(args)
+        elif tool_name == "mnemosyne_get":
+            return self._handle_get(args)
+        elif tool_name == "mnemosyne_triple_add":
+            return self._handle_triple_add(args)
+        elif tool_name == "mnemosyne_triple_query":
+            return self._handle_triple_query(args)
+        elif tool_name == "mnemosyne_triple_end":
+            return self._handle_triple_end(args)
+        elif tool_name == "mnemosyne_remember_canonical":
+            return self._handle_remember_canonical(args)
+        elif tool_name == "mnemosyne_recall_canonical":
+            return self._handle_recall_canonical(args)
+        elif tool_name == "mnemosyne_forget_canonical":
+            return self._handle_forget_canonical(args)
+        elif tool_name == "mnemosyne_apply_pending":
+            return self._handle_apply_pending(args)
+        elif tool_name == "mnemosyne_model_card":
+            return self._handle_model_card(args)
+        elif tool_name == "mnemosyne_model_refresh":
+            return self._handle_model_refresh(args)
+        elif tool_name == "mnemosyne_scratchpad_write":
+            return self._handle_scratchpad_write(args)
+        elif tool_name == "mnemosyne_scratchpad_read":
+            return self._handle_scratchpad_read(args)
+        elif tool_name == "mnemosyne_scratchpad_clear":
+            return self._handle_scratchpad_clear(args)
+        elif tool_name == "mnemosyne_export":
+            return self._handle_export(args)
+        elif tool_name == "mnemosyne_update":
+            return self._handle_update(args)
+        elif tool_name == "mnemosyne_forget":
+            return self._handle_forget(args)
+        elif tool_name == "mnemosyne_import":
+            return self._handle_import(args)
+        elif tool_name == "mnemosyne_diagnose":
+            return self._handle_diagnose(args)
+        elif tool_name == "mnemosyne_recall_diagnostics":
+            return self._handle_recall_diagnostics(args)
+        elif tool_name == "mnemosyne_task_progress":
+            return self._handle_task_progress(args)
+        elif tool_name == "mnemosyne_graph_query":
+            return self._handle_graph_query(args)
+        elif tool_name == "mnemosyne_graph_link":
+            return self._handle_graph_link(args)
+        elif tool_name.startswith("mnemosyne_sync_"):
+            return self._handle_sync_tool(tool_name, args)
+        elif tool_name.startswith("mnemosyne_persona_"):
+            return self._handle_persona_tool(tool_name, args)
+        else:
+            return json.dumps({"error": f"Unknown Mnemosyne tool: {tool_name}"})
 
     def _handle_sync_tool(self, tool_name: str, args: Dict[str, Any]) -> str:
         try:
@@ -1784,7 +2150,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 from mnemosyne.core.canonical import CanonicalStore
                 store = CanonicalStore(db_path=self._beam.db_path, conn=self._beam.conn)
                 self._beam.canonical = store
-            canonical_rows = _canonical_prefetch_rows(store, self._canonical_owner(), query, limit=max(2, min(top_k, 5)))
+            canonical_rows = _canonical_recall_rows(store, self._canonical_owner(), query, limit=max(2, min(top_k, 5)))
         except Exception:
             canonical_rows = []
         if canonical_rows:
@@ -2696,7 +3062,47 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         })
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-        self._turn_count = turn_number
+        with self._ensure_beam_access_lock():
+            self._turn_count = turn_number
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """Rebind session-scoped state after Hermes rotates the active session."""
+        del parent_session_id, rewound
+        new_session_id = str(new_session_id or "").strip()
+        if not new_session_id:
+            return
+
+        with self._ensure_beam_access_lock():
+            self._gateway_session_key = (
+                kwargs.get("gateway_session_key") or self._gateway_session_key
+            )
+            retry_args = getattr(self, "_retry_init_args", None)
+            if retry_args is not None:
+                _, retry_kwargs = retry_args
+                retry_kwargs = dict(retry_kwargs)
+                retry_kwargs["gateway_session_key"] = self._gateway_session_key
+                self._retry_init_args = (new_session_id, retry_kwargs)
+            previous_session_id, provider_session_id = self._rebind_session_locked(
+                new_session_id
+            )
+            if reset:
+                self._turn_count = 0
+                self._reflect_calls_this_session = 0
+
+        logger.debug(
+            "Mnemosyne session switched: %s -> %s%s",
+            previous_session_id,
+            provider_session_id,
+            " (state reset)" if reset else "",
+        )
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         # Bound the consolidation call so a slow LLM (e.g., a Hermes-routed
@@ -2707,20 +3113,44 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if not self._beam:
             return
         try:
-            skip = self._reserve_reflection_budget("session_end")
-            if skip is not None:
-                logger.info("Mnemosyne session-end sleep skipped: %s", json.dumps(skip))
-                return
             logger.info("Mnemosyne session end — running consolidation")
             timeout = self.SESSION_END_SLEEP_TIMEOUT_SECONDS
-            beam = self._beam
+            with self._ensure_beam_access_lock():
+                skip = self._reserve_reflection_budget_locked("session_end")
+                if skip is not None:
+                    logger.info("Mnemosyne session-end sleep skipped: %s", json.dumps(skip))
+                    return
+                beam = self._beam
+                if beam is None:
+                    return
+                sleep_args = {
+                    "session_id": beam.session_id,
+                    "db_path": beam.db_path,
+                    "author_id": beam.author_id,
+                    "author_type": beam.author_type,
+                    "channel_id": beam.channel_id,
+                }
+                canonical_owner_id = getattr(
+                    beam, "canonical_owner_id", "default"
+                )
+                agent_context = getattr(
+                    beam,
+                    "agent_context",
+                    getattr(self, "_agent_context", "primary"),
+                )
+                beam_lock = self._ensure_beam_access_lock()
 
             def _sleep_with_logging():
                 # Wrap the target so exceptions get logged at the same
                 # severity the previous synchronous version used, instead
                 # of bubbling out as an uncaught daemon-thread traceback.
                 try:
-                    beam.sleep()
+                    with beam_lock:
+                        BeamClass = _get_beam_class()
+                        sleep_beam = BeamClass(**sleep_args)
+                        sleep_beam.canonical_owner_id = canonical_owner_id
+                        sleep_beam.agent_context = agent_context
+                        sleep_beam.sleep()
                 except Exception as inner:
                     logger.debug("Mnemosyne session-end sleep failed: %s", inner)
 
@@ -2737,16 +3167,19 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             logger.debug("Mnemosyne session-end sleep failed: %s", e)
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
-        if not self._beam or action not in ("add", "replace"):
+        if action not in ("add", "replace"):
             return
         try:
-            scope = "global" if target == "user" else "session"
-            self._beam.remember(
-                content=content,
-                source=f"builtin_memory_{target}",
-                importance=0.7 if target == "user" else 0.5,
-                scope=scope,
-            )
+            with self._beam_session_scope("") as beam:
+                if beam is None:
+                    return
+                scope = "global" if target == "user" else "session"
+                beam.remember(
+                    content=content,
+                    source=f"builtin_memory_{target}",
+                    importance=0.7 if target == "user" else 0.5,
+                    scope=scope,
+                )
         except Exception as e:
             logger.debug("Mnemosyne mirror write failed: %s", e)
 
@@ -2788,6 +3221,19 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 unregister_hermes_host_llm()
             except Exception as exc:
                 logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
+        self._clear_provider_adapters()
+        if self._memory is not None:
+            try:
+                self._memory.close()
+            except Exception:
+                logger.debug("Mnemosyne: could not close wrapper", exc_info=True)
+        self._memory = None
+        if self._audit is not None:
+            try:
+                self._audit.close()
+            except Exception:
+                logger.debug("Mnemosyne: could not close audit log", exc_info=True)
+        self._audit = None
         self._beam = None
 
         # C13: decrement this instance's contribution to the module-level
@@ -2865,17 +3311,17 @@ def register(ctx):
         handler_fn=mnemosyne_command,
     )
 
-    # Register all tools (29 memory + 3 sync + 4 persona) so the agent can call them.
+    # Register the configured tools so the PluginManager surface matches memory
+    # provider discovery. The provider resolves HERMES_HOME before initialize().
     # Note: when loaded via memory provider discovery (plugins/memory/),
     # the ctx is a _ProviderCollector whose register_tool() is a no-op --
     # tools are surfaced through get_tool_schemas() via the memory manager
     # instead. This registration covers the standalone PluginManager path.
-    from .tools import ALL_TOOL_SCHEMAS
     from functools import partial
 
     global _provider
     _provider = MnemosyneMemoryProvider()
-    for _schema in ALL_TOOL_SCHEMAS:
+    for _schema in _provider.get_tool_schemas():
         _name = _schema["name"]
         # Sync tools route through SyncAdapter, persona tools through PersonaAdapter,
         # memory tools through main provider.

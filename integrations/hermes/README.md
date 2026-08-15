@@ -78,6 +78,24 @@ Returned context can include prior decisions, constraints, failure modes, projec
 
 `mnemosyne_sleep` compresses old working memories into episodic summaries. Think of it as a nightly cleanup that knows what to keep and what to summarize. The working set stays small. Recall stays sharp. Long-running agents don't drown in their own history.
 
+### Session lifecycle
+
+The provider follows Hermes session changes without requiring a provider restart. After
+`/new`, `/resume`, `/branch`, undo, or context compression, the active `BeamMemory`
+session is rebound before the next memory operation, keeping writes and tool calls
+attributed to the current conversation.
+
+Non-empty session IDs supplied to per-turn prefetch and sync calls scope that
+individual operation; empty values preserve the active session. A configured
+`gateway_session_key` remains the stable scope across both paths and across
+session changes, so a branch or compression switch does not adopt the child
+session ID.
+
+Provider lifecycle hooks are fail-soft. Database or disk failures during
+prefetch, turn sync, session-end or automatic consolidation, and wrapper or
+audit cleanup are logged and suppressed so Hermes can continue without a
+lifecycle exception surfacing to the user.
+
 ---
 
 ## Quickstart
@@ -92,6 +110,15 @@ hermes config set memory.provider mnemosyne
 hermes memory status
 ```
 
+To install only at the selected Hermes home without linking opted-in child
+profiles, use:
+
+```bash
+mnemosyne-hermes install --no-profile-links
+```
+
+The default continues to link opted-in child profiles for backward compatibility.
+
 That's it. The entry point in `mnemosyne-hermes` registers with Hermes' memory
 provider discovery system (`hermes_agent.memory_providers`). No symlinks. No
 directory copying. No plugin.yaml gymnastics. The provider surfaces
@@ -105,6 +132,52 @@ hermes memory status
 #   Provider:  mnemosyne
 #   Plugin:    installed ✓
 ```
+
+#### Selecting Hermes' interpreter
+
+`mnemosyne-hermes install` finds Hermes' Python by following the `hermes` launcher
+on PATH, through symlinks and through the `exec` handoff of a shell-wrapper
+launcher, and accepts the interpreter sitting beside it only when that directory
+is a real virtual environment. It then checks the known install roots
+(`$HERMES_HOME/hermes-agent`, `~/hermes-agent`, `/opt/hermes/hermes-agent`,
+`/usr/local/lib/hermes-agent`, `/usr/lib/hermes-agent`), which are held to the
+same bar.
+
+Wrapper resolution is deliberately bounded: it reads a limited prefix of the
+launcher, follows a limited number of hops, and understands a fixed set of forms
+(`exec /path/to/hermes`, a relative or bare target, and `env`/`VAR=val` prefixes).
+Anything outside that, such as `exec env -u VAR ...` or a launcher that starts
+Hermes without `exec`, is not followed, and discovery moves on to the install
+roots rather than guessing. Layouts that end there need `--python`.
+
+On the default path, if none of those yields a virtual environment the install
+stops rather than guessing. An interpreter that merely sits next to the launcher
+is usually a Homebrew or system Python, and installing `mnemosyne-hermes[all]`
+into it leaves Hermes' own environment untouched while reporting success. A
+Hermes installed outside a virtual environment therefore needs `--python`.
+
+`--no-bootstrap` is the deliberate exception. It already means "do not install
+anything into Hermes' venv", so there is no wrong-interpreter install left to
+prevent. When discovery finds nothing there, the installer says so, skips
+dependency validation, and continues. The plugin is linked, but nothing has
+confirmed that Hermes can import it, so a `--no-bootstrap` install is not a
+validated one. Verify it separately:
+
+```bash
+hermes memory status
+```
+
+Pass `--python` to skip discovery entirely when your layout is unusual or the
+wrong interpreter is being picked:
+
+```bash
+mnemosyne-hermes install --python /path/to/hermes/venv/bin/python
+mnemosyne-hermes install --dry-run          # shows which interpreter would be used
+```
+
+`--python` is authoritative in both install modes: it overrides discovery for a
+symlink install, and selects the site-packages a `--mode wrapper` install imports
+from.
 
 The installer also deploys the bundled `mnemosyne-memory-override` skill to
 `$HERMES_HOME/skills/memory/mnemosyne-memory-override/SKILL.md`. The skill is a
@@ -150,6 +223,11 @@ No required config. Everything defaults to `~/.mnemosyne/`. Optional overrides:
 | `MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT` | `800` | Assistant content truncation in `sync_turn()` (`0` = no limit) |
 | `MNEMOSYNE_FACT_RECALL_ENABLED` | `false` | Merge LLM-extracted facts into standard recall |
 | `MNEMOSYNE_PREFETCH_CONTENT_CHARS` | `0` | Per-memory prefetch content cap (`0` = full content) |
+| `MNEMOSYNE_PREFETCH_MIN_DISTINCTIVE_TOKENS` | `2` | Shared non-generic terms required for automatic prefetch injection |
+| `MNEMOSYNE_PREFETCH_MIN_QUERY_COVERAGE` | `0.30` | Minimum fraction of non-generic query terms covered by a prefetched memory |
+| `MNEMOSYNE_PREFETCH_CANONICAL_RARE_TOKEN_MAX_FREQUENCY` | `1` | Maximum canonical document frequency that permits a one-token match (`0` disables the exception) |
+| `MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS` | path-specific built-in canonical set | Complete replacement for the canonical generic-token set used by automatic and explicit canonical lookup; does not affect working/episodic prefetch |
+| `MNEMOSYNE_PREFETCH_CANONICAL_EXTRA_GENERIC_TOKENS` | _(empty)_ | Extra owner/deployment terms added to automatic canonical prefetch only |
 | `MNEMOSYNE_DEFAULT_SCOPE` | `session` | Default scope for remember (`global` enables cross-session immediate recall) |
 
 Or in `~/.hermes/config.yaml`:

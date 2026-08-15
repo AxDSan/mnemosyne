@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -78,6 +79,64 @@ class NoiseCandidate:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+_ALLOWED_HYGIENE_TABLES = {"working_memory", "memories", "episodic_memory"}
+_ALLOWED_HYGIENE_ACTIONS = {"delete", "archive", "keep", "flag"}
+
+
+def validate_hygiene_candidate(candidate_data: Any) -> None:
+    """Validate a raw hygiene candidate dict against the MCP contract.
+
+    Mirrors the schema checks in mnemosyne/mcp_tools.py:_handle_hygiene_clean
+    so that CLI and MCP reject the same malformed inputs before constructing
+    a NoiseCandidate.
+    """
+    if not isinstance(candidate_data, dict):
+        raise ValueError("candidate must be a JSON object")
+
+    for key in ("memory_id", "table_name"):
+        value = candidate_data.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"Missing required field '{key}': must be a non-empty string")
+
+    if candidate_data["table_name"] not in _ALLOWED_HYGIENE_TABLES:
+        raise ValueError(
+            f"'table_name' must be one of {sorted(_ALLOWED_HYGIENE_TABLES)}"
+        )
+
+    noise_score = candidate_data.get("noise_score", 0.0)
+    if isinstance(noise_score, bool) or not isinstance(noise_score, (int, float)):
+        raise ValueError("'noise_score' must be a finite number between 0 and 1")
+    if isinstance(noise_score, float) and not math.isfinite(noise_score):
+        raise ValueError("'noise_score' must be a finite number between 0 and 1")
+    if not 0 <= noise_score <= 1:
+        raise ValueError("'noise_score' must be a finite number between 0 and 1")
+
+    importance = candidate_data.get("importance", 0.5)
+    if isinstance(importance, bool) or not isinstance(importance, (int, float)):
+        raise ValueError("'importance' must be a finite number")
+    if isinstance(importance, float) and not math.isfinite(importance):
+        raise ValueError("'importance' must be a finite number")
+
+    content_length = candidate_data.get("content_length", 0)
+    if isinstance(content_length, bool) or not isinstance(content_length, int) or content_length < 0:
+        raise ValueError("'content_length' must be a non-negative integer")
+
+    for key in ("noise_reasons", "secret_flags"):
+        if key in candidate_data:
+            value = candidate_data[key]
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise ValueError(f"'{key}' must be a list of strings")
+
+    for key in ("content_preview", "source", "timestamp", "suggested_action"):
+        if key in candidate_data and not isinstance(candidate_data[key], str):
+            raise ValueError(f"'{key}' must be a string")
+
+    if candidate_data.get("suggested_action", "keep") not in _ALLOWED_HYGIENE_ACTIONS:
+        raise ValueError(
+            f"'suggested_action' must be one of {sorted(_ALLOWED_HYGIENE_ACTIONS)}"
+        )
 
 
 @dataclass
