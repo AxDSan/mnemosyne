@@ -583,7 +583,7 @@ def test_status_mismatch_names_interpreters_and_emits_a_runnable_command(
 def _two_venvs_over_one_base(tmp_path):
     """Two virtualenvs whose bin/python symlink to a single base interpreter."""
     base = _fake_python(tmp_path / "base")
-    hermes_venv = tmp_path / "hermes-env" / "venv"
+    hermes_venv = tmp_path / "hermes env" / "venv"  # spaces: quoting matters
     this_venv = tmp_path / "this-env" / "venv"
     for venv in (hermes_venv, this_venv):
         (venv / "bin").mkdir(parents=True, exist_ok=True)
@@ -654,8 +654,10 @@ def test_provider_diagnostic_reports_two_venvs_over_one_base(
 
     err = capsys.readouterr().err
     assert f"Hermes' Python: {hermes_python}" in err
+    # The venv path contains a space, so the remediation is only runnable quoted.
     assert (
-        f"FIX: Run: {hermes_python} -m pip install -U 'mnemosyne-hermes[all]'" in err
+        f"FIX: Run: {shlex.quote(str(hermes_python))}"
+        " -m pip install -U 'mnemosyne-hermes[all]'" in err
     )
 
 

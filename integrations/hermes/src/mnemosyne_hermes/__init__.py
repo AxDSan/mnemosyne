@@ -3281,8 +3281,10 @@ def register_memory_provider(ctx):
                     f"[mnemosyne-hermes]   Hermes' Python: {_hp} ({_ver})",
                     file=_sys.stderr,
                 )
+                import shlex as _shlex
                 print(
-                    f"[mnemosyne-hermes]   FIX: Run: {_hp} -m pip install -U 'mnemosyne-hermes[all]'",
+                    f"[mnemosyne-hermes]   FIX: Run: {_shlex.quote(str(_hp))}"
+                    " -m pip install -U 'mnemosyne-hermes[all]'",
                     file=_sys.stderr,
                 )
         except Exception:
