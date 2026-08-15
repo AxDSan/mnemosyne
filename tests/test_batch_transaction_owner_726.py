@@ -4,6 +4,8 @@ import contextlib
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 import mnemosyne.core.beam as beam_module
 from mnemosyne.batch_tool import apply_beam_batch, validate_batch_operations
 from mnemosyne.core.beam import BeamMemory, _deferred_commits, _guarded_transaction
@@ -310,51 +312,37 @@ def test_get_context_preserves_caller_owned_transaction_without_nested_begin(tmp
     assert conn.execute("SELECT COUNT(*) FROM caller_marker").fetchone()[0] == 0
 
 
-def test_forced_active_vec_path_defers_commit_inside_caller_owned_batch(
+def test_active_sqlite_vec_path_defers_commit_inside_caller_owned_batch(
     tmp_path, monkeypatch
 ):
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("sqlite_vec")
     beam = _beam(tmp_path)
+    if not beam_module._wm_vec_available(beam.conn):
+        pytest.skip("sqlite-vec vec_working table unavailable")
+
     beam.conn.execute("CREATE TABLE caller_marker (value TEXT NOT NULL)")
-    beam.conn.execute("CREATE TABLE vector_probe (memory_id TEXT NOT NULL)")
     beam.conn.commit()
 
-    vec_calls = []
     real_commits = []
     original_real_commit = beam_module._BeamConnection._real_commit
-
-    def forced_vec_insert(conn, table, rowid, embedding, *, commit=True):
-        vec_calls.append((table, commit))
-        memory_id = conn.execute(
-            "SELECT id FROM working_memory WHERE rowid = ?", (rowid,)
-        ).fetchone()[0]
-        conn.execute("INSERT INTO vector_probe VALUES (?)", (memory_id,))
-        if commit:
-            conn.commit()
 
     def observing_real_commit(self):
         real_commits.append(True)
         return original_real_commit(self)
 
-    class SyntheticEmbedding:
-        def __array__(self, dtype=None, copy=None):
-            # Some CI environments have NumPy, so support its conversion at
-            # the fallback-store boundary before vec_working is reached.
-            numpy = __import__("numpy")
-            return numpy.zeros(beam_module.EMBEDDING_DIM, dtype=dtype)
-
-        def tolist(self):
-            # Other CI environments deliberately omit NumPy; serialize() then
-            # consumes this same real-vector-shaped interface directly.
-            return [0.0] * beam_module.EMBEDDING_DIM
+    # Keep the embedding backend deterministic while exercising production's
+    # real float conversion, sqlite-vec SQL, and vec_working virtual table.
+    embedding = np.array(
+        [1.0] + [0.0] * (beam_module.EMBEDDING_DIM - 1), dtype=np.float32
+    )
 
     monkeypatch.setattr(beam_module._embeddings, "available", lambda: True)
     monkeypatch.setattr(
         beam_module._embeddings,
         "embed",
-        lambda contents: [SyntheticEmbedding() for _ in contents],
+        lambda contents: [embedding.copy() for _ in contents],
     )
-    monkeypatch.setattr(beam_module, "_wm_vec_available", lambda conn: True)
-    monkeypatch.setattr(beam_module, "_vec_table_insert", forced_vec_insert)
     monkeypatch.setattr(
         beam_module._BeamConnection, "_real_commit", observing_real_commit
     )
@@ -368,17 +356,57 @@ def test_forced_active_vec_path_defers_commit_inside_caller_owned_batch(
     )
 
     assert result["status"] == "ok"
-    assert vec_calls == [("vec_working", True)]
     assert real_commits == []
     assert beam.conn.in_transaction is True
+    memory_id = result["results"][0]["memory_id"]
+    rowid = beam.conn.execute(
+        "SELECT rowid FROM working_memory WHERE id = ?", (memory_id,)
+    ).fetchone()[0]
+    assert (
+        beam.conn.execute(
+            "SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?", (memory_id,)
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        beam.conn.execute(
+            "SELECT COUNT(*) FROM vec_working WHERE rowid = ?", (rowid,)
+        ).fetchone()[0]
+        == 1
+    )
+
     with sqlite3.connect(beam.db_path) as outside:
         assert outside.execute("SELECT COUNT(*) FROM caller_marker").fetchone()[0] == 0
-        assert outside.execute("SELECT COUNT(*) FROM vector_probe").fetchone()[0] == 0
+        assert (
+            outside.execute(
+                "SELECT COUNT(*) FROM working_memory WHERE id = ?", (memory_id,)
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            outside.execute(
+                "SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?",
+                (memory_id,),
+            ).fetchone()[0]
+            == 0
+        )
 
     beam.conn.rollback()
-    assert beam.conn.execute("SELECT COUNT(*) FROM vector_probe").fetchone()[0] == 0
-
-    beam.remember("#726 forced active vec direct")
-    assert vec_calls[-1] == ("vec_working", True)
-    with sqlite3.connect(beam.db_path) as outside:
-        assert outside.execute("SELECT COUNT(*) FROM vector_probe").fetchone()[0] == 1
+    assert (
+        beam.conn.execute(
+            "SELECT COUNT(*) FROM working_memory WHERE id = ?", (memory_id,)
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        beam.conn.execute(
+            "SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?", (memory_id,)
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        beam.conn.execute(
+            "SELECT COUNT(*) FROM vec_working WHERE rowid = ?", (rowid,)
+        ).fetchone()[0]
+        == 0
+    )
