@@ -215,6 +215,9 @@ def test_direct_wrapper_caller_decides_update_and_forget_rows(
     expected = 0 if operation == "forget" and decision == "commit" else 1
     assert _row_count(memory.conn, "working_memory", memory_id) == expected
     assert _row_count(memory.conn, "memories", memory_id) == expected
+    if operation == "update" and decision == "commit":
+        assert _contents(memory.conn, "working_memory", memory_id) == "#726 caller changed"
+        assert _contents(memory.conn, "memories", memory_id) == "#726 caller changed"
     if operation == "update" and decision == "rollback":
         assert _contents(memory.conn, "working_memory", memory_id) == original_content
         assert _contents(memory.conn, "memories", memory_id) == original_content
