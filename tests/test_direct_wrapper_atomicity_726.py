@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 import mnemosyne.core.beam as beam_module
+from mnemosyne.core.beam import BeamMemory
 from mnemosyne.core.memory import Mnemosyne
 
 
@@ -288,3 +289,47 @@ def test_direct_wrapper_vector_path_does_not_commit_a_caller_transaction(
     memory.conn.rollback()
     assert _row_count(memory.conn, "working_memory", memory_id) == 0
     assert _row_count(memory.conn, "memories", memory_id) == 0
+
+
+def test_direct_wrapper_republishes_live_core_connection_after_beam_other_path(
+    tmp_path, monkeypatch
+):
+    path_a = Path(tmp_path) / "a.db"
+    path_b = Path(tmp_path) / "b.db"
+    first = Mnemosyne(session_id="first-a", db_path=path_a)
+    BeamMemory(session_id="standalone-b", db_path=path_b)
+
+    second = Mnemosyne(session_id="second-a", db_path=path_a)
+
+    assert second.conn is first.conn
+    assert second.conn is second.beam.conn
+    assert second.conn.execute("SELECT 1").fetchone()[0] == 1
+    memory_id = second.remember("#726 A B A cache repair")
+    assert _row_count(second.conn, "working_memory", memory_id) == 1
+    assert _row_count(second.conn, "memories", memory_id) == 1
+
+    original_remember = second.beam.remember
+
+    def fail_after_beam(*args, **kwargs):
+        original_remember(*args, **kwargs)
+        raise RuntimeError("forced A B A BEAM failure")
+
+    monkeypatch.setattr(second.beam, "remember", fail_after_beam)
+    with pytest.raises(RuntimeError, match="forced A B A BEAM failure"):
+        second.remember("#726 A B A rollback")
+    assert second.conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 1
+    assert second.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1
+
+
+def test_owner_forget_removes_legacy_only_row_but_foreign_caller_cannot(tmp_path):
+    path = Path(tmp_path) / "legacy-only-forget.db"
+    owner = Mnemosyne(session_id="owner", db_path=path)
+    memory_id = owner.remember("#726 legacy-only owner row")
+    owner.conn.execute("DELETE FROM working_memory WHERE id = ?", (memory_id,))
+    owner.conn.commit()
+    caller = Mnemosyne(session_id="other", db_path=path)
+
+    assert caller.forget(memory_id) is False
+    assert _row_count(caller.conn, "memories", memory_id) == 1
+    assert owner.forget(memory_id) is False
+    assert _row_count(owner.conn, "memories", memory_id) == 0

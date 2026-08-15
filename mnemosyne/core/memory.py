@@ -92,11 +92,11 @@ def _get_connection(db_path = None) -> sqlite3.Connection:
         except Exception:
             pass
         _thread_local.db_path = str(path)
-        # Mnemosyne's historic public ``conn`` is the core module cache. Keep
-        # that identity while making BEAM use the same owner-aware connection
-        # for direct-wrapper durable dual writes.
-        beam_module._thread_local.conn = _thread_local.conn
-        beam_module._thread_local.db_path = str(path)
+    # BeamMemory consults its own TLS cache during construction. Re-publish on
+    # every successful core lookup, not only reconnection, because a standalone
+    # BeamMemory for another path may have replaced that cache in the meantime.
+    beam_module._thread_local.conn = _thread_local.conn
+    beam_module._thread_local.db_path = str(path)
     return _thread_local.conn
 
 
@@ -643,13 +643,28 @@ class Mnemosyne:
                 (memory_id, self.session_id),
             ).fetchone()
             if owner is None:
-                return False
-            cursor.execute(
-                "DELETE FROM memories WHERE id = ? AND session_id = ?",
-                (memory_id, owner["session_id"]),
-            )
-            self.conn.commit()
-            result = self.beam.forget_working(memory_id)
+                # Trimming removes only the BEAM working row. Preserve the
+                # historical owner-only legacy delete for that orphaned mirror,
+                # while never authorizing a foreign session through fallback.
+                legacy_owner = cursor.execute(
+                    "SELECT 1 FROM memories WHERE id = ? AND session_id = ?",
+                    (memory_id, self.session_id),
+                ).fetchone()
+                if legacy_owner is None:
+                    return False
+                cursor.execute(
+                    "DELETE FROM memories WHERE id = ? AND session_id = ?",
+                    (memory_id, self.session_id),
+                )
+                self.conn.commit()
+                result = False
+            else:
+                cursor.execute(
+                    "DELETE FROM memories WHERE id = ? AND session_id = ?",
+                    (memory_id, owner["session_id"]),
+                )
+                self.conn.commit()
+                result = self.beam.forget_working(memory_id)
         self._emit_wrapper("MEMORY_INVALIDATED", memory_id)
         return result
 
