@@ -2597,7 +2597,7 @@ class TestUpdateCrossSessionAuthorization:
         conn.close()
 
         # Initializing BeamMemory runs the schema migrations.
-        beam = BeamMemory(session_id="session-a", db_path=str(temp_db))
+        BeamMemory(session_id="session-a", db_path=str(temp_db))
 
         conn = sqlite3.connect(str(temp_db))
         scope = conn.execute(

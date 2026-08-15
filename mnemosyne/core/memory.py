@@ -630,7 +630,6 @@ class Mnemosyne:
         )
 
         # Legacy mirror: best-effort, scoped to this session's rows only.
-        legacy_ok = False
         cursor = self.conn.cursor()
         updates = []
         params = []
@@ -648,7 +647,6 @@ class Mnemosyne:
                 params
             )
             self.conn.commit()
-            legacy_ok = cursor.rowcount > 0
 
         if beam_ok:
             self._emit_wrapper(
