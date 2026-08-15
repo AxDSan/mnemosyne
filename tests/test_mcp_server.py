@@ -18,6 +18,7 @@ from mnemosyne.core.beam import BeamMemory
 # Test tool schemas
 from mnemosyne.mcp_tools import (
     TOOLS, get_tool_definitions, handle_tool_call, _create_instance,
+    _TOOL_HANDLERS,
 )
 
 
@@ -1285,12 +1286,17 @@ print(json.dumps({"result": result, "after": after}))
         assert not mnemosyne_home.exists()
 
     def test_get_tool_definitions_returns_all(self):
-        """get_tool_definitions returns all registered tools."""
+        """get_tool_definitions returns every tool with a dispatch handler.
+
+        Schemas without an MCP handler (see #728) must not be advertised:
+        they would appear in ``tools/list`` but fail ``tools/call``.
+        """
         tools = get_tool_definitions()
         names = [t["name"] for t in tools]
-        assert len(tools) == len(TOOLS)
         assert len(names) == len(set(names))
         assert "mnemosyne_remember" in names
+        handler_names = set(_TOOL_HANDLERS)
+        assert set(names) == handler_names
 
     def test_tool_definitions_convertible_to_tool_pydantic(self):
         """Tool dict definitions must be compatible with the ``mcp`` SDK 2.x Tool Pydantic model.

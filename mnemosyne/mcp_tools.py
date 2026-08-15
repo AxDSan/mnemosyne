@@ -1183,8 +1183,13 @@ def handle_tool_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def get_tool_definitions() -> List[Dict[str, Any]]:
-    """Return all tool definitions for MCP server registration."""
-    return TOOLS
+    """Return tool definitions for MCP server registration.
+
+    Only tools with a dispatch handler are advertised. A schema without a
+    handler would be selectable in ``tools/list`` but would fail every
+    ``tools/call`` with ``Unknown tool``, so it is filtered out here (#728).
+    """
+    return [t for t in TOOLS if t["name"] in _TOOL_HANDLERS]
 
 
 # Keep the exact pre-lazy-import star-import surface.  ``Mnemosyne`` remains
