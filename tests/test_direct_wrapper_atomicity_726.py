@@ -304,9 +304,15 @@ def test_direct_wrapper_republishes_live_core_connection_after_beam_other_path(
     assert second.conn is first.conn
     assert second.conn is second.beam.conn
     assert second.conn.execute("SELECT 1").fetchone()[0] == 1
-    memory_id = second.remember("#726 A B A cache repair")
+    content = "#726 A B A cache repair recall smoke"
+    memory_id = second.remember(content)
     assert _row_count(second.conn, "working_memory", memory_id) == 1
     assert _row_count(second.conn, "memories", memory_id) == 1
+    recalled = second.recall("A B A cache repair", top_k=5)
+    assert any(
+        result["id"] == memory_id and result["content"] == content
+        for result in recalled
+    )
 
     original_remember = second.beam.remember
 
