@@ -182,7 +182,8 @@ def test_direct_wrapper_caller_decides_update_and_forget_rows(
     tmp_path, operation, decision
 ):
     memory = _memory(tmp_path)
-    memory_id = memory.remember(f"#726 caller {operation}")
+    original_content = f"#726 caller {operation} original"
+    memory_id = memory.remember(original_content)
     memory.conn.execute(
         "INSERT INTO memories (id, content, session_id) VALUES ('marker', 'marker', ?)",
         (memory.session_id,),
@@ -191,10 +192,40 @@ def test_direct_wrapper_caller_decides_update_and_forget_rows(
         memory.update(memory_id, content="#726 caller changed")
     else:
         memory.forget(memory_id)
+    if operation == "update":
+        # The caller's transaction owns visibility as well as final outcome.
+        with sqlite3.connect(memory.db_path) as outside:
+            assert _contents(outside, "working_memory", memory_id) == original_content
+            assert _contents(outside, "memories", memory_id) == original_content
     getattr(memory.conn, decision)()
     expected = 0 if operation == "forget" and decision == "commit" else 1
     assert _row_count(memory.conn, "working_memory", memory_id) == expected
     assert _row_count(memory.conn, "memories", memory_id) == expected
+    if operation == "update" and decision == "rollback":
+        assert _contents(memory.conn, "working_memory", memory_id) == original_content
+        assert _contents(memory.conn, "memories", memory_id) == original_content
+
+
+def test_direct_wrapper_cross_session_forget_removes_global_dual_rows(tmp_path):
+    path = Path(tmp_path) / "global-forget.db"
+    creator = Mnemosyne(session_id="session-a", db_path=path)
+    memory_id = creator.remember("#726 global forget", scope="global")
+    caller = Mnemosyne(session_id="session-b", db_path=path)
+
+    assert caller.forget(memory_id) is True
+    assert _row_count(caller.conn, "working_memory", memory_id) == 0
+    assert _row_count(caller.conn, "memories", memory_id) == 0
+
+
+def test_direct_wrapper_cross_session_forget_preserves_private_rows(tmp_path):
+    path = Path(tmp_path) / "private-forget.db"
+    creator = Mnemosyne(session_id="session-a", db_path=path)
+    memory_id = creator.remember("#726 private forget")
+    caller = Mnemosyne(session_id="session-b", db_path=path)
+
+    assert caller.forget(memory_id) is False
+    assert _row_count(caller.conn, "working_memory", memory_id) == 1
+    assert _row_count(caller.conn, "memories", memory_id) == 1
 
 
 def test_direct_wrapper_vector_path_does_not_commit_a_caller_transaction(

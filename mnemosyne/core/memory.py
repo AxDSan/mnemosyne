@@ -26,7 +26,8 @@ import os
 logger = logging.getLogger(__name__)
 
 from mnemosyne.core import embeddings as _embeddings
-from mnemosyne.core.beam import BeamMemory, _deferred_commits, init_beam
+from mnemosyne.core import beam as beam_module
+from mnemosyne.core.beam import BeamMemory, _BeamConnection, _deferred_commits, init_beam
 _thread_local = threading.local()
 
 # Default data directory
@@ -62,7 +63,9 @@ def _get_connection(db_path = None) -> sqlite3.Connection:
     path = Path(db_path) if db_path else _default_db_path()
     if not hasattr(_thread_local, 'conn') or _thread_local.conn is None or getattr(_thread_local, 'db_path', None) != str(path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        _thread_local.conn = sqlite3.connect(str(path), check_same_thread=False)
+        _thread_local.conn = sqlite3.connect(
+            str(path), check_same_thread=False, factory=_BeamConnection
+        )
         _thread_local.conn.row_factory = sqlite3.Row
         _thread_local.conn.execute("PRAGMA journal_mode=WAL")
         _thread_local.conn.execute("PRAGMA busy_timeout=5000")
@@ -75,6 +78,11 @@ def _get_connection(db_path = None) -> sqlite3.Connection:
         except Exception:
             pass
         _thread_local.db_path = str(path)
+        # Mnemosyne's historic public ``conn`` is the core module cache. Keep
+        # that identity while making BEAM use the same owner-aware connection
+        # for direct-wrapper durable dual writes.
+        beam_module._thread_local.conn = _thread_local.conn
+        beam_module._thread_local.db_path = str(path)
     return _thread_local.conn
 
 
@@ -218,10 +226,9 @@ class Mnemosyne:
                                author_id=author_id, author_type=author_type,
                                channel_id=channel_id,
                                event_emitter=self._stream_emit)
-        # Direct wrapper mutations dual-write legacy rows and BEAM rows. They
-        # must share BEAM's owner-aware connection so nested commits defer and
-        # caller-owned transactions use a savepoint.
-        self.conn = self.beam.conn
+        # ``self.conn`` remains the core module cache. _get_connection
+        # coordinates it with BEAM, preserving core connection identity while
+        # direct wrappers dual-write through one transaction-capable handle.
 
     # ─── Phase 8: Streaming ─────────────────────────────────────────
 
@@ -611,8 +618,22 @@ class Mnemosyne:
         """Delete a memory by ID from legacy table and working_memory."""
         with _deferred_commits(self.conn):
             cursor = self.conn.cursor()
-            cursor.execute("DELETE FROM memories WHERE id = ? AND session_id = ?",
-                          (memory_id, self.session_id))
+            # Authorize from the authoritative BEAM row before deleting either
+            # representation. A global row may be removed cross-session, but
+            # its legacy mirror belongs to the creating session, not the caller.
+            owner = cursor.execute(
+                """
+                SELECT session_id FROM working_memory
+                WHERE id = ? AND (session_id = ? OR scope = 'global')
+                """,
+                (memory_id, self.session_id),
+            ).fetchone()
+            if owner is None:
+                return False
+            cursor.execute(
+                "DELETE FROM memories WHERE id = ? AND session_id = ?",
+                (memory_id, owner["session_id"]),
+            )
             self.conn.commit()
             result = self.beam.forget_working(memory_id)
         self._emit_wrapper("MEMORY_INVALIDATED", memory_id)
