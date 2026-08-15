@@ -51,8 +51,23 @@ def test_embed_passes_list_and_returns_fixed_dim(monkeypatch):
 def test_embed_fixed_dim_independent_of_text_length(monkeypatch):
     _fake_embed_module(monkeypatch)
 
-    shapes = {shmr._embed("short").shape[0] for t in ("a", "long text here", "finished")}
+    shapes = {
+        shmr._embed(t).shape[0]
+        for t in ("a", "long text here", "finished")
+    }
     assert shapes == {shmr.EMBEDDING_DIM}
+
+
+def test_embed_falls_back_to_zero_vector_for_missing_or_empty_results(monkeypatch):
+    expected = np.zeros(shmr.EMBEDDING_DIM, dtype=np.float32)
+
+    for response in (None, np.empty((0, shmr.EMBEDDING_DIM), dtype=np.float32)):
+        monkeypatch.setattr(shmr._embeddings, "embed", lambda texts: response)
+        emb = shmr._embed("finished")
+
+        assert emb.shape == (shmr.EMBEDDING_DIM,)
+        assert emb.dtype == np.float32
+        np.testing.assert_array_equal(emb, expected)
 
 
 def test_cluster_by_similarity_tolerates_variable_length_texts(monkeypatch):
