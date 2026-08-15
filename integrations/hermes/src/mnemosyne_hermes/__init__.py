@@ -3266,11 +3266,11 @@ def register_memory_provider(ctx):
             f"[mnemosyne-hermes]   Python: {_sys.version!r}",
             file=_sys.stderr,
         )
-        # Try to detect Hermes' Python for version mismatch diagnostics
+        # Try to detect Hermes' Python for environment mismatch diagnostics
         try:
-            from .install import _find_hermes_python
+            from .install import _find_hermes_python, _hermes_python_mismatch
             _hp = _find_hermes_python()
-            if _hp and _hp.resolve() != Path(_sys.executable).resolve():
+            if _hp and _hermes_python_mismatch(_hp):
                 import subprocess as _sp
                 _r = _sp.run(
                     [str(_hp), "--version"],

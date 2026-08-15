@@ -578,3 +578,115 @@ def test_status_mismatch_names_interpreters_and_emits_a_runnable_command(
         in out
     )
     assert "→ Run: 3.12.13" not in out
+
+
+def _two_venvs_over_one_base(tmp_path):
+    """Two virtualenvs whose bin/python symlink to a single base interpreter."""
+    base = _fake_python(tmp_path / "base")
+    hermes_venv = tmp_path / "hermes-env" / "venv"
+    this_venv = tmp_path / "this-env" / "venv"
+    for venv in (hermes_venv, this_venv):
+        (venv / "bin").mkdir(parents=True, exist_ok=True)
+        (venv / "pyvenv.cfg").write_text("home = /base\n", encoding="utf-8")
+        (venv / "bin" / "python").symlink_to(base)
+    hermes_python = hermes_venv / "bin" / "python"
+    this_python = this_venv / "bin" / "python"
+    # The premise: resolving really does collapse them onto one binary.
+    assert hermes_python.resolve() == this_python.resolve() == base
+    return hermes_venv, hermes_python, this_venv, this_python
+
+
+def test_hermes_python_mismatch_normalises_a_detour_spelling(tmp_path, monkeypatch):
+    """`<venv>/bin/../bin/python` names the same environment as `<venv>/bin/python`.
+
+    Deriving the root with `.parent.parent` before normalising yields
+    `<venv>/bin/..`, which names `<venv>` but does not compare equal to it, so
+    one environment is reported as two.
+    """
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    python = venv / "bin" / "python"
+    python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    detour = venv / "bin" / ".." / "bin" / "python"
+
+    monkeypatch.setattr(sys, "prefix", str(venv))
+
+    assert install._hermes_python_mismatch(python) is False
+    assert install._hermes_python_mismatch(detour) is False
+    # A genuinely different environment must still be reported.
+    other = tmp_path / "other" / "venv"
+    (other / "bin").mkdir(parents=True)
+    assert install._hermes_python_mismatch(other / "bin" / "python") is True
+
+
+def test_provider_diagnostic_reports_two_venvs_over_one_base(
+    tmp_path, monkeypatch, capsys
+):
+    """#709: the provider's failure diagnostic compared resolved interpreter paths.
+
+    A venv's bin/python is a symlink to the base interpreter it was created
+    from, so resolving collapsed two distinct environments onto that one binary
+    and suppressed the diagnostic in exactly the case it exists to report.
+    """
+    if sys.platform.startswith("win32"):
+        pytest.skip("POSIX symlink test")
+    _, hermes_python, this_venv, this_python = _two_venvs_over_one_base(tmp_path)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("construction failed for test")
+
+    class _Ctx:
+        def register_memory_provider(self, provider):
+            raise AssertionError("must not register when construction fails")
+
+    monkeypatch.setattr(mnemosyne_hermes, "MnemosyneMemoryProvider", _boom)
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kw: hermes_python)
+    # Both point at the other venv. The old check compared resolved interpreter
+    # paths, which are identical for these two venvs, so it prints nothing and
+    # the test fails without the fix. If sys.executable kept pointing at the
+    # real pytest interpreter, the old check would fire anyway and the test
+    # would pass with or without the fix.
+    monkeypatch.setattr(sys, "executable", str(this_python))
+    monkeypatch.setattr(sys, "prefix", str(this_venv))
+
+    with pytest.raises(RuntimeError, match="construction failed for test"):
+        mnemosyne_hermes.register_memory_provider(_Ctx())
+
+    err = capsys.readouterr().err
+    assert f"Hermes' Python: {hermes_python}" in err
+    assert (
+        f"FIX: Run: {hermes_python} -m pip install -U 'mnemosyne-hermes[all]'" in err
+    )
+
+
+def test_provider_diagnostic_stays_quiet_for_one_environment(
+    tmp_path, monkeypatch, capsys
+):
+    """The control: one environment must produce no interpreter diagnostic.
+
+    This passes before and after the change, so it is a guard rather than
+    evidence of the fix. It exists to catch a check that reports a mismatch
+    unconditionally.
+    """
+    if sys.platform.startswith("win32"):
+        pytest.skip("POSIX symlink test")
+    hermes_venv, hermes_python, _, _ = _two_venvs_over_one_base(tmp_path)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("construction failed for test")
+
+    class _Ctx:
+        def register_memory_provider(self, provider):
+            raise AssertionError("must not register when construction fails")
+
+    monkeypatch.setattr(mnemosyne_hermes, "MnemosyneMemoryProvider", _boom)
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kw: hermes_python)
+    monkeypatch.setattr(sys, "executable", str(hermes_python))
+    monkeypatch.setattr(sys, "prefix", str(hermes_venv))
+
+    with pytest.raises(RuntimeError, match="construction failed for test"):
+        mnemosyne_hermes.register_memory_provider(_Ctx())
+
+    err = capsys.readouterr().err
+    assert "Hermes' Python:" not in err
+    assert "FIX: Run:" not in err

@@ -1035,8 +1035,16 @@ def _hermes_python_mismatch(hermes_python: Path) -> bool:
     ``parent.parent``) instead of resolved interpreter paths: separate venvs
     created over one base interpreter resolve to the same binary while keeping
     different site-packages, so a resolved-path comparison misses the mismatch.
+
+    Both sides are normalised with ``os.path.normpath`` first. It collapses
+    ``.`` and ``..`` lexically and leaves symlinks alone, so a path spelled
+    ``<venv>/bin/../bin/python`` still yields ``<venv>`` rather than
+    ``<venv>/bin/..``, which names the same directory but compares unequal and
+    would report one environment as two. Normalising lexically is what keeps
+    venv identity intact, since following the symlink is the original defect.
     """
-    return Path(hermes_python).parent.parent != Path(sys.prefix)
+    hermes_root = Path(os.path.normpath(hermes_python)).parent.parent
+    return hermes_root != Path(os.path.normpath(sys.prefix))
 
 
 def _link_profile(profile_home: Path, source: Path, *, force: bool = False) -> Optional[Path]:
