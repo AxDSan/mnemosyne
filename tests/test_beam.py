@@ -912,6 +912,68 @@ class TestWorkingMemory:
         ).fetchone()
         assert row["active"] == 0
 
+    def test_stored_offset_bearing_valid_until_chronologically_filtered(self, temp_db, non_utc_tz):
+        """#525: read filters judge stored offset-bearing / space-separated
+        values chronologically even when the write boundary did not
+        canonicalize them (e.g. rows imported before the fix).
+
+        Values are chosen to be lexically misleading: a future instant at
+        UTC-05 reads as an earlier wall-clock time than aware-UTC now, and a
+        past instant at UTC+05 reads as a later one. A space-separated naive
+        future value sorts before any aware-UTC ``T``-separated string. A
+        lexical filter would drop the still-valid rows and surface the
+        expired one; the chronological julianday filter must do the opposite.
+        """
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        future_mid = beam.remember("offset stored future", source="test", importance=0.9)
+        past_mid = beam.remember("offset stored past", source="test", importance=0.9)
+        space_mid = beam.remember("space naive stored", source="test", importance=0.9)
+        beam.conn.execute(
+            "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+            (
+                (datetime.now(timezone.utc) + timedelta(hours=1)).astimezone(
+                    timezone(timedelta(hours=-5))
+                ).isoformat(),
+                future_mid,
+            ),
+        )
+        beam.conn.execute(
+            "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+            (
+                (datetime.now(timezone.utc) - timedelta(hours=1)).astimezone(
+                    timezone(timedelta(hours=5))
+                ).isoformat(),
+                past_mid,
+            ),
+        )
+        beam.conn.execute(
+            "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+            (
+                (datetime.now(timezone.utc) + timedelta(hours=2)).replace(
+                    tzinfo=None
+                ).strftime("%Y-%m-%d %H:%M:%S"),
+                space_mid,
+            ),
+        )
+        beam.conn.commit()
+
+        # Sanity: these stored values genuinely mislead a lexical filter.
+        now = datetime.now(timezone.utc).isoformat()
+        lexical = {r["id"] for r in beam.conn.execute(
+            "SELECT id FROM working_memory WHERE (valid_until IS NULL OR valid_until > ?)",
+            (now,),
+        ).fetchall()}
+        assert future_mid not in lexical
+        assert past_mid in lexical
+        assert space_mid not in lexical
+
+        ctx = {r["id"] for r in beam.get_context(limit=10)}
+        assert future_mid in ctx
+        assert space_mid in ctx
+        assert past_mid not in ctx
+        assert future_mid in {r["id"] for r in beam.recall("offset stored future", top_k=10)}
+        assert past_mid not in {r["id"] for r in beam.recall("offset stored past", top_k=10)}
+
     def test_offset_bearing_valid_until_normalized_to_utc(self, temp_db, non_utc_tz):
         """#525: offset-bearing valid_until is canonicalized to UTC on write.
 
@@ -1573,6 +1635,102 @@ class TestExportImport:
             stats = target.import_from_file(str(export_path))
             assert stats["legacy"]["inserted"] >= 1
             assert stats["beam"]["working_memory"]["inserted"] >= 1
+
+    def test_import_from_dict_canonicalizes_valid_until(self, temp_db):
+        """#525: import_from_dict must normalize offset-bearing valid_until
+        to aware UTC on both working and episodic rows before the SQL
+        chronological predicates rely on the stored value."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        future_offset = (datetime.now(timezone.utc) + timedelta(hours=4)).astimezone(
+            timezone(timedelta(hours=-2))
+        )
+        past_offset = (datetime.now(timezone.utc) - timedelta(hours=4)).astimezone(
+            timezone(timedelta(hours=14))
+        )
+        payload = {
+            "working_memory": [
+                {
+                    "id": "wm-future", "content": "imported future", "source": "test",
+                    "timestamp": "2026-01-01T00:00:00+00:00", "session_id": "s1",
+                    "importance": 0.9, "metadata_json": "{}",
+                    "valid_until": future_offset.isoformat(),
+                },
+                {
+                    "id": "wm-past", "content": "imported past", "source": "test",
+                    "timestamp": "2026-01-01T00:00:00+00:00", "session_id": "s1",
+                    "importance": 0.9, "metadata_json": "{}",
+                    "valid_until": past_offset.isoformat(),
+                },
+                {
+                    "id": "wm-space", "content": "imported space naive", "source": "test",
+                    "timestamp": "2026-01-01T00:00:00+00:00", "session_id": "s1",
+                    "importance": 0.9, "metadata_json": "{}",
+                    "valid_until": (datetime.now(timezone.utc) + timedelta(hours=2)).replace(
+                        tzinfo=None
+                    ).strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            ],
+            "episodic_memory": [
+                {
+                    "id": "em-future", "content": "imported episodic future", "source": "test",
+                    "timestamp": "2026-01-01T00:00:00+00:00", "session_id": "s1",
+                    "importance": 0.9, "metadata_json": "{}", "summary_of": "",
+                    "valid_until": future_offset.isoformat(),
+                },
+            ],
+            "scratchpad": [],
+            "consolidation_log": [],
+        }
+        stats = beam.import_from_dict(payload)
+        assert stats["working_memory"]["inserted"] == 3
+        assert stats["episodic_memory"]["inserted"] == 1
+
+        stored = beam.conn.execute(
+            "SELECT valid_until FROM working_memory WHERE id = 'wm-future'"
+        ).fetchone()[0]
+        assert datetime.fromisoformat(stored).utcoffset() == timedelta(0)
+        assert stored > datetime.now(timezone.utc).isoformat()
+
+        # Space-separated naive values are canonicalized to aware UTC too.
+        stored_space = beam.conn.execute(
+            "SELECT valid_until FROM working_memory WHERE id = 'wm-space'"
+        ).fetchone()[0]
+        assert "T" in stored_space
+        assert datetime.fromisoformat(stored_space).utcoffset() == timedelta(0)
+
+        # Future rows surface in context and linear recall.
+        ctx = {r["id"] for r in beam.get_context(limit=20)}
+        assert "wm-future" in ctx
+        assert "wm-space" in ctx
+        assert "wm-past" not in ctx
+        recall = {r["id"] for r in beam.recall("imported future", top_k=10)}
+        assert "wm-future" in recall
+        assert "wm-past" not in {r["id"] for r in beam.recall("imported past", top_k=10)}
+        assert "em-future" in {r["id"] for r in beam.recall("imported episodic future", top_k=20)}
+
+    def test_import_from_dict_date_only_valid_until_passes_through(self, temp_db):
+        """#525: date-only valid_until values keep pass-through semantics
+        across the import boundary."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        payload = {
+            "working_memory": [
+                {
+                    "id": "wm-date", "content": "imported date-only", "source": "test",
+                    "timestamp": "2026-01-01T00:00:00+00:00", "session_id": "s1",
+                    "importance": 0.9, "metadata_json": "{}",
+                    "valid_until": "2099-12-31",
+                },
+            ],
+            "episodic_memory": [],
+            "scratchpad": [],
+            "consolidation_log": [],
+        }
+        beam.import_from_dict(payload)
+        stored = beam.conn.execute(
+            "SELECT valid_until FROM working_memory WHERE id = 'wm-date'"
+        ).fetchone()[0]
+        assert stored == "2099-12-31"
+        assert "wm-date" in {r["id"] for r in beam.get_context(limit=20)}
 
     def test_mnemosyne_export_includes_annotations(self, temp_db):
         """Post-E6 regression guard: export_to_file must include annotations
