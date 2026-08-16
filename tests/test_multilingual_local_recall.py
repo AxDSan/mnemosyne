@@ -8,6 +8,7 @@ from mnemosyne.core.beam import (
     _hyphen_fragment_tokens,
     _lexical_relevance,
     _recall_tokens,
+    _symbolic_code_tokens,
     BeamMemory,
 )
 
@@ -193,6 +194,13 @@ def test_fts_query_terms_never_emit_hyphen_leading_terms():
     assert all(not term.startswith('"-') for term in terms)
 
 
+def test_fts_query_terms_never_emit_symbolic_code_terms():
+    terms = _fts_query_terms("C++")
+    assert terms == []  # unicode61 tokenizes C++ down to "c"; never emit "c" noise
+    terms = _fts_query_terms("code in C++")
+    assert terms == ['"code"']
+
+
 def test_hyphen_fragments_score_lexically_without_admitting_distractors():
     query_lower = "rm -rf"
     assert _lexical_relevance([], "The user does not like rm -rf.", query_lower) == 1.0
@@ -224,6 +232,62 @@ def test_single_char_flag_recalls_via_public_api(tmp_path):
     )
 
     results = beam.recall("python -v", top_k=5)
+
+    assert results[0]["id"] == expected_id
+    assert all(result["id"] != distractor_id for result in results)
+
+
+def test_symbolic_code_tokens_extract_symbolic_names_only():
+    assert _symbolic_code_tokens("C++") == ["c++"]
+    assert _symbolic_code_tokens("uses c# for dotnet") == ["c#"]
+    assert _symbolic_code_tokens("g++ compiles") == ["g++"]
+    assert _symbolic_code_tokens("F#") == ["f#"]
+    assert _symbolic_code_tokens("C++20") == ["c++20"]
+    assert _symbolic_code_tokens("a+b") == []  # arithmetic, not a code name
+    assert _symbolic_code_tokens("git-rebase") == []  # hyphenated, not symbolic
+    assert _symbolic_code_tokens("node_modules") == []
+    assert _symbolic_code_tokens("python -v") == []
+    assert _symbolic_code_tokens("") == []
+
+
+def test_symbolic_code_queries_score_lexically_without_admitting_distractors():
+    query_lower = "C++"
+    assert _lexical_relevance([], "The user codes in C++.", query_lower) == 1.0
+    assert _lexical_relevance([], "The user uses c# for dotnet.", query_lower) == 0.0
+    assert _lexical_relevance([], "Coffee before noon is fine.", query_lower) == 0.0
+
+    query_lower = "c#"
+    assert _lexical_relevance([], "The user prefers c# for dotnet.", query_lower) == 1.0
+    assert _lexical_relevance([], "The user codes in C++.", query_lower) == 0.0
+
+
+def test_symbolic_code_queries_recall_via_public_api(tmp_path):
+    beam = BeamMemory(session_id="symbolic-code", db_path=tmp_path / "memory.db")
+    expected_id = beam.remember(
+        "The user codes in C++ for performance-critical work.",
+        source="test",
+        importance=0.5,
+    )
+    distractor_id = beam.remember(
+        "The user prefers git rebase over merge commits.", source="test", importance=0.5
+    )
+
+    results = beam.recall("C++", top_k=5)
+
+    assert results[0]["id"] == expected_id
+    assert all(result["id"] != distractor_id for result in results)
+
+
+def test_symbolic_code_queries_recall_via_public_api_hash(tmp_path):
+    beam = BeamMemory(session_id="symbolic-code-hash", db_path=tmp_path / "memory.db")
+    expected_id = beam.remember(
+        "The user prefers c# for dotnet services.", source="test", importance=0.5
+    )
+    distractor_id = beam.remember(
+        "The user codes in C++.", source="test", importance=0.5
+    )
+
+    results = beam.recall("c#", top_k=5)
 
     assert results[0]["id"] == expected_id
     assert all(result["id"] != distractor_id for result in results)

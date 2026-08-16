@@ -1938,6 +1938,28 @@ def _hyphen_fragment_tokens(text: str) -> List[str]:
     return list(dict.fromkeys(tokens))
 
 
+# Symbolic code names (C++, C#, F#, g++) contain + or #. They must not go
+# through the FTS5 MATCH builder: unicode61 tokenizes C++ down to the single
+# character "c", so a quoted "c++" term matches every row containing a bare
+# "c" token, drowning real matches in noise. They are admitted only in the
+# lexical layer, which compares the literal symbolic form (c++ == c++) on
+# both sides. Pure symbolic queries therefore produce zero FTS terms and
+# fall back to the bounded recent-row scoring path, matching exact-only, as
+# agreed for the #744 contract.
+_SYMBOLIC_CODE_RE = re.compile(r"(?u)(?<![A-Za-z0-9_])[A-Za-z]+(?:\+\+|#+)[0-9]*(?![A-Za-z0-9_])")
+
+
+def _symbolic_code_tokens(text: str) -> List[str]:
+    """Return unique symbolic code tokens in ``text``.
+
+    ``C++`` yields ``['c++']``, ``c#`` yields ``['c#']`` and ``g++`` yields
+    ``['g++']``. ``a+b`` (arithmetic) is rejected because a single ``+`` is
+    not a symbolic code name; ``git-rebase`` and ``node_modules`` contain
+    neither ``++`` nor ``#`` and are intentionally not matched here.
+    """
+    return list(dict.fromkeys(_SYMBOLIC_CODE_RE.findall(text.lower())))
+
+
 def _component_unit_weight(components: List[str]) -> int:
     """Return the lexical-unit weight for a token's hyphen components."""
     return len(components) if len(components) >= 2 else 1
@@ -2090,6 +2112,7 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
     }
     if query_lower:
         query_tokens = [*query_tokens, *_hyphen_fragment_tokens(query_lower)]
+        query_tokens = [*query_tokens, *_symbolic_code_tokens(query_lower)]
     if not query_tokens and not query_cjk:
         return 0.0
     # Callers pass raw _recall_tokens() output. Count each compound's
@@ -2104,6 +2127,10 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
     # must start with a word character); admit their components on both
     # sides so shell-style queries like "rm -rf" are not silently missed.
     content_tokens.update(_hyphen_fragment_tokens(content_lower))
+    # Symbolic code names (C++, C#, g++) are invisible to _recall_tokens()
+    # (a token must start with a word character); admit the literal symbolic
+    # form on both sides so exact-only symbolic queries still match.
+    content_tokens.update(_symbolic_code_tokens(content_lower))
     # Structured MEMORIA contexts often encode keys as snake_case
     # (telemetry_api_latency_ms). Split separators so natural-language
     # queries get full lexical credit for the same fact.
