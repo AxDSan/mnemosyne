@@ -37,10 +37,9 @@ def _build_wheel(project_root: Path, build_name: str, tmp_path: Path) -> Path:
         [
             sys.executable,
             "-m",
-            "pip",
-            "wheel",
-            "--no-deps",
-            "--wheel-dir",
+            "build",
+            "--wheel",
+            "--outdir",
             str(wheel_dir),
             ".",
         ],
