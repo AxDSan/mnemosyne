@@ -39,12 +39,7 @@ from pathlib import Path
 import sqlite3
 
 
-# Opaque enhanced-recall request digests. ``v2:`` is the legacy schema
-# (kept accepted so stale on-disk/in-memory entries and any external
-# callers don't degrade to fuzzy semantic lookups); ``v3:`` is the current
-# schema (dense candidate predicate changed, #696/#427 — pre-change v2
-# entries are intentionally never generated or reused by beam.py).
-_OPAQUE_V2_KEY_RE = re.compile(r"(?:v2|v3):[0-9a-f]{64}")
+_OPAQUE_V2_KEY_RE = re.compile(r"v2:[0-9a-f]{64}")
 
 
 def _is_opaque_v2_key(key: str) -> bool:

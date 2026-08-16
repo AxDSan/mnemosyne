@@ -7335,7 +7335,7 @@ class BeamMemory:
     # cached under an older digest are not reused. Part of the hashed payload;
     # the opaque key keeps the "v2:" prefix because QueryCache's opaque-path
     # recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
-    _ENHANCED_RECALL_CACHE_VERSION = 4
+    _ENHANCED_RECALL_CACHE_VERSION = 5
 
     def _enhanced_recall_cache_key(
         self,
@@ -7465,12 +7465,14 @@ class BeamMemory:
             },
         }
         material = json.dumps(canonicalize(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        # Opaque schema version bump (v2 -> v3): the default dense
-        # candidate predicate changed (dialog / honcho / consolidated
-        # exclusion, #696 / #427), so pre-change opaque cache entries can
-        # still contain dialog, honcho or consolidated dense candidates.
-        # Bumping the prefix guarantees those entries are never reused.
-        return "v3:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+        # The default dense candidate predicate changed (dialog / honcho /
+        # consolidated exclusion, #696 / #427), so pre-change opaque cache
+        # entries could still contain dialog, honcho or consolidated dense
+        # candidates. _ENHANCED_RECALL_CACHE_VERSION is part of the hashed
+        # payload; bumping it (4 -> 5) guarantees those entries are never
+        # reused. The "v2:" prefix stays fixed — QueryCache's opaque-path
+        # recognition keys off that exact prefix.
+        return "v2:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     def recall_enhanced(self, query: str, top_k: int = 40, *,
                         use_cache: bool = True,
