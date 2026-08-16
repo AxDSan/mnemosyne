@@ -1516,7 +1516,8 @@ def test_reclaim_orphans_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
 def test_degrade_episodic_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
     """degrade_episodic() mutates episodic content/embeddings; a warmed
     enhanced-recall entry must be invalidated even when called directly
-    (not only via sleep())."""
+    (not only via sleep()). The test plants a real tier-2 row old enough
+    to be degraded, so the mutation actually happens."""
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setattr(
@@ -1526,6 +1527,17 @@ def test_degrade_episodic_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
     try:
         memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
         memory.remember("degrade cache sentinel epsilon", source="fact")
+
+        # Plant an old tier-2 episodic row (older than TIER3_DAYS=180) so
+        # degrade_episodic() really performs a tier2->tier3 transition.
+        old_ts = (datetime.now() - timedelta(days=400)).isoformat()
+        memory.conn.execute(
+            "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, "
+            "importance, tier, created_at) VALUES (?, ?, ?, ?, ?, ?, 2, ?)",
+            ("old-tier2-row", "old episodic content epsilon " * 5, "fact",
+             old_ts, "session-a", 0.5, old_ts),
+        )
+        memory.conn.commit()
 
         # Warm the enhanced-recall cache for this query.
         _call(memory, "degrade cache sentinel epsilon", top_k=3)
@@ -1545,6 +1557,11 @@ def test_degrade_episodic_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
 
         result = memory.degrade_episodic(dry_run=False)
         assert result["status"] == "degraded"
+        assert result["tier2_to_tier3"] == 1  # the planted row really degraded
+        tier = memory.conn.execute(
+            "SELECT tier FROM episodic_memory WHERE id = ?", ("old-tier2-row",)
+        ).fetchone()
+        assert tier is not None and tier[0] == 3
         assert memory._query_cache.stats()["version"] == cache_version + 1
 
         # The next request must recompute, not serve the stale entry.
