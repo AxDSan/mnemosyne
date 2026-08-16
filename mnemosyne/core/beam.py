@@ -24,6 +24,7 @@ import threading
 import math
 from dataclasses import dataclass
 
+from mnemosyne.core._connection_gc import collect_connection_cycles
 from mnemosyne.core.config import resolve_beam_runtime
 
 logger = logging.getLogger(__name__)
@@ -488,6 +489,7 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
             conn._mnemosyne_vec_loaded = False
         _thread_local.conn = conn
         _thread_local.db_path = str(path)
+        collect_connection_cycles()
     return _thread_local.conn
 
 
