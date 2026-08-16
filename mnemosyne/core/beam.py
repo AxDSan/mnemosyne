@@ -1913,8 +1913,12 @@ def _hyphen_components(token: str) -> List[str]:
 # widen FTS candidate generation and lexical units, while precision is still
 # enforced downstream by the lexical abstention gates. The lookbehind rejects
 # both word characters and '-' so embedded sequences like 'git--rebase' cannot
-# start a fragment at the second hyphen.
-_HYPHEN_FRAGMENT_RE = re.compile(r"(?u)(?<![-\w])-+[^\W_][\w]*")
+# start a fragment at the second hyphen. Internal single hyphens remain part of
+# a CLI flag (``--dry-run``); the final lookahead rejects malformed doubled
+# separators instead of silently truncating them to a different literal.
+_HYPHEN_FRAGMENT_RE = re.compile(
+    r"(?u)(?<![-\w])-+[^\W_][\w]*(?:-[^\W_][\w]*)*(?![-\w])"
+)
 
 
 def _hyphen_fragment_tokens(text: str) -> List[str]:
@@ -6070,6 +6074,12 @@ class BeamMemory:
         results = []
         query_lower = query.lower()
         query_words = _recall_tokens(query_lower)
+        query_has_literal_flag = bool(_leading_hyphen_fragments(query_lower))
+        literal_candidate_content: Dict[tuple[str, str], str] = {}
+
+        def _track_literal_content(tier: str, memory_id: str, content: str) -> None:
+            if query_has_literal_flag:
+                literal_candidate_content[(tier, memory_id)] = content
 
         # ---- Configurable hybrid scoring setup (Phase 4) ----
         weight_snapshot = (
@@ -6354,6 +6364,7 @@ class BeamMemory:
                     _wm_fts_kept += 1
                 elif row["id"] in wm_vec_sims:
                     _wm_vec_kept += 1
+                _track_literal_content("working", row["id"], row["content"])
                 results.append({
                     "id": row["id"],
                     "content": row["content"][:500],
@@ -6424,6 +6435,7 @@ class BeamMemory:
                     if temporal_weight > 0.0:
                         t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
                         score *= (1.0 + temporal_weight * t_boost)
+                    _track_literal_content("working", row["id"], row["content"])
                     results.append({
                         "id": row["id"],
                         "content": row["content"][:500],
@@ -6486,6 +6498,7 @@ class BeamMemory:
                     if temporal_weight > 0.0:
                         t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
                         score *= (1.0 + temporal_weight * t_boost)
+                    _track_literal_content("episodic", row["id"], row["content"])
                     results.append({
                         "id": row["id"],
                         "content": row["content"][:500],
@@ -6547,6 +6560,7 @@ class BeamMemory:
                     if temporal_weight > 0.0:
                         t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
                         score *= (1.0 + temporal_weight * t_boost)
+                    _track_literal_content("working", row["id"], row["content"])
                     results.append({
                         "id": row["id"],
                         "content": row["content"][:500],
@@ -6608,6 +6622,7 @@ class BeamMemory:
                     if temporal_weight > 0.0:
                         t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
                         score *= (1.0 + temporal_weight * t_boost)
+                    _track_literal_content("episodic", row["id"], row["content"])
                     results.append({
                         "id": row["id"],
                         "content": row["content"][:500],
@@ -6834,6 +6849,7 @@ class BeamMemory:
                 _em_fts_kept += 1
             elif rid in vec_results:
                 _em_vec_kept += 1
+            _track_literal_content("episodic", row["id"], row["content"])
             results.append({
                 "id": row["id"],
                 "content": row["content"][:500],
@@ -6941,6 +6957,7 @@ class BeamMemory:
                         score *= (1.0 + temporal_weight * t_boost)
                     # [C4] Kept-row credit for em_fallback tier.
                     _em_fallback_kept += 1
+                    _track_literal_content("episodic", row["id"], row["content"])
                     results.append({
                         "id": row["id"],
                         "content": row["content"][:500],
@@ -7093,8 +7110,12 @@ class BeamMemory:
                             _source_ids,
                         ).fetchall()
                         for _row in _src_rows:
+                            memoria_source_id = f"memoria_source_{_row['id']}"
+                            _track_literal_content(
+                                "memoria_source", memoria_source_id, _row["content"]
+                            )
                             results.append({
-                                "id": f"memoria_source_{_row['id']}",
+                                "id": memoria_source_id,
                                 "content": _row["content"][:500],
                                 "source": _row["source"],
                                 "timestamp": _row["timestamp"],
@@ -7136,44 +7157,21 @@ class BeamMemory:
         # Literal CLI flags are a selection invariant, not a fixed score
         # bonus. Reject candidates that expose only a bare flag component
         # ("force" for "--force") after every linear candidate source has
-        # contributed and before top-K truncation. Persisted result content is
-        # truncated to 500 characters in the public payload, so classify WM/EM
-        # rows against their full stored content. Chunk IDs to stay below
-        # SQLite's parameter limit for broad fallback candidate sets. The
-        # polyphonic feature-mode path returns above and intentionally keeps
-        # its separate contract.
-        if _leading_hyphen_fragments(query_lower):
-            persisted_content: Dict[tuple[str, str], str] = {}
-            for result_tier, table in (
-                ("working", "working_memory"),
-                ("episodic", "episodic_memory"),
-            ):
-                candidate_ids = list(dict.fromkeys(
-                    result["id"]
-                    for result in results
-                    if result.get("tier") == result_tier and result.get("id")
-                ))
-                for offset in range(0, len(candidate_ids), 500):
-                    id_chunk = candidate_ids[offset:offset + 500]
-                    placeholders = ",".join("?" * len(id_chunk))
-                    stored_rows = self.conn.execute(
-                        f"SELECT id, content FROM {table} WHERE id IN ({placeholders})",
-                        id_chunk,
-                    ).fetchall()
-                    persisted_content.update(
-                        ((result_tier, row["id"]), row["content"])
-                        for row in stored_rows
-                    )
-            results = [
-                result for result in results
-                if not _is_bare_literal_flag_collision(
-                    query_lower,
-                    persisted_content.get(
-                        (result.get("tier"), result.get("id")),
-                        result.get("content", ""),
-                    ),
-                )
-            ]
+        # contributed and before top-K truncation. Candidate assembly already
+        # has the full persisted content, so retain references in a local side
+        # map instead of querying SQLite again or changing the public result
+        # shape. The polyphonic feature-mode path returns above and
+        # intentionally keeps its separate contract.
+        filtered_results = []
+        for result in results:
+            literal_content = literal_candidate_content.get(
+                (result.get("tier"), result.get("id")),
+                result.get("content", ""),
+            )
+            if (not query_has_literal_flag
+                    or not _is_bare_literal_flag_collision(query_lower, literal_content)):
+                filtered_results.append(result)
+        results = filtered_results
         _ranked_results_for_explain = list(results) if _explain_trace is not None else None
         final_results = results[:top_k]
 

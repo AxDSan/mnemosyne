@@ -306,6 +306,7 @@ def test_symbolic_code_queries_recall_via_public_api_hash(tmp_path):
 
 def test_leading_hyphen_fragments_keep_the_literal_form():
     assert _leading_hyphen_fragments("--force") == ["--force"]
+    assert _leading_hyphen_fragments("--dry-run") == ["--dry-run"]
     assert _leading_hyphen_fragments("rm -rf") == ["-rf"]
     assert _leading_hyphen_fragments("install --force -rf") == ["--force", "-rf"]
     assert _leading_hyphen_fragments("python -v") == ["-v"]
@@ -373,24 +374,75 @@ def test_literal_flag_component_collision_requires_a_bare_component_only_match()
     assert collision("--force", "The force field calibration is complete.")
     assert collision("deploy --force", "We deploy using brute force.")
     assert collision("--force", "The foo--force spelling is invalid.")
+    assert collision("--dry-run", "Use --dry-clean for this command.")
+    assert collision("--dry-run", "The --dry-running mode is experimental.")
+    assert collision("--dry-run", "The foo--dry-run spelling is invalid.")
     assert not collision("--force", "Use --force after confirmation.")
+    assert not collision("--dry-run", "Use --dry-run after confirmation.")
     assert not collision("--force", "The --forceful approach failed.")
     assert not collision("deploy", "We deploy using brute force.")
 
 
-def test_literal_flag_selection_uses_full_persisted_content(tmp_path):
+@pytest.mark.parametrize("tier", ["working", "episodic"])
+def test_literal_flag_selection_uses_full_persisted_content(tmp_path, tier):
     beam = BeamMemory(session_id="literal-flag-full-content", db_path=tmp_path / "memory.db")
-    expected_id = beam.remember(
-        f"{'force calibration notes ' * 30}Use --force after confirmation.",
-        source="test",
-        importance=0.1,
-    )
-    distractor_id = beam.remember(
-        "The force field calibration is complete.", source="test", importance=1.0
-    )
+    exact_content = f"{'force calibration notes ' * 30}Use --force after confirmation."
+    if tier == "working":
+        expected_id = beam.remember(exact_content, source="test", importance=0.1)
+        distractor_id = beam.remember(
+            "The force field calibration is complete.", source="test", importance=1.0
+        )
+    else:
+        expected_id = beam.consolidate_to_episodic(
+            exact_content, source_wm_ids=[], source="test", importance=0.1
+        )
+        distractor_id = beam.consolidate_to_episodic(
+            "The force field calibration is complete.",
+            source_wm_ids=[],
+            source="test",
+            importance=1.0,
+        )
 
     results = beam.recall(
         "--force",
+        top_k=2,
+        vec_weight=0.0,
+        fts_weight=0.0,
+        importance_weight=1.0,
+    )
+
+    assert results[0]["id"] == expected_id
+    assert distractor_id not in {result["id"] for result in results}
+
+
+@pytest.mark.parametrize("tier", ["working", "episodic"])
+def test_multicomponent_literal_flag_rejects_a_different_flag_with_shared_prefix(
+    tmp_path, tier
+):
+    beam = BeamMemory(session_id=f"literal-flag-multicomponent-{tier}", db_path=tmp_path / "memory.db")
+    if tier == "working":
+        expected_id = beam.remember(
+            "Use --dry-run after confirmation.", source="test", importance=0.1
+        )
+        distractor_id = beam.remember(
+            "Use --dry-clean for this command.", source="test", importance=1.0
+        )
+    else:
+        expected_id = beam.consolidate_to_episodic(
+            "Use --dry-run after confirmation.",
+            source_wm_ids=[],
+            source="test",
+            importance=0.1,
+        )
+        distractor_id = beam.consolidate_to_episodic(
+            "Use --dry-clean for this command.",
+            source_wm_ids=[],
+            source="test",
+            importance=1.0,
+        )
+
+    results = beam.recall(
+        "--dry-run",
         top_k=2,
         vec_weight=0.0,
         fts_weight=0.0,
