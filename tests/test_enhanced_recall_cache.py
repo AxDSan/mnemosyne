@@ -852,18 +852,18 @@ def test_enhanced_cache_key_version_bump_invalidates_literal_flag_ranking_change
     """The literal-flag ranking adjustment must invalidate pre-change cache entries.
 
     ``recall_enhanced()`` resolves its request against an opaque digest before
-    the new ``_literal_flag_bonus`` adjustment runs. The algorithm ``version``
-    is part of that hashed payload, so bumping it after a ranking change means
-    a result cached under the previous version can never be returned for the
-    updated algorithm. The ``v2:`` key prefix is preserved so the key still
-    uses the exact-only opaque cache path (``_is_opaque_v2_key``).
+    the literal-flag selection rule runs. The algorithm ``version`` is part of
+    that hashed payload, so bumping it after a ranking change means a result
+    cached under the previous version can never be returned for the updated
+    algorithm. The ``v2:`` key prefix is preserved so the key still uses the
+    exact-only opaque cache path (``_is_opaque_v2_key``).
     """
     memory, calls = enhanced
 
-    # Run once under the pre-change algorithm version so the cache holds a
-    # v2-ranked result, keyed through the real request path.
+    # Run once under the previous algorithm version so the cache holds a
+    # bonus-only ranked result, keyed through the real request path.
     with monkeypatch.context() as ctx:
-        ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 2)
+        ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 3)
         stale = memory.recall_enhanced(
             "--force",
             use_weibull=False,
@@ -874,9 +874,9 @@ def test_enhanced_cache_key_version_bump_invalidates_literal_flag_ranking_change
     assert len(calls) == 1
     stale_id = stale[0]["id"]
 
-    assert memory._ENHANCED_RECALL_CACHE_VERSION >= 3
+    assert memory._ENHANCED_RECALL_CACHE_VERSION >= 4
 
-    # The current-version digest differs from the stale v2 key: cache miss.
+    # The current-version digest differs from the stale v3 key: cache miss.
     fresh = memory.recall_enhanced(
         "--force",
         use_weibull=False,

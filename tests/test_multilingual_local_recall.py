@@ -1,6 +1,7 @@
 import pytest
 
 from mnemosyne.core import embeddings
+from mnemosyne.core import beam as beam_module
 from mnemosyne.core.beam import (
     _expanded_query_tokens,
     _expand_hyphenated_tokens,
@@ -348,8 +349,7 @@ def test_literal_flag_recall_cannot_be_outranked_by_bare_component(tmp_path):
     results = beam.recall("--force", top_k=5)
 
     assert results[0]["id"] == expected_id
-    distractor_rank = next(i for i, r in enumerate(results) if r["id"] == distractor_id)
-    assert results[0]["score"] > results[distractor_rank]["score"]
+    assert all(result["id"] != distractor_id for result in results)
 
 
 def test_literal_flag_recall_wins_in_a_mixed_query(tmp_path):
@@ -364,8 +364,41 @@ def test_literal_flag_recall_wins_in_a_mixed_query(tmp_path):
     results = beam.recall("deploy --force", top_k=5)
 
     assert results[0]["id"] == expected_id
-    assert all(result["id"] != distractor_id for result in results[:1])
-    assert results[0]["keyword_score"] >= results[1]["keyword_score"]
+    assert all(result["id"] != distractor_id for result in results)
+
+
+def test_literal_flag_component_collision_requires_a_bare_component_only_match():
+    collision = beam_module._is_bare_literal_flag_collision
+
+    assert collision("--force", "The force field calibration is complete.")
+    assert collision("deploy --force", "We deploy using brute force.")
+    assert collision("--force", "The foo--force spelling is invalid.")
+    assert not collision("--force", "Use --force after confirmation.")
+    assert not collision("--force", "The --forceful approach failed.")
+    assert not collision("deploy", "We deploy using brute force.")
+
+
+def test_literal_flag_selection_uses_full_persisted_content(tmp_path):
+    beam = BeamMemory(session_id="literal-flag-full-content", db_path=tmp_path / "memory.db")
+    expected_id = beam.remember(
+        f"{'force calibration notes ' * 30}Use --force after confirmation.",
+        source="test",
+        importance=0.1,
+    )
+    distractor_id = beam.remember(
+        "The force field calibration is complete.", source="test", importance=1.0
+    )
+
+    results = beam.recall(
+        "--force",
+        top_k=2,
+        vec_weight=0.0,
+        fts_weight=0.0,
+        importance_weight=1.0,
+    )
+
+    assert results[0]["id"] == expected_id
+    assert distractor_id not in {result["id"] for result in results}
 
 
 def test_literal_flag_is_not_boosted_by_a_different_flag_prefix(tmp_path):

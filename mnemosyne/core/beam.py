@@ -1957,13 +1957,14 @@ def _literal_flag_bonus(query_lower: str, content: str) -> float:
     ``_lexical_relevance()`` already scores an exact ``--force`` match above a
     bare ``force`` occurrence, but both live in ``[0, 1]`` and the final rank
     blends keyword relevance with ``importance``. Without a dedicated signal a
-    high-importance row that merely uses the word "force" can still outrank a
-    low-importance row that literally contains the flag. This additive premium
-    is applied where the other recall bonuses live (recency/current-state,
-    graph/fact/binary) so a query for the literal CLI flag cannot be outranked
-    by an ordinary use of the same word. The premium requires an exact
-    extracted token match on the content side too: ``--force`` never matches
-    ``--forceful`` or ``foo--force``. Fragments embedded in a word
+    high-importance row that merely uses the word "force" can otherwise rank
+    too closely to a low-importance row that literally contains the flag. This
+    additive premium is applied where the other recall bonuses live
+    (recency/current-state, graph/fact/binary); the final linear-recall
+    selection separately rejects bare-component collisions so the precision
+    contract does not depend on this fixed amount. The premium requires an
+    exact extracted token match on the content side too: ``--force`` never
+    matches ``--forceful`` or ``foo--force``. Fragments embedded in a word
     (``git-rebase``) never match, exactly like ``_leading_hyphen_fragments()``.
     """
     if not query_lower or not content:
@@ -2023,6 +2024,33 @@ def _expand_hyphenated_tokens(tokens: List[str]) -> List[str]:
                 seen.add(candidate)
                 expanded.append(candidate)
     return expanded
+
+
+def _is_bare_literal_flag_collision(query: str, content: str) -> bool:
+    """Return whether ``content`` only has a bare component of a query flag.
+
+    A literal query such as ``--force`` must not degrade into an ordinary
+    search for the word ``force`` when configurable weights favor importance.
+    Exact literal matches remain eligible. Prefixes and embedded forms such as
+    ``--forceful`` and ``foo--force`` are not exact literals; only the latter
+    is a bare-component collision because it still exposes the word ``force``.
+    """
+    if not query or not content:
+        return False
+    query_literals = set(_leading_hyphen_fragments(query.lower()))
+    if not query_literals:
+        return False
+    content_lower = content.lower()
+    missing_literals = query_literals - set(_leading_hyphen_fragments(content_lower))
+    if not missing_literals:
+        return False
+    bare_components = {
+        component
+        for literal in missing_literals
+        for component in _hyphen_fragment_tokens(literal)
+    }
+    content_components = set(re.findall(r"(?u)[^\W_]+", content_lower))
+    return bool(bare_components & content_components)
 
 
 def _expanded_query_tokens(tokens: List[str]) -> List[str]:
@@ -7105,6 +7133,47 @@ class BeamMemory:
                 covered.update(set(_recall_tokens(picked.get("content", "").lower())) & q_word_set)
             results = selected + pool
 
+        # Literal CLI flags are a selection invariant, not a fixed score
+        # bonus. Reject candidates that expose only a bare flag component
+        # ("force" for "--force") after every linear candidate source has
+        # contributed and before top-K truncation. Persisted result content is
+        # truncated to 500 characters in the public payload, so classify WM/EM
+        # rows against their full stored content. Chunk IDs to stay below
+        # SQLite's parameter limit for broad fallback candidate sets. The
+        # polyphonic feature-mode path returns above and intentionally keeps
+        # its separate contract.
+        if _leading_hyphen_fragments(query_lower):
+            persisted_content: Dict[tuple[str, str], str] = {}
+            for result_tier, table in (
+                ("working", "working_memory"),
+                ("episodic", "episodic_memory"),
+            ):
+                candidate_ids = list(dict.fromkeys(
+                    result["id"]
+                    for result in results
+                    if result.get("tier") == result_tier and result.get("id")
+                ))
+                for offset in range(0, len(candidate_ids), 500):
+                    id_chunk = candidate_ids[offset:offset + 500]
+                    placeholders = ",".join("?" * len(id_chunk))
+                    stored_rows = self.conn.execute(
+                        f"SELECT id, content FROM {table} WHERE id IN ({placeholders})",
+                        id_chunk,
+                    ).fetchall()
+                    persisted_content.update(
+                        ((result_tier, row["id"]), row["content"])
+                        for row in stored_rows
+                    )
+            results = [
+                result for result in results
+                if not _is_bare_literal_flag_collision(
+                    query_lower,
+                    persisted_content.get(
+                        (result.get("tier"), result.get("id")),
+                        result.get("content", ""),
+                    ),
+                )
+            ]
         _ranked_results_for_explain = list(results) if _explain_trace is not None else None
         final_results = results[:top_k]
 
@@ -7180,6 +7249,8 @@ class BeamMemory:
             try:
                 fact_rows = self.fact_recall(query, top_k=max(top_k, 10))
                 for fr in fact_rows:
+                    if _is_bare_literal_flag_collision(query_lower, fr["content"]):
+                        continue
                     # Dedup against existing results by content hash
                     content_hash = hashlib.md5(fr["content"].encode()).hexdigest()
                     if content_hash in {hashlib.md5(r["content"].encode()).hexdigest() for r in final_results}:
@@ -7219,7 +7290,7 @@ class BeamMemory:
     # cached under an older digest are not reused. Part of the hashed payload;
     # the opaque key keeps the "v2:" prefix because QueryCache's opaque-path
     # recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
-    _ENHANCED_RECALL_CACHE_VERSION = 3
+    _ENHANCED_RECALL_CACHE_VERSION = 4
 
     def _enhanced_recall_cache_key(
         self,
