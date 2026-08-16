@@ -2852,14 +2852,23 @@ def _fts_query_terms(query: str) -> List[str]:
     column-exclusion operator, so e.g. ``'"rm" OR "-rf"'`` raises
     ``no such column: rf`` and recall fails silently. Leading-hyphen
     fragments are therefore split into their components (``rm -rf`` ->
-    ``"rf"``) and any hyphen-leading token is dropped.
+    ``"rf"``) and any hyphen-leading token is dropped. Symbolic code
+    names (``C++``, ``C++20``) are also excluded: unicode61 tokenizes
+    them down to bare characters, so an FTS term would only flood
+    candidates with noise; they are matched exact-only by the lexical
+    layer via ``_symbolic_code_tokens()``.
     """
     terms: List[str] = []
     seen: Set[str] = set()
+    symbolic = set(_symbolic_code_tokens(query))
     for term in _expanded_query_tokens(_recall_tokens(query)):
         if term.startswith("-"):
             # FTS5-only terms never reach MATCH verbatim. The fragment's
             # components are added below via _hyphen_fragment_tokens().
+            continue
+        if term in symbolic:
+            # Symbolic code names are handled by exact lexical matching
+            # only; never emit an FTS5 term for them.
             continue
         term = term.replace('"', '""').strip()
         if term and term not in seen:

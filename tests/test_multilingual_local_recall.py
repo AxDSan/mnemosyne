@@ -199,6 +199,14 @@ def test_fts_query_terms_never_emit_symbolic_code_terms():
     assert terms == []  # unicode61 tokenizes C++ down to "c"; never emit "c" noise
     terms = _fts_query_terms("code in C++")
     assert terms == ['"code"']
+    # A symbolic token with a suffix ("C++20") survives _recall_tokens() via the
+    # `+` separator but must never reach the FTS MATCH builder: unicode61 splits
+    # it into bare "c" + "20" tokens, flooding candidates. Exact lexical matching
+    # alone handles it.
+    terms = _fts_query_terms("C++20")
+    assert terms == []
+    terms = _fts_query_terms("code in C++20")
+    assert terms == ['"code"']
 
 
 def test_hyphen_fragments_score_lexically_without_admitting_distractors():
