@@ -329,7 +329,7 @@ class Mnemosyne:
             SELECT id, content, source, timestamp, session_id, importance
             FROM working_memory
             WHERE (session_id = ? OR scope = 'global')
-              AND (valid_until IS NULL OR valid_until > ?)
+              AND (valid_until IS NULL OR julianday(valid_until) > julianday(?))
               AND superseded_by IS NULL
         """, (self.session_id, now))
         rows = [dict(row) for row in cursor.fetchall()]
@@ -338,7 +338,7 @@ class Mnemosyne:
             SELECT id, content, source, timestamp, session_id, importance
             FROM episodic_memory
             WHERE (session_id = ? OR scope = 'global')
-              AND (valid_until IS NULL OR valid_until > ?)
+              AND (valid_until IS NULL OR julianday(valid_until) > julianday(?))
               AND superseded_by IS NULL
         """, (self.session_id, now))
         for row in cursor.fetchall():

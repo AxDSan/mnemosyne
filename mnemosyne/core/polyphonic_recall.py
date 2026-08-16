@@ -310,7 +310,7 @@ class PolyphonicRecallEngine:
                             FROM episodic_memory em
                             WHERE em.rowid IN ({placeholders})
                               AND em.superseded_by IS NULL
-                              AND (em.valid_until IS NULL OR em.valid_until > ?)
+                              AND (em.valid_until IS NULL OR julianday(em.valid_until) > julianday(?))
                             """,
                             (*rowid_list, now_iso),
                         ).fetchall()
@@ -393,7 +393,7 @@ class PolyphonicRecallEngine:
                         FROM memory_embeddings me
                         JOIN episodic_memory em ON me.memory_id = em.id
                         WHERE em.superseded_by IS NULL
-                          AND (em.valid_until IS NULL OR em.valid_until > ?)
+                          AND (em.valid_until IS NULL OR julianday(em.valid_until) > julianday(?))
                         LIMIT ?
                         """,
                         (now_iso, vec_limit),
@@ -446,7 +446,7 @@ class PolyphonicRecallEngine:
                     FROM memory_embeddings me
                     JOIN working_memory wm ON me.memory_id = wm.id
                     WHERE wm.superseded_by IS NULL
-                      AND (wm.valid_until IS NULL OR wm.valid_until > ?)
+                      AND (wm.valid_until IS NULL OR julianday(wm.valid_until) > julianday(?))
                     LIMIT ?
                     """,
                     (now_iso, vec_limit),
