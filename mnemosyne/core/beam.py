@@ -1518,19 +1518,24 @@ def _parse_iso_datetime_utc(value: str) -> datetime:
     return _normalize_datetime_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
 
 
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
 def _normalize_valid_until(value: Optional[str]) -> Optional[str]:
     """Canonicalize a caller-supplied ``valid_until`` to aware UTC ISO.
 
     Offset-bearing ISO timestamps are converted to UTC so comparisons
     against aware-UTC now stay chronologically correct (e.g.
     ``2026-08-15T11:00:00-02:00`` is 13:00Z but sorts before
-    ``12:30:00+00:00`` lexically). Date-only values
-    (``YYYY-MM-DD``) keep their documented pass-through API semantics;
-    unparseable values pass through unchanged.
+    ``12:30:00+00:00`` lexically). Only an exact date-only value
+    (``YYYY-MM-DD``) keeps its documented pass-through API semantics;
+    everything else is parsed chronologically, so a lowercase ``t``
+    separator or ``Z`` suffix is normalized too. Unparseable values pass
+    through unchanged.
     """
     if not value:
         return value
-    if "T" not in value and " " not in value:
+    if _DATE_ONLY_RE.match(value):
         return value
     try:
         return _parse_iso_datetime_utc(value).isoformat()

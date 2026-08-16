@@ -974,6 +974,33 @@ class TestWorkingMemory:
         assert future_mid in {r["id"] for r in beam.recall("offset stored future", top_k=10)}
         assert past_mid not in {r["id"] for r in beam.recall("offset stored past", top_k=10)}
 
+    def test_lowercase_t_valid_until_normalized_to_utc(self, temp_db, non_utc_tz):
+        """#525: valid_until with a lowercase ``t`` separator is normalized.
+
+        ``datetime.fromisoformat()`` accepts a lowercase ``t``, but the
+        date-only pass-through guard only excluded values with an uppercase
+        ``T`` or a space, so a value like ``2099-12-31t23:00:00-02:00`` was
+        stored unnormalized. SQLite ``julianday()`` returns NULL for the
+        lowercase form, so SQL recall excluded the row while the Python
+        filter treated it as active. Only an exact ``YYYY-MM-DD`` value is a
+        pass-through; everything else is canonicalized to aware UTC.
+        """
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        mid = beam.remember(
+            "lowercase t expiry", source="test", importance=0.9,
+            valid_until="2099-12-31t23:00:00-02:00",
+        )
+        row = beam.conn.execute(
+            "SELECT valid_until FROM working_memory WHERE id = ?", (mid,)
+        ).fetchone()
+        stored = datetime.fromisoformat(row[0])
+        assert stored.utcoffset() == timedelta(0)
+        assert stored > datetime.now(timezone.utc)
+        # Both the SQL-backed recall path and the Python filter agree it is
+        # still valid.
+        assert mid in {r["id"] for r in beam.get_context(limit=10)}
+        assert mid in {r["id"] for r in beam.recall("lowercase t expiry", top_k=10)}
+
     def test_offset_bearing_valid_until_normalized_to_utc(self, temp_db, non_utc_tz):
         """#525: offset-bearing valid_until is canonicalized to UTC on write.
 
