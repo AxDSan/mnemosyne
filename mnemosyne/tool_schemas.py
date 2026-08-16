@@ -12,6 +12,17 @@ The MCP server layer renames it to "input_schema" at registration time
 
 from typing import Dict, Any, List
 
+BANK_PROPERTY: Dict[str, Any] = {
+    "type": "string",
+    "description": (
+        "Optional memory bank to operate on. Resolution precedence: explicit "
+        "'bank' argument, then the MNEMOSYNE_MCP_BANK environment variable, "
+        "then 'default'. Omit to use MNEMOSYNE_MCP_BANK when set, otherwise "
+        "the default bank (backward compatible). Named banks use separate "
+        "local SQLite files and do not cross-read or cross-write."
+    ),
+}
+
 REMEMBER_SCHEMA = {
     "name": "mnemosyne_remember",
     "description": (
@@ -38,6 +49,7 @@ REMEMBER_SCHEMA = {
             "extract": {"type": "boolean", "description": "Extract subject-predicate-object fact triples via LLM for fact-aware recall. Default False.", "default": False},
             "metadata": {"type": "object", "description": "Optional dict of additional fields (source_doc, tags, page, etc.). Default empty.", "default": {}},
             "veracity": {"type": "string", "description": "Confidence label: 'stated' | 'inferred' | 'tool' | 'imported' | 'unknown'. Default 'unknown'.", "default": "unknown"},
+            "bank": BANK_PROPERTY,
         },
         "required": ["content"],
     },
@@ -88,6 +100,7 @@ RECALL_SCHEMA = {
                 "description": "If true, return a structured per-query recall explain trace. Default false.",
                 "default": False,
             },
+            "bank": BANK_PROPERTY,
         },
         "required": ["query"],
     },
@@ -167,6 +180,7 @@ SLEEP_SCHEMA = {
                 "description": "If true, skip the age threshold and consolidate all non-consolidated working memories immediately.",
                 "default": False,
             },
+            "bank": BANK_PROPERTY,
         },
     },
 }
@@ -176,7 +190,9 @@ STATS_SCHEMA = {
     "description": "Return Mnemosyne memory statistics: working count, episodic count, BEAM tiers.",
     "parameters": {
         "type": "object",
-        "properties": {}
+        "properties": {
+            "bank": BANK_PROPERTY,
+        }
     }
 }
 
@@ -193,6 +209,7 @@ INVALIDATE_SCHEMA = {
         "properties": {
             "memory_id": {"type": "string", "description": "ID of memory to invalidate."},
             "replacement_id": {"type": "string", "description": "Optional new memory that replaces this one.", "default": ""},
+            "bank": BANK_PROPERTY,
         },
         "required": ["memory_id"],
     },
@@ -255,6 +272,7 @@ GET_SCHEMA = {
         "type": "object",
         "properties": {
             "memory_id": {"type": "string", "description": "The memory ID to retrieve."},
+            "bank": BANK_PROPERTY,
         },
         "required": ["memory_id"],
     },
@@ -280,6 +298,7 @@ TRIPLE_ADD_SCHEMA = {
             "source": {"type": "string", "description": "Provenance label.", "default": ""},
             "confidence": {"type": "number", "description": "0.0-1.0 (default 1.0).", "default": 1.0},
             "supersede": {"type": "boolean", "description": "If false, do not close prior same subject+predicate triples (multi-valued).", "default": True},
+            "bank": BANK_PROPERTY,
         },
         "required": ["subject", "predicate", "object"],
     },
@@ -317,6 +336,7 @@ TRIPLE_QUERY_SCHEMA = {
             "predicate": {"type": "string", "default": ""},
             "object": {"type": "string", "default": ""},
             "as_of": {"type": "string", "description": "ISO date YYYY-MM-DD; query facts valid as of this date (default: today).", "default": ""},
+            "bank": BANK_PROPERTY,
         },
     },
 }
@@ -340,6 +360,7 @@ REMEMBER_CANONICAL_SCHEMA = {
             "body": {"type": "string", "description": "The authoritative free-text value for this slot"},
             "source": {"type": "string", "description": "Optional provenance label", "default": ""},
             "confidence": {"type": "number", "description": "Optional 0..1 confidence", "default": 1.0},
+            "bank": BANK_PROPERTY,
         },
         "required": ["category", "name", "body"],
     },
@@ -362,6 +383,7 @@ RECALL_CANONICAL_SCHEMA = {
             "query": {"type": "string", "description": "Substring search across the profile's canonical values", "default": ""},
             "include_history": {"type": "boolean", "description": "Include superseded versions (requires category+name)", "default": False},
             "limit": {"type": "integer", "description": "Max results for query/list modes", "default": 10},
+            "bank": BANK_PROPERTY,
         },
     },
 }
@@ -380,6 +402,7 @@ FORGET_CANONICAL_SCHEMA = {
         "properties": {
             "category": {"type": "string", "description": "Slot group, e.g. 'identity', 'voice', 'preference'"},
             "name": {"type": "string", "description": "Slot key within the category, e.g. 'name', 'pronouns'"},
+            "bank": BANK_PROPERTY,
         },
         "required": ["category", "name"],
     },
@@ -392,6 +415,7 @@ SCRATCHPAD_WRITE_SCHEMA = {
         "type": "object",
         "properties": {
             "content": {"type": "string", "description": "Content to write"},
+            "bank": BANK_PROPERTY,
         },
         "required": ["content"],
     },
@@ -400,13 +424,23 @@ SCRATCHPAD_WRITE_SCHEMA = {
 SCRATCHPAD_READ_SCHEMA = {
     "name": "mnemosyne_scratchpad_read",
     "description": "Read the Mnemosyne scratchpad entries.",
-    "parameters": {"type": "object", "properties": {}},
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "bank": BANK_PROPERTY,
+        },
+    },
 }
 
 SCRATCHPAD_CLEAR_SCHEMA = {
     "name": "mnemosyne_scratchpad_clear",
     "description": "Clear all entries from the Mnemosyne scratchpad.",
-    "parameters": {"type": "object", "properties": {}},
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "bank": BANK_PROPERTY,
+        },
+    },
 }
 
 EXPORT_SCHEMA = {
@@ -419,6 +453,7 @@ EXPORT_SCHEMA = {
                 "type": "string",
                 "description": "File path to write the export JSON (e.g., /tmp/mnemosyne_backup.json)",
             },
+            "bank": BANK_PROPERTY,
         },
         "required": ["output_path"],
     },
@@ -433,6 +468,7 @@ UPDATE_SCHEMA = {
             "memory_id": {"type": "string", "description": "ID of the memory to update"},
             "content": {"type": "string", "description": "New content for the memory (optional)"},
             "importance": {"type": "number", "description": "New importance from 0.0 to 1.0 (optional)"},
+            "bank": BANK_PROPERTY,
         },
         "required": ["memory_id"],
     },
@@ -445,6 +481,7 @@ FORGET_SCHEMA = {
         "type": "object",
         "properties": {
             "memory_id": {"type": "string", "description": "ID of the memory to delete"},
+            "bank": BANK_PROPERTY,
         },
         "required": ["memory_id"],
     },
@@ -485,7 +522,7 @@ BATCH_SCHEMA = {
                 },
             },
             "dry_run": {"type": "boolean", "default": False},
-            "bank": {"type": "string"},
+            "bank": BANK_PROPERTY,
             "author_id": {"type": "string"},
             "author_type": {"type": "string"},
             "channel_id": {"type": "string"},
@@ -538,6 +575,7 @@ IMPORT_SCHEMA = {
                 "description": "If true, overwrite existing records instead of skipping",
                 "default": False,
             },
+            "bank": BANK_PROPERTY,
         },
     },
 }
@@ -587,6 +625,7 @@ GRAPH_QUERY_SCHEMA = {
                 "description": "Minimum edge weight threshold (0.0 to 1.0, default: 0.0 = no filter)",
                 "default": 0.0,
             },
+            "bank": BANK_PROPERTY,
         },
         "required": ["seed_memory_id"],
     },
@@ -615,6 +654,7 @@ GRAPH_LINK_SCHEMA = {
                 "description": "Edge weight from 0.0 to 1.0 (default: 0.5)",
                 "default": 0.5,
             },
+            "bank": BANK_PROPERTY,
         },
         "required": ["source_id", "target_id", "relationship"],
     },
@@ -812,10 +852,7 @@ HYGIENE_AUDIT_SCHEMA = {
                 },
                 "description": "Tables to scan. Default: working_memory + memories + episodic_memory.",
             },
-            "bank": {
-                "type": "string",
-                "description": "Memory bank to audit (default: 'default').",
-            },
+            "bank": BANK_PROPERTY,
         },
     },
 }
@@ -847,10 +884,7 @@ HYGIENE_CLEAN_SCHEMA = {
                 "description": "Must be true for any modification. If false, performs dry-run only.",
                 "default": False,
             },
-            "bank": {
-                "type": "string",
-                "description": "Memory bank (default: 'default').",
-            },
+            "bank": BANK_PROPERTY,
         },
         "required": ["candidates_json"],
     },

@@ -86,7 +86,12 @@ class TestToolSchemas:
         assert "source" in schema["properties"]
         assert "importance" in schema["properties"]
         assert "metadata" in schema["properties"]
-        # bank is not in the schema - handled via MCP server env var MNEMOSYNE_MCP_BANK
+        # #769: bank is advertised (optional) and documented with precedence
+        assert "bank" in schema["properties"]
+        assert schema["properties"]["bank"]["type"] == "string"
+        assert "bank" not in schema["required"]  # optional: omission falls back
+        assert "explicit" in schema["properties"]["bank"]["description"]
+        assert "MNEMOSYNE_MCP_BANK" in schema["properties"]["bank"]["description"]
         assert "extract_entities" in schema["properties"]
         assert "extract" in schema["properties"]
         assert "veracity" in schema["properties"]
@@ -98,7 +103,12 @@ class TestToolSchemas:
         assert "required" in schema
         assert "query" in schema["required"]
         assert "limit" in schema["properties"]
-        # bank is not in the schema - handled via MCP server env var MNEMOSYNE_MCP_BANK
+        # #769: bank is advertised (optional) and documented with precedence
+        assert "bank" in schema["properties"]
+        assert schema["properties"]["bank"]["type"] == "string"
+        assert "bank" not in schema["required"]  # optional: omission falls back
+        assert "explicit" in schema["properties"]["bank"]["description"]
+        assert "MNEMOSYNE_MCP_BANK" in schema["properties"]["bank"]["description"]
         assert "temporal_weight" in schema["properties"]
         assert schema["properties"]["explain"]["type"] == "boolean"
 
@@ -299,6 +309,50 @@ class TestToolHandlers:
         assert result["status"] == "stored"
         assert result["bank"] == "personal"
         assert create_instance.call_args.kwargs["bank"] == "personal"
+
+    def test_named_bank_write_recall_isolated_from_default(self, tmp_path, monkeypatch):
+        """#769 smoke: a named-bank write is recallable from that same bank
+        and invisible to the default bank.
+
+        This proves the schema-exposed ``bank`` parameter is honored
+        end-to-end by the handlers: MCP clients that select a bank actually
+        operate on it, and the default bank stays isolated (the failure mode
+        #769 describes — silent default-bank reads/writes).
+        """
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("MNEMOSYNE_MCP_BANK", raising=False)
+
+        stored = handle_tool_call("mnemosyne_remember", {
+            "content": "named bank secret",
+            "source": "test",
+            "importance": 0.9,
+            "bank": "team",
+        })
+        assert stored["status"] == "stored"
+        assert stored["bank"] == "team"
+
+        # Same-bank recall finds it.
+        same_bank = handle_tool_call("mnemosyne_recall", {
+            "query": "named bank secret",
+            "limit": 5,
+            "bank": "team",
+        })
+        assert isinstance(same_bank, dict)
+        hits = same_bank.get("results", same_bank.get("memories", []))
+        assert any(
+            "named bank secret" in str(h.get("content", h)) for h in hits
+        ), f"expected hit in team bank, got: {same_bank}"
+
+        # Default-bank recall must NOT see it (isolation).
+        default_bank = handle_tool_call("mnemosyne_recall", {
+            "query": "named bank secret",
+            "limit": 5,
+        })
+        default_hits = default_bank.get("results", default_bank.get("memories", []))
+        assert not any(
+            "named bank secret" in str(h.get("content", h)) for h in default_hits
+        ), f"named-bank memory leaked into default bank: {default_bank}"
 
     def test_handle_invalidate_preserves_session_scope_and_reports_not_found(self, tmp_path, monkeypatch):
         """MCP invalidate must not report success for a foreign session row."""

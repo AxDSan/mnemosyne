@@ -196,3 +196,69 @@ def test_mcp_advertised_surface_has_handlers():
         f"advertised without handler: {sorted(advertised - handlers)}; "
         f"handlers without advertisement: {sorted(handlers - advertised)}"
     )
+
+
+def test_bank_aware_schemas_advertise_bank():
+    """#769: every MCP-callable schema whose handler resolves a bank must
+    advertise the optional ``bank`` property, and non-bank-aware tools must
+    not gain one accidentally.
+
+    The handler registry is the source of truth: a tool is bank-aware iff
+    its handler calls ``_resolve_bank`` (normal precedence). Schemas must
+    match, so a schema/handler edit that silently changes bank routing or
+    hides it from MCP clients is caught here.
+    """
+    import inspect
+
+    from mnemosyne import mcp_tools, tool_schemas
+
+    # Handlers that route through the normal bank resolver.
+    bank_aware = set()
+    for name, handler in mcp_tools._TOOL_HANDLERS.items():
+        src = inspect.getsource(handler)
+        if "_resolve_bank" in src:
+            bank_aware.add(name)
+
+    # Intentional exclusions: schemas that legitimately carry a ``bank``
+    # property with a DIFFERENT meaning, so they must not match the shared
+    # BANK_PROPERTY shape (they are handled explicitly below).
+    DIFFERENT_BANK_MEANING = {"mnemosyne_validate"}  # bank = private|surface enum
+
+    shared = tool_schemas.BANK_PROPERTY
+    by_name = {s["name"]: s for s in tool_schemas.ALL_TOOL_SCHEMAS}
+    missing = []
+    wrong_shape = []
+    required_bank = []
+    for tool in sorted(bank_aware):
+        parameters = by_name[tool]["parameters"]
+        props = parameters.get("properties", {})
+        if "bank" not in props:
+            missing.append(tool)
+            continue
+        if "bank" in parameters.get("required", []):
+            required_bank.append(tool)
+        prop = props["bank"]
+        if prop is not shared and prop != shared:
+            wrong_shape.append(f"{tool}: bank property is not the shared BANK_PROPERTY")
+    assert not missing, (
+        f"bank-aware MCP tools whose schemas omit the optional 'bank' "
+        f"property (#769): {missing}"
+    )
+    assert not wrong_shape, "\n".join(wrong_shape)
+    assert not required_bank, (
+        f"bank-aware MCP tools that declare 'bank' as required (must stay "
+        f"optional so omission falls back to MNEMOSYNE_MCP_BANK/default): "
+        f"{required_bank}"
+    )
+
+    # Non-bank-aware MCP tools must NOT advertise bank, except the ones with
+    # a different bank meaning.
+    stray = []
+    for tool in sorted(set(by_name) - bank_aware - DIFFERENT_BANK_MEANING):
+        props = by_name[tool]["parameters"].get("properties", {})
+        if "bank" in props:
+            stray.append(tool)
+    assert not stray, (
+        f"MCP tools that advertise 'bank' without a bank-resolving handler "
+        f"(should be removed or justified): {stray}"
+    )

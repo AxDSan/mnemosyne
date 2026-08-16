@@ -94,6 +94,56 @@ def _dict_keys_of_assignment(rel_path: str, var_name: str) -> list:
             if isinstance(tgt, ast.Name) and tgt.id == var_name and isinstance(value, ast.Dict):
                 return [k.value for k in value.keys
                         if isinstance(k, ast.Constant) and isinstance(k.value, str)]
+
+
+def _literal_module_names(rel_path: str) -> dict:
+    """
+    Every module-level name whose value is a literal (or a pure literal
+    expression), keyed by name.
+
+    Schemas may reference shared constants (e.g. BANK_PROPERTY) instead of
+    inlining the same dict in every tool. literal_eval alone would then
+    reject the schema dicts; this registry lets the schema evaluator resolve
+    those names to their values.
+    """
+    out = {}
+    for node in _parse(rel_path).body:
+        if isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        elif isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        else:
+            continue
+        for tgt in targets:
+            if isinstance(tgt, ast.Name) and value is not None:
+                try:
+                    out[tgt.id] = ast.literal_eval(value)
+                except (ValueError, TypeError, SyntaxError):
+                    pass
+    return out
+
+
+def _eval_schema_node(node, registry: dict):
+    """
+    Evaluate an AST node representing schema data, resolving Name references
+    (shared constants like BANK_PROPERTY) against a registry of module-level
+    literal names. Falls back to literal_eval for anything else.
+    """
+    if isinstance(node, ast.Name):
+        if node.id in registry:
+            return registry[node.id]
+        return ast.literal_eval(node)  # raises; caller decides
+    if isinstance(node, ast.Dict):
+        return {
+            _eval_schema_node(k, registry): _eval_schema_node(v, registry)
+            for k, v in zip(node.keys, node.values)
+            if k is not None and v is not None
+        }
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [_eval_schema_node(e, registry) for e in node.elts]
+    if isinstance(node, ast.Constant):
+        return node.value
+    return ast.literal_eval(node)
     return []
 
 
@@ -120,6 +170,7 @@ def _collect_tools() -> list:
 
     # Every module-level *_SCHEMA dict, keyed by its variable name.
     by_var, tree = {}, _parse("mnemosyne/tool_schemas.py")
+    registry = _literal_module_names("mnemosyne/tool_schemas.py")
     for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
@@ -127,7 +178,7 @@ def _collect_tools() -> list:
         if not (isinstance(tgt, ast.Name) and tgt.id.endswith("_SCHEMA")):
             continue
         try:
-            schema = ast.literal_eval(node.value)
+            schema = _eval_schema_node(node.value, registry)
         except (ValueError, TypeError, SyntaxError):
             continue
         if isinstance(schema, dict) and "name" in schema:
@@ -585,14 +636,15 @@ def _render_tool_list(tools) -> list:
             lines.append(t["description"])
             lines.append("")
         if t["props"]:
-            lines.append("| Parameter | Type | Required | Default |")
-            lines.append("|-----------|------|----------|---------|")
+            lines.append("| Parameter | Type | Required | Default | Description |")
+            lines.append("|-----------|------|----------|---------|-------------|")
             for pname, spec in t["props"].items():
                 spec = spec if isinstance(spec, dict) else {}
                 required = "yes" if pname in t["required"] else "no"
                 default = _fmt_default(spec["default"]) if "default" in spec else "*(none)*"
-                lines.append("| `{}` | `{}` | {} | {} |".format(
-                    pname, _type_of(spec), required, default))
+                desc = (spec.get("description") or "").replace("\n", " ").replace("|", "\\|")
+                lines.append("| `{}` | `{}` | {} | {} | {} |".format(
+                    pname, _type_of(spec), required, default, desc))
             lines.append("")
         else:
             lines.append("*No parameters.*")
