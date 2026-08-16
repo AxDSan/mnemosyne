@@ -8745,6 +8745,11 @@ class BeamMemory:
                     logger.info("degrade_episodic: rollback failed", exc_info=True)
 
         self.conn.commit()
+        # Tier demotion changes episodic content + embeddings; drop warmed
+        # enhanced-recall entries. Also covers direct degrade_episodic()
+        # calls and the sleep_all_sessions() degradation pass, which do not
+        # go through sleep()'s own invalidation.
+        self._invalidate_query_cache_after_commit("degrade_episodic")
         return results
 
     def get_contaminated(self, limit: int = 50, min_importance: float = 0.0) -> List[Dict]:

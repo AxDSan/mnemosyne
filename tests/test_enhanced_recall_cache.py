@@ -1513,6 +1513,47 @@ def test_reclaim_orphans_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
         _close_memory(memory)
 
 
+def test_degrade_episodic_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
+    """degrade_episodic() mutates episodic content/embeddings; a warmed
+    enhanced-recall entry must be invalidated even when called directly
+    (not only via sleep())."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    memory = None
+    try:
+        memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+        memory.remember("degrade cache sentinel epsilon", source="fact")
+
+        # Warm the enhanced-recall cache for this query.
+        _call(memory, "degrade cache sentinel epsilon", top_k=3)
+        assert memory._query_cache is not None
+
+        # Prove the warmed entry is a real cache hit (no recompute on an
+        # identical call), then instrument recall for the post-mutation check.
+        recall_calls = []
+        orig_recall = memory.recall
+        memory.recall = lambda query, top_k=40, **kwargs: (
+            recall_calls.append(1), orig_recall(query, top_k=top_k, **kwargs))[1]
+        again = _call(memory, "degrade cache sentinel epsilon", top_k=3)
+        assert again is not None
+        assert len(recall_calls) == 0  # served from cache, no recompute
+
+        cache_version = memory._query_cache.stats()["version"]
+
+        result = memory.degrade_episodic(dry_run=False)
+        assert result["status"] == "degraded"
+        assert memory._query_cache.stats()["version"] == cache_version + 1
+
+        # The next request must recompute, not serve the stale entry.
+        _call(memory, "degrade cache sentinel epsilon", top_k=3)
+        assert len(recall_calls) == 1  # recomputed, not served from cache
+    finally:
+        _close_memory(memory)
+
+
 def test_sleep_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
     """sleep() flips consolidated_at and writes summaries — both change
     dense-pool eligibility; a warmed entry must be invalidated."""
