@@ -1961,7 +1961,9 @@ def _literal_flag_bonus(query_lower: str, content: str) -> float:
     low-importance row that literally contains the flag. This additive premium
     is applied where the other recall bonuses live (recency/current-state,
     graph/fact/binary) so a query for the literal CLI flag cannot be outranked
-    by an ordinary use of the same word. Fragments embedded in a word
+    by an ordinary use of the same word. The premium requires an exact
+    extracted token match on the content side too: ``--force`` never matches
+    ``--forceful`` or ``foo--force``. Fragments embedded in a word
     (``git-rebase``) never match, exactly like ``_leading_hyphen_fragments()``.
     """
     if not query_lower or not content:
@@ -1969,8 +1971,8 @@ def _literal_flag_bonus(query_lower: str, content: str) -> float:
     literals = _leading_hyphen_fragments(query_lower)
     if not literals:
         return 0.0
-    content_lower = content.lower()
-    return 0.3 if any(fragment in content_lower for fragment in literals) else 0.0
+    content_literals = set(_leading_hyphen_fragments(content.lower()))
+    return 0.3 if set(literals) & content_literals else 0.0
 
 
 # Symbolic code names (C++, C#, F#, g++) contain + or #. They must not go
@@ -7213,6 +7215,12 @@ class BeamMemory:
 
         return final_results
 
+    # Bump whenever the enhanced-recall ranking algorithm changes so entries
+    # cached under an older digest are not reused. Part of the hashed payload;
+    # the opaque key keeps the "v2:" prefix because QueryCache's opaque-path
+    # recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
+    _ENHANCED_RECALL_CACHE_VERSION = 3
+
     def _enhanced_recall_cache_key(
         self,
         *,
@@ -7280,7 +7288,7 @@ class BeamMemory:
 
         db_namespace = str(self.db_path.resolve())
         payload = {
-            "version": 2,
+            "version": self._ENHANCED_RECALL_CACHE_VERSION,
             "db_namespace": hashlib.sha256(db_namespace.encode("utf-8")).hexdigest(),
             "query": {"original": original_query, "expanded": expanded_query},
             "scope": {

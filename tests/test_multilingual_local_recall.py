@@ -8,6 +8,7 @@ from mnemosyne.core.beam import (
     _hyphen_fragment_tokens,
     _leading_hyphen_fragments,
     _lexical_relevance,
+    _literal_flag_bonus,
     _recall_tokens,
     _symbolic_code_tokens,
     BeamMemory,
@@ -312,6 +313,15 @@ def test_leading_hyphen_fragments_keep_the_literal_form():
     assert _leading_hyphen_fragments("") == []
 
 
+def test_literal_flag_bonus_requires_an_exact_token_match():
+    assert _literal_flag_bonus("--force", "Use --force now.") == 0.3
+    assert _literal_flag_bonus("--force", "The --forceful approach failed.") == 0.0
+    assert _literal_flag_bonus("--force", "The foo--force flag is not valid.") == 0.0
+    assert _literal_flag_bonus("--force", "The force field is ready.") == 0.0
+    assert _literal_flag_bonus("--force", "") == 0.0
+    assert _literal_flag_bonus("deploy --force", "Deploy with --force after review.") == 0.3
+
+
 def test_literal_flag_scores_above_a_bare_component_match():
     query_lower = "--force"
     assert _lexical_relevance([], "The deployment used --force to proceed.", query_lower) == 1.0
@@ -356,6 +366,21 @@ def test_literal_flag_recall_wins_in_a_mixed_query(tmp_path):
     assert results[0]["id"] == expected_id
     assert all(result["id"] != distractor_id for result in results[:1])
     assert results[0]["keyword_score"] >= results[1]["keyword_score"]
+
+
+def test_literal_flag_is_not_boosted_by_a_different_flag_prefix(tmp_path):
+    beam = BeamMemory(session_id="literal-flag-boundary", db_path=tmp_path / "memory.db")
+    expected_id = beam.remember(
+        "Use --force only after confirmation.", source="test", importance=0.1
+    )
+    distractor_id = beam.remember(
+        "The --forceful migration already ran.", source="test", importance=1.0
+    )
+
+    results = beam.recall("--force", top_k=5)
+
+    assert results[0]["id"] == expected_id
+    assert all(result["id"] != distractor_id for result in results[:1])
 
 
 def test_sentence_transformers_multilingual_dimensions_are_known():

@@ -846,6 +846,63 @@ def test_pipeline_flags_and_process_ranking_configuration_change_digest(enhanced
     assert memory._enhanced_recall_cache_key(**common) != baseline
 
 
+def test_enhanced_cache_key_version_bump_invalidates_literal_flag_ranking_change(enhanced):
+    """The literal-flag ranking adjustment must invalidate pre-change cache entries.
+
+    ``recall_enhanced()`` resolves its request against an opaque digest before
+    the new ``_literal_flag_bonus`` adjustment runs. The algorithm ``version``
+    is part of that hashed payload, so bumping it after a ranking change means
+    a result cached under the previous version can never be returned for the
+    updated algorithm. The ``v2:`` key prefix is preserved so the key still
+    uses the exact-only opaque cache path (``_is_opaque_v2_key``).
+    """
+    memory, calls = enhanced
+    runtime = SimpleNamespace(cross_session=False)
+    common = dict(
+        original_query="--force",
+        expanded_query="--force",
+        top_k=3,
+        runtime=runtime,
+        use_weibull=False,
+        use_mmr=False,
+        use_intent=False,
+        use_synonyms=False,
+        use_associative=False,
+        associative_depth=1,
+        mmr_lambda=0.7,
+        recall_kwargs={},
+    )
+    assert memory._ENHANCED_RECALL_CACHE_VERSION >= 3
+
+    key = memory._enhanced_recall_cache_key(**common)
+    assert key.startswith("v2:")
+
+    # First call initializes the lazy query cache under the current digest.
+    memory.recall_enhanced(
+        "--force",
+        use_weibull=False,
+        use_mmr=False,
+        use_intent=False,
+        use_synonyms=False,
+    )
+    assert len(calls) == 1
+    assert memory._query_cache is not None
+
+    # Simulate an entry created by the pre-change algorithm (different digest).
+    memory._query_cache.put_opaque("v2:" + "f" * 64, [{"id": "stale-v2-result"}])
+
+    second = memory.recall_enhanced(
+        "--force",
+        use_weibull=False,
+        use_mmr=False,
+        use_intent=False,
+        use_synonyms=False,
+    )
+
+    assert len(calls) == 1  # served from the current-key cache entry
+    assert all(r.get("id") != "stale-v2-result" for r in second)
+
+
 def test_private_enhanced_cache_key_weight_fallback_honors_yaml_over_env(
     enhanced, monkeypatch, tmp_path: Path
 ):
