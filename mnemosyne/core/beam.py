@@ -1938,6 +1938,41 @@ def _hyphen_fragment_tokens(text: str) -> List[str]:
     return list(dict.fromkeys(tokens))
 
 
+def _leading_hyphen_fragments(text: str) -> List[str]:
+    """Return unique literal leading-hyphen fragment forms in ``text``.
+
+    ``rm -rf`` yields ``['-rf']``, ``--force`` yields ``['--force']`` and
+    ``python -v`` yields ``['-v']``. Unlike ``_hyphen_fragment_tokens()``
+    which strips the hyphens into bare components, the literal form is kept
+    intact so a query for the CLI flag ``--force`` can be distinguished from
+    an ordinary occurrence of the word ``force``. Fragments embedded in a
+    word (``git-rebase``, ``git--rebase``) are intentionally not matched.
+    """
+    return list(dict.fromkeys(_HYPHEN_FRAGMENT_RE.findall(text.lower())))
+
+
+def _literal_flag_bonus(query_lower: str, content: str) -> float:
+    """Precision premium for a literal leading-hyphen flag inside ``content``.
+
+    ``_lexical_relevance()`` already scores an exact ``--force`` match above a
+    bare ``force`` occurrence, but both live in ``[0, 1]`` and the final rank
+    blends keyword relevance with ``importance``. Without a dedicated signal a
+    high-importance row that merely uses the word "force" can still outrank a
+    low-importance row that literally contains the flag. This additive premium
+    is applied where the other recall bonuses live (recency/current-state,
+    graph/fact/binary) so a query for the literal CLI flag cannot be outranked
+    by an ordinary use of the same word. Fragments embedded in a word
+    (``git-rebase``) never match, exactly like ``_leading_hyphen_fragments()``.
+    """
+    if not query_lower or not content:
+        return 0.0
+    literals = _leading_hyphen_fragments(query_lower)
+    if not literals:
+        return 0.0
+    content_lower = content.lower()
+    return 0.3 if any(fragment in content_lower for fragment in literals) else 0.0
+
+
 # Symbolic code names (C++, C#, F#, g++) contain + or #. They must not go
 # through the FTS5 MATCH builder: unicode61 tokenizes C++ down to the single
 # character "c", so a quoted "c++" term matches every row containing a bare
@@ -2113,6 +2148,13 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
     if query_lower:
         query_tokens = [*query_tokens, *_hyphen_fragment_tokens(query_lower)]
         query_tokens = [*query_tokens, *_symbolic_code_tokens(query_lower)]
+        # The literal leading-hyphen form (e.g. "--force") is a distinct
+        # token from its bare component ("force"): a row that literally
+        # contains the flag must score higher than one with only the bare
+        # word. Deduplicate so a fragment whose component is also a plain
+        # word (query_lower="_force" -> "force") is not double-counted.
+        query_tokens = [*query_tokens, *_leading_hyphen_fragments(query_lower)]
+        query_tokens = list(dict.fromkeys(query_tokens))
     if not query_tokens and not query_cjk:
         return 0.0
     # Callers pass raw _recall_tokens() output. Count each compound's
@@ -2131,6 +2173,9 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
     # (a token must start with a word character); admit the literal symbolic
     # form on both sides so exact-only symbolic queries still match.
     content_tokens.update(_symbolic_code_tokens(content_lower))
+    # Admit the literal leading-hyphen form on the content side too, so an
+    # exact "--force" match is a distinct lexical unit from a bare "force".
+    content_tokens.update(_leading_hyphen_fragments(content_lower))
     # Structured MEMORIA contexts often encode keys as snake_case
     # (telemetry_api_latency_ms). Split separators so natural-language
     # queries get full lexical credit for the same fact.
@@ -6258,6 +6303,9 @@ class BeamMemory:
                     base_score = base_score * 0.80 + vec_sim * 0.20
                 score = base_score * (rc_share + (1.0 - rc_share) * decay)
                 score += _current_state_recency_bonus(query_words, row["content"])
+                # A literal leading-hyphen flag match ("--force") must not be
+                # outranked by an ordinary occurrence of the bare word.
+                score += _literal_flag_bonus(query_lower, row["content"])
                 # Temporal boost (Phase 3)
                 if temporal_weight > 0.0:
                     t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
@@ -6742,6 +6790,9 @@ class BeamMemory:
             score = max(base_score, lexical * 0.8) * (0.7 + 0.3 * decay)
             score += _current_state_recency_bonus(query_words, row["content"])
             score += graph_bonus + fact_bonus + binary_bonus  # Phase 5: polyphonic bonuses
+            # A literal leading-hyphen flag match ("--force") must not be
+            # outranked by an ordinary occurrence of the bare word.
+            score += _literal_flag_bonus(query_lower, row["content"])
             # Temporal boost (Phase 3)
             if temporal_weight > 0.0:
                 t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
@@ -6816,6 +6867,9 @@ class BeamMemory:
                     base_score = relevance * kw_share + row["importance"] * iw + (relevance ** 2) * 0.08
                     score = base_score * (rc_share + (1.0 - rc_share) * decay)
                     score += _current_state_recency_bonus(query_words, row["content"])
+                    # A literal leading-hyphen flag match ("--force") must not
+                    # be outranked by an ordinary occurrence of the bare word.
+                    score += _literal_flag_bonus(query_lower, row["content"])
 
                     # Phase 5: Graph + fact + binary bonuses for fallback.
                     # Gated by the same toggles as the main loop above

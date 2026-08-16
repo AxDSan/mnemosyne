@@ -6,6 +6,7 @@ from mnemosyne.core.beam import (
     _expand_hyphenated_tokens,
     _fts_query_terms,
     _hyphen_fragment_tokens,
+    _leading_hyphen_fragments,
     _lexical_relevance,
     _recall_tokens,
     _symbolic_code_tokens,
@@ -299,6 +300,62 @@ def test_symbolic_code_queries_recall_via_public_api_hash(tmp_path):
 
     assert results[0]["id"] == expected_id
     assert all(result["id"] != distractor_id for result in results)
+
+
+def test_leading_hyphen_fragments_keep_the_literal_form():
+    assert _leading_hyphen_fragments("--force") == ["--force"]
+    assert _leading_hyphen_fragments("rm -rf") == ["-rf"]
+    assert _leading_hyphen_fragments("install --force -rf") == ["--force", "-rf"]
+    assert _leading_hyphen_fragments("python -v") == ["-v"]
+    assert _leading_hyphen_fragments("git--rebase") == []  # embedded, not a fragment
+    assert _leading_hyphen_fragments("git-rebase") == []
+    assert _leading_hyphen_fragments("") == []
+
+
+def test_literal_flag_scores_above_a_bare_component_match():
+    query_lower = "--force"
+    assert _lexical_relevance([], "The deployment used --force to proceed.", query_lower) == 1.0
+    assert _lexical_relevance([], "The force field calibration is complete.", query_lower) == 0.5
+
+    query_lower = "deploy --force"
+    query = _recall_tokens(query_lower)
+    assert _lexical_relevance(query, "We deploy with --force after review.", query_lower) == 1.0
+    assert _lexical_relevance(query, "We deploy using brute force.", query_lower) == 2 / 3
+    assert _lexical_relevance(query, "The ship sails at noon.", query_lower) == 0.0
+
+
+def test_literal_flag_recall_cannot_be_outranked_by_bare_component(tmp_path):
+    beam = BeamMemory(session_id="literal-flag-precision", db_path=tmp_path / "memory.db")
+    expected_id = beam.remember(
+        "Use the deployment command with --force only after confirmation.",
+        source="test",
+        importance=0.1,
+    )
+    distractor_id = beam.remember(
+        "The force field calibration is complete.", source="test", importance=1.0
+    )
+
+    results = beam.recall("--force", top_k=5)
+
+    assert results[0]["id"] == expected_id
+    distractor_rank = next(i for i, r in enumerate(results) if r["id"] == distractor_id)
+    assert results[0]["score"] > results[distractor_rank]["score"]
+
+
+def test_literal_flag_recall_wins_in_a_mixed_query(tmp_path):
+    beam = BeamMemory(session_id="literal-flag-mixed", db_path=tmp_path / "memory.db")
+    expected_id = beam.remember(
+        "We deploy with --force after review.", source="test", importance=0.2
+    )
+    distractor_id = beam.remember(
+        "We deploy using brute force.", source="test", importance=1.0
+    )
+
+    results = beam.recall("deploy --force", top_k=5)
+
+    assert results[0]["id"] == expected_id
+    assert all(result["id"] != distractor_id for result in results[:1])
+    assert results[0]["keyword_score"] >= results[1]["keyword_score"]
 
 
 def test_sentence_transformers_multilingual_dimensions_are_known():
