@@ -846,7 +846,9 @@ def test_pipeline_flags_and_process_ranking_configuration_change_digest(enhanced
     assert memory._enhanced_recall_cache_key(**common) != baseline
 
 
-def test_enhanced_cache_key_version_bump_invalidates_literal_flag_ranking_change(enhanced):
+def test_enhanced_cache_key_version_bump_invalidates_literal_flag_ranking_change(
+    enhanced, monkeypatch
+):
     """The literal-flag ranking adjustment must invalidate pre-change cache entries.
 
     ``recall_enhanced()`` resolves its request against an opaque digest before
@@ -857,50 +859,44 @@ def test_enhanced_cache_key_version_bump_invalidates_literal_flag_ranking_change
     uses the exact-only opaque cache path (``_is_opaque_v2_key``).
     """
     memory, calls = enhanced
-    runtime = SimpleNamespace(cross_session=False)
-    common = dict(
-        original_query="--force",
-        expanded_query="--force",
-        top_k=3,
-        runtime=runtime,
-        use_weibull=False,
-        use_mmr=False,
-        use_intent=False,
-        use_synonyms=False,
-        use_associative=False,
-        associative_depth=1,
-        mmr_lambda=0.7,
-        recall_kwargs={},
-    )
+
+    # Run once under the pre-change algorithm version so the cache holds a
+    # v2-ranked result, keyed through the real request path.
+    with monkeypatch.context() as ctx:
+        ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 2)
+        stale = memory.recall_enhanced(
+            "--force",
+            use_weibull=False,
+            use_mmr=False,
+            use_intent=False,
+            use_synonyms=False,
+        )
+    assert len(calls) == 1
+    stale_id = stale[0]["id"]
+
     assert memory._ENHANCED_RECALL_CACHE_VERSION >= 3
 
-    key = memory._enhanced_recall_cache_key(**common)
-    assert key.startswith("v2:")
-
-    # First call initializes the lazy query cache under the current digest.
-    memory.recall_enhanced(
+    # The current-version digest differs from the stale v2 key: cache miss.
+    fresh = memory.recall_enhanced(
         "--force",
         use_weibull=False,
         use_mmr=False,
         use_intent=False,
         use_synonyms=False,
     )
-    assert len(calls) == 1
-    assert memory._query_cache is not None
+    assert len(calls) == 2  # base recall ran; the stale v2 result was not reused
+    assert fresh[0]["id"] != stale_id
 
-    # Simulate an entry created by the pre-change algorithm (different digest).
-    memory._query_cache.put_opaque("v2:" + "f" * 64, [{"id": "stale-v2-result"}])
-
-    second = memory.recall_enhanced(
+    # The current-version entry is now cached and reused.
+    again = memory.recall_enhanced(
         "--force",
         use_weibull=False,
         use_mmr=False,
         use_intent=False,
         use_synonyms=False,
     )
-
-    assert len(calls) == 1  # served from the current-key cache entry
-    assert all(r.get("id") != "stale-v2-result" for r in second)
+    assert len(calls) == 2
+    assert again == fresh
 
 
 def test_private_enhanced_cache_key_weight_fallback_honors_yaml_over_env(
