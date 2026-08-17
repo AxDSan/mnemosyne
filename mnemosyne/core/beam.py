@@ -4450,6 +4450,22 @@ class BeamMemory:
                 exc,
             )
 
+    def _invalidate_query_cache_after_commit(self, operation: str) -> None:
+        """Best-effort query-cache invalidation after a mutating commit.
+
+        Consolidation / reclaim / sleep change dense-pool eligibility
+        (``consolidated_at`` transitions, new episodic summaries, episodic
+        degradation), so warmed enhanced-recall v3 entries must not be served
+        stale after those mutations.
+        """
+        try:
+            self._invalidate_query_cache()
+        except Exception as exc:
+            logger.warning(
+                "%s: query-cache invalidation failed after commit (%s): %s",
+                operation, type(exc).__name__, exc,
+            )
+
     def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
         """
         Mark a memory as invalid/superseded.
@@ -4950,21 +4966,29 @@ class BeamMemory:
                 except Exception:
                     pass  # Non-blocking
 
-        self.conn.commit()
+        try:
+            self.conn.commit()
 
-        # Phase 3-4: Graph + veracity for consolidated episodic memory
-        # E4.a.1 review fix (H2): thread the aggregated row_veracity into
-        # graph + fact extraction so Bayesian compounding on consolidated
-        # facts uses the source-aggregated signal, not a hardcoded
-        # 'inferred'. Pre-fix this line passed 'inferred' regardless, which
-        # the consolidator's `consolidate_fact` then used as the veracity
-        # weight in its confidence update -- undermining the very signal
-        # we just preserved in the episodic INSERT.
-        self._ingest_graph_and_veracity(memory_id, summary, source, veracity=row_veracity)
+            # Phase 3-4: Graph + veracity for consolidated episodic memory
+            # E4.a.1 review fix (H2): thread the aggregated row_veracity into
+            # graph + fact extraction so Bayesian compounding on consolidated
+            # facts uses the source-aggregated signal, not a hardcoded
+            # 'inferred'. Pre-fix this line passed 'inferred' regardless, which
+            # the consolidator's `consolidate_fact` then used as the veracity
+            # weight in its confidence update -- undermining the very signal
+            # we just preserved in the episodic INSERT.
+            self._ingest_graph_and_veracity(memory_id, summary, source, veracity=row_veracity)
 
-        self._emit_event("MEMORY_CONSOLIDATED", memory_id, content=summary,
-                         source=source, importance=importance,
-                         metadata={"summary_of": source_wm_ids, **(metadata or {})})
+            self._emit_event("MEMORY_CONSOLIDATED", memory_id, content=summary,
+                             source=source, importance=importance,
+                             metadata={"summary_of": source_wm_ids, **(metadata or {})})
+        finally:
+            # The new episodic row, its embeddings, and the graph/fact
+            # mutations all change dense-pool eligibility for enhanced recall;
+            # drop warmed cache entries after every write path, even if the
+            # enrichment step fails (another worker could otherwise refill the
+            # cache between the commit and the graph writes).
+            self._invalidate_query_cache_after_commit("consolidate_to_episodic")
         return memory_id
 
     # ------------------------------------------------------------------
@@ -6244,6 +6268,29 @@ class BeamMemory:
         
         wm_where = " AND ".join(wm_where_clauses)
 
+        # Vector pool isolation (#696): raw dialog capture (source='conversation',
+        # source='honcho_message') stays fully FTS-reachable but is excluded from
+        # the working-memory DENSE candidate pool. Conversational queries are
+        # topically identical to their own dialog rows, so the nearest-N pool
+        # saturates with them and starves distilled facts out of the dense
+        # voice (facts semantically matching a query can rank beyond the pool
+        # and surface with dense_score=0.0 or not at all). Durable honcho rows
+        # are NOT raw dialog and stay eligible for a dense score:
+        # honcho_summary is a deliberate session summary with higher
+        # importance, honcho_import is a generic import default. Consolidated
+        # rows (consolidated_at IS NOT NULL) are likewise kept out of the
+        # default dense candidates: per #427 they must not compete with hot
+        # unconsolidated memories (mirrors get_context). An explicit
+        # source=/topic= filter keeps the caller in control — asking for
+        # conversation rows directly still works.
+        wm_vec_where = wm_where
+        if not (source or topic):
+            wm_vec_where = (
+                f"{wm_where} AND (source IS NULL OR "
+                f"(source <> 'conversation' AND source <> 'honcho_message'))"
+                f" AND consolidated_at IS NULL"
+            )
+
         # ---- Working memory (vector search) ----
         wm_vec_sims = {}
         if embeddings_available:
@@ -6252,7 +6299,7 @@ class BeamMemory:
                 if emb_result is not None:
                     wm_vec = _wm_vec_search(self.conn, emb_result,
                                               k=max(top_k, 20) if _BEAM_MODE else max(top_k * 3, 50),
-                                              where_sql=wm_where,
+                                              where_sql=wm_vec_where,
                                               where_params=tuple(wm_params))
                     for vr in wm_vec:
                         wm_vec_sims[vr["id"]] = vr["sim"]
@@ -7290,7 +7337,7 @@ class BeamMemory:
     # cached under an older digest are not reused. Part of the hashed payload;
     # the opaque key keeps the "v2:" prefix because QueryCache's opaque-path
     # recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
-    _ENHANCED_RECALL_CACHE_VERSION = 4
+    _ENHANCED_RECALL_CACHE_VERSION = 5
 
     def _enhanced_recall_cache_key(
         self,
@@ -7420,6 +7467,13 @@ class BeamMemory:
             },
         }
         material = json.dumps(canonicalize(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        # The default dense candidate predicate changed (dialog / honcho /
+        # consolidated exclusion, #696 / #427), so pre-change opaque cache
+        # entries could still contain dialog, honcho or consolidated dense
+        # candidates. _ENHANCED_RECALL_CACHE_VERSION is part of the hashed
+        # payload; bumping it (4 -> 5) guarantees those entries are never
+        # reused. The "v2:" prefix stays fixed — QueryCache's opaque-path
+        # recognition keys off that exact prefix.
         return "v2:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     def recall_enhanced(self, query: str, top_k: int = 40, *,
@@ -7507,7 +7561,7 @@ class BeamMemory:
         kwargs["fts_weight"] = weight_snapshot.fts
         kwargs["importance_weight"] = weight_snapshot.importance
 
-        # 3. Query cache check.  Opaque v2 keys use QueryCache's exact-only
+        # 3. Query cache check.  Opaque v3 keys use QueryCache's exact-only
         # path, so no semantic tier can reuse a different effective request.
         runtime = resolve_beam_runtime()
         explain = bool(kwargs.get("explain", False))
@@ -7911,6 +7965,15 @@ class BeamMemory:
                 query=query,
                 query_embedding=query_embedding,
                 top_k=top_k * 2,  # over-fetch for filter dropouts
+                # Explicit source=/topic= filters must not be pre-empted by
+                # the default dense-source exclusion (dialog / honcho /
+                # consolidated rows) inside the vector voice — the caller
+                # asked for those rows directly (#696). The explicit values
+                # are propagated as real predicates so they apply BEFORE
+                # top-K selection, mirroring the linear wm_where semantics.
+                default_dense_source_filter=not (source or topic),
+                source=source,
+                topic=topic,
             )
         except Exception as exc:
             logger.exception("polyphonic recall engine failed: %s", exc)
@@ -8109,7 +8172,11 @@ class BeamMemory:
             return False
         if source and row_dict.get("source") != source:
             return False
-        if topic and topic not in (row_dict.get("source") or ""):
+        # topic is stored in the source field (pending a dedicated topic
+        # column) — match EXACTLY like the linear path's `source = ?`, so a
+        # non-vector voice returning source='conversation_archive' cannot
+        # pass topic='conversation'.
+        if topic and row_dict.get("source") != topic:
             return False
         if author_id and row_dict.get("author_id") != author_id:
             return False
@@ -8682,6 +8749,11 @@ class BeamMemory:
                     logger.info("degrade_episodic: rollback failed", exc_info=True)
 
         self.conn.commit()
+        # Tier demotion changes episodic content + embeddings; drop warmed
+        # enhanced-recall entries. Also covers direct degrade_episodic()
+        # calls and the sleep_all_sessions() degradation pass, which do not
+        # go through sleep()'s own invalidation.
+        self._invalidate_query_cache_after_commit("degrade_episodic")
         return results
 
     def get_contaminated(self, limit: int = 50, min_importance: float = 0.0) -> List[Dict]:
@@ -8882,6 +8954,9 @@ class BeamMemory:
         )
         reclaimed = cursor.rowcount
         self.conn.commit()
+        # Clearing consolidated_at re-admits rows to the default dense
+        # pool; warmed enhanced-recall entries are no longer accurate.
+        self._invalidate_query_cache_after_commit("reclaim_orphans")
         logger.info("reclaim_orphans: reclaimed=%d candidates=%d", reclaimed, len(candidate_ids))
         return {
             "status": "reclaimed" if reclaimed else "no_op",
@@ -8989,6 +9064,11 @@ class BeamMemory:
             # Filter rows to only those we successfully claimed.
             rows = [r for r in rows if r["id"] in claimed_ids]
             self.conn.commit()
+            # The claim flips consolidated_at on live working rows, which
+            # changes default dense-pool eligibility (#427 predicate);
+            # drop warmed enhanced-recall entries immediately so a stale
+            # result set is never served while summaries are being written.
+            self._invalidate_query_cache_after_commit("sleep.claim")
 
         grouped: Dict[str, List[Dict]] = {}
         for row in rows:
@@ -9219,6 +9299,9 @@ class BeamMemory:
 
         # Run tiered degradation after consolidation
         degrade_result = self.degrade_episodic(dry_run=dry_run)
+        if not dry_run:
+            # Summaries + degradation both changed recallable content.
+            self._invalidate_query_cache_after_commit("sleep")
 
         logger.info(
             "sleep: consolidated=%d summaries=%d conflicts=%d llm=%s method=%s",
