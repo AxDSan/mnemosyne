@@ -952,7 +952,10 @@ def test_packaged_provider_auto_sleep_uses_worker_local_beam(monkeypatch, provid
         "author_type": "user",
         "channel_id": "channel-a",
     }
-    assert source_calls == [("worker", "sleep_all_sessions")]
+    # Session-scoped only (#771): the worker beam is bound to the triggering
+    # session, so it must run sleep() rather than sleep_all_sessions(), which
+    # would sweep every session in a shared-surface DB.
+    assert source_calls == [("worker", "sleep")]
 
 
 def test_provider_remember_extract_uses_default_scope(provider_modules):
