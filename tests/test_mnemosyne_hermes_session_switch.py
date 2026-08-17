@@ -1545,20 +1545,28 @@ def test_auto_sleep_disabled_via_auto_sleep_enabled_config_key(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """auto_sleep_enabled: false must disable auto-sleep (#771).
+    """auto_sleep_enabled: false must disable auto-sleep via the core config (#771).
 
     The provider previously read only the Hermes ``auto_sleep`` key; the core
     config key ``auto_sleep_enabled`` (set via ``mnemosyne config set``) never
     reached it, so operators could not opt out of the capability-selected
-    sleep path.
+    sleep path. The fix bridges ``_read_config_key()`` to the core
+    ``MnemosyneConfig`` singleton; this test pins that bridge by mocking
+    ``get_config()`` with the Hermes config left empty, so it fails if the
+    bridge is removed.
     """
     monkeypatch.delenv("MNEMOSYNE_AUTO_SLEEP_ENABLED", raising=False)
     (tmp_path / "config.yaml").write_text(
         "memory:\n"
         "  provider: mnemosyne\n"
-        "  mnemosyne:\n"
-        "    auto_sleep_enabled: false\n"
+        "  mnemosyne: {}\n"
     )
+
+    fake_config = Mock()
+    fake_config.get.side_effect = lambda key, default=None: (
+        False if key == "auto_sleep_enabled" else default
+    )
+    monkeypatch.setattr("mnemosyne.core.config.get_config", lambda: fake_config)
 
     provider = MnemosyneMemoryProvider()
     provider._hermes_home = str(tmp_path)
