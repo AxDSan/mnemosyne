@@ -1299,7 +1299,7 @@ def test_auto_sleep_eligibility_and_snapshot_share_switch_lock(
         def __init__(self, **kwargs: Any) -> None:
             type(self).calls.append(dict(kwargs))
 
-        def sleep_all_sessions(self) -> None:
+        def sleep(self) -> None:
             worker_started.set()
             if not release_worker.wait(timeout=5):
                 raise TimeoutError("auto-sleep worker was not released")
@@ -1477,3 +1477,100 @@ def test_shutdown_closes_existing_audit_log() -> None:
     assert provider._audit is None
     assert provider._provider_sync_adapter is None
     assert provider._provider_persona_adapter is None
+
+
+def test_auto_sleep_worker_uses_session_scoped_sleep_not_sleep_all_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Auto-sleep must consolidate only the triggering session (#771).
+
+    A replica of a shared-surface DB carries aged-but-unconsolidated rows for
+    the MCP's fixed ``mcp_{bank}`` session. If auto-sleep selects
+    ``sleep_all_sessions()`` via capability probing, the first write on the
+    replica sweeps the whole backlog into a gist in one pass (407 -> 147 rows
+    in the issue). The worker must run the session-scoped ``sleep()`` on an
+    isolated beam bound to the triggering session.
+    """
+    worker_calls: list[str] = []
+    worker_kwargs: list[dict[str, Any]] = []
+
+    class _SourceBeam:
+        session_id = "hermes_SESS-A"
+        channel_id = "hermes_SESS-A"
+        db_path = "memory.db"
+        author_id = "author"
+        author_type = "agent"
+        canonical_owner_id = "profile-owner"
+        agent_context = "primary"
+
+        def get_working_stats(self) -> dict[str, int]:
+            return {"total": 2}
+
+        def _count_unconsolidated_before(self, _cutoff: str) -> int:
+            return 1
+
+        def sleep(self) -> None:
+            raise AssertionError("auto-sleep must use a worker-local Beam")
+
+        def sleep_all_sessions(self) -> None:
+            raise AssertionError("auto-sleep must use a worker-local Beam")
+
+    class _WorkerBeam:
+        def __init__(self, **kwargs: Any) -> None:
+            worker_kwargs.append(dict(kwargs))
+
+        def sleep(self) -> None:
+            worker_calls.append("sleep")
+
+        def sleep_all_sessions(self) -> None:
+            worker_calls.append("sleep_all_sessions")
+
+    provider = MnemosyneMemoryProvider()
+    provider._beam = _SourceBeam()
+    provider._session_id = "hermes_SESS-A"
+    provider._auto_sleep_threshold = 1
+    provider._auto_sleep_enabled = True
+    provider._AUTO_SLEEP_TIMEOUT_SECONDS = 5
+    provider._reserve_reflection_budget_locked = lambda _reason: None
+    monkeypatch.setattr(mnemosyne_hermes, "_get_beam_class", lambda: _WorkerBeam)
+
+    provider._maybe_auto_sleep(expected_session_id="hermes_SESS-A")
+
+    assert worker_calls == ["sleep"], f"auto-sleep must be session-scoped: {worker_calls}"
+    assert worker_kwargs[0]["session_id"] == "hermes_SESS-A"
+    assert worker_kwargs[0]["db_path"] == "memory.db"
+
+
+def test_auto_sleep_disabled_via_auto_sleep_enabled_config_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """auto_sleep_enabled: false must disable auto-sleep via the core config (#771).
+
+    The provider previously read only the Hermes ``auto_sleep`` key; the core
+    config key ``auto_sleep_enabled`` (set via ``mnemosyne config set``) never
+    reached it, so operators could not opt out of the capability-selected
+    sleep path. The fix bridges ``_read_config_key()`` to the core
+    ``MnemosyneConfig`` singleton; this test pins that bridge by mocking
+    ``get_config()`` with the Hermes config left empty, so it fails if the
+    bridge is removed.
+    """
+    monkeypatch.delenv("MNEMOSYNE_AUTO_SLEEP_ENABLED", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "memory:\n"
+        "  provider: mnemosyne\n"
+        "  mnemosyne: {}\n"
+    )
+
+    fake_config = Mock()
+    fake_config.get.side_effect = lambda key, default=None: (
+        False if key == "auto_sleep_enabled" else default
+    )
+    monkeypatch.setattr("mnemosyne.core.config.get_config", lambda: fake_config)
+
+    provider = MnemosyneMemoryProvider()
+    provider._hermes_home = str(tmp_path)
+    provider._auto_sleep_enabled = True
+    provider._apply_provider_config({})
+
+    assert provider._auto_sleep_enabled is False
