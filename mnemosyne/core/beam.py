@@ -9656,6 +9656,9 @@ class BeamMemory:
         max_candidates = max(1, int(max_candidates))
         if max_llm_validations is None:
             max_llm_validations = _cross_session_max_llm_validations()
+        # Clamp direct overrides too: a negative/zero value would otherwise
+        # make the cap trigger immediately (resolving no LLM-confirmed conflicts).
+        max_llm_validations = max(1, int(max_llm_validations))
 
         cursor = self.conn.cursor()
         now = datetime.now().isoformat()
