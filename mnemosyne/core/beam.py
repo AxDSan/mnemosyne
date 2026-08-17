@@ -9591,6 +9591,7 @@ class BeamMemory:
         min_gap_hours: Optional[float] = None,
         max_candidates: Optional[int] = None,
         max_llm_validations: Optional[int] = None,
+        llm_eval: bool = False,
     ) -> Dict:
         """Resolve factual contradictions among global-scope memories across
         sessions, exposed as an on-demand, operator-invoked tool.
@@ -9605,8 +9606,11 @@ class BeamMemory:
 
         Confirmation is LLM-backed via `validate_conflict_pair` only when
         `MNEMOSYNE_LLM_CONFLICT_DETECTION` is on *and* this is an explicit apply
-        (`dry_run=False`); a dry run is deliberately deterministic — no LLM
-        calls and no mutation — so it only reports detector candidates.
+        (`dry_run=False`). A dry run is deterministic by default (no LLM calls,
+        no mutation), but can opt into the same LLM vetting — still without
+        mutating — by passing `llm_eval=True`, so the reported parity with an
+        apply (which pairs the LLM would confirm vs. reject) can be tested
+        first. A dry run without `llm_eval` only reports detector candidates.
         `min_gap_hours` relaxes the intra-conversation back-to-back heuristic
         for independent threads (default 0).
 
@@ -9753,7 +9757,14 @@ class BeamMemory:
                 if older.get("superseded_by") or newer.get("superseded_by"):
                     continue
                 confirmed = True
-                if LLM_CONFLICT_DETECTION_ENABLED and not dry_run:
+                # LLM confirmation runs on an explicit apply when the env flag
+                # is on; a dry run is deterministic by default but can opt into
+                # the same LLM vetting (no mutation) via llm_eval=True, so the
+                # reported parity with an apply can be tested first.
+                run_llm = LLM_CONFLICT_DETECTION_ENABLED and not dry_run
+                if dry_run and llm_eval:
+                    run_llm = True
+                if run_llm:
                     if llm_validations >= max_llm_validations:
                         llm_cap_reached = True
                         break

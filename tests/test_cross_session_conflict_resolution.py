@@ -196,6 +196,54 @@ def test_dry_run_reports_and_does_not_mutate(temp_db, monkeypatch, disable_llm):
     assert row[0] is None, "dry run must not supersede"
 
 
+def test_dry_run_llm_eval_switches_llm_without_mutating(temp_db, monkeypatch, disable_llm):
+    """`llm_eval=True` makes a dry run run the LLM gate (previewing exactly what
+    an apply would confirm/decline) while still not mutating. The default dry
+    run stays deterministic (no LLM calls). This closes the dry-run/apply
+    parity gap under LLM detection without changing the deterministic default."""
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    import mnemosyne.core.llm_conflict_detector as lcd
+    monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+
+    A = BeamMemory(session_id="tA", db_path=temp_db)
+    B = BeamMemory(session_id="tB", db_path=temp_db)
+    blue = A.remember("[USER] favorite color is blue", source="conversation",
+                      importance=0.7, scope="global")
+    green = B.remember("[USER] favorite color is green now", source="conversation",
+                       importance=0.7, scope="global")
+    C = BeamMemory(session_id="tC", db_path=temp_db)
+    C._detect_conflicts = _stub_detect_pair(blue, green)
+
+    # default dry run: deterministic, LLM never consulted even when the flag is on
+    calls = []
+    def _confirm(older, newer, session_id, db_path):
+        calls.append((older, newer))
+        return True, 0.9, "now"
+    monkeypatch.setattr(lcd, "validate_conflict_pair", _confirm)
+    res = C.resolve_cross_session_conflicts(dry_run=True)
+    assert res["llm_validations"] == 0 and len(calls) == 0
+    assert res["conflicts_resolved"] == 1
+
+    # dry run + llm_eval: LLM consulted (confirms) but nothing mutates
+    confirmed = C.resolve_cross_session_conflicts(dry_run=True, llm_eval=True)
+    assert confirmed["llm_validations"] >= 1
+    assert confirmed["conflicts_resolved"] == 1
+    assert confirmed["invalidated"] == 0
+    row = C.conn.execute(
+        "SELECT superseded_by FROM working_memory WHERE id = ?", (blue,)).fetchone()
+    assert row[0] is None, "llm_eval dry run must not supersede"
+
+    # dry run + llm_eval where the LLM declines: leaks the apply-time veto
+    C2 = BeamMemory(session_id="tC2", db_path=temp_db)
+    C2._detect_conflicts = _stub_detect_pair(blue, green)
+    monkeypatch.setattr(lcd, "validate_conflict_pair",
+                        lambda older, newer, session_id, db_path: (False, 0.2, None))
+    declined = C2.resolve_cross_session_conflicts(dry_run=True, llm_eval=True)
+    assert declined["llm_validations"] >= 1
+    assert declined["conflicts_resolved"] == 0
+    assert declined["invalidated"] == 0
+
+
 def test_source_grouping_excludes_different_sources(temp_db, monkeypatch, disable_llm):
     """Contradictory global rows carrying different `source` values land in
     separate groups, so no pair is flagged (the grouping contract the resolver
