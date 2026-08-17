@@ -513,12 +513,33 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
     return candidates[:limit]
 
 
+def _prefetch_is_polyphonic(row: Dict[str, Any]) -> bool:
+    """True when a recall result came from the polyphonic engine.
+
+    The polyphonic engine ranks via RRF and carries `voice_scores` (keys
+    vector/graph/fact/temporal) instead of the linear per-signal
+    keyword/fts/dense fields. Such rows are already relevance-ranked by the
+    engine, so prefetch must not drop them merely for lacking the linear
+    signal fields.
+    """
+    vs = row.get("voice_scores")
+    if not isinstance(vs, dict) or not vs:
+        return False
+    return bool(set(vs) & {"vector", "graph", "fact", "temporal"})
+
+
 def _prefetch_topic_signal(row: Dict[str, Any]) -> float:
     signal = max(
         float(row.get("keyword_score") or 0.0),
         float(row.get("fts_score") or 0.0),
         float(row.get("dense_score") or 0.0),
     )
+    if _prefetch_is_polyphonic(row):
+        # Polyphonic results are ranked by the engine (RRF over its voices)
+        # and expose only `voice_scores` provenance -- not fabricated per-signal
+        # scores. Use the strongest voice contribution as an honest relevance
+        # proxy so these rows can be ranked without inventing fts/dense values.
+        signal = max(float(v) for v in (row.get("voice_scores") or {}).values())
     if row.get("fact_match") or row.get("entity_match"):
         signal = max(signal, 0.20)
     return signal
@@ -1527,14 +1548,20 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 # mnemosyne_recall remains available for semantic exploration.
                 if not _prefetch_has_distinctive_lexical_evidence(query, r.get("content", "")):
                     continue
-                signal = _prefetch_topic_signal(r)
-                score = float(r.get("score") or 0.0)
-                importance = float(r.get("importance") or 0.0)
-                required_signal = 0.18 if _prefetch_is_raw(r) else 0.08
-                if signal < required_signal:
-                    continue
-                if score < 0.20 and importance < 0.65:
-                    continue
+                # Polyphonic results are already relevance-ranked by the engine
+                # (RRF over vector/graph/fact/temporal voices) and expose only
+                # `voice_scores` provenance, not the linear per-signal fields.
+                # They pass the lexical gate above, so do not drop them for the
+                # absent keyword/fts/dense signal or the linear 0.20 score floor.
+                if not _prefetch_is_polyphonic(r):
+                    signal = _prefetch_topic_signal(r)
+                    score = float(r.get("score") or 0.0)
+                    importance = float(r.get("importance") or 0.0)
+                    required_signal = 0.18 if _prefetch_is_raw(r) else 0.08
+                    if signal < required_signal:
+                        continue
+                    if score < 0.20 and importance < 0.65:
+                        continue
                 filtered.append(r)
 
             if canonical_rows:
