@@ -933,9 +933,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         """
         # auto_sleep: prefer kwargs, then config.yaml, then env var, defaulting
         # on to match Mnemosyne core's consolidation behavior for fresh installs.
+        # Both key spellings are honored: the Hermes ``auto_sleep`` key and the
+        # core ``auto_sleep_enabled`` key (set via ``mnemosyne config set``),
+        # so operators can disable auto-sleep through the documented core
+        # config surface (issue #771).
         auto_sleep = kwargs.get("auto_sleep")
         if auto_sleep is None:
             auto_sleep = self._read_config_key("auto_sleep")
+        if auto_sleep is None:
+            auto_sleep = self._read_config_key("auto_sleep_enabled")
         if auto_sleep is not None:
             self._auto_sleep_enabled = _coerce_bool(auto_sleep, self._auto_sleep_enabled)
         # env var/default is already applied in __init__, so it is the base default
@@ -1068,8 +1074,28 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         return False
 
     def _read_config_key(self, key: str) -> Any:
-        """Read a single key from memory.mnemosyne in config.yaml."""
-        return read_hermes_config_key(getattr(self, "_hermes_home", None), key)
+        """Read a single key, checking Hermes config first, then Mnemosyne config.
+
+        Precedence: Hermes config.yaml (memory.mnemosyne.<key>) > Mnemosyne
+        config.yaml > env var > hardcoded default.
+
+        The Mnemosyne fallback bridges the two config systems so that
+        ``mnemosyne config set`` actually affects the running provider
+        (issue #771).
+        """
+        from mnemosyne.core.config import get_config
+
+        # 1. Hermes config (memory.mnemosyne.<key>)
+        val = read_hermes_config_key(getattr(self, "_hermes_home", None), key)
+        if val is not None:
+            return val
+
+        # 2. Mnemosyne config singleton (auto-reloads on file change)
+        val = get_config().get(key)
+        if val is not None:
+            return val
+
+        return None
 
 
     def _configured_tool_schemas(self) -> List[Dict[str, Any]]:
@@ -1801,7 +1827,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             "author_type": beam_ref.author_type,
             "channel_id": beam_ref.channel_id,
         }
-        sleep_all_sessions = hasattr(beam_ref, "sleep_all_sessions")
         canonical_owner_id = getattr(beam_ref, "canonical_owner_id", "default")
         agent_context = getattr(
             beam_ref,
@@ -1812,7 +1837,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             working,
             eligible,
             sleep_args,
-            sleep_all_sessions,
             canonical_owner_id,
             agent_context,
         )
@@ -1826,7 +1850,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     working,
                     eligible,
                     sleep_args,
-                    sleep_all_sessions,
                     canonical_owner_id,
                     agent_context,
                 ) = snapshot
@@ -1846,11 +1869,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                             )
                             sleep_beam.canonical_owner_id = canonical_owner_id
                             sleep_beam.agent_context = agent_context
-                            (
-                                sleep_beam.sleep_all_sessions
-                                if sleep_all_sessions
-                                else sleep_beam.sleep
-                            )()
+                            # Session-scoped only (#771): the worker beam is
+                            # bound to the triggering session_id above, so
+                            # sleep() consolidates just that session. Selecting
+                            # sleep_all_sessions() by capability (hasattr)
+                            # would sweep every session in a shared-surface DB,
+                            # collapsing a replica's entire mcp_{bank} backlog
+                            # into a gist on one write (issue #771).
+                            sleep_beam.sleep()
                     except Exception as inner:
                         logger.debug("Mnemosyne auto-sleep worker failed: %s", inner)
 
