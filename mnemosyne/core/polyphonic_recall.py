@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List
 from dataclasses import dataclass
 from pathlib import Path
@@ -250,7 +250,7 @@ class PolyphonicRecallEngine:
             conn.row_factory = sqlite3.Row
             own_conn = True
         try:
-            now_iso = datetime.now().isoformat()
+            now_iso = datetime.now(timezone.utc).isoformat()
             by_id: Dict[str, RecallResult] = {}
 
             # --- EM tier -- prefer sqlite-vec ANN, fall back to numpy ---
@@ -326,7 +326,7 @@ class PolyphonicRecallEngine:
                             FROM episodic_memory em
                             WHERE em.rowid IN ({placeholders})
                               AND em.superseded_by IS NULL
-                              AND (em.valid_until IS NULL OR em.valid_until > ?)
+                              AND (em.valid_until IS NULL OR julianday(em.valid_until) > julianday(?))
                             """,
                             (*rowid_list, now_iso),
                         ).fetchall()
@@ -409,7 +409,7 @@ class PolyphonicRecallEngine:
                         FROM memory_embeddings me
                         JOIN episodic_memory em ON me.memory_id = em.id
                         WHERE em.superseded_by IS NULL
-                          AND (em.valid_until IS NULL OR em.valid_until > ?)
+                          AND (em.valid_until IS NULL OR julianday(em.valid_until) > julianday(?))
                         LIMIT ?
                         """,
                         (now_iso, vec_limit),
@@ -462,7 +462,7 @@ class PolyphonicRecallEngine:
                     FROM memory_embeddings me
                     JOIN working_memory wm ON me.memory_id = wm.id
                     WHERE wm.superseded_by IS NULL
-                      AND (wm.valid_until IS NULL OR wm.valid_until > ?)
+                      AND (wm.valid_until IS NULL OR julianday(wm.valid_until) > julianday(?))
                     LIMIT ?
                     """,
                     (now_iso, vec_limit),

@@ -825,6 +825,32 @@ def _handle_recall_canonical(arguments: Dict[str, Any]) -> Dict[str, Any]:
             "results_count": len(results), "results": results, "store": "canonical"}
 
 
+def _handle_forget_canonical(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_forget_canonical tool call."""
+    from mnemosyne.core.canonical import CanonicalStore
+
+    category = arguments.get("category")
+    name = arguments.get("name")
+    if not isinstance(category, str) or not isinstance(name, str):
+        return {"error": "category and name are required"}
+    category = category.strip()
+    name = name.strip()
+    if not category or not name:
+        return {"error": "category and name are required"}
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    store = getattr(mem.beam, "canonical", None)
+    if store is None:
+        db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
+        store = CanonicalStore(db_path=db_path, conn=mem.beam.conn)
+
+    owner_id = _canonical_owner(arguments)
+    retired = store.forget(owner_id, category, name)
+    return {"retired": retired, "owner_id": owner_id, "category": category,
+            "name": name, "store": "canonical"}
+
+
 def _handle_scratchpad_write(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_scratchpad_write tool call."""
     content = arguments.get("content", "").strip()
@@ -1119,6 +1145,7 @@ _TOOL_HANDLERS = {
     "mnemosyne_triple_query": _handle_triple_query,
     "mnemosyne_remember_canonical": _handle_remember_canonical,
     "mnemosyne_recall_canonical": _handle_recall_canonical,
+    "mnemosyne_forget_canonical": _handle_forget_canonical,
     "mnemosyne_scratchpad_write": _handle_scratchpad_write,
     "mnemosyne_scratchpad_read": _handle_scratchpad_read,
     "mnemosyne_scratchpad_clear": _handle_scratchpad_clear,
@@ -1156,8 +1183,13 @@ def handle_tool_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def get_tool_definitions() -> List[Dict[str, Any]]:
-    """Return all tool definitions for MCP server registration."""
-    return TOOLS
+    """Return tool definitions for MCP server registration.
+
+    Only tools with a dispatch handler are advertised. A schema without a
+    handler would be selectable in ``tools/list`` but would fail every
+    ``tools/call`` with ``Unknown tool``, so it is filtered out here (#728).
+    """
+    return [t for t in TOOLS if t["name"] in _TOOL_HANDLERS]
 
 
 # Keep the exact pre-lazy-import star-import surface.  ``Mnemosyne`` remains

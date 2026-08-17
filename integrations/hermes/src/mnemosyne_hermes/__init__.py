@@ -3266,11 +3266,11 @@ def register_memory_provider(ctx):
             f"[mnemosyne-hermes]   Python: {_sys.version!r}",
             file=_sys.stderr,
         )
-        # Try to detect Hermes' Python for version mismatch diagnostics
+        # Try to detect Hermes' Python for environment mismatch diagnostics
         try:
-            from .install import _find_hermes_python
+            from .install import _find_hermes_python, _hermes_python_mismatch
             _hp = _find_hermes_python()
-            if _hp and _hp.resolve() != Path(_sys.executable).resolve():
+            if _hp and _hermes_python_mismatch(_hp):
                 import subprocess as _sp
                 _r = _sp.run(
                     [str(_hp), "--version"],
@@ -3281,8 +3281,10 @@ def register_memory_provider(ctx):
                     f"[mnemosyne-hermes]   Hermes' Python: {_hp} ({_ver})",
                     file=_sys.stderr,
                 )
+                import shlex as _shlex
                 print(
-                    f"[mnemosyne-hermes]   FIX: Run: {_hp} -m pip install -U 'mnemosyne-hermes[all]'",
+                    f"[mnemosyne-hermes]   FIX: Run: {_shlex.quote(str(_hp))}"
+                    " -m pip install -U 'mnemosyne-hermes[all]'",
                     file=_sys.stderr,
                 )
         except Exception:
@@ -3311,17 +3313,17 @@ def register(ctx):
         handler_fn=mnemosyne_command,
     )
 
-    # Register all tools (29 memory + 3 sync + 4 persona) so the agent can call them.
+    # Register the configured tools so the PluginManager surface matches memory
+    # provider discovery. The provider resolves HERMES_HOME before initialize().
     # Note: when loaded via memory provider discovery (plugins/memory/),
     # the ctx is a _ProviderCollector whose register_tool() is a no-op --
     # tools are surfaced through get_tool_schemas() via the memory manager
     # instead. This registration covers the standalone PluginManager path.
-    from .tools import ALL_TOOL_SCHEMAS
     from functools import partial
 
     global _provider
     _provider = MnemosyneMemoryProvider()
-    for _schema in ALL_TOOL_SCHEMAS:
+    for _schema in _provider.get_tool_schemas():
         _name = _schema["name"]
         # Sync tools route through SyncAdapter, persona tools through PersonaAdapter,
         # memory tools through main provider.

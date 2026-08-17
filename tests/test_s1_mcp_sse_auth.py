@@ -12,10 +12,7 @@ Run with: pytest tests/test_s1_mcp_sse_auth.py -v
 """
 from __future__ import annotations
 
-import os
-import sys
-import json
-import subprocess
+import asyncio
 from pathlib import Path
 from unittest.mock import patch
 
@@ -156,6 +153,34 @@ def _starlette_available() -> bool:
         return False
 
 
+def _call_asgi_app(app, *, path: str, method: str, authorization: bytes):
+    """Call an ASGI app with raw header bytes and return emitted messages."""
+    messages = []
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("ascii"),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"authorization", authorization)],
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        messages.append(message)
+
+    asyncio.run(app(scope, receive, send))
+    return messages
+
+
 @pytest.mark.skipif(
     not _starlette_available(),
     reason="starlette/mcp not installed -- build_sse_app skipped",
@@ -227,6 +252,48 @@ class TestBuildSseApp:
         assert resp.status_code == 401
         body = resp.json()
         assert "invalid bearer token" in body.get("error", "").lower()
+
+    @pytest.mark.parametrize(
+        ("path", "method"),
+        [("/sse", "GET"), ("/messages/", "POST")],
+    )
+    def test_bearer_middleware_rejects_non_ascii_token_without_500(
+        self, monkeypatch, path, method
+    ):
+        """Non-ASCII bearer bytes are an auth failure, not a server error."""
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKEN", "supersecret")
+        from mnemosyne.mcp_server import _build_sse_app
+
+        app = _build_sse_app(host="0.0.0.0")
+        messages = _call_asgi_app(
+            app,
+            path=path,
+            method=method,
+            authorization=b"Bearer caf\xe9",
+        )
+
+        response_start = next(
+            message for message in messages if message["type"] == "http.response.start"
+        )
+        assert response_start["status"] == 401
+
+    def test_bearer_middleware_accepts_matching_ascii_token(self, monkeypatch):
+        """A matching ASCII token passes through the auth middleware."""
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKEN", "supersecret")
+        from mnemosyne.mcp_server import _build_sse_app
+
+        app = _build_sse_app(host="0.0.0.0")
+        messages = _call_asgi_app(
+            app,
+            path="/not-found",
+            method="GET",
+            authorization=b"Bearer supersecret",
+        )
+
+        response_start = next(
+            message for message in messages if message["type"] == "http.response.start"
+        )
+        assert response_start["status"] == 404
 
     def test_bearer_middleware_rejects_malformed_header(self, monkeypatch):
         """Token without 'Bearer ' prefix is rejected as missing."""
