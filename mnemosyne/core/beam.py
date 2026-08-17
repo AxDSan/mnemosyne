@@ -24,6 +24,7 @@ import threading
 import math
 from dataclasses import dataclass
 
+from mnemosyne.core._connection_gc import collect_connection_cycles
 from mnemosyne.core.config import resolve_beam_runtime
 
 logger = logging.getLogger(__name__)
@@ -488,6 +489,7 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
             conn._mnemosyne_vec_loaded = False
         _thread_local.conn = conn
         _thread_local.db_path = str(path)
+        collect_connection_cycles()
     return _thread_local.conn
 
 
@@ -1905,6 +1907,103 @@ def _hyphen_components(token: str) -> List[str]:
     ))
 
 
+# Tokens may not start with '-', so _recall_tokens() never captures
+# leading-hyphen fragments (e.g. the '-rf' in 'rm -rf'). FTS5 treats a
+# leading '-' in a term as the NOT / column-exclusion operator, so those
+# fragments must also never reach MATCH verbatim. Components may be shorter
+# than the 3-char meaningful gate (e.g. 'rf', or the 'v' in '-v'); they only
+# widen FTS candidate generation and lexical units, while precision is still
+# enforced downstream by the lexical abstention gates. The lookbehind rejects
+# both word characters and '-' so embedded sequences like 'git--rebase' cannot
+# start a fragment at the second hyphen. Internal single hyphens remain part of
+# a CLI flag (``--dry-run``); the final lookahead rejects malformed doubled
+# separators instead of silently truncating them to a different literal.
+_HYPHEN_FRAGMENT_RE = re.compile(
+    r"(?u)(?<![-\w])-+[^\W_][\w]*(?:-[^\W_][\w]*)*(?![-\w])"
+)
+
+
+def _hyphen_fragment_tokens(text: str) -> List[str]:
+    """Return unique components of leading-hyphen fragments in ``text``.
+
+    ``rm -rf`` yields ``['rf']``, ``--force`` yields ``['force']`` and
+    ``python -v`` yields ``['v']``. One-character components are kept when
+    they are not stopwords or digits so single-letter flags stay recallable.
+    Fragments embedded in a word (``git-rebase``) are already covered by
+    ``_recall_tokens()`` and are intentionally not matched here.
+    """
+    tokens: List[str] = []
+    for fragment in _HYPHEN_FRAGMENT_RE.findall(text.lower()):
+        for part in fragment.split("-"):
+            if (
+                len(part) >= 1
+                and part not in _FACT_MATCH_STOPWORDS
+                and not part.isdigit()
+            ):
+                tokens.append(part)
+    return list(dict.fromkeys(tokens))
+
+
+def _leading_hyphen_fragments(text: str) -> List[str]:
+    """Return unique literal leading-hyphen fragment forms in ``text``.
+
+    ``rm -rf`` yields ``['-rf']``, ``--force`` yields ``['--force']`` and
+    ``python -v`` yields ``['-v']``. Unlike ``_hyphen_fragment_tokens()``
+    which strips the hyphens into bare components, the literal form is kept
+    intact so a query for the CLI flag ``--force`` can be distinguished from
+    an ordinary occurrence of the word ``force``. Fragments embedded in a
+    word (``git-rebase``, ``git--rebase``) are intentionally not matched.
+    """
+    return list(dict.fromkeys(_HYPHEN_FRAGMENT_RE.findall(text.lower())))
+
+
+def _literal_flag_bonus(query_lower: str, content: str) -> float:
+    """Precision premium for a literal leading-hyphen flag inside ``content``.
+
+    ``_lexical_relevance()`` already scores an exact ``--force`` match above a
+    bare ``force`` occurrence, but both live in ``[0, 1]`` and the final rank
+    blends keyword relevance with ``importance``. Without a dedicated signal a
+    high-importance row that merely uses the word "force" can otherwise rank
+    too closely to a low-importance row that literally contains the flag. This
+    additive premium is applied where the other recall bonuses live
+    (recency/current-state, graph/fact/binary); the final linear-recall
+    selection separately rejects bare-component collisions so the precision
+    contract does not depend on this fixed amount. The premium requires an
+    exact extracted token match on the content side too: ``--force`` never
+    matches ``--forceful`` or ``foo--force``. Fragments embedded in a word
+    (``git-rebase``) never match, exactly like ``_leading_hyphen_fragments()``.
+    """
+    if not query_lower or not content:
+        return 0.0
+    literals = _leading_hyphen_fragments(query_lower)
+    if not literals:
+        return 0.0
+    content_literals = set(_leading_hyphen_fragments(content.lower()))
+    return 0.3 if set(literals) & content_literals else 0.0
+
+
+# Symbolic code names (C++, C#, F#, g++) contain + or #. They must not go
+# through the FTS5 MATCH builder: unicode61 tokenizes C++ down to the single
+# character "c", so a quoted "c++" term matches every row containing a bare
+# "c" token, drowning real matches in noise. They are admitted only in the
+# lexical layer, which compares the literal symbolic form (c++ == c++) on
+# both sides. Pure symbolic queries therefore produce zero FTS terms and
+# fall back to the bounded recent-row scoring path, matching exact-only, as
+# agreed for the #744 contract.
+_SYMBOLIC_CODE_RE = re.compile(r"(?u)(?<![A-Za-z0-9_])[A-Za-z]+(?:\+\+|#+)[0-9]*(?![A-Za-z0-9_])")
+
+
+def _symbolic_code_tokens(text: str) -> List[str]:
+    """Return unique symbolic code tokens in ``text``.
+
+    ``C++`` yields ``['c++']``, ``c#`` yields ``['c#']`` and ``g++`` yields
+    ``['g++']``. ``a+b`` (arithmetic) is rejected because a single ``+`` is
+    not a symbolic code name; ``git-rebase`` and ``node_modules`` contain
+    neither ``++`` nor ``#`` and are intentionally not matched here.
+    """
+    return list(dict.fromkeys(_SYMBOLIC_CODE_RE.findall(text.lower())))
+
+
 def _component_unit_weight(components: List[str]) -> int:
     """Return the lexical-unit weight for a token's hyphen components."""
     return len(components) if len(components) >= 2 else 1
@@ -1931,6 +2030,33 @@ def _expand_hyphenated_tokens(tokens: List[str]) -> List[str]:
                 seen.add(candidate)
                 expanded.append(candidate)
     return expanded
+
+
+def _is_bare_literal_flag_collision(query: str, content: str) -> bool:
+    """Return whether ``content`` only has a bare component of a query flag.
+
+    A literal query such as ``--force`` must not degrade into an ordinary
+    search for the word ``force`` when configurable weights favor importance.
+    Exact literal matches remain eligible. Prefixes and embedded forms such as
+    ``--forceful`` and ``foo--force`` are not exact literals; only the latter
+    is a bare-component collision because it still exposes the word ``force``.
+    """
+    if not query or not content:
+        return False
+    query_literals = set(_leading_hyphen_fragments(query.lower()))
+    if not query_literals:
+        return False
+    content_lower = content.lower()
+    missing_literals = query_literals - set(_leading_hyphen_fragments(content_lower))
+    if not missing_literals:
+        return False
+    bare_components = {
+        component
+        for literal in missing_literals
+        for component in _hyphen_fragment_tokens(literal)
+    }
+    content_components = set(re.findall(r"(?u)[^\W_]+", content_lower))
+    return bool(bare_components & content_components)
 
 
 def _expanded_query_tokens(tokens: List[str]) -> List[str]:
@@ -2055,6 +2181,16 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
         or "\u3040" <= ch <= "\u30ff"
         or "\uac00" <= ch <= "\ud7af"
     }
+    if query_lower:
+        query_tokens = [*query_tokens, *_hyphen_fragment_tokens(query_lower)]
+        query_tokens = [*query_tokens, *_symbolic_code_tokens(query_lower)]
+        # The literal leading-hyphen form (e.g. "--force") is a distinct
+        # token from its bare component ("force"): a row that literally
+        # contains the flag must score higher than one with only the bare
+        # word. Deduplicate so a fragment whose component is also a plain
+        # word (query_lower="_force" -> "force") is not double-counted.
+        query_tokens = [*query_tokens, *_leading_hyphen_fragments(query_lower)]
+        query_tokens = list(dict.fromkeys(query_tokens))
     if not query_tokens and not query_cjk:
         return 0.0
     # Callers pass raw _recall_tokens() output. Count each compound's
@@ -2065,6 +2201,17 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
         _component_unit_weight(components) for components in component_groups
     )
     content_tokens = set(_recall_tokens(content_lower))
+    # Leading-hyphen fragments are invisible to _recall_tokens() (a token
+    # must start with a word character); admit their components on both
+    # sides so shell-style queries like "rm -rf" are not silently missed.
+    content_tokens.update(_hyphen_fragment_tokens(content_lower))
+    # Symbolic code names (C++, C#, g++) are invisible to _recall_tokens()
+    # (a token must start with a word character); admit the literal symbolic
+    # form on both sides so exact-only symbolic queries still match.
+    content_tokens.update(_symbolic_code_tokens(content_lower))
+    # Admit the literal leading-hyphen form on the content side too, so an
+    # exact "--force" match is a distinct lexical unit from a bare "force".
+    content_tokens.update(_leading_hyphen_fragments(content_lower))
     # Structured MEMORIA contexts often encode keys as snake_case
     # (telemetry_api_latency_ms). Split separators so natural-language
     # queries get full lexical credit for the same fact.
@@ -2779,12 +2926,40 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
 
 
 def _fts_query_terms(query: str) -> List[str]:
-    """FTS-safe meaningful terms for natural-language recall queries."""
-    terms = []
+    """FTS-safe meaningful terms for natural-language recall queries.
+
+    Terms are quoted so FTS5 treats them as literal phrases. A term must
+    never start with ``-``: FTS5 parses a leading hyphen as the NOT /
+    column-exclusion operator, so e.g. ``'"rm" OR "-rf"'`` raises
+    ``no such column: rf`` and recall fails silently. Leading-hyphen
+    fragments are therefore split into their components (``rm -rf`` ->
+    ``"rf"``) and any hyphen-leading token is dropped. Symbolic code
+    names (``C++``, ``C++20``) are also excluded: unicode61 tokenizes
+    them down to bare characters, so an FTS term would only flood
+    candidates with noise; they are matched exact-only by the lexical
+    layer via ``_symbolic_code_tokens()``.
+    """
+    terms: List[str] = []
+    seen: Set[str] = set()
+    symbolic = set(_symbolic_code_tokens(query))
     for term in _expanded_query_tokens(_recall_tokens(query)):
+        if term.startswith("-"):
+            # FTS5-only terms never reach MATCH verbatim. The fragment's
+            # components are added below via _hyphen_fragment_tokens().
+            continue
+        if term in symbolic:
+            # Symbolic code names are handled by exact lexical matching
+            # only; never emit an FTS5 term for them.
+            continue
         term = term.replace('"', '""').strip()
-        if term:
+        if term and term not in seen:
+            seen.add(term)
             terms.append(f'"{term}"')
+    for component in _hyphen_fragment_tokens(query):
+        component = component.replace('"', '""').strip()
+        if component and component not in seen:
+            seen.add(component)
+            terms.append(f'"{component}"')
     return terms
 
 
@@ -5901,6 +6076,12 @@ class BeamMemory:
         results = []
         query_lower = query.lower()
         query_words = _recall_tokens(query_lower)
+        query_has_literal_flag = bool(_leading_hyphen_fragments(query_lower))
+        literal_candidate_content: Dict[tuple[str, str], str] = {}
+
+        def _track_literal_content(tier: str, memory_id: str, content: str) -> None:
+            if query_has_literal_flag:
+                literal_candidate_content[(tier, memory_id)] = content
 
         # ---- Configurable hybrid scoring setup (Phase 4) ----
         weight_snapshot = (
@@ -6164,6 +6345,9 @@ class BeamMemory:
                     base_score = base_score * 0.80 + vec_sim * 0.20
                 score = base_score * (rc_share + (1.0 - rc_share) * decay)
                 score += _current_state_recency_bonus(query_words, row["content"])
+                # A literal leading-hyphen flag match ("--force") must not be
+                # outranked by an ordinary occurrence of the bare word.
+                score += _literal_flag_bonus(query_lower, row["content"])
                 # Temporal boost (Phase 3)
                 if temporal_weight > 0.0:
                     t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
@@ -6182,6 +6366,7 @@ class BeamMemory:
                     _wm_fts_kept += 1
                 elif row["id"] in wm_vec_sims:
                     _wm_vec_kept += 1
+                _track_literal_content("working", row["id"], row["content"])
                 results.append({
                     "id": row["id"],
                     "content": row["content"][:500],
@@ -6252,6 +6437,7 @@ class BeamMemory:
                     if temporal_weight > 0.0:
                         t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
                         score *= (1.0 + temporal_weight * t_boost)
+                    _track_literal_content("working", row["id"], row["content"])
                     results.append({
                         "id": row["id"],
                         "content": row["content"][:500],
@@ -6314,6 +6500,7 @@ class BeamMemory:
                     if temporal_weight > 0.0:
                         t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
                         score *= (1.0 + temporal_weight * t_boost)
+                    _track_literal_content("episodic", row["id"], row["content"])
                     results.append({
                         "id": row["id"],
                         "content": row["content"][:500],
@@ -6375,6 +6562,7 @@ class BeamMemory:
                     if temporal_weight > 0.0:
                         t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
                         score *= (1.0 + temporal_weight * t_boost)
+                    _track_literal_content("working", row["id"], row["content"])
                     results.append({
                         "id": row["id"],
                         "content": row["content"][:500],
@@ -6436,6 +6624,7 @@ class BeamMemory:
                     if temporal_weight > 0.0:
                         t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
                         score *= (1.0 + temporal_weight * t_boost)
+                    _track_literal_content("episodic", row["id"], row["content"])
                     results.append({
                         "id": row["id"],
                         "content": row["content"][:500],
@@ -6648,6 +6837,9 @@ class BeamMemory:
             score = max(base_score, lexical * 0.8) * (0.7 + 0.3 * decay)
             score += _current_state_recency_bonus(query_words, row["content"])
             score += graph_bonus + fact_bonus + binary_bonus  # Phase 5: polyphonic bonuses
+            # A literal leading-hyphen flag match ("--force") must not be
+            # outranked by an ordinary occurrence of the bare word.
+            score += _literal_flag_bonus(query_lower, row["content"])
             # Temporal boost (Phase 3)
             if temporal_weight > 0.0:
                 t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
@@ -6659,6 +6851,7 @@ class BeamMemory:
                 _em_fts_kept += 1
             elif rid in vec_results:
                 _em_vec_kept += 1
+            _track_literal_content("episodic", row["id"], row["content"])
             results.append({
                 "id": row["id"],
                 "content": row["content"][:500],
@@ -6722,6 +6915,9 @@ class BeamMemory:
                     base_score = relevance * kw_share + row["importance"] * iw + (relevance ** 2) * 0.08
                     score = base_score * (rc_share + (1.0 - rc_share) * decay)
                     score += _current_state_recency_bonus(query_words, row["content"])
+                    # A literal leading-hyphen flag match ("--force") must not
+                    # be outranked by an ordinary occurrence of the bare word.
+                    score += _literal_flag_bonus(query_lower, row["content"])
 
                     # Phase 5: Graph + fact + binary bonuses for fallback.
                     # Gated by the same toggles as the main loop above
@@ -6763,6 +6959,7 @@ class BeamMemory:
                         score *= (1.0 + temporal_weight * t_boost)
                     # [C4] Kept-row credit for em_fallback tier.
                     _em_fallback_kept += 1
+                    _track_literal_content("episodic", row["id"], row["content"])
                     results.append({
                         "id": row["id"],
                         "content": row["content"][:500],
@@ -6915,8 +7112,12 @@ class BeamMemory:
                             _source_ids,
                         ).fetchall()
                         for _row in _src_rows:
+                            memoria_source_id = f"memoria_source_{_row['id']}"
+                            _track_literal_content(
+                                "memoria_source", memoria_source_id, _row["content"]
+                            )
                             results.append({
-                                "id": f"memoria_source_{_row['id']}",
+                                "id": memoria_source_id,
                                 "content": _row["content"][:500],
                                 "source": _row["source"],
                                 "timestamp": _row["timestamp"],
@@ -6955,6 +7156,24 @@ class BeamMemory:
                 covered.update(set(_recall_tokens(picked.get("content", "").lower())) & q_word_set)
             results = selected + pool
 
+        # Literal CLI flags are a selection invariant, not a fixed score
+        # bonus. Reject candidates that expose only a bare flag component
+        # ("force" for "--force") after every linear candidate source has
+        # contributed and before top-K truncation. Candidate assembly already
+        # has the full persisted content, so retain references in a local side
+        # map instead of querying SQLite again or changing the public result
+        # shape. The polyphonic feature-mode path returns above and
+        # intentionally keeps its separate contract.
+        filtered_results = []
+        for result in results:
+            literal_content = literal_candidate_content.get(
+                (result.get("tier"), result.get("id")),
+                result.get("content", ""),
+            )
+            if (not query_has_literal_flag
+                    or not _is_bare_literal_flag_collision(query_lower, literal_content)):
+                filtered_results.append(result)
+        results = filtered_results
         _ranked_results_for_explain = list(results) if _explain_trace is not None else None
         final_results = results[:top_k]
 
@@ -7030,6 +7249,8 @@ class BeamMemory:
             try:
                 fact_rows = self.fact_recall(query, top_k=max(top_k, 10))
                 for fr in fact_rows:
+                    if _is_bare_literal_flag_collision(query_lower, fr["content"]):
+                        continue
                     # Dedup against existing results by content hash
                     content_hash = hashlib.md5(fr["content"].encode()).hexdigest()
                     if content_hash in {hashlib.md5(r["content"].encode()).hexdigest() for r in final_results}:
@@ -7064,6 +7285,12 @@ class BeamMemory:
             }
 
         return final_results
+
+    # Bump whenever the enhanced-recall ranking algorithm changes so entries
+    # cached under an older digest are not reused. Part of the hashed payload;
+    # the opaque key keeps the "v2:" prefix because QueryCache's opaque-path
+    # recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
+    _ENHANCED_RECALL_CACHE_VERSION = 4
 
     def _enhanced_recall_cache_key(
         self,
@@ -7132,7 +7359,7 @@ class BeamMemory:
 
         db_namespace = str(self.db_path.resolve())
         payload = {
-            "version": 2,
+            "version": self._ENHANCED_RECALL_CACHE_VERSION,
             "db_namespace": hashlib.sha256(db_namespace.encode("utf-8")).hexdigest(),
             "query": {"original": original_query, "expanded": expanded_query},
             "scope": {

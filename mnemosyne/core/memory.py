@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 from mnemosyne.core import embeddings as _embeddings
 from mnemosyne.core import beam as beam_module
+from mnemosyne.core._connection_gc import collect_connection_cycles
 from mnemosyne.core.beam import BeamMemory, _BeamConnection, _deferred_commits, init_beam
 _thread_local = threading.local()
 
@@ -92,6 +93,7 @@ def _get_connection(db_path = None) -> sqlite3.Connection:
         except Exception:
             pass
         _thread_local.db_path = str(path)
+        collect_connection_cycles()
     # BeamMemory consults its own TLS cache during construction. Re-publish on
     # every successful core lookup, not only reconnection, because a standalone
     # BeamMemory for another path may have replaced that cache in the meantime.
