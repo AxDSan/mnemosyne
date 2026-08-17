@@ -8920,8 +8920,10 @@ class BeamMemory:
             WHERE created_at > datetime('now', '-7 days')
               AND (
                   items_consolidated = 0
-                  AND summary_preview LIKE '%error%'
-                  OR summary_preview LIKE '%fail%'
+                  AND (
+                      summary_preview LIKE '%error%'
+                      OR summary_preview LIKE '%fail%'
+                  )
               )
         """)
         error_count = cursor.fetchone()["err_count"]
