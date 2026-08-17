@@ -27,6 +27,7 @@ all arms run with flag=ON to test against the polyphonic engine
 instead of the inline bonus shortcut.
 """
 
+import os
 import sqlite3
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -587,7 +588,7 @@ class TestE5ResultShape:
         from mnemosyne.core.polyphonic_recall import PolyphonicResult
 
         class _StubEngine:
-            def recall(self, query, query_embedding=None, top_k=10):
+            def recall(self, query, query_embedding=None, top_k=10, **kwargs):
                 return [PolyphonicResult(
                     memory_id=seed_id, combined_score=0.035,
                     voice_scores={"vector": 0.019, "temporal": 0.016},
