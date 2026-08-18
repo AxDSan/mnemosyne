@@ -188,6 +188,31 @@ def _source_to_trust_tier(source: str) -> str:
     # Conservative default: treat as direct user input
     return "STATED"
 
+
+def _clamp_memory_type(value: Optional[str]) -> Optional[str]:
+    """Validate an explicit memory_type label, or return None.
+
+    None passes through, which is the signal to fall back to the content
+    classifier. An unrecognized label also returns None, with a WARNING: a
+    typo should degrade to classification, not strip the type off the row.
+
+    Mirrors the posture of clamp_veracity -- validate at the lowest public
+    ingest path rather than trusting callers, since the value reaches a
+    column that recall filters on.
+    """
+    if value is None:
+        return None
+    if MemoryType is None:  # typed_memory unavailable; nothing to validate against
+        return None
+    candidate = str(value).strip().lower()
+    if candidate in {m.value for m in MemoryType}:
+        return candidate
+    logger.warning(
+        "remember: unknown memory_type %r; falling back to the classifier", value
+    )
+    return None
+
+
 try:
     import numpy as np
 except ImportError:
@@ -3642,7 +3667,9 @@ class BeamMemory:
                  extract_entities: bool = False,
                  extract: bool = False,
                  veracity: str = "unknown",
-                 trust_tier: str = None) -> str:
+                 trust_tier: str = None,
+                 memory_type: str = None,
+                 dedupe: bool = True) -> str:
         """Store into working_memory. Deduplicates exact content matches.
 
         When called from the legacy-compatible Mnemosyne.remember() path,
@@ -3664,6 +3691,29 @@ class BeamMemory:
             veracity: Confidence level -- 'stated', 'inferred', 'tool', 'imported', 'unknown'.
                 Non-canonical labels are clamped to 'unknown' with a WARNING
                 (mirrors the C12.b clamp at the hermes_memory_provider boundary).
+            memory_type: Optional explicit MemoryType value (e.g. 'artifact').
+                Overrides the content classifier entirely -- the classifier is
+                not consulted when this is supplied. Unrecognized labels log a
+                WARNING and fall back to classification, so a typo degrades to
+                default behaviour rather than stripping the type. Callers that
+                *know* what they are writing (a media caption is an artifact,
+                whatever its words look like) should set this.
+            dedupe: When False, skip the exact-content duplicate check and
+                always write a new row.
+
+                Callers writing programmatically-generated text need this. The
+                dedup key is (session_id, content), and generated text collides
+                far more readily than prose -- "a black frame", "a screenshot
+                of a terminal window", a repeated slide. Two such rows
+                describing *different* sources would otherwise collapse into
+                one, and any sidecar table binding to the returned id would
+                bind the second source's row to the first source's memory.
+                Nothing raises and the counts all look right, which is what
+                makes it worth an explicit opt-out.
+
+                Leaving dedupe on has a second effect worth knowing: the
+                dedup-update path applies memory_type via COALESCE, so an
+                explicit type on a colliding write retypes the existing row.
         """
         # Clamp veracity at the BeamMemory.remember entry too -- the
         # method is the lowest-level public ingest path under BeamMemory,
@@ -3690,8 +3740,12 @@ class BeamMemory:
             trust_tier = "STATED"
 
         # --- Typed memory classification (Phase 1 -- zero overhead) ---
-        memory_type = None
-        if classify_memory is not None:
+        # An explicit memory_type wins outright and short-circuits the
+        # classifier: a caller that declares the type knows something the
+        # content does not say. An unrecognized label degrades to
+        # classification rather than to NULL.
+        memory_type = _clamp_memory_type(memory_type)
+        if memory_type is None and classify_memory is not None:
             try:
                 result = classify_memory(content)
                 memory_type = result.memory_type.value
@@ -3699,7 +3753,7 @@ class BeamMemory:
                 pass  # Classifier failures are non-blocking
 
         # --- Deduplication: exact match ---
-        existing_id = self._find_duplicate(content)
+        existing_id = self._find_duplicate(content) if dedupe else None
         if existing_id:
             cursor = self.conn.cursor()
             # Dedup-update clears consolidated_at so a re-remembered row
@@ -3964,8 +4018,11 @@ class BeamMemory:
             memory_id = _generate_id(item["content"])
             ids.append(memory_id)
             # Typed memory classification
-            item_type = None
-            if classify_memory is not None:
+            # Per-item explicit type wins and short-circuits the classifier,
+            # matching remember(). There is no method-level default: a batch
+            # is heterogeneous by nature.
+            item_type = _clamp_memory_type(item.get("memory_type"))
+            if item_type is None and classify_memory is not None:
                 try:
                     result = classify_memory(item["content"])
                     item_type = result.memory_type.value

@@ -387,7 +387,9 @@ class Mnemosyne:
                  extract_entities: bool = False,
                  extract: bool = False,
                  veracity: str = "unknown",
-                 trust_tier: str = None) -> str:
+                 trust_tier: str = None,
+                 memory_type: str = None,
+                 dedupe: bool = True) -> str:
         """
         Store a memory directly to SQLite.
         Writes to both BEAM working_memory and legacy memories table.
@@ -402,10 +404,20 @@ class Mnemosyne:
             trust_tier: Trust classification for prompt-injection defense.
                 None = use beam default ('STATED'). 'EXTERNAL_WRITE' for MCP
                 tool calls, 'IMPORTED' for bulk imports.
+            memory_type: Optional explicit MemoryType value; overrides the
+                content classifier. See BeamMemory.remember.
+            dedupe: When False, always write a new row instead of folding into
+                an exact content match. See BeamMemory.remember.
 
         Returns:
             memory_id on success, or None if the content was filtered by
             the write classifier (noise pattern or secret detection).
+
+        Note for programmatic writers: this facade can return None, because
+        the write filter below may veto the content outright. It also does not
+        accept a caller-supplied memory_id. Callers that must observe every
+        write and control its id -- media ingest, importers -- should call
+        BeamMemory.remember directly rather than going through here.
         """
         # --- Core-level write filter (issues #406, #428) ---
         # Placed here so ALL entry points (Hermes provider, MCP server, SDK,
@@ -458,6 +470,8 @@ class Mnemosyne:
                 extract_entities=extract_entities, extract=extract,
                 veracity=veracity,
                 trust_tier=trust_tier,
+                memory_type=memory_type,
+                dedupe=dedupe,
             )
             timestamp = datetime.now().isoformat()
 
