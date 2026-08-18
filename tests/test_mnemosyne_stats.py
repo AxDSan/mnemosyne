@@ -8,11 +8,11 @@ import subprocess
 import json
 import os
 import sys
-import shutil
-import tempfile
 import sqlite3
 from pathlib import Path
 from datetime import datetime
+
+import pytest
 
 
 def _safe_count(db, table):
@@ -36,6 +36,11 @@ DB_PATH = _expected_data_dir() / "mnemosyne.db"
 SNAP_DIR = Path.home() / ".hermes" / "mnemosyne" / "stats"
 WIKI_PATH = Path.home() / "wiki"
 
+# Populated by the module-scoped `_hermetic_stats_env` fixture below. Every
+# subprocess invocation of the stats CLI inherits this environment, so tests
+# never read or write the developer's real Mnemosyne database or home dirs.
+TEST_ENV = None
+
 passed = 0
 failed = 0
 errors = []
@@ -43,8 +48,138 @@ errors = []
 def run(args="", check=True):
     """Run the script and return (exit_code, stdout, stderr)."""
     cmd = f"cd {SCRIPT.parent} && python3 {SCRIPT} {args}"
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30, env=TEST_ENV)
     return result.returncode, result.stdout, result.stderr
+
+def _seed_stats_db(db_path, wiki_path):
+    """Create a small deterministic database and wiki for the stats CLI to read."""
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE working_memory (
+            id TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            source TEXT,
+            timestamp TEXT,
+            session_id TEXT DEFAULT 'default',
+            importance REAL DEFAULT 0.5,
+            metadata_json TEXT,
+            veracity TEXT DEFAULT 'unknown',
+            recall_count INTEGER DEFAULT 0,
+            last_recalled TEXT,
+            valid_until TEXT,
+            superseded_by TEXT,
+            scope TEXT DEFAULT 'global',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE episodic_memory (
+            id TEXT UNIQUE NOT NULL,
+            content TEXT NOT NULL,
+            source TEXT,
+            timestamp TEXT,
+            session_id TEXT DEFAULT 'default',
+            importance REAL DEFAULT 0.5,
+            metadata_json TEXT,
+            summary_of TEXT DEFAULT '',
+            veracity TEXT DEFAULT 'unknown',
+            recall_count INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE triples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject TEXT NOT NULL,
+            predicate TEXT NOT NULL,
+            object TEXT NOT NULL,
+            valid_from TEXT NOT NULL,
+            valid_until TEXT,
+            source TEXT,
+            confidence REAL DEFAULT 1.0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE consolidation_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            items_consolidated INTEGER,
+            summary_preview TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE memory_embeddings (
+            memory_id TEXT PRIMARY KEY,
+            embedding_json TEXT NOT NULL,
+            model TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO working_memory (id, content, source, session_id, importance, veracity, recall_count, scope) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("wm-1", "global hermetic stats seed memory", "test", "default", 0.8, "tool", 3, "global"),
+    )
+    conn.execute(
+        "INSERT INTO working_memory (id, content, source, session_id, importance, veracity, recall_count, scope) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("wm-2", "unrecalled session memory for the stats fixture", "user", "default", 0.2, "stated", 0, "session"),
+    )
+    conn.execute(
+        "INSERT INTO episodic_memory (id, content, source, importance) VALUES (?, ?, ?, ?)",
+        ("em-1", "episodic summary of the hermetic stats run", "test", 0.6),
+    )
+    conn.execute(
+        "INSERT INTO triples (subject, predicate, object, valid_from) VALUES (?, ?, ?, ?)",
+        ("stats-fixture", "prefers", "hermetic tests", "2024-01-01"),
+    )
+    conn.execute(
+        "INSERT INTO consolidation_log (session_id, items_consolidated, summary_preview) VALUES (?, ?, ?)",
+        ("sess-1", 2, "consolidated two fixture memories"),
+    )
+    conn.execute(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+        ("wm-1", "[0.1, 0.2, 0.3]", "test-model"),
+    )
+    (wiki_path / "memories" / "alpha.md").write_text("# Alpha\n")
+    (wiki_path / "concepts" / "beta.md").write_text("# Beta\n")
+    conn.commit()
+    conn.close()
+
+@pytest.fixture(scope="module", autouse=True)
+def _hermetic_stats_env(tmp_path_factory):
+    """Point the stats CLI at pytest-owned data, home, and wiki dirs (#783).
+
+    These tests shell out to scripts/mnemosyne-stats.py as a subprocess. Without
+    a hermetic environment that subprocess resolves the ambient MNEMOSYNE_DATA_DIR
+    / HERMES_HOME / HOME and reads the developer's real database, which makes
+    test_rapid_fire flaky under concurrent writers and leaks stored memories into
+    test output. This fixture replaces those env vars with tmp dirs, seeds a
+    small deterministic database, and re-points the module-level DB_PATH /
+    SNAP_DIR / WIKI_PATH that the assertion helpers read.
+    """
+    global DB_PATH, SNAP_DIR, WIKI_PATH, TEST_ENV
+    root = tmp_path_factory.mktemp("stats-env")
+    data_dir = root / "mnemosyne-data"
+    data_dir.mkdir()
+    home = root / "home"
+    home.mkdir()
+    wiki = home / "wiki"
+    (wiki / "memories").mkdir(parents=True)
+    (wiki / "concepts").mkdir()
+
+    db_path = data_dir / "mnemosyne.db"
+    _seed_stats_db(db_path, wiki)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["HERMES_HOME"] = str(root / "hermes-home")
+    env["MNEMOSYNE_DATA_DIR"] = str(data_dir)
+    env["MNEMOSYNE_NO_EMBEDDINGS"] = "1"
+
+    DB_PATH = db_path
+    SNAP_DIR = home / ".hermes" / "mnemosyne" / "stats"
+    WIKI_PATH = wiki
+    TEST_ENV = env
+
+    yield env
+    TEST_ENV = None
 
 def _test(name, fn):
     """Run a test function and track results."""
@@ -233,15 +368,15 @@ def test_empty_db_path():
         DB_PATH.rename(tmp)
         try:
             code, out, err = run("--json")
-            # Should either error gracefully or return empty data
-            if code == 0:
-                data = json.loads(out)
-                # If it returns data, it should handle missing DB
+            assert code == 0, f"Exit code {code}: {err}"
+            payload = json.loads(out)
+            assert "error" in payload, "Missing DB should surface an error payload"
         finally:
             tmp.rename(DB_PATH)
 
 def test_corrupted_json_snapshot():
     """Script should handle corrupted snapshot files."""
+    SNAP_DIR.mkdir(parents=True, exist_ok=True)
     snap_file = SNAP_DIR / "snap_corrupted.json"
     snap_file.write_text("NOT VALID JSON{{{")
     try:
@@ -253,6 +388,7 @@ def test_corrupted_json_snapshot():
 
 def test_empty_snapshot_dir():
     """Script should handle empty snapshot directory."""
+    SNAP_DIR.mkdir(parents=True, exist_ok=True)
     tmp_dir = SNAP_DIR / "tmp_empty_test"
     tmp_dir.mkdir(exist_ok=True)
     try:
