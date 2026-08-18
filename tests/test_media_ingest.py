@@ -40,8 +40,21 @@ def beam(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def enabled(monkeypatch):
+def enabled(monkeypatch, tmp_path):
+    """Opt in the way a real operator must.
+
+    Setting only ``MNEMOSYNE_MODALITY_ENABLED`` is not enough. ``config.yaml``
+    wins over env vars, and presence beats value: once a key exists in the
+    file, the variable is never consulted. A seeded config carries
+    ``modality_enabled: false``, so an env-only fixture passes on a machine
+    whose config predates the key and fails on a fresh one, which is exactly
+    how this slipped through locally and failed in CI.
+
+    Pointing ``MNEMOSYNE_DATA_DIR`` at a fresh directory makes the seed honour
+    the variables, which is the same path a new install takes.
+    """
     from mnemosyne.core.config import MnemosyneConfig
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "cfg-enabled"))
     monkeypatch.setenv("MNEMOSYNE_MODALITY_ENABLED", "1")
     MnemosyneConfig.reset_instance()
     yield
@@ -551,6 +564,11 @@ def test_ingest_through_the_real_openai_compat_adapter(beam, tmp_path, monkeypat
     })
     server = _Stub([(200, reply)])
     try:
+        # A fresh data directory, because the endpoint keys have to be set
+        # before the config is seeded: config.yaml wins over the environment
+        # and presence beats value, so the empty base_url seeded by the
+        # `enabled` fixture would shadow the variable set here.
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "cfg-live-adapter"))
         monkeypatch.setenv("MNEMOSYNE_MODALITY_ENABLED", "1")
         monkeypatch.setenv("MNEMOSYNE_MODALITY_BASE_URL", server.base_url)
         monkeypatch.setenv("MNEMOSYNE_MODALITY_API_KEY", "test-key-not-real")
