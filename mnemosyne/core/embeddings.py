@@ -350,9 +350,9 @@ def _ensure_api_vectors(result: Optional[np.ndarray], base_url: str) -> np.ndarr
             f"Embedding API returned no vectors (endpoint={_safe_api_endpoint(base_url)}, "
             f"model={_DEFAULT_MODEL}): {hint}."
         )
-    if len(result) == 0:
+    if result.size == 0:
         raise RuntimeError(
-            f"Embedding API returned an empty vector list "
+            f"Embedding API returned an empty vector result "
             f"(endpoint={_safe_api_endpoint(base_url)}, model={_DEFAULT_MODEL}); "
             f"the endpoint may not support embeddings for the given input."
         )
