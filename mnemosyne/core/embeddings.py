@@ -128,7 +128,7 @@ def _is_api_model(model_name: str) -> bool:
     # Custom endpoint: if MNEMOSYNE_EMBEDDING_API_URL is set to a non-OpenRouter URL,
     # assume the user has their own API server and any model name should route there.
     base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "")
-    if base_url and "openrouter.ai" not in base_url:
+    if base_url and not _is_openrouter_url(base_url):
         return True
     # Explicit opt-in for non-OpenAI embedding models hosted on OpenRouter
     # (qwen/qwen3-embedding-*, baai/bge-*, jina-embeddings-*, nvidia/*-embed-*, etc.).
@@ -325,6 +325,17 @@ def _safe_api_endpoint(url: str) -> str:
         return "<invalid-url>"
 
 
+def _is_openrouter_url(base_url: str) -> bool:
+    """Whether the embedding endpoint is OpenRouter proper (hostname-based).
+
+    Substring matching misclassifies custom endpoints whose URL merely
+    contains ``openrouter.ai`` in the path or query, blocking them from the
+    keyless custom-endpoint path. Match the resolved hostname instead.
+    """
+    hostname = urllib.parse.urlsplit(base_url).hostname or ""
+    return hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai")
+
+
 def _ensure_api_vectors(result: Optional[np.ndarray], base_url: str, expected: int) -> np.ndarray:
     """Validate that the API embedding result matches the request contract.
 
@@ -339,7 +350,7 @@ def _ensure_api_vectors(result: Optional[np.ndarray], base_url: str, expected: i
     credential.
     """
     if result is None:
-        if "openrouter.ai" in base_url and not _OPENAI_API_KEY:
+        if _is_openrouter_url(base_url) and not _OPENAI_API_KEY:
             hint = (
                 "no API key is configured; set MNEMOSYNE_EMBEDDING_API_KEY "
                 "or OPENAI_API_KEY"
@@ -379,7 +390,7 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     global _API_CALL_COUNT
     # Require API key for OpenRouter; custom endpoints may not need one.
     base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1")
-    is_custom = "openrouter.ai" not in base_url
+    is_custom = not _is_openrouter_url(base_url)
     if not is_custom and not _OPENAI_API_KEY:
         logger.warning(
             "embedding API: no API key set for OpenRouter endpoint %s, returning None vectors",
@@ -470,7 +481,7 @@ def available() -> bool:
     if _is_api_model(_DEFAULT_MODEL):
         # Custom endpoints (non-OpenRouter) may not require an API key
         base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "")
-        if base_url and "openrouter.ai" not in base_url:
+        if base_url and not _is_openrouter_url(base_url):
             return True
         return bool(_OPENAI_API_KEY)
     return _FASTEMBED_AVAILABLE
