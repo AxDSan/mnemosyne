@@ -71,6 +71,35 @@ Mnemosyne follows **strict SemVer** (MAJOR.MINOR.PATCH).
 - Altered env var semantics (not just adding new ones)
 - Changed Python version requirements
 
+### Pre-releases
+
+A major needs a beta cycle, so the tag format accepts a PEP 440 pre-release
+suffix: `aN`, `bN` or `rcN`. `v4.0.0b1` is valid; `v4.0.0-beta.1` is not.
+
+`__version__` carries the same string, so a beta is `4.0.0b1` in
+`mnemosyne/__init__.py` and `hermes_memory_provider/plugin.yaml`, exactly as
+`release.py prepare 4.0.0b1` writes it.
+
+Ordering is PEP 440, not `sort -V`:
+
+```
+4.0.0a1  <  4.0.0b1  <  4.0.0rc1  <  4.0.0
+```
+
+The pre-push hook enforces that ordering in Python rather than with `sort -V`,
+which gets it backwards: `sort -V` places `4.0.0` before `4.0.0b1`, so with it
+the real release would be rejected as behind its own beta.
+
+pip will not install a pre-release unless asked, so a beta reaches only the
+people who opt in:
+
+```bash
+pip install --pre mnemosyne-memory
+```
+
+The GitHub release is flagged as a pre-release automatically, so a beta never
+becomes the repository's "Latest release".
+
 ### When to release
 
 - **Patches:** As soon as CI is green on main. Bug fixes don't wait.
@@ -143,7 +172,9 @@ The auto-generated notes from `generate_release_notes: true` are a starting poin
 
 A pre-push hook in <code>.githooks/pre-push</code> validates each pushed tag:
 
-1. Tag format: `vMAJOR.MINOR.PATCH` (e.g. `v3.1.2`, not `v3.1` or `v3.1.2-beta`)
+1. Tag format: `vMAJOR.MINOR.PATCH`, with an optional PEP 440 pre-release
+   suffix (e.g. `v3.1.2`, `v4.0.0b1`, `v4.0.0rc1`; not `v3.1` or
+   `v4.0.0-beta.1`)
 2. A `v0.*` standalone tag matches `[project].version` in
    <code>integrations/hermes/pyproject.toml</code>; other tags match
    <code>__version__</code> in <code>mnemosyne/__init__.py</code> (without `v`)

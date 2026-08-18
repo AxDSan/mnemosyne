@@ -51,7 +51,9 @@ SIBLINGS = os.path.dirname(REPO)
 DOCS = os.path.join(SIBLINGS, "mnemosyne-docs")
 SITE = os.path.join(SIBLINGS, "mnemosyne-website")
 
-VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+# MAJOR.MINOR.PATCH with an optional PEP 440 pre-release suffix, so a major
+# can run the beta cycle RELEASING.md requires.
+VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:(?:a|b|rc)\d+)?$")
 
 
 # ---------------------------------------------------------------- helpers
@@ -142,7 +144,17 @@ def cmd_check(args: argparse.Namespace) -> int:
     tags = set(_git("tag", "--list").split())
 
     def _parts(v: str) -> tuple:
-        return tuple(int(x) for x in re.findall(r"\d+", v))
+        """Sort key honouring PEP 440 pre-release order.
+
+        A naive digit sweep reads "4.0.0b1" as (4, 0, 0, 1) and ranks it above
+        "4.0.0", which is backwards: a pre-release precedes its final release.
+        """
+        m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:(a|b|rc)(\d+))?", v.lstrip("v"))
+        if not m:
+            return tuple(int(x) for x in re.findall(r"\d+", v))
+        major, minor, patch, kind, num = m.groups()
+        stage = {None: 3, "a": 0, "b": 1, "rc": 2}[kind]
+        return (int(major), int(minor), int(patch), stage, int(num or 0))
 
     tagged = sorted((_parts(t) for t in tags if VERSION_RE.match(t.lstrip("v"))), reverse=True)
     newest_tag = tagged[0] if tagged else (0,)
@@ -298,9 +310,9 @@ def cmd_prepare(args: argparse.Namespace) -> int:
 
     print()
     print("Next:")
-    print(f"  1. review the diffs in all three repos")
+    print("  1. review the diffs in all three repos")
     print(f"  2. python3 scripts/release.py announce {version}")
-    print(f"  3. commit and merge each repo")
+    print("  3. commit and merge each repo")
     print(f"  4. python3 scripts/release.py check {version}")
     print(f"  5. python3 scripts/release.py tag {version}")
     return 0
@@ -435,7 +447,7 @@ Full changelog: <https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v{versi
 
     print(f"Drafts written to dist-announce/ for {version}:\n")
     print(f"  {slug}.mdx          blog post -> mnemosyne-website/content/blog/")
-    print(f"                          verified to build; renders one page per locale (7)")
+    print("                          verified to build; renders one page per locale (7)")
     print(f"  {slug}-x.txt        X post ({len(x_post)} chars)")
     print(f"  {slug}-discord.md   Discord announcement")
     print()
@@ -464,7 +476,7 @@ def cmd_tag(args: argparse.Namespace) -> int:
     print()
     print("Then, once PyPI shows the new version:")
     print("    merge the version bumps in mnemosyne-docs and mnemosyne-website")
-    print(f"    publish the drafts from dist-announce/")
+    print("    publish the drafts from dist-announce/")
     return 0
 
 
