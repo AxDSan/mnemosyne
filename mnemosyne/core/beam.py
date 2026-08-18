@@ -6481,9 +6481,6 @@ class BeamMemory:
 
         # ---- Working memory (vector search) ----
         wm_vec_sims = {}
-        # Kept only for the opt-in evidence-pack candidate path. Primary
-        # recall remains lexical-gated and therefore ranking-identical.
-        wm_vec_ranks = {}
         if embeddings_available:
             try:
                 emb_result = _get_query_embedding()
@@ -6492,9 +6489,8 @@ class BeamMemory:
                                               k=max(top_k, 20) if _BEAM_MODE else max(top_k * 3, 50),
                                               where_sql=wm_vec_where,
                                               where_params=tuple(wm_params))
-                    for vec_rank, vr in enumerate(wm_vec, start=1):
+                    for vr in wm_vec:
                         wm_vec_sims[vr["id"]] = vr["sim"]
-                        wm_vec_ranks[vr["id"]] = vec_rank
                         wm_ids.add(vr["id"])  # Merge vector results with FTS5 results
             except Exception:
                 logger.info("Regex extraction failed, skipping", exc_info=True)
