@@ -59,24 +59,25 @@ CREATE TABLE IF NOT EXISTS sync_meta (
 _MEMORY_EVENTS_INDICES = [
     (
         "idx_me_timestamp",
-        "CREATE INDEX IF NOT EXISTS idx_me_timestamp "
-        "ON memory_events(timestamp)",
+        "CREATE INDEX IF NOT EXISTS idx_me_timestamp ON memory_events(timestamp)",
     ),
     (
         "idx_me_memory_id",
-        "CREATE INDEX IF NOT EXISTS idx_me_memory_id "
-        "ON memory_events(memory_id)",
+        "CREATE INDEX IF NOT EXISTS idx_me_memory_id ON memory_events(memory_id)",
     ),
     (
         "idx_me_device_id",
-        "CREATE INDEX IF NOT EXISTS idx_me_device_id "
-        "ON memory_events(device_id)",
+        "CREATE INDEX IF NOT EXISTS idx_me_device_id ON memory_events(device_id)",
     ),
 ]
 
 
 # The new tables this migration adds (in 3.11.1).
 NEW_TABLES = ("memory_events", "sync_meta")
+_TABLES = (
+    ("memory_events", _MEMORY_EVENTS_DDL),
+    ("sync_meta", _SYNC_META_DDL),
+)
 
 
 class MigrationReport(TypedDict):
@@ -84,6 +85,13 @@ class MigrationReport(TypedDict):
     tables_added: list[str]
     tables_already_present: list[str]
     indices_added: int
+
+
+class MigrationDryRunReport(MigrationReport):
+    # Report-only (dry-run) fields; present in every dry-run report.
+    would_add: int
+    tables_would_add: list[str]
+    indices_would_add: int
 
 
 def _has_table(conn: sqlite3.Connection, name: str) -> bool:
@@ -102,15 +110,27 @@ def _has_index(conn: sqlite3.Connection, name: str) -> bool:
     return cursor.fetchone() is not None
 
 
-def migrate_311_tables(db_path: Path) -> MigrationReport:
+def migrate_311_tables(
+    db_path: Path, dry_run: bool = False
+) -> MigrationReport | MigrationDryRunReport:
     """Add the 3.11.1 schema tables to an existing bank at the older
     54-table schema. Idempotent.
+
+    With ``dry_run=True`` the database is opened read-only
+    (``mode=ro`` + ``PRAGMA query_only=ON``), no DDL is executed and no
+    commit happens. The report keeps ``added`` / ``tables_added`` /
+    ``indices_added`` at zero and instead exposes ``would_add`` /
+    ``tables_would_add`` / ``indices_would_add`` for the pending DDL
+    (all zero/empty when the bank does not exist yet).
 
     Returns a report dict with:
       - added: int (number of tables added in this call)
       - tables_added: List[str] (names of tables added in this call)
       - tables_already_present: List[str] (names already in the schema)
       - indices_added: int (number of indices added in this call)
+      - dry-run reports additionally carry would_add /
+        tables_would_add / indices_would_add describing the DDL a real
+        run would execute.
     """
     db_path = Path(db_path)
     report: MigrationReport = {
@@ -119,16 +139,35 @@ def migrate_311_tables(db_path: Path) -> MigrationReport:
         "tables_already_present": [],
         "indices_added": 0,
     }
+    if dry_run:
+        report["would_add"] = 0
+        report["tables_would_add"] = []
+        report["indices_would_add"] = 0
     if not db_path.exists():
-        # Nothing to migrate (the bank doesn't exist yet).
+        # Nothing to migrate (the bank doesn't exist yet); the dry-run
+        # fields above still describe the pending DDL truthfully.
+        return report
+
+    if dry_run:
+        conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            for name, _ddl in _TABLES:
+                if _has_table(conn, name):
+                    report["tables_already_present"].append(name)
+                else:
+                    report["tables_would_add"].append(name)
+                    report["would_add"] += 1
+            for index_name, _index_ddl in _MEMORY_EVENTS_INDICES:
+                if not _has_index(conn, index_name):
+                    report["indices_would_add"] += 1
+        finally:
+            conn.close()
         return report
 
     conn = sqlite3.connect(str(db_path))
     try:
-        for name, ddl in (
-            ("memory_events", _MEMORY_EVENTS_DDL),
-            ("sync_meta", _SYNC_META_DDL),
-        ):
+        for name, ddl in _TABLES:
             if _has_table(conn, name):
                 report["tables_already_present"].append(name)
                 continue
