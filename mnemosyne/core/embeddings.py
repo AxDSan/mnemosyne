@@ -325,15 +325,18 @@ def _safe_api_endpoint(url: str) -> str:
         return "<invalid-url>"
 
 
-def _ensure_api_vectors(result: Optional[np.ndarray], base_url: str) -> np.ndarray:
-    """Validate that the API embedding result contains vectors.
+def _ensure_api_vectors(result: Optional[np.ndarray], base_url: str, expected: int) -> np.ndarray:
+    """Validate that the API embedding result matches the request contract.
 
     ``embed()`` / ``embed_query()`` must fail loud here: a bare ``None`` is
     indistinguishable from "embeddings unavailable", so callers (e.g.
     ``BeamMemory.remember``) would silently skip vector storage without
-    their ``except Exception`` warning ever firing. The message carries
-    only the redacted endpoint and model name -- never the input text or
-    any credential.
+    their ``except Exception`` warning ever firing. The result must be a
+    rank-two array with exactly ``expected`` non-empty vectors (one per
+    requested input), so partial, malformed or rank-invalid responses fail
+    here too instead of being silently consumed. The message carries only
+    the redacted endpoint and model name -- never the input text or any
+    credential.
     """
     if result is None:
         if "openrouter.ai" in base_url and not _OPENAI_API_KEY:
@@ -355,6 +358,18 @@ def _ensure_api_vectors(result: Optional[np.ndarray], base_url: str) -> np.ndarr
             f"Embedding API returned an empty vector result "
             f"(endpoint={_safe_api_endpoint(base_url)}, model={_DEFAULT_MODEL}); "
             f"the endpoint may not support embeddings for the given input."
+        )
+    if result.ndim != 2:
+        raise RuntimeError(
+            f"Embedding API returned an unexpected rank-{result.ndim} result "
+            f"(endpoint={_safe_api_endpoint(base_url)}, model={_DEFAULT_MODEL}); "
+            f"expected a rank-2 array with one vector per input."
+        )
+    if len(result) != expected:
+        raise RuntimeError(
+            f"Embedding API returned {len(result)} vector(s) for {expected} input(s) "
+            f"(endpoint={_safe_api_endpoint(base_url)}, model={_DEFAULT_MODEL}); "
+            f"the endpoint may be returning a partial or misaligned response."
         )
     return result
 
@@ -480,7 +495,7 @@ def embed_query(text: str) -> Optional[np.ndarray]:
 def _embed_query_cached(prefixed: str) -> Optional[np.ndarray]:
     if _is_api_model(_DEFAULT_MODEL):
         result = _embed_api([prefixed])
-        _ensure_api_vectors(result, os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1"))
+        _ensure_api_vectors(result, os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1"), 1)
         return result[0]
 
     model = _get_model()
@@ -503,7 +518,7 @@ def embed(texts: List[str]) -> Optional[np.ndarray]:
 
     if _is_api_model(_DEFAULT_MODEL):
         result = _embed_api(prefixed)
-        return _ensure_api_vectors(result, os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1"))
+        return _ensure_api_vectors(result, os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1"), len(prefixed))
 
     model = _get_model()
     if model is None or model == "api":
