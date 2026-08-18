@@ -30,7 +30,8 @@ def test_direct_forget_deletes_only_authorized_target_gists(tmp_path: Path):
     beam = _beam(tmp_path)
     delete_id = beam.remember("#782 delete target")
     keep_id = beam.remember("#782 keep target")
-    _seed_gist(beam, delete_id, "delete")
+    _seed_gist(beam, delete_id, "delete-first")
+    _seed_gist(beam, delete_id, "delete-second")
     _seed_gist(beam, keep_id, "keep")
     expected_keep_gists = _gist_count(beam, keep_id)
 
@@ -55,6 +56,21 @@ def test_batch_forget_uses_the_same_gist_cascade(tmp_path: Path):
 
     assert result["status"] == "ok"
     assert _gist_count(beam, memory_id) == 0
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (memory_id,)
+    ).fetchone()[0] == 0
+
+
+def test_forget_succeeds_when_optional_gists_table_is_absent(tmp_path: Path):
+    beam = _beam(tmp_path)
+    memory_id = beam.remember("#782 no gists table")
+    beam.conn.execute("DROP TABLE gists")
+    beam.conn.commit()
+
+    assert beam.forget_working(memory_id) is True
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (memory_id,)
+    ).fetchone()[0] == 0
 
 
 def test_foreign_session_forget_keeps_private_memory_and_gist(tmp_path: Path):

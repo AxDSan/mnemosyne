@@ -4865,7 +4865,11 @@ class BeamMemory:
                     "DELETE FROM annotations WHERE memory_id = ?", (memory_id,)
                 )
                 cursor.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
-                cursor.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
+                gists_table = cursor.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gists'"
+                ).fetchone()
+                if gists_table is not None:
+                    cursor.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
         forgotten = wm_rows > 0
         if forgotten:
             self._invalidate_query_cache()
