@@ -6090,7 +6090,7 @@ class BeamMemory:
             raise ValueError("candidate_k must exceed top_k when pack_k is positive")
         if kwargs.get("explain"):
             raise ValueError("explain is not supported by recall_with_evidence_pack")
-        if {"_track_recall", "_include_vector_only_candidates"}.intersection(kwargs):
+        if "_track_recall" in kwargs:
             raise ValueError("internal recall controls are managed by recall_with_evidence_pack")
 
         primary = self.recall(query, top_k=top_k, **kwargs)
@@ -6099,10 +6099,7 @@ class BeamMemory:
         if pack_k == 0:
             return build_evidence_pack(primary_rows, [], max_items=0)
 
-        candidates = self.recall(
-            query, top_k=candidate_k, _track_recall=False,
-            _include_vector_only_candidates=True, **kwargs
-        )
+        candidates = self.recall(query, top_k=candidate_k, _track_recall=False, **kwargs)
         candidate_rows = candidates.get("results", []) if isinstance(candidates, dict) else candidates
         # Only storage-backed tiers can receive a verified source-session backfill.
         candidate_rows = [
@@ -6172,8 +6169,7 @@ class BeamMemory:
                explain: bool = False,
                _cross_session: Optional[bool] = None,
                _resolved_weights: Optional[_RecallWeightSnapshot] = None,
-               _track_recall: bool = True,
-               _include_vector_only_candidates: bool = False) -> List[Dict]:
+               _track_recall: bool = True) -> List[Dict]:
         """
         Hybrid recall across working_memory + episodic_memory.
         Uses sqlite-vec + FTS5 for episodic, FTS5 for working.
@@ -6243,7 +6239,6 @@ class BeamMemory:
                 veracity=veracity, memory_type=memory_type,
                 cross_session=cross_session,
                 _track_recall=_track_recall,
-                _include_vector_only_candidates=_include_vector_only_candidates,
             )
             # [C4] Polyphonic path diagnostics. The linear-path recording
             # below (record_call / record_tier_hits at the end of recall())
@@ -6578,24 +6573,9 @@ class BeamMemory:
                 relevance = _lexical_relevance(query_words, row["content"], query_lower)
                 row_min_relevance = single_token_relevance if broad_multi_hit_query else min_relevance
             vec_sim = wm_vec_sims.get(row["id"], 0.0)
-            vector_only_rank_eligible = (
-                _include_vector_only_candidates
-                and row["id"] in wm_vec_sims
-                and row["id"] not in wm_ranks
-                and wm_vec_ranks.get(row["id"], top_k + 1) <= top_k
-                # The evidence-only semantic path needs an absolute quality
-                # floor as well as a relative vector rank.  0.84 preserves the
-                # validated multi-session evidence while rejecting arbitrary
-                # nearest neighbours in small banks.
-                and vec_sim >= 0.84
-            )
-            lexical_relevance_reported = relevance
-            if vector_only_rank_eligible:
-                relevance = max(relevance, vec_sim)
             if (
                 relevance >= row_min_relevance
                 or (wm_ranks and len(query_words) <= 1 and relevance > 0)
-                or vector_only_rank_eligible
             ):
                 decay = _recency_decay(row["timestamp"])
                 # Phase 4: configurable scoring for working memory
@@ -6638,9 +6618,9 @@ class BeamMemory:
                     "timestamp": row["timestamp"],
                     "tier": "working",
                     "score": round(score, 4),
-                    "keyword_score": round(lexical_relevance_reported, 4),
+                    "keyword_score": round(relevance, 4),
                     "dense_score": round(vec_sim, 4),
-                    "fts_score": round(lexical_relevance_reported, 4) if row["id"] in wm_ranks else 0.0,
+                    "fts_score": round(relevance, 4) if wm_ranks else 0.0,
                     "importance": row["importance"],
                     "recall_count": row["recall_count"] or 0,
                     "last_recalled": row["last_recalled"],
@@ -8140,8 +8120,7 @@ class BeamMemory:
                            veracity: Optional[str] = None,
                            memory_type: Optional[str] = None,
                            cross_session: Optional[bool] = None,
-                           _track_recall: bool = True,
-                           _include_vector_only_candidates: bool = False) -> List[Dict]:
+                           _track_recall: bool = True) -> List[Dict]:
         """[E5] Polyphonic recall path.
 
         Delegates to PolyphonicRecallEngine when MNEMOSYNE_POLYPHONIC_RECALL=1.
@@ -8293,10 +8272,6 @@ class BeamMemory:
         # the linear path updates them and downstream features (decay
         # scheduling, importance reinforcement) depend on the signal.
         # /review caught the missing update as a silent telemetry loss.
-        # Polyphonic recall is vector-backed by design, so vector-only
-        # candidates are already available on this path. Keep the private
-        # flag in the signature for parity with recall()'s internal caller.
-        del _include_vector_only_candidates
         if _track_recall and recalled_episodic_ids:
             placeholders = ",".join("?" * len(recalled_episodic_ids))
             params = [now_iso, *recalled_episodic_ids, *_rec_scope_params()]

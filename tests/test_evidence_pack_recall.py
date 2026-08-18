@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 
 from mnemosyne.core.beam import BeamMemory
-from mnemosyne.core import beam as beam_module
 from mnemosyne.core.recall_diagnostics import get_recall_diagnostics, reset_recall_diagnostics
 
 
@@ -33,8 +32,6 @@ def test_evidence_pack_rejects_invalid_internal_controls(tmp_path: Path):
         beam.recall_with_evidence_pack("q", explain=True)
     with pytest.raises(ValueError, match="internal recall controls"):
         beam.recall_with_evidence_pack("q", _track_recall=False)
-    with pytest.raises(ValueError, match="internal recall controls"):
-        beam.recall_with_evidence_pack("q", _include_vector_only_candidates=True)
 
 
 def test_candidate_only_recall_does_not_mutate_usage_state(tmp_path: Path):
@@ -330,67 +327,6 @@ def test_evidence_pack_polyphonic_candidate_only_pass_is_telemetry_neutral(tmp_p
     assert after[1] is not None
     assert diagnostics["totals"]["calls"] == 1
     assert all(tier["total_hits"] == 0 for tier in diagnostics["by_tier"].values())
-
-
-def test_vector_only_candidate_is_opt_in(tmp_path: Path, monkeypatch):
-    np = pytest.importorskip("numpy")
-    db_path = tmp_path / "vector-only.db"
-    beam = BeamMemory(session_id="local", db_path=db_path)
-    memory_id = beam.remember("semantic-only candidate", source="test", importance=0.8)
-
-    monkeypatch.setattr(beam_module._embeddings, "available", lambda: True)
-    monkeypatch.setattr(beam_module._embeddings, "embed_query", lambda query: np.array([1.0], dtype=np.float32))
-    monkeypatch.setattr(beam_module, "_vec_search", lambda *args, **kwargs: [])
-    monkeypatch.setattr(
-        beam_module, "_wm_vec_search",
-        lambda conn, emb, k=20, **kwargs: [{"id": memory_id, "sim": 0.9}],
-    )
-
-    primary = beam.recall("unrelated lexical query", top_k=5)
-    candidates = beam.recall(
-        "unrelated lexical query", top_k=5,
-        _track_recall=False, _include_vector_only_candidates=True,
-    )
-    assert memory_id not in [row["id"] for row in primary]
-    assert memory_id in [row["id"] for row in candidates]
-
-    monkeypatch.setattr(
-        beam_module, "_wm_vec_search",
-        lambda conn, emb, k=20, **kwargs: [{"id": memory_id, "sim": 0.83}],
-    )
-    low_similarity = beam.recall(
-        "unrelated lexical query", top_k=5,
-        _track_recall=False, _include_vector_only_candidates=True,
-    )
-    assert memory_id not in [row["id"] for row in low_similarity]
-
-    monkeypatch.setattr(
-        beam_module, "_wm_vec_search",
-        lambda conn, emb, k=20, **kwargs: [{"id": memory_id, "sim": 0.84}],
-    )
-    at_threshold = beam.recall(
-        "unrelated lexical query", top_k=5,
-        _track_recall=False, _include_vector_only_candidates=True,
-    )
-    # The evidence-only vector-similarity floor is inclusive.
-    candidate = next(row for row in at_threshold if row["id"] == memory_id)
-    assert candidate["keyword_score"] == 0.0
-    assert candidate["fts_score"] == 0.0
-    assert candidate["dense_score"] == 0.84
-
-
-def test_vector_only_candidate_obeys_session_scope(tmp_path: Path, monkeypatch):
-    np = pytest.importorskip("numpy")
-    db_path = tmp_path / "vector-scope.db"
-    local = BeamMemory(session_id="local", db_path=db_path)
-    foreign = BeamMemory(session_id="foreign", db_path=db_path)
-    foreign_id = foreign.remember("foreign semantic candidate", source="test", importance=0.8)
-    monkeypatch.setattr(beam_module._embeddings, "available", lambda: True)
-    monkeypatch.setattr(beam_module._embeddings, "embed_query", lambda query: np.array([1.0], dtype=np.float32))
-    monkeypatch.setattr(beam_module, "_vec_search", lambda *args, **kwargs: [])
-    monkeypatch.setattr(beam_module, "_wm_vec_search", lambda *args, **kwargs: [{"id": foreign_id, "sim": 0.9}])
-    results = local.recall("unrelated lexical query", top_k=5, _track_recall=False, _include_vector_only_candidates=True)
-    assert foreign_id not in [row["id"] for row in results]
 
 
 def test_provenance_backfill_keeps_same_ids_separate_by_tier(tmp_path: Path, monkeypatch):
