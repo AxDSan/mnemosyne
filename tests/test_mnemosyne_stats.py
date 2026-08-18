@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 """
-Comprehensive test suite for mnemosyne-stats.py
-Runs 30 iterations across edge cases, integration, and stress tests.
+Comprehensive pytest suite for scripts/mnemosyne-stats.py.
+
+All tests run against a hermetic pytest-owned database, home, and wiki (see
+the module-scoped `_hermetic_stats_env` fixture): the stats CLI subprocess is
+never allowed to touch the developer's real Mnemosyne data.
 """
 
 import subprocess
 import json
 import os
 import sys
+import shlex
 import sqlite3
 from pathlib import Path
 from datetime import datetime
 
 import pytest
+
+from mnemosyne.core.beam import init_beam
+from mnemosyne.core.triples import init_triples
 
 
 def _safe_count(db, table):
@@ -41,89 +48,48 @@ WIKI_PATH = Path.home() / "wiki"
 # never read or write the developer's real Mnemosyne database or home dirs.
 TEST_ENV = None
 
-passed = 0
-failed = 0
-errors = []
-
 def run(args="", check=True):
     """Run the script and return (exit_code, stdout, stderr)."""
-    cmd = f"cd {SCRIPT.parent} && python3 {SCRIPT} {args}"
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30, env=TEST_ENV)
+    if TEST_ENV is None:
+        raise RuntimeError(
+            "run() called without the hermetic environment; "
+            "_hermetic_stats_env must be active (issue #783)."
+        )
+    cmd = [sys.executable, str(SCRIPT), *shlex.split(args)]
+    result = subprocess.run(
+        cmd,
+        cwd=str(SCRIPT.parent),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=TEST_ENV,
+    )
     return result.returncode, result.stdout, result.stderr
 
 def _seed_stats_db(db_path, wiki_path):
-    """Create a small deterministic database and wiki for the stats CLI to read."""
+    """Create a deterministic database and wiki for the stats CLI to read."""
+    # Use the production schema initializers so the fixture cannot drift from
+    # the shipped schema (columns such as consolidated_at, timestamp, scope,
+    # recall_count are added by migrations in init_beam; triples lives in its
+    # own store, initialized by init_triples).
+    init_beam(Path(db_path))
+    init_triples(Path(db_path))
+    older = datetime(2024, 1, 1).isoformat()
+    newer = datetime(2024, 1, 2).isoformat()
     conn = sqlite3.connect(str(db_path))
-    conn.executescript(
-        """
-        CREATE TABLE working_memory (
-            id TEXT PRIMARY KEY,
-            content TEXT NOT NULL,
-            source TEXT,
-            timestamp TEXT,
-            session_id TEXT DEFAULT 'default',
-            importance REAL DEFAULT 0.5,
-            metadata_json TEXT,
-            veracity TEXT DEFAULT 'unknown',
-            recall_count INTEGER DEFAULT 0,
-            last_recalled TEXT,
-            valid_until TEXT,
-            superseded_by TEXT,
-            scope TEXT DEFAULT 'global',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE episodic_memory (
-            id TEXT UNIQUE NOT NULL,
-            content TEXT NOT NULL,
-            source TEXT,
-            timestamp TEXT,
-            session_id TEXT DEFAULT 'default',
-            importance REAL DEFAULT 0.5,
-            metadata_json TEXT,
-            summary_of TEXT DEFAULT '',
-            veracity TEXT DEFAULT 'unknown',
-            recall_count INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE triples (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            subject TEXT NOT NULL,
-            predicate TEXT NOT NULL,
-            object TEXT NOT NULL,
-            valid_from TEXT NOT NULL,
-            valid_until TEXT,
-            source TEXT,
-            confidence REAL DEFAULT 1.0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE consolidation_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT,
-            items_consolidated INTEGER,
-            summary_preview TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE memory_embeddings (
-            memory_id TEXT PRIMARY KEY,
-            embedding_json TEXT NOT NULL,
-            model TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """
+    conn.execute(
+        "INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, veracity, recall_count, scope, consolidated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("wm-1", "global hermetic stats seed memory", "test", older, "default", 0.8, "tool", 3, "global", newer),
     )
     conn.execute(
-        "INSERT INTO working_memory (id, content, source, session_id, importance, veracity, recall_count, scope) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        ("wm-1", "global hermetic stats seed memory", "test", "default", 0.8, "tool", 3, "global"),
+        "INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, veracity, recall_count, scope) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("wm-2", "unrecalled session memory for the stats fixture", "user", newer, "default", 0.2, "stated", 0, "session"),
     )
     conn.execute(
-        "INSERT INTO working_memory (id, content, source, session_id, importance, veracity, recall_count, scope) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        ("wm-2", "unrecalled session memory for the stats fixture", "user", "default", 0.2, "stated", 0, "session"),
-    )
-    conn.execute(
-        "INSERT INTO episodic_memory (id, content, source, importance) VALUES (?, ?, ?, ?)",
-        ("em-1", "episodic summary of the hermetic stats run", "test", 0.6),
+        "INSERT INTO episodic_memory (id, content, source, timestamp, importance) VALUES (?, ?, ?, ?, ?)",
+        ("em-1", "episodic summary of the hermetic stats run", "test", newer, 0.6),
     )
     conn.execute(
         "INSERT INTO triples (subject, predicate, object, valid_from) VALUES (?, ?, ?, ?)",
@@ -180,22 +146,6 @@ def _hermetic_stats_env(tmp_path_factory):
 
     yield env
     TEST_ENV = None
-
-def _test(name, fn):
-    """Run a test function and track results."""
-    global passed, failed
-    try:
-        fn()
-        passed += 1
-        print(f"  ✓ {name}")
-    except AssertionError as e:
-        failed += 1
-        errors.append((name, str(e)))
-        print(f"  ✗ {name}: {e}")
-    except Exception as e:
-        failed += 1
-        errors.append((name, f"EXCEPTION: {e}"))
-        print(f"  ✗ {name}: EXCEPTION: {e}")
 
 # ═══════════════════════════════════════════════════════════
 # GROUP 1: Normal Operation (10 tests)
@@ -375,30 +325,33 @@ def test_empty_db_path():
             tmp.rename(DB_PATH)
 
 def test_corrupted_json_snapshot():
-    """Script should handle corrupted snapshot files."""
+    """Corrupted snapshot files are skipped without losing valid trends."""
     SNAP_DIR.mkdir(parents=True, exist_ok=True)
+    # Two valid snapshots so trends has data to report even after the
+    # corrupted file is skipped.
+    good_a = SNAP_DIR / "snap_a.json"
+    good_b = SNAP_DIR / "snap_b.json"
+    good_a.write_text(json.dumps({"timestamp": "2024-01-01T00:00:00", "wm_total": 1}))
+    good_b.write_text(json.dumps({"timestamp": "2024-01-02T00:00:00", "wm_total": 2}))
     snap_file = SNAP_DIR / "snap_corrupted.json"
     snap_file.write_text("NOT VALID JSON{{{")
     try:
         code, out, err = run("--trends")
-        # Should handle gracefully, not crash
         assert code == 0, f"Crashed on corrupted snapshot: {err}"
+        assert "TRENDS" in out, "Valid snapshots must still produce trends: " + out
     finally:
         snap_file.unlink(missing_ok=True)
+        good_a.unlink(missing_ok=True)
+        good_b.unlink(missing_ok=True)
 
 def test_empty_snapshot_dir():
-    """Script should handle empty snapshot directory."""
+    """Trends reports no data when the snapshot directory is empty."""
     SNAP_DIR.mkdir(parents=True, exist_ok=True)
-    tmp_dir = SNAP_DIR / "tmp_empty_test"
-    tmp_dir.mkdir(exist_ok=True)
-    try:
-        # The script uses SNAP_DIR, not a configurable path
-        # So we can't easily test this without mocking
-        # But we can verify the script doesn't crash with current state
-        code, out, err = run("--trends")
-        assert code == 0
-    finally:
-        tmp_dir.rmdir()
+    for snap in SNAP_DIR.glob("snap_*.json"):
+        snap.unlink()
+    code, out, err = run("--trends")
+    assert code == 0, f"Exit code {code}: {err}"
+    assert "No trend data yet" in out, out
 
 def test_special_characters_in_memory():
     """SQLite special characters should not crash output."""
@@ -597,75 +550,3 @@ def test_quality_score_bounds():
     data = json.loads(out)
     score = data["quality_score"]
     assert 0 <= score <= 7, f"Quality score out of bounds: {score}"
-
-# ═══════════════════════════════════════════════════════════
-# RUN ALL TESTS
-# ═══════════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    print("=" * 60)
-    print("  MNEMOSYNE-STATS.PY TEST SUITE")
-    print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 60)
-
-    print("\n  GROUP 1: Normal Operation (10 tests)")
-    print("  " + "─" * 40)
-    _test("Full dashboard output", test_full_dashboard)
-    _test("Compact mode", test_compact_mode)
-    _test("JSON mode", test_json_mode)
-    _test("Save snapshot", test_save_snapshot)
-    _test("Trends display", test_trends)
-    _test("Auto-snapshot on full run", test_auto_snapshot)
-    _test("Health score format", test_health_score_in_output)
-    _test("DB size in output", test_db_size_in_output)
-    _test("Quality indicators section", test_quality_indicators_section)
-    _test("Recommendations section", test_recommendations_section)
-
-    print("\n  GROUP 2: Edge Cases (10 tests)")
-    print("  " + "─" * 40)
-    _test("Invalid flag handling", test_invalid_flag)
-    _test("Multiple flags", test_multiple_flags)
-    _test("Missing DB path", test_empty_db_path)
-    _test("Corrupted snapshot file", test_corrupted_json_snapshot)
-    _test("Empty snapshot dir", test_empty_snapshot_dir)
-    _test("Special characters in memories", test_special_characters_in_memory)
-    _test("Output size reasonable", test_large_output)
-    _test("JSON structure valid", test_json_valid_structure)
-    _test("Snapshot JSON valid", test_snapshot_json_valid)
-    _test("Concurrent access safety", test_concurrent_access)
-
-    print("\n  GROUP 3: Integration (5 tests)")
-    print("  " + "─" * 40)
-    _test("Wiki count matches files", test_wiki_count_matches)
-    _test("WM count matches DB", test_db_count_matches)
-    _test("Episodic count matches DB", test_episodic_count_matches)
-    _test("Triples count matches DB", test_triples_count_matches)
-    _test("Consolidation count matches DB", test_consolidation_count_matches)
-
-    print("\n  GROUP 4: Stress / Boundary (5 tests)")
-    print("  " + "─" * 40)
-    _test("Rapid fire (10 runs)", test_rapid_fire)
-    _test("JSON pipe to python", test_json_pipe_to_python)
-    _test("Output encoding (UTF-8)", test_output_encoding)
-    _test("Performance (<5s)", test_performance)
-    _test("Snapshot growth tracking", test_snapshot_growth)
-
-    print("\n  GROUP 5: Data Integrity (5 tests)")
-    print("  " + "─" * 40)
-    _test("Importance dist sums to total", test_importance_distribution_sums)
-    _test("Recall dist sums to total", test_recall_distribution_sums)
-    _test("Noise % calculation correct", test_noise_pct_calculation)
-    _test("Global count accuracy", test_global_count_accuracy)
-    _test("Quality score in bounds", test_quality_score_bounds)
-
-    # Summary
-    print(f"\n{'=' * 60}")
-    print(f"  RESULTS: {passed} passed, {failed} failed, {passed+failed} total")
-    print(f"{'=' * 60}")
-
-    if errors:
-        print("\n  FAILURES:")
-        for name, err in errors:
-            print(f"    ✗ {name}: {err}")
-
-    sys.exit(0 if failed == 0 else 1)
