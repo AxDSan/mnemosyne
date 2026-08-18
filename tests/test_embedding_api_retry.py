@@ -220,6 +220,46 @@ def test_embed_raises_on_zero_length_embedding_row(monkeypatch):
             embeddings.embed(["anything"])
 
 
+def test_embed_raises_on_scalar_embedding_row(monkeypatch):
+    # A scalar "embedding" value yields a rank-1 array that looks non-empty;
+    # the contract requires a rank-2 result with one vector per input.
+    _api_env(monkeypatch)
+
+    with patch("urllib.request.urlopen", return_value=Response({"data": [{"embedding": 0.5}]})):
+        with pytest.raises(RuntimeError, match="unexpected rank-1 result"):
+            embeddings.embed(["anything"])
+
+
+def test_embed_raises_on_partial_response(monkeypatch):
+    # Fewer vectors than requested inputs must not silently misalign the
+    # caller's vector-to-text mapping.
+    _api_env(monkeypatch)
+    data = {"data": [
+        {"embedding": [0.1, 0.2]},
+        {"embedding": [0.3, 0.4]},
+    ]}
+
+    with patch("urllib.request.urlopen", return_value=Response(data)):
+        with pytest.raises(RuntimeError, match=r"2 vector\(s\) for 3 input\(s\)"):
+            embeddings.embed(["a", "b", "c"])
+
+
+def test_embed_query_raises_on_partial_response(monkeypatch):
+    # The query path requests exactly one vector; a multi-vector response must
+    # be rejected before indexing result[0].
+    _api_env(monkeypatch)
+    data = {"data": [
+        {"embedding": [0.1, 0.2]},
+        {"embedding": [0.3, 0.4]},
+    ]}
+
+    with patch("urllib.request.urlopen", return_value=Response(data)):
+        with pytest.raises(RuntimeError, match=r"2 vector\(s\) for 1 input\(s\)"):
+            embeddings.embed_query("anything")
+
+    embeddings._embed_query_cached.cache_clear()
+
+
 def test_embed_query_raises_when_api_request_fails(monkeypatch):
     _api_env(monkeypatch)
     error = urllib.error.HTTPError("http://127.0.0.1:11435/v1/embeddings", 401, "unauthorized", {}, None)
