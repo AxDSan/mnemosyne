@@ -40,6 +40,9 @@ def test_register_uses_one_provider_for_manager_and_tools(monkeypatch):
     assert len(created) == 1
     assert context.provider is created[0]
     assert plugin._provider is created[0]
+    remember = context.tools["mnemosyne_remember"]
+    bound = getattr(remember, "func", remember)
+    assert getattr(bound, "__self__", None) is created[0]
 
 
 def test_plugin_remember_without_prior_initialize_stores(tmp_path, monkeypatch):
@@ -48,13 +51,16 @@ def test_plugin_remember_without_prior_initialize_stores(tmp_path, monkeypatch):
 
     context = _Context()
     plugin.register(context)
+    try:
+        raw = context.tools["mnemosyne_remember"](
+            {"content": "user prefers tea", "importance": 0.9, "scope": "global"}
+        )
+        data = json.loads(raw)
 
-    raw = context.tools["mnemosyne_remember"](
-        {"content": "user prefers tea", "importance": 0.9, "scope": "global"}
-    )
-    data = json.loads(raw)
-
-    assert data.get("status") != "memory_unavailable", data
-    assert "not initialized" not in str(data).lower()
-    assert data.get("status") == "stored"
-    assert data.get("memory_id")
+        assert data.get("status") != "memory_unavailable", data
+        assert "not initialized" not in str(data).lower()
+        assert data.get("status") == "stored"
+        assert data.get("memory_id")
+    finally:
+        if context.provider is not None:
+            context.provider.shutdown()

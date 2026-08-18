@@ -1922,9 +1922,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps({"error": str(exc)})
         if tool_name == "mnemosyne_sleep" and self._reflect_disabled_for_cron and (self._agent_context or "").strip().lower() == "cron":
             return json.dumps(self._reflection_skip_response("reflect_disabled_for_cron", "tool"))
-        self._maybe_retry_init()
-        self._ensure_initialized_for_tools()
         try:
+            self._maybe_retry_init()
+            self._ensure_initialized_for_tools()
             # Tools use the durable session selected by on_session_switch().
             # Hold the same session lock for the complete dispatch so a write,
             # recall, or sleep cannot be re-attributed mid-operation.
