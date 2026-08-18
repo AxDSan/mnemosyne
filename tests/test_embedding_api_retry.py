@@ -170,3 +170,115 @@ def test_safe_api_endpoint_handles_unbalanced_ipv6_bracket():
 
 def test_safe_api_endpoint_rejects_schemeless_credential_text():
     assert embeddings._safe_api_endpoint("user:pw@example.test/v1") == "<invalid-url>"
+
+
+# ---------------------------------------------------------------------------
+# #735: embed()/embed_query() must fail loud on the API path instead of
+# silently returning None. A bare None is indistinguishable from "embeddings
+# unavailable", so BeamMemory.remember()'s `if vec is not None` would skip
+# vector storage without its except-Exception warning ever firing.
+# ---------------------------------------------------------------------------
+
+def _api_env(monkeypatch, base_url="http://127.0.0.1:11435/v1"):
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", base_url)
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDINGS_VIA_API", "1")
+    monkeypatch.delenv("MNEMOSYNE_NO_EMBEDDINGS", raising=False)
+    monkeypatch.delenv("MNEMOSYNE_SKIP_EMBEDDINGS", raising=False)
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDINGS_OFF", raising=False)
+    embeddings._embed_query_cached.cache_clear()
+
+
+def test_embed_raises_when_api_request_fails_while_available(monkeypatch):
+    _api_env(monkeypatch)
+    error = urllib.error.URLError(OSError(65, "No route to host"))
+
+    with patch("urllib.request.urlopen", side_effect=error), \
+         patch("mnemosyne.core.embeddings.random.uniform", return_value=0), \
+         patch("mnemosyne.core.embeddings.time.sleep"):
+        with pytest.raises(RuntimeError, match="Embedding API returned no vectors") as excinfo:
+            embeddings.embed(["private memory content"])
+
+    assert "private memory content" not in str(excinfo.value)
+
+
+def test_embed_raises_on_empty_data_list(monkeypatch):
+    _api_env(monkeypatch)
+
+    with patch("urllib.request.urlopen", return_value=Response({"data": []})):
+        with pytest.raises(RuntimeError, match="empty vector list"):
+            embeddings.embed(["anything"])
+
+
+def test_embed_query_raises_when_api_request_fails(monkeypatch):
+    _api_env(monkeypatch)
+    error = urllib.error.HTTPError("http://127.0.0.1:11435/v1/embeddings", 401, "unauthorized", {}, None)
+
+    with patch("urllib.request.urlopen", side_effect=error):
+        with pytest.raises(RuntimeError, match="Embedding API returned no vectors") as excinfo:
+            embeddings.embed_query("private query text")
+
+    assert "private query text" not in str(excinfo.value)
+    embeddings._embed_query_cached.cache_clear()
+
+
+def test_embed_raise_message_is_redacted_and_retries_transient_failures(monkeypatch):
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", "https://user:password@example.test/v1?token=secret")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
+    embeddings._embed_query_cached.cache_clear()
+    error = urllib.error.HTTPError("https://example.test/v1/embeddings", 503, "unavailable", {}, None)
+
+    with patch("urllib.request.urlopen", side_effect=error) as request, \
+         patch("mnemosyne.core.embeddings.random.uniform", return_value=0), \
+         patch("mnemosyne.core.embeddings.time.sleep"):
+        with pytest.raises(RuntimeError) as excinfo:
+            embeddings.embed(["secret content"])
+
+    msg = str(excinfo.value)
+    assert "endpoint=https://example.test/v1" in msg
+    assert "model=" in msg
+    assert "secret-key" not in msg
+    assert "user:password" not in msg
+    assert "token=secret" not in msg
+    assert "secret content" not in msg
+    assert request.call_count == 3
+
+
+def test_embed_raise_message_names_missing_openrouter_key(monkeypatch):
+    # OpenRouter base + no API key is the previously-silent path: _embed_api
+    # logged nothing and returned None. It must now log, and the public API
+    # must name the missing key instead of a generic failure.
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDINGS_VIA_API", "1")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "")
+
+    with pytest.raises(RuntimeError, match="no API key is configured") as excinfo:
+        embeddings.embed(["content"])
+
+    assert "openrouter.ai" in str(excinfo.value)
+
+
+def test_embed_api_no_key_path_logs_warning_and_returns_none(monkeypatch, caplog):
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDINGS_VIA_API", "1")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "")
+
+    with caplog.at_level(logging.WARNING, logger="mnemosyne.core.embeddings"):
+        assert embeddings._embed_api(["content"]) is None
+
+    assert "no API key" in caplog.text
+
+
+def test_embed_returns_none_on_non_api_path_when_model_unavailable(monkeypatch):
+    # The fail-loud rule is scoped to the API branch only: when no API is
+    # configured and the local model is unavailable, embed()/embed_query()
+    # keep returning None so the "embeddings not available" degradation is
+    # preserved.
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDING_API_URL", raising=False)
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDINGS_VIA_API", raising=False)
+    embeddings._embed_query_cached.cache_clear()
+
+    with patch.object(embeddings, "_get_model", return_value=None):
+        assert embeddings.embed(["hello"]) is None
+        assert embeddings.embed_query("hello") is None
+
+    embeddings._embed_query_cached.cache_clear()
