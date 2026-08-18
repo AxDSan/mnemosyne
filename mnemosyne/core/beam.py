@@ -4831,7 +4831,7 @@ class BeamMemory:
 
     def forget_working(self, memory_id: str) -> bool:
         """Delete a session-authorized working memory row and its cascade
-        (vector, annotations, embeddings) atomically."""
+        (vector, annotations, embeddings, gists) atomically."""
         # E6.a: the cascade-delete of annotations must be authorized by the
         # session-scoped working_memory DELETE. The annotations table has no
         # session_id column, so an unconditional `DELETE FROM annotations
@@ -4865,6 +4865,7 @@ class BeamMemory:
                     "DELETE FROM annotations WHERE memory_id = ?", (memory_id,)
                 )
                 cursor.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
+                cursor.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
         forgotten = wm_rows > 0
         if forgotten:
             self._invalidate_query_cache()
