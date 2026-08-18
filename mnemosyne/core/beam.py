@@ -6094,11 +6094,15 @@ class BeamMemory:
             raise ValueError("internal recall controls are managed by recall_with_evidence_pack")
 
         primary = self.recall(query, top_k=top_k, **kwargs)
+        primary_rows = primary.get("results", []) if isinstance(primary, dict) else primary
+        from mnemosyne.core.evidence_packs import build_evidence_pack
+        if pack_k == 0:
+            return build_evidence_pack(primary_rows, [], max_items=0)
+
         candidates = self.recall(
             query, top_k=candidate_k, _track_recall=False,
             _include_vector_only_candidates=True, **kwargs
         )
-        primary_rows = primary.get("results", []) if isinstance(primary, dict) else primary
         candidate_rows = candidates.get("results", []) if isinstance(candidates, dict) else candidates
         # Only storage-backed tiers can receive a verified source-session backfill.
         candidate_rows = [
@@ -6149,7 +6153,6 @@ class BeamMemory:
             if session_id is not None:
                 row["session_id"] = session_id
 
-        from mnemosyne.core.evidence_packs import build_evidence_pack
         return build_evidence_pack(primary_rows, candidate_rows, max_items=pack_k)
 
     def recall(self, query: str, top_k: int = 40, *,

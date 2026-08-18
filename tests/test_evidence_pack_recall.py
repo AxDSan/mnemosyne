@@ -122,6 +122,28 @@ def test_evidence_pack_does_not_leak_other_session_rows(tmp_path: Path):
     assert other_id not in returned_ids
 
 
+def test_evidence_pack_zero_skips_candidate_recall(tmp_path: Path, monkeypatch):
+    beam = BeamMemory(session_id="zero-pack", db_path=tmp_path / "zero-pack.db")
+    memory_id = beam.remember("Orion zero pack fixture", source="test", importance=0.8)
+    real_recall = beam.recall
+    calls = []
+
+    def recording_recall(*args, **kwargs):
+        calls.append(kwargs)
+        return real_recall(*args, **kwargs)
+
+    monkeypatch.setattr(beam, "recall", recording_recall)
+    packed = beam.recall_with_evidence_pack(
+        "Orion zero pack", top_k=1, candidate_k=5, pack_k=0
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["top_k"] == 1
+    assert "_track_recall" not in calls[0]
+    assert [row["id"] for row in packed["primary"]] == [memory_id]
+    assert packed["evidence_pack"] == []
+
+
 def test_cross_session_scope_can_produce_a_bounded_supplemental_pack(tmp_path: Path):
     db_path = tmp_path / "cross-session-pack.db"
     reader = BeamMemory(session_id="reader", db_path=db_path)
@@ -139,6 +161,33 @@ def test_cross_session_scope_can_produce_a_bounded_supplemental_pack(tmp_path: P
     assert {row["evidence_rank"] for row in packed["evidence_pack"]} == {2, 3}
     returned_ids = {row["id"] for row in packed["primary"] + packed["evidence_pack"]}
     assert {second_id, third_id}.issubset(returned_ids)
+
+
+def test_evidence_pack_honors_temporal_filters(tmp_path: Path):
+    db_path = tmp_path / "temporal-pack.db"
+    reader = BeamMemory(session_id="reader", db_path=db_path)
+    old_writer = BeamMemory(session_id="old", db_path=db_path)
+    current_writer = BeamMemory(session_id="current", db_path=db_path)
+    old_id = old_writer.remember("Orion temporal old fixture", source="test", importance=0.8, scope="global")
+    current_id = current_writer.remember(
+        "Orion temporal current fixture", source="test", importance=0.8, scope="global"
+    )
+    reader.conn.execute(
+        "UPDATE working_memory SET timestamp = ? WHERE id = ?", ("2020-01-01T00:00:00", old_id)
+    )
+    reader.conn.execute(
+        "UPDATE working_memory SET timestamp = ? WHERE id = ?", ("2026-01-01T00:00:00", current_id)
+    )
+    reader.conn.commit()
+
+    packed = reader.recall_with_evidence_pack(
+        "Orion temporal", top_k=1, candidate_k=5, pack_k=2,
+        _cross_session=True, from_date="2025-01-01",
+    )
+    returned_ids = {row["id"] for row in packed["primary"] + packed["evidence_pack"]}
+
+    assert current_id in returned_ids
+    assert old_id not in returned_ids
 
 
 def test_evidence_pack_excludes_consolidated_working_candidates(tmp_path: Path):
