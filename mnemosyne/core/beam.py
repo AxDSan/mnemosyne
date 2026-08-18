@@ -3027,7 +3027,10 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
         # guidance; keep this pointer short and point at it.
         query_dim = len(embedding)
         try:
-            existing_dim = _existing_vec_dim(conn)
+            # vec_episodes specifically: mixed or partially migrated stores
+            # can carry vec tables at different dimensions, and guidance
+            # about THIS table's KNN must be based on THIS table's DDL.
+            existing_dim = _existing_vec_dim(conn, tables=("vec_episodes",))
         except Exception:
             existing_dim = None
         if _is_query_dim_mismatch(exc, query_dim, existing_dim):
