@@ -308,6 +308,22 @@ def test_embed_raise_message_names_missing_openrouter_key(monkeypatch):
     assert "openrouter.ai" in str(excinfo.value)
 
 
+def test_embed_raises_redacted_runtime_error_on_malformed_endpoint_url(monkeypatch):
+    # urlsplit() raises ValueError on malformed URLs (e.g. "http://["); host
+    # classification must not leak that as a raw ValueError -- the API path
+    # should still fail loud with the redacted RuntimeError and never echo
+    # the malformed URL.
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", "http://[")
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDINGS_VIA_API", "1")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "")
+
+    with patch("mnemosyne.core.embeddings.time.sleep"):
+        with pytest.raises(RuntimeError, match="Embedding API returned no vectors") as excinfo:
+            embeddings.embed(["content"])
+
+    assert "http://[" not in str(excinfo.value)
+
+
 def test_custom_endpoint_with_openrouter_ai_in_query_needs_no_key(monkeypatch):
     # Substring-based OpenRouter detection would misclassify this custom
     # endpoint because its query contains "openrouter.ai", blocking it from

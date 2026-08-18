@@ -331,8 +331,14 @@ def _is_openrouter_url(base_url: str) -> bool:
     Substring matching misclassifies custom endpoints whose URL merely
     contains ``openrouter.ai`` in the path or query, blocking them from the
     keyless custom-endpoint path. Match the resolved hostname instead.
+    Malformed URLs (e.g. ``http://[``) raise ``ValueError`` from
+    ``urlsplit``; treat those as non-OpenRouter so the request still reaches
+    the API path and fails loud with the redacted ``RuntimeError``.
     """
-    hostname = urllib.parse.urlsplit(base_url).hostname or ""
+    try:
+        hostname = urllib.parse.urlsplit(base_url).hostname or ""
+    except ValueError:
+        return False
     return hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai")
 
 
