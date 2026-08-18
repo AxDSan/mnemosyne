@@ -171,7 +171,14 @@ def test_package_metadata_uses_the_same_version_contract():
     )
 
 
-def test_standalone_hermes_release_source_surfaces_are_ready_for_0_6_0():
+def test_standalone_hermes_release_source_surfaces_agree():
+    """All four standalone version surfaces must carry the same value.
+
+    The version itself is read from pyproject.toml, which RELEASING.md names as
+    the source of truth, rather than hardcoded. Pinning a literal here meant
+    every plugin release had to rename this test, and a rename is easy to do
+    without re-reading what it asserts.
+    """
     hermes_root = ROOT / "integrations" / "hermes"
     distribution_version = _project_version(hermes_root / "pyproject.toml")
     runtime_version = _assignment_version(
@@ -182,14 +189,17 @@ def test_standalone_hermes_release_source_surfaces_are_ready_for_0_6_0():
         hermes_root / "src" / "mnemosyne_hermes" / "plugin.yaml"
     )
 
-    assert distribution_version == "0.6.0"
+    assert distribution_version, "pyproject.toml declares no [project].version"
     assert runtime_version == distribution_version
     assert source_manifest_version == distribution_version
     assert packaged_manifest_version == distribution_version
 
 
-def test_standalone_hermes_release_wheel_is_ready_for_0_6_0(tmp_path):
-    wheel = _build_standalone_wheel(ROOT / "integrations" / "hermes", tmp_path)
+def test_standalone_hermes_release_wheel_matches_the_declared_version(tmp_path):
+    """The built wheel must carry the version pyproject.toml declares."""
+    hermes_root = ROOT / "integrations" / "hermes"
+    expected = _project_version(hermes_root / "pyproject.toml")
+    wheel = _build_standalone_wheel(hermes_root, tmp_path)
 
     with zipfile.ZipFile(wheel) as archive:
         metadata = BytesParser(policy=policy.default).parsebytes(
@@ -199,8 +209,8 @@ def test_standalone_hermes_release_wheel_is_ready_for_0_6_0(tmp_path):
 
         assert manifest_path in archive.namelist()
         assert metadata["Name"] == "mnemosyne-hermes"
-        assert metadata["Version"] == "0.6.0"
-        assert _manifest_version_from_wheel(archive, manifest_path) == "0.6.0"
+        assert metadata["Version"] == expected
+        assert _manifest_version_from_wheel(archive, manifest_path) == expected
 
 
 def test_core_wheel_ships_the_hermes_memory_provider_plugin_manifest(tmp_path):

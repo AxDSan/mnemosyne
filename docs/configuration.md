@@ -200,13 +200,13 @@ MNEMOSYNE_EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
 # Low-resource local multilingual embeddings
 MNEMOSYNE_EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 
-# Or any fastembed-supported model
-MNEMOSYNE_EMBEDDING_MODEL=intfloat/multilingual-e5-base
+# Larger FastEmbed E5 multilingual embeddings
+MNEMOSYNE_EMBEDDING_MODEL=intfloat/multilingual-e5-large
 ```
 
-The embedding dimension resolves in this order: an explicit `MNEMOSYNE_EMBEDDING_DIM` (positive integer) takes precedence for every model; otherwise the built-in table below provides known dimensions; an unknown model with no explicit dimension **fails loudly at startup** rather than silently assuming 384. Blank/whitespace-only `MNEMOSYNE_EMBEDDING_DIM` is treated as unset (common in Docker Compose and `.env` files).
+The embedding dimension resolves in this order: a non-empty explicit `MNEMOSYNE_EMBEDDING_DIM` (positive integer) takes precedence for every model; otherwise Mnemosyne uses its built-in mappings, including the examples below; an unknown model with no explicit dimension **fails loudly at startup** rather than silently assuming 384. Blank/whitespace-only `MNEMOSYNE_EMBEDDING_DIM` is treated as unset (common in Docker Compose and `.env` files).
 
-Supported models with known dimensions:
+Examples of models with built-in dimension mappings (not an exhaustive model catalog):
 
 | Model | Dims | Language |
 |---|---|---|
@@ -216,8 +216,6 @@ Supported models with known dimensions:
 | `BAAI/bge-base-zh-v1.5` | 768 | Chinese |
 | `BAAI/bge-large-zh-v1.5` | 1,024 | Chinese |
 | `BAAI/bge-m3` | 1,024 | Multilingual |
-| `intfloat/multilingual-e5-small` | 384 | Multilingual |
-| `intfloat/multilingual-e5-base` | 768 | Multilingual |
 | `intfloat/multilingual-e5-large` | 1,024 | Multilingual |
 | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | 384 | Multilingual |
 | `sentence-transformers/all-MiniLM-L6-v2` | 384 | Multilingual |
@@ -226,13 +224,36 @@ Supported models with known dimensions:
 | `openai/text-embedding-3-small` | 1,536 | API |
 | `openai/text-embedding-3-large` | 3,072 | API |
 
-For models not in the table (e.g. `mxbai-embed-large` via a custom endpoint), set the dimension explicitly:
+For an unknown or custom model (for example, `mxbai-embed-large` via a custom endpoint), set a non-empty explicit dimension only when you know its actual output dimension:
 
 ```bash
-MNEMOSYNE_EMBEDDING_DIM=768
+MNEMOSYNE_EMBEDDING_DIM=<actual-output-dimension>
 ```
 
-> **Warning:** Changing the embedding model after data has been stored will cause a dimension mismatch. The vec0 virtual table is locked to the dimension it was created with. **Stores created under the old silent-384 fallback**: setting the model's true dimension can trigger the existing dimension-mismatch guard, so operators may need the documented reindex/recovery path rather than treating the override as a one-step fix.
+> **Warning:** Changing the embedding model after data has been stored requires a reindex, even when the old and new models have the same dimension: their embedding spaces are incompatible. When dimensions differ, the vec0 virtual table is also locked to the dimension it was created with. **Stores created under the old silent-384 fallback**: setting the model's true dimension can trigger the existing dimension-mismatch guard, so use the reindex path below rather than treating the override as a one-step fix.
+
+#### Changing an embedding model safely
+
+1. Persist `MNEMOSYNE_EMBEDDING_MODEL` with the target model in the deployment configuration, so it survives restarts. If `MNEMOSYNE_EMBEDDING_DIM` is non-empty, persist the intended explicit dimension there too; for an unknown or custom model, use it only when you know the model's actual output dimension.
+2. Stop the provider or gateway and every other process that can write to the same local SQLite database before reindexing.
+3. Before invoking any reindex command, run the CLI from the same persisted deployment environment/configuration that the provider or gateway will use after restart—or load/export that exact configuration into the admin shell. Confirm both the target model and any explicit `MNEMOSYNE_EMBEDDING_DIM` are the post-restart values.
+4. Inspect the non-mutating rebuild plan:
+
+   ```bash
+   mnemosyne reindex --model <target-model> --dry-run
+   ```
+
+   It **must** report the intended model and intended dimension. Do **not** run `--yes` if either differs from the post-restart configuration.
+5. Run the rebuild only after that check passes:
+
+   ```bash
+   mnemosyne reindex --model <target-model> --yes
+   ```
+
+   The CLI creates a backup by default, re-embeds working and episodic memory, and, when sqlite-vec is available, rebuilds its tables at the dimension selected by that effective configuration. `--model` affects only that invocation; it does not override an explicit `MNEMOSYNE_EMBEDDING_DIM`. Therefore, the target sqlite-vec dimension is not determined by the `--model` name alone.
+6. Restart the provider or gateway and verify recall for both working and episodic memory through the deployment's configured retrieval path. When sqlite-vec is available, also verify vector-backed recall for both tiers.
+
+See [Health and repair](cli-reference.md#health-and-repair) for the `reindex` command and flag reference.
 
 ## LLM Consolidation
 
@@ -240,13 +261,18 @@ MNEMOSYNE_EMBEDDING_DIM=768
 
 | Variable | Default | Description |
 |---|---|---|
-| `MNEMOSYNE_LLM_ENABLED` | `false` | Enable LLM summarization during sleep cycle |
+| `MNEMOSYNE_LLM_ENABLED` | `true` | Global gate for host, remote, and local LLM-backed consolidation. Resolved from the environment when the local-LLM module is imported; currently not controlled by `config.yaml` `llm_enabled`. |
 | `MNEMOSYNE_LLM_N_CTX` | `2048` | Context window size for the local model |
-| `MNEMOSYNE_LLM_MAX_TOKENS` | `512` | Maximum output tokens per summary |
+| `MNEMOSYNE_LLM_MAX_TOKENS` | `2048` | Maximum output tokens per summary |
 | `MNEMOSYNE_LLM_N_THREADS` | `4` | CPU threads for local inference |
 | `MNEMOSYNE_LLM_REPO` | `openbmb/MiniCPM5-1B-GGUF` | HuggingFace repo for GGUF model |
 | `MNEMOSYNE_LLM_FILE` | `MiniCPM5-1B-Q4_K_M.gguf` | GGUF filename |
+| `MNEMOSYNE_MODEL_CACHE_DIR` | `~/.hermes/mnemosyne/models` | Directory the GGUF model is cached in |
 | `MNEMOSYNE_SLEEP_PROMPT` | *(built-in)* | Optional sleep/consolidation prompt override. Supports `{source}`, `{memories}`, and `{memory_count}` placeholders for language-specific summaries. |
+
+`MNEMOSYNE_LLM_ENABLED=false` disables all LLM-backed consolidation, including Hermes host routing and configured remote endpoints; Mnemosyne then uses its AAAK/no-LLM fallback. The generated [configuration reference](api/configuration.mdx) records the current distinction between this environment gate and the separately declared `config.yaml` key.
+
+When the gate is enabled and neither a usable host backend nor a configured remote endpoint succeeds, Mnemosyne falls back to the local GGUF model. The default `MiniCPM5-1B-Q4_K_M.gguf` model is approximately 656 MB and is cached in `~/.hermes/mnemosyne/models`, or in `MNEMOSYNE_MODEL_CACHE_DIR` when that is set. `sleep()` is synchronous, so the first uncached local fallback can block while it downloads the model from Hugging Face. To avoid a download, set `MNEMOSYNE_LLM_ENABLED=false` for AAAK-only consolidation or pre-cache the GGUF model; a cached local fallback does not require network access.
 
 ### Remote LLM (OpenAI-compatible)
 
@@ -259,7 +285,7 @@ Use a remote model instead of the local MiniCPM5-1B GGUF:
 | `MNEMOSYNE_LLM_MODEL` | *(none)* | Model identifier sent in requests |
 | `MNEMOSYNE_LLM_TIMEOUT` | `60` | HTTP timeout in seconds for remote LLM calls. Increase for slow proxies or models with long generation times (e.g. `300` for reasoning models routed through local proxies). |
 
-When `MNEMOSYNE_LLM_BASE_URL` is set, Mnemosyne uses the remote endpoint for consolidation. Falls back to local ctransformers if the remote is unreachable, then to AAAK encoding.
+With `MNEMOSYNE_LLM_ENABLED` enabled, Mnemosyne uses the remote endpoint when no host call was attempted, an explicit or provider-preset-resolved remote base URL is available, and `MNEMOSYNE_FORCE_LOCAL` is not enabled. On failure it falls back to the local GGUF backend, then AAAK encoding.
 
 Works with: llama.cpp server, vLLM, Ollama, LM Studio, or any OpenAI-compatible API.
 
@@ -305,10 +331,12 @@ When the host call fails, the adapter falls back to the local GGUF model rather 
 
 ### Fallback Chain
 
-```
+With `MNEMOSYNE_LLM_ENABLED=true`:
+
+```text
 0. Host LLM adapter (if MNEMOSYNE_HOST_LLM_ENABLED=true AND a backend is registered)
    ↓ (on failure: skip remote, go to local)
-1. Remote LLM (if MNEMOSYNE_LLM_BASE_URL is set AND host is not enabled)
+1. Remote LLM (if no host call was attempted, an explicit or provider-preset-resolved remote base URL is available, AND MNEMOSYNE_FORCE_LOCAL is not enabled)
    ↓ (on failure)
 2. Local LLM (llama-cpp-python / ctransformers + MiniCPM5-1B GGUF)
    ↓ (on failure or not installed)

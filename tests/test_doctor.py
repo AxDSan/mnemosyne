@@ -119,7 +119,7 @@ def test_open_readonly_doctor_db_rejects_schema_and_data_writes(tmp_path):
 
 
 def test_optional_sqlite_vec_load_keeps_doctor_connection_write_protected(tmp_path):
-    sqlite_vec = pytest.importorskip("sqlite_vec")
+    pytest.importorskip("sqlite_vec")
     db_path = tmp_path / "doctor.db"
     sqlite3.connect(db_path).close()
 
@@ -716,6 +716,7 @@ def test_adapter_catalog_errors_are_unknown_and_redacted():
         "episodic_memory",
         "canonical_facts",
         "triples",
+        "media_moments",
     }
     assert all(metric == {"status": STATUS_UNKNOWN, "error_class": "database_error"} for metric in result.metrics.values())
     assert "private body" not in json.dumps(result.metrics)

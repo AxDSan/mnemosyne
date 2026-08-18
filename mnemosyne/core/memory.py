@@ -17,7 +17,7 @@ import hashlib
 import logging
 import threading
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Optional, Any
 from pathlib import Path
 
@@ -26,7 +26,9 @@ import os
 logger = logging.getLogger(__name__)
 
 from mnemosyne.core import embeddings as _embeddings
-from mnemosyne.core.beam import BeamMemory, init_beam
+from mnemosyne.core import beam as beam_module
+from mnemosyne.core._connection_gc import collect_connection_cycles
+from mnemosyne.core.beam import BeamMemory, _BeamConnection, _deferred_commits, init_beam
 _thread_local = threading.local()
 
 # Default data directory
@@ -60,9 +62,25 @@ def _default_db_path() -> Path:
 def _get_connection(db_path = None) -> sqlite3.Connection:
     """Get thread-local database connection"""
     path = Path(db_path) if db_path else _default_db_path()
-    if not hasattr(_thread_local, 'conn') or _thread_local.conn is None or getattr(_thread_local, 'db_path', None) != str(path):
+    needs_reconnect = (
+        not hasattr(_thread_local, "conn")
+        or _thread_local.conn is None
+        or getattr(_thread_local, "db_path", None) != str(path)
+    )
+    if not needs_reconnect:
+        # Public callers can close Mnemosyne.conn. Do not return that stale
+        # core-cache handle; recreating it below also re-establishes BEAM's
+        # shared owner-aware _BeamConnection for this path.
+        try:
+            _thread_local.conn.execute("SELECT 1")
+        except Exception:
+            needs_reconnect = True
+
+    if needs_reconnect:
         path.parent.mkdir(parents=True, exist_ok=True)
-        _thread_local.conn = sqlite3.connect(str(path), check_same_thread=False)
+        _thread_local.conn = sqlite3.connect(
+            str(path), check_same_thread=False, factory=_BeamConnection
+        )
         _thread_local.conn.row_factory = sqlite3.Row
         _thread_local.conn.execute("PRAGMA journal_mode=WAL")
         _thread_local.conn.execute("PRAGMA busy_timeout=5000")
@@ -75,6 +93,12 @@ def _get_connection(db_path = None) -> sqlite3.Connection:
         except Exception:
             pass
         _thread_local.db_path = str(path)
+        collect_connection_cycles()
+    # BeamMemory consults its own TLS cache during construction. Re-publish on
+    # every successful core lookup, not only reconnection, because a standalone
+    # BeamMemory for another path may have replaced that cache in the meantime.
+    beam_module._thread_local.conn = _thread_local.conn
+    beam_module._thread_local.db_path = str(path)
     return _thread_local.conn
 
 
@@ -218,6 +242,9 @@ class Mnemosyne:
                                author_id=author_id, author_type=author_type,
                                channel_id=channel_id,
                                event_emitter=self._stream_emit)
+        # ``self.conn`` remains the core module cache. _get_connection
+        # coordinates it with BEAM, preserving core connection identity while
+        # direct wrappers dual-write through one transaction-capable handle.
 
     # ─── Phase 8: Streaming ─────────────────────────────────────────
 
@@ -298,13 +325,13 @@ class Mnemosyne:
         and expired memories are excluded so retracted notes do not skew
         pattern detection.
         """
-        now = datetime.now().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         cursor = self.beam.conn.cursor()
         cursor.execute("""
             SELECT id, content, source, timestamp, session_id, importance
             FROM working_memory
             WHERE (session_id = ? OR scope = 'global')
-              AND (valid_until IS NULL OR valid_until > ?)
+              AND (valid_until IS NULL OR julianday(valid_until) > julianday(?))
               AND superseded_by IS NULL
         """, (self.session_id, now))
         rows = [dict(row) for row in cursor.fetchall()]
@@ -313,7 +340,7 @@ class Mnemosyne:
             SELECT id, content, source, timestamp, session_id, importance
             FROM episodic_memory
             WHERE (session_id = ? OR scope = 'global')
-              AND (valid_until IS NULL OR valid_until > ?)
+              AND (valid_until IS NULL OR julianday(valid_until) > julianday(?))
               AND superseded_by IS NULL
         """, (self.session_id, now))
         for row in cursor.fetchall():
@@ -360,7 +387,9 @@ class Mnemosyne:
                  extract_entities: bool = False,
                  extract: bool = False,
                  veracity: str = "unknown",
-                 trust_tier: str = None) -> str:
+                 trust_tier: str = None,
+                 memory_type: str = None,
+                 dedupe: bool = True) -> str:
         """
         Store a memory directly to SQLite.
         Writes to both BEAM working_memory and legacy memories table.
@@ -375,10 +404,20 @@ class Mnemosyne:
             trust_tier: Trust classification for prompt-injection defense.
                 None = use beam default ('STATED'). 'EXTERNAL_WRITE' for MCP
                 tool calls, 'IMPORTED' for bulk imports.
+            memory_type: Optional explicit MemoryType value; overrides the
+                content classifier. See BeamMemory.remember.
+            dedupe: When False, always write a new row instead of folding into
+                an exact content match. See BeamMemory.remember.
 
         Returns:
             memory_id on success, or None if the content was filtered by
             the write classifier (noise pattern or secret detection).
+
+        Note for programmatic writers: this facade can return None, because
+        the write filter below may veto the content outright. It also does not
+        accept a caller-supplied memory_id. Callers that must observe every
+        write and control its id -- media ingest, importers -- should call
+        BeamMemory.remember directly rather than going through here.
         """
         # --- Core-level write filter (issues #406, #428) ---
         # Placed here so ALL entry points (Hermes provider, MCP server, SDK,
@@ -423,36 +462,39 @@ class Mnemosyne:
             if durations:
                 metadata["_durations"] = durations
 
-        memory_id = self.beam.remember(
-            _content, source=source,
-            importance=importance, metadata=metadata,
-            valid_until=valid_until, scope=scope,
-            extract_entities=extract_entities, extract=extract,
-            veracity=veracity,
-            trust_tier=trust_tier,
-        )
-        timestamp = datetime.now().isoformat()
+        with _deferred_commits(self.conn):
+            memory_id = self.beam.remember(
+                _content, source=source,
+                importance=importance, metadata=metadata,
+                valid_until=valid_until, scope=scope,
+                extract_entities=extract_entities, extract=extract,
+                veracity=veracity,
+                trust_tier=trust_tier,
+                memory_type=memory_type,
+                dedupe=dedupe,
+            )
+            timestamp = datetime.now().isoformat()
 
-        # Legacy dual-write with same ID (INSERT OR REPLACE for dedup safety)
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            INSERT OR REPLACE INTO memories (id, content, source, timestamp, session_id, importance, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            memory_id, _content, source, timestamp, self.session_id,
-            importance, json.dumps(metadata or {})
-        ))
+            # Legacy dual-write with same ID (INSERT OR REPLACE for dedup safety)
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO memories (id, content, source, timestamp, session_id, importance, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                memory_id, _content, source, timestamp, self.session_id,
+                importance, json.dumps(metadata or {})
+            ))
 
-        # Legacy embedding store
-        if _embeddings.available():
-            vec = _embeddings.embed([_content])
-            if vec is not None:
-                cursor.execute("""
-                    INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model)
-                    VALUES (?, ?, ?)
-                """, (memory_id, _embeddings.serialize(vec[0]), _embeddings._DEFAULT_MODEL))
+            # Legacy embedding store
+            if _embeddings.available():
+                vec = _embeddings.embed([_content])
+                if vec is not None:
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model)
+                        VALUES (?, ?, ?)
+                    """, (memory_id, _embeddings.serialize(vec[0]), _embeddings._DEFAULT_MODEL))
 
-        self.conn.commit()
+            self.conn.commit()
 
         # The first BEAM write already inserted the working_memory row with
         # the correct memory_id (we used it for the legacy dual-write above)
@@ -604,11 +646,41 @@ class Mnemosyne:
 
     def forget(self, memory_id: str) -> bool:
         """Delete a memory by ID from legacy table and working_memory."""
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM memories WHERE id = ? AND session_id = ?",
-                      (memory_id, self.session_id))
-        self.conn.commit()
-        result = self.beam.forget_working(memory_id)
+        with _deferred_commits(self.conn):
+            cursor = self.conn.cursor()
+            # Authorize from the authoritative BEAM row before deleting either
+            # representation. A global row may be removed cross-session, but
+            # its legacy mirror belongs to the creating session, not the caller.
+            owner = cursor.execute(
+                """
+                SELECT session_id FROM working_memory
+                WHERE id = ? AND (session_id = ? OR scope = 'global')
+                """,
+                (memory_id, self.session_id),
+            ).fetchone()
+            if owner is None:
+                # Trimming removes only the BEAM working row. Preserve the
+                # historical owner-only legacy delete for that orphaned mirror,
+                # while never authorizing a foreign session through fallback.
+                legacy_owner = cursor.execute(
+                    "SELECT 1 FROM memories WHERE id = ? AND session_id = ?",
+                    (memory_id, self.session_id),
+                ).fetchone()
+                if legacy_owner is None:
+                    return False
+                cursor.execute(
+                    "DELETE FROM memories WHERE id = ? AND session_id = ?",
+                    (memory_id, self.session_id),
+                )
+                self.conn.commit()
+                result = False
+            else:
+                cursor.execute(
+                    "DELETE FROM memories WHERE id = ? AND session_id = ?",
+                    (memory_id, owner["session_id"]),
+                )
+                self.conn.commit()
+                result = self.beam.forget_working(memory_id)
         self._emit_wrapper("MEMORY_INVALIDATED", memory_id)
         return result
 
@@ -632,14 +704,15 @@ class Mnemosyne:
             return False
 
         params.extend([memory_id, self.session_id])
-        cursor.execute(
-            f"UPDATE memories SET {', '.join(updates)} WHERE id = ? AND session_id = ?",
-            params
-        )
-        self.conn.commit()
+        with _deferred_commits(self.conn):
+            cursor.execute(
+                f"UPDATE memories SET {', '.join(updates)} WHERE id = ? AND session_id = ?",
+                params
+            )
+            self.conn.commit()
 
-        # Sync BEAM working_memory
-        self.beam.update_working(memory_id, content=content, importance=importance)
+            # Sync BEAM working_memory
+            self.beam.update_working(memory_id, content=content, importance=importance)
 
         self._emit_wrapper("MEMORY_UPDATED", memory_id, content=content, importance=importance)
         return cursor.rowcount > 0

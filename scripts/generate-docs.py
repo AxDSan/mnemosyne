@@ -307,6 +307,16 @@ CONFIG_DESCRIPTIONS = {
     "host_llm_model": "Model override passed to the host backend.",
     "host_llm_n_ctx": "Context budget assumed for the host backend.",
 
+    # Modality providers (RFC 0002)
+    "modality_enabled": "Allow outbound calls to describe non-text media. Off by default; nothing is sent until this is set.",
+    "modality_base_url": "Base URL of an OpenAI-compatible vision endpoint. Any provider that speaks the protocol works.",
+    "modality_api_key": "API key for the modality endpoint.",
+    "modality_vision_model": "Model used to describe images and documents.",
+    "modality_video_model": "Model used to describe video.",
+    "modality_audio_model": "Model used to transcribe or describe audio.",
+    "modality_timeout": "Timeout in seconds for a modality describe call.",
+    "modality_max_moments": "Maximum moments retained per media asset.",
+
     # Conflict detection
     "llm_conflict_detection": "Enable LLM-based contradiction detection during sleep.",
     "conflict_llm_base_url": "Base URL for the conflict detection endpoint.",
@@ -489,6 +499,7 @@ ENV_ONLY_DESCRIPTIONS = {
     "MNEMOSYNE_LEXICAL_GATE_MIN": "Override the lexical admission gate (float 0.0–1.0, clamped; non-finite/invalid values fall back to the historical query-length thresholds 0.15/0.5/0.3). `0.0` admits purely-vector candidates (recall-first, at a precision cost). Read on every recall call; retrieval stays local (sqlite-vec + JSON/NumPy embeddings, or lexical-only FTS5 when embeddings are unavailable).",
     "MNEMOSYNE_MCP_BANK": "Memory bank used by the MCP server.",
     "MNEMOSYNE_MCP_TOKEN": "Bearer token for MCP SSE auth. Required for any non-loopback bind.",
+    "MNEMOSYNE_MODEL_CACHE_DIR": "Directory holding the local GGUF consolidation model. Unset or blank keeps `~/.hermes/mnemosyne/models`. Read at import; an explicitly set path is authoritative, so an unusable one fails rather than falling back to the default.",
     "MNEMOSYNE_PERSONA_FILE": "Path to an external persona facts file.",
     "MNEMOSYNE_PREFETCH_MODEL_SLOT_LIMIT": "Maximum canonical slots prefetched per turn.",
     "MNEMOSYNE_PREFETCH_MODEL_SLOT_MIN_OVERLAP": "Minimum token overlap for a canonical slot to count as relevant.",

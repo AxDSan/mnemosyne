@@ -136,7 +136,7 @@ except Exception as _persona_import_exc:  # pragma: no cover - graceful import f
         def _with_persona_block(self, base: str) -> str:
             return base
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 logger = logging.getLogger(__name__)
 
@@ -933,9 +933,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         """
         # auto_sleep: prefer kwargs, then config.yaml, then env var, defaulting
         # on to match Mnemosyne core's consolidation behavior for fresh installs.
+        # Both key spellings are honored: the Hermes ``auto_sleep`` key and the
+        # core ``auto_sleep_enabled`` key (set via ``mnemosyne config set``),
+        # so operators can disable auto-sleep through the documented core
+        # config surface (issue #771).
         auto_sleep = kwargs.get("auto_sleep")
         if auto_sleep is None:
             auto_sleep = self._read_config_key("auto_sleep")
+        if auto_sleep is None:
+            auto_sleep = self._read_config_key("auto_sleep_enabled")
         if auto_sleep is not None:
             self._auto_sleep_enabled = _coerce_bool(auto_sleep, self._auto_sleep_enabled)
         # env var/default is already applied in __init__, so it is the base default
@@ -1068,8 +1074,28 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         return False
 
     def _read_config_key(self, key: str) -> Any:
-        """Read a single key from memory.mnemosyne in config.yaml."""
-        return read_hermes_config_key(getattr(self, "_hermes_home", None), key)
+        """Read a single key, checking Hermes config first, then Mnemosyne config.
+
+        Precedence: Hermes config.yaml (memory.mnemosyne.<key>) > Mnemosyne
+        config.yaml > env var > hardcoded default.
+
+        The Mnemosyne fallback bridges the two config systems so that
+        ``mnemosyne config set`` actually affects the running provider
+        (issue #771).
+        """
+        from mnemosyne.core.config import get_config
+
+        # 1. Hermes config (memory.mnemosyne.<key>)
+        val = read_hermes_config_key(getattr(self, "_hermes_home", None), key)
+        if val is not None:
+            return val
+
+        # 2. Mnemosyne config singleton (auto-reloads on file change)
+        val = get_config().get(key)
+        if val is not None:
+            return val
+
+        return None
 
 
     def _configured_tool_schemas(self) -> List[Dict[str, Any]]:
@@ -1801,7 +1827,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             "author_type": beam_ref.author_type,
             "channel_id": beam_ref.channel_id,
         }
-        sleep_all_sessions = hasattr(beam_ref, "sleep_all_sessions")
         canonical_owner_id = getattr(beam_ref, "canonical_owner_id", "default")
         agent_context = getattr(
             beam_ref,
@@ -1812,7 +1837,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             working,
             eligible,
             sleep_args,
-            sleep_all_sessions,
             canonical_owner_id,
             agent_context,
         )
@@ -1826,7 +1850,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     working,
                     eligible,
                     sleep_args,
-                    sleep_all_sessions,
                     canonical_owner_id,
                     agent_context,
                 ) = snapshot
@@ -1846,11 +1869,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                             )
                             sleep_beam.canonical_owner_id = canonical_owner_id
                             sleep_beam.agent_context = agent_context
-                            (
-                                sleep_beam.sleep_all_sessions
-                                if sleep_all_sessions
-                                else sleep_beam.sleep
-                            )()
+                            # Session-scoped only (#771): the worker beam is
+                            # bound to the triggering session_id above, so
+                            # sleep() consolidates just that session. Selecting
+                            # sleep_all_sessions() by capability (hasattr)
+                            # would sweep every session in a shared-surface DB,
+                            # collapsing a replica's entire mcp_{bank} backlog
+                            # into a gist on one write (issue #771).
+                            sleep_beam.sleep()
                     except Exception as inner:
                         logger.debug("Mnemosyne auto-sleep worker failed: %s", inner)
 
@@ -3266,11 +3292,11 @@ def register_memory_provider(ctx):
             f"[mnemosyne-hermes]   Python: {_sys.version!r}",
             file=_sys.stderr,
         )
-        # Try to detect Hermes' Python for version mismatch diagnostics
+        # Try to detect Hermes' Python for environment mismatch diagnostics
         try:
-            from .install import _find_hermes_python
+            from .install import _find_hermes_python, _hermes_python_mismatch
             _hp = _find_hermes_python()
-            if _hp and _hp.resolve() != Path(_sys.executable).resolve():
+            if _hp and _hermes_python_mismatch(_hp):
                 import subprocess as _sp
                 _r = _sp.run(
                     [str(_hp), "--version"],
@@ -3281,8 +3307,10 @@ def register_memory_provider(ctx):
                     f"[mnemosyne-hermes]   Hermes' Python: {_hp} ({_ver})",
                     file=_sys.stderr,
                 )
+                import shlex as _shlex
                 print(
-                    f"[mnemosyne-hermes]   FIX: Run: {_hp} -m pip install -U 'mnemosyne-hermes[all]'",
+                    f"[mnemosyne-hermes]   FIX: Run: {_shlex.quote(str(_hp))}"
+                    " -m pip install -U 'mnemosyne-hermes[all]'",
                     file=_sys.stderr,
                 )
         except Exception:
@@ -3311,17 +3339,17 @@ def register(ctx):
         handler_fn=mnemosyne_command,
     )
 
-    # Register all tools (29 memory + 3 sync + 4 persona) so the agent can call them.
+    # Register the configured tools so the PluginManager surface matches memory
+    # provider discovery. The provider resolves HERMES_HOME before initialize().
     # Note: when loaded via memory provider discovery (plugins/memory/),
     # the ctx is a _ProviderCollector whose register_tool() is a no-op --
     # tools are surfaced through get_tool_schemas() via the memory manager
     # instead. This registration covers the standalone PluginManager path.
-    from .tools import ALL_TOOL_SCHEMAS
     from functools import partial
 
     global _provider
     _provider = MnemosyneMemoryProvider()
-    for _schema in ALL_TOOL_SCHEMAS:
+    for _schema in _provider.get_tool_schemas():
         _name = _schema["name"]
         # Sync tools route through SyncAdapter, persona tools through PersonaAdapter,
         # memory tools through main provider.

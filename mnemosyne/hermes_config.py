@@ -14,7 +14,11 @@ def read_hermes_config_key(hermes_home: str | None, key: str) -> Any:
     provider whitelist/default-scope path working in minimal Hermes plugin
     environments where PyYAML is not installed.
     """
-    config_path = os.path.join(hermes_home, "config.yaml") if hermes_home else ""
+    # Schema discovery happens before a provider receives initialize(...,
+    # hermes_home=...). HERMES_HOME is the explicit active-profile authority in
+    # that phase; do not fall back to ~/.hermes, which could cross profiles.
+    resolved_home = hermes_home or os.environ.get("HERMES_HOME")
+    config_path = os.path.join(resolved_home, "config.yaml") if resolved_home else ""
     if not config_path or not os.path.exists(config_path):
         return None
     try:
@@ -68,6 +72,8 @@ def read_config_key_without_yaml(config_path: str, key: str) -> Any:
         value = stripped.split(":", 1)[1].strip()
         if value == "[]":
             return []
+        if value.lower() == "null" or value == "~":
+            return None
         if value:
             return value.strip('"\'')
         items = []
