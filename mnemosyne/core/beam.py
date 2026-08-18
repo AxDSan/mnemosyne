@@ -3907,6 +3907,21 @@ class BeamMemory:
             # Enrichment can refill enhanced recall after the early post-commit eviction.
             self._invalidate_query_cache_after_remember_commit()
 
+    def remember_media(self, ref: str, **kwargs):
+        """Register a piece of media and, if configured, describe it.
+
+        Delegates to :func:`mnemosyne.core.media.remember_media`, which owns the
+        flow. Keeping the body here to one line is deliberate: `beam.py` is
+        already ~8,000 lines, and the ingest path is far easier to test as a
+        free function against a stub than as a method on this class.
+
+        Returns a ``MediaIngestResult``, not a bare id -- the degradation ladder
+        produces a status (``ok``/``partial``/``unavailable``/``refused``) that a
+        string return would discard, and ``unavailable`` is a success.
+        """
+        from mnemosyne.core.media import remember_media as _remember_media
+        return _remember_media(self, ref=ref, **kwargs)
+
     def remember_batch(self, items: List[Dict],
                        *,
                        veracity: Optional[str] = None,
