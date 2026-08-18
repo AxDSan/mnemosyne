@@ -172,6 +172,24 @@ def test_evidence_pack_honors_temporal_filters(tmp_path: Path):
     current_id = current_writer.remember(
         "Orion temporal current fixture", source="test", importance=0.8, scope="global"
     )
+    episodic_current_id = "orion-temporal-episodic-current"
+    episodic_future_id = "orion-temporal-episodic-future"
+    reader.conn.execute(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, importance, scope) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            episodic_current_id, "Orion temporal episodic current fixture", "test",
+            "2026-02-01T00:00:00", "episodic-current", 0.8, "global",
+        ),
+    )
+    reader.conn.execute(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, importance, scope) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            episodic_future_id, "Orion temporal episodic future fixture", "test",
+            "2027-01-01T00:00:00", "episodic-future", 0.8, "global",
+        ),
+    )
     reader.conn.execute(
         "UPDATE working_memory SET timestamp = ? WHERE id = ?", ("2020-01-01T00:00:00", old_id)
     )
@@ -181,13 +199,15 @@ def test_evidence_pack_honors_temporal_filters(tmp_path: Path):
     reader.conn.commit()
 
     packed = reader.recall_with_evidence_pack(
-        "Orion temporal", top_k=1, candidate_k=5, pack_k=2,
-        _cross_session=True, from_date="2025-01-01",
+        "Orion temporal", top_k=1, candidate_k=10, pack_k=5,
+        _cross_session=True, from_date="2025-01-01", to_date="2026-06-01",
     )
     returned_ids = {row["id"] for row in packed["primary"] + packed["evidence_pack"]}
 
     assert current_id in returned_ids
+    assert episodic_current_id in returned_ids
     assert old_id not in returned_ids
+    assert episodic_future_id not in returned_ids
 
 
 def test_evidence_pack_excludes_consolidated_working_candidates(tmp_path: Path):
