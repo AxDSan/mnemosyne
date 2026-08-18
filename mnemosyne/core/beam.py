@@ -3388,6 +3388,81 @@ def _wm_vec_search_fallback(conn: sqlite3.Connection, query_embedding, k: int = 
     return results[:k]
 
 
+def _cross_session_conflict_resolution_enabled() -> bool:
+    """Master switch for the cross-session global contradiction pass (default off)."""
+    return os.environ.get(
+        "MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "0"
+    ).lower() in ("1", "true", "yes")
+
+
+def _cross_session_min_gap_hours() -> float:
+    """Min hour-gap for cross-session pairs. Defaults to 0: statements in
+    independent threads are not subject to the intra-conversation back-to-back
+    heuristic, so no minimum time gap is required between them."""
+    try:
+        return float(os.environ.get("MNEMOSYNE_CROSS_SESSION_MIN_GAP_HOURS", "0") or 0)
+    except ValueError:
+        return 0.0
+
+
+_CROSS_SESSION_MAX_CANDIDATES_DEFAULT = 10000
+
+
+def _cross_session_max_candidates() -> int:
+    """Candidate-row cap for the cross-session SELECT, applied per bank.
+
+    Bounds both the O(n^2) pairwise scan in `_detect_conflicts` (most global
+    rows share ``source='conversation'``, so one large group is the common
+    case) and the memory footprint of loading global rows plus their
+    embeddings. Default 10000; override with
+    ``MNEMOSYNE_CROSS_SESSION_MAX_CANDIDATES``.
+    """
+    raw = os.environ.get("MNEMOSYNE_CROSS_SESSION_MAX_CANDIDATES", "").strip()
+    try:
+        return max(1, int(raw)) if raw else _CROSS_SESSION_MAX_CANDIDATES_DEFAULT
+    except ValueError:
+        return _CROSS_SESSION_MAX_CANDIDATES_DEFAULT
+
+
+def _decode_sqlite_vec_binary(blob: bytes, vec_type: str) -> np.ndarray:
+    """Decode a raw sqlite-vec embedding BLOB into a float32 ndarray for cosine
+    comparison (storage types from ``_effective_vec_type``).
+
+    float32 BLOBs are stored byte-for-byte. int8 and bit are quantized forms of
+    a unit-normalized vector; their global scale/sign factors cancel in cosine
+    similarity, so returning a vector proportional to the stored one is
+    sufficient for `_detect_conflicts`. Falls back to float32 for unknown types.
+    """
+    if vec_type == "int8":
+        return np.frombuffer(blob, dtype=np.int8).astype(np.float32)
+    if vec_type == "bit":
+        bits = np.unpackbits(np.frombuffer(blob, dtype=np.uint8))
+        return (bits.astype(np.float32) * 2.0) - 1.0
+    return np.frombuffer(blob, dtype=np.float32).copy()
+
+
+_CROSS_SESSION_MAX_LLM_VALIDATIONS = 20
+
+
+def _cross_session_max_llm_validations() -> int:
+    """Per-run cap on LLM confirmation calls during a cross-session apply.
+
+    With `MNEMOSYNE_LLM_CONFLICT_DETECTION` on, an apply issues one
+    `validate_conflict_pair` LLM call per confirmed candidate pair. Each call is
+    a network round-trip that, for a provider tool, runs while the shared Beam
+    access lock is held (it serializes auto-sleep and every other tool call), so
+    unbounded LLM work would stall the whole provider. The cap bounds that to a
+    fixed per-invocation budget; any candidate pairs beyond the cap are left
+    pending for a later explicit run. Independent of `max_candidates`; override
+    with ``MNEMOSYNE_CROSS_SESSION_MAX_LLM_VALIDATIONS`` (default 20).
+    """
+    raw = os.environ.get("MNEMOSYNE_CROSS_SESSION_MAX_LLM_VALIDATIONS", "").strip()
+    try:
+        return max(1, int(raw)) if raw else _CROSS_SESSION_MAX_LLM_VALIDATIONS
+    except ValueError:
+        return _CROSS_SESSION_MAX_LLM_VALIDATIONS
+
+
 class BeamMemory:
     """
     BEAM memory interface.
@@ -4466,12 +4541,21 @@ class BeamMemory:
                 operation, type(exc).__name__, exc,
             )
 
-    def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
+    def invalidate(self, memory_id: str, replacement_id: str = None,
+                   bank: Optional[str] = None) -> bool:
         """
         Mark a memory as invalid/superseded.
         If replacement_id is provided, sets superseded_by.
         Otherwise sets valid_until to now (immediate expiry).
+
+        `bank` binds the supersession to a single table (`working_memory` or
+        `episodic_memory`) when id values are shared across banks: without it,
+        the target is resolved working-first, which can supersede the wrong
+        bank's row when a duplicate id exists in both. `None` preserves the
+        existing working-first behavior.
         """
+        if bank is not None and bank not in ("working_memory", "episodic_memory"):
+            raise ValueError(f"invalid bank: {bank!r}")
         cursor = self.conn.cursor()
         if replacement_id:
             if replacement_id == memory_id:
@@ -4487,15 +4571,21 @@ class BeamMemory:
             owns_transaction = not self.conn.in_transaction
 
             def validate_and_invalidate() -> bool:
+                now = datetime.now().isoformat()
+                # Both the replacement and the target must still be ACTIVE
+                # (not superseded, not expired): a concurrent resolver may have
+                # superseded either between our scan and this write, and we must
+                # not overwrite an existing successor.
+                active = "AND superseded_by IS NULL AND (valid_until IS NULL OR valid_until > ?)"
                 replacement_found = False
                 for table in ("working_memory", "episodic_memory"):
                     cursor.execute(
                         f"""
                         SELECT 1 FROM {table}
-                        WHERE id = ? AND (session_id = ? OR scope = 'global')
+                        WHERE id = ? AND (session_id = ? OR scope = 'global') {active}
                         LIMIT 1
                         """,
-                        (replacement_id, self.session_id),
+                        (replacement_id, self.session_id, now),
                     )
                     if cursor.fetchone() is not None:
                         replacement_found = True
@@ -4503,18 +4593,27 @@ class BeamMemory:
                 if not replacement_found:
                     return False
 
-                now = datetime.now(timezone.utc).isoformat()
-                cursor.execute("""
-                    UPDATE working_memory
-                    SET valid_until = ?, superseded_by = ?
-                    WHERE id = ? AND (session_id = ? OR scope = 'global')
-                """, (now, replacement_id, memory_id, self.session_id))
+                if bank is not None:
+                    cursor.execute(
+                        f"UPDATE {bank} "
+                        f"SET valid_until = ?, superseded_by = ? "
+                        f"WHERE id = ? AND (session_id = ? OR scope = 'global') {active}",
+                        (now, replacement_id, memory_id, self.session_id, now),
+                    )
+                    return cursor.rowcount > 0
+                cursor.execute(
+                    f"UPDATE working_memory "
+                    f"SET valid_until = ?, superseded_by = ? "
+                    f"WHERE id = ? AND (session_id = ? OR scope = 'global') {active}",
+                    (now, replacement_id, memory_id, self.session_id, now),
+                )
                 if cursor.rowcount == 0:
-                    cursor.execute("""
-                        UPDATE episodic_memory
-                        SET valid_until = ?, superseded_by = ?
-                        WHERE id = ? AND (session_id = ? OR scope = 'global')
-                    """, (now, replacement_id, memory_id, self.session_id))
+                    cursor.execute(
+                        f"UPDATE episodic_memory "
+                        f"SET valid_until = ?, superseded_by = ? "
+                        f"WHERE id = ? AND (session_id = ? OR scope = 'global') {active}",
+                        (now, replacement_id, memory_id, self.session_id, now),
+                    )
                 return cursor.rowcount > 0
 
             if owns_transaction:
@@ -4528,36 +4627,95 @@ class BeamMemory:
             return invalidated
 
         now = datetime.now(timezone.utc).isoformat()
-        # Try working_memory first
-        cursor.execute("""
-            UPDATE working_memory
-            SET valid_until = ?, superseded_by = ?
-            WHERE id = ? AND (session_id = ? OR scope = 'global')
-        """, (now, replacement_id, memory_id, self.session_id))
-        if cursor.rowcount > 0:
-            self.conn.commit()
-            self._invalidate_query_cache()
-            return True
-        # Try episodic_memory
-        cursor.execute("""
-            UPDATE episodic_memory
-            SET valid_until = ?, superseded_by = ?
-            WHERE id = ? AND (session_id = ? OR scope = 'global')
-        """, (now, replacement_id, memory_id, self.session_id))
-        invalidated = cursor.rowcount > 0
+        # With a bank binding, touch only that table; otherwise try
+        # working_memory first, then episodic_memory.
+        targets = (bank,) if bank is not None else ("working_memory", "episodic_memory")
+        for table in targets:
+            cursor.execute(
+                f"""UPDATE {table}
+                    SET valid_until = ?, superseded_by = ?
+                    WHERE id = ? AND (session_id = ? OR scope = 'global')
+                """,
+                (now, replacement_id, memory_id, self.session_id),
+            )
+            if cursor.rowcount > 0:
+                self.conn.commit()
+                self._invalidate_query_cache()
+                return True
         self.conn.commit()
-        if invalidated:
-            self._invalidate_query_cache()
-        return invalidated
+        self._invalidate_query_cache()
+        return False
 
-    def _detect_conflicts(self, rows: List[Dict], similarity_threshold: float = 0.88) -> List[tuple]:
+    def _embedding_map(self, memory_ids: List[str]) -> Dict[str, np.ndarray]:
+        """Load float32 embeddings for memory ids.
+
+        Covers working-memory rows (and episodic rows that fell back to
+        `memory_embeddings`) from `memory_embeddings`; fills any remaining gaps
+        from `vec_episodes` (rowid-keyed, used when sqlite-vec is present) so
+        conflict detection works uniformly over both working and episodic rows.
+        Returns {memory_id: np.ndarray} for ids with a usable embedding.
+        """
+        cursor = self.conn.cursor()
+        emb_map: Dict[str, np.ndarray] = {}
+        if not memory_ids:
+            return emb_map
+
+        ph = ",".join("?" * len(memory_ids))
+        try:
+            cursor.execute(
+                f"SELECT memory_id, embedding_json FROM memory_embeddings "
+                f"WHERE memory_id IN ({ph})",
+                memory_ids,
+            )
+            for row in cursor.fetchall():
+                try:
+                    emb_map[row["memory_id"]] = np.array(
+                        json.loads(row["embedding_json"]), dtype=np.float32
+                    )
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        missing = [i for i in memory_ids if i not in emb_map]
+        if missing and _vec_available(self.conn):
+            # Episodic rows are stored rowid-keyed in vec_episodes, possibly
+            # quantized (float32/int8/bit) — decode per the stored vector type.
+            vec_type = _effective_vec_type(self.conn, "vec_episodes")
+            try:
+                mph = ", ".join("?" * len(missing))
+                cursor.execute(
+                    f"SELECT id, rowid FROM episodic_memory WHERE id IN ({mph})",
+                    missing,
+                )
+                rowid_by_id = {r["id"]: r["rowid"] for r in cursor.fetchall()}
+                if rowid_by_id:
+                    rph = ", ".join("?" * len(rowid_by_id))
+                    cursor.execute(
+                        f"SELECT rowid, embedding FROM vec_episodes WHERE rowid IN ({rph})",
+                        list(rowid_by_id.values()),
+                    )
+                    id_by_rid = {rid: mid for mid, rid in rowid_by_id.items()}
+                    for r in cursor.fetchall():
+                        try:
+                            vec = _decode_sqlite_vec_binary(r["embedding"], vec_type)
+                            emb_map[id_by_rid[r["rowid"]]] = vec
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+        return emb_map
+
+    def _detect_conflicts(self, rows: List[Dict], similarity_threshold: float = 0.88,
+                          min_gap_hours: float = 1.0) -> List[tuple]:
         """
         Heuristic-only conflict detection for consolidation time.
 
         For each pair of memories in rows (already sorted by timestamp ASC):
-        1. Get their embeddings from memory_embeddings table
+        1. Get their embeddings (memory_embeddings, plus vec_episodes for
+           episodic rows)
         2. Compute cosine similarity
-        3. If similarity > threshold AND timestamps differ >1h AND
+        3. If similarity > threshold AND timestamps differ >min_gap_hours AND
            they share overlapping tokens AND they're not duplicates...
            flag the older as potentially superseded
 
@@ -4567,27 +4725,12 @@ class BeamMemory:
         if len(rows) < 2:
             return []
 
-        # Collect embeddings for all memory IDs in one query
+        # Collect embeddings for all memory IDs in one pass (working via
+        # memory_embeddings, episodic via vec_episodes when sqlite-vec present).
         memory_ids = [r["id"] for r in rows]
-        cursor = self.conn.cursor()
-        placeholders = ",".join("?" * len(memory_ids))
-        try:
-            cursor.execute(f"""
-                SELECT memory_id, embedding_json
-                FROM memory_embeddings
-                WHERE memory_id IN ({placeholders})
-            """, memory_ids)
-        except Exception:
+        emb_map = self._embedding_map(memory_ids)
+        if not emb_map:
             return []
-
-        emb_map = {}
-        for row in cursor.fetchall():
-            try:
-                emb_map[row["memory_id"]] = np.array(
-                    json.loads(row["embedding_json"]), dtype=np.float32
-                )
-            except Exception:
-                continue
 
         # Skip rows that are already superseded
         superseded_ids = {r["id"] for r in rows if r.get("superseded_by")}
@@ -4639,7 +4782,7 @@ class BeamMemory:
                     ts_a = datetime.fromisoformat(a["timestamp"])
                     ts_b = datetime.fromisoformat(b["timestamp"])
                     hours_diff = abs((ts_b - ts_a).total_seconds()) / 3600.0
-                    if hours_diff < 1.0:
+                    if hours_diff < min_gap_hours:
                         continue
                 except (ValueError, TypeError):
                     continue
@@ -9015,6 +9158,7 @@ class BeamMemory:
               AND timestamp < ?
               AND consolidated_at IS NULL
               AND (pinned IS NULL OR pinned = 0)
+              AND superseded_by IS NULL
             ORDER BY timestamp ASC
             LIMIT {SLEEP_BATCH_SIZE}
         """, (self.session_id, cutoff))
@@ -9444,6 +9588,237 @@ class BeamMemory:
             },
             "session_results": session_results,
             "degradation": degrade_result
+        }
+
+    def resolve_cross_session_conflicts(
+        self,
+        dry_run: bool = False,
+        min_gap_hours: Optional[float] = None,
+        max_candidates: Optional[int] = None,
+        max_llm_validations: Optional[int] = None,
+        llm_eval: bool = False,
+    ) -> Dict:
+        """Resolve factual contradictions among global-scope memories across
+        sessions, exposed as an on-demand, operator-invoked tool.
+
+        Selects not-superseded `scope='global'` rows from BOTH working_memory
+        and episodic_memory across all sessions, groups them by `source`, then
+        runs the existing heuristic `_detect_conflicts` over each group (sorted
+        ascending). For each confirmed pair the older row is superseded via the
+        cross-session-safe ``invalidate(older_id, replacement_id=newer_id)``
+        (recall already filters `superseded_by IS NULL`, so the loser vanishes
+        from every surface while its history is preserved).
+
+        Confirmation is LLM-backed via `validate_conflict_pair` only when
+        `MNEMOSYNE_LLM_CONFLICT_DETECTION` is on *and* this is an explicit apply
+        (`dry_run=False`). A dry run is deterministic by default (no LLM calls,
+        no mutation), but can opt into the same LLM vetting — still without
+        mutating — by passing `llm_eval=True`, so the reported parity with an
+        apply (which pairs the LLM would confirm vs. reject) can be tested
+        first. A dry run without `llm_eval` only reports detector candidates.
+        `min_gap_hours` relaxes the intra-conversation back-to-back heuristic
+        for independent threads (default 0).
+
+        Session-private rows are never considered (they cannot be seen
+        cross-thread), so session isolation is preserved. The candidate scan is
+        bounded per bank by `max_candidates` (default from
+        `MNEMOSYNE_CROSS_SESSION_MAX_CANDIDATES`, else 10000) to keep the
+        pairwise scan and embedding load bounded; truncation is reported in the
+        result payload. LLM confirmation is also bounded per run by
+        `max_llm_validations` (default from
+        `MNEMOSYNE_CROSS_SESSION_MAX_LLM_VALIDATIONS`, else 20): when the cap is
+        reached the pass stops issuing further validation calls and leaves any
+        remaining candidate pairs pending for a later explicit run — this bounds
+        network round-trips that a provider tool performs while its shared Beam
+        access lock is held.
+
+        This is phase one of the cross-session resolution work: candidate
+        reporting (`dry_run=True`) and explicit apply (`dry_run=False`). An
+        automatic invocation from `sleep_all_sessions` is deliberately deferred
+        to a follow-up PR, so resolution only ever happens on an explicit
+        operator action.
+
+        Gated by ``MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION`` (default off);
+        when disabled this returns a no-op result.
+        """
+        if not _cross_session_conflict_resolution_enabled():
+            return {
+                "status": "disabled",
+                "message": "cross-session conflict resolution disabled "
+                           "(set MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION=1)",
+                "rows_scanned": 0, "pairs_flagged": 0,
+                "conflicts_resolved": 0, "invalidated": 0,
+                "llm_validations": 0, "llm_cap_reached": False,
+                "candidates_truncated": False,
+            }
+
+        if min_gap_hours is None:
+            min_gap_hours = _cross_session_min_gap_hours()
+        if max_candidates is None:
+            max_candidates = _cross_session_max_candidates()
+        # Normalize direct overrides too: a negative/zero value would otherwise
+        # make LIMIT return an unbounded result set.
+        max_candidates = max(1, int(max_candidates))
+        if max_llm_validations is None:
+            max_llm_validations = _cross_session_max_llm_validations()
+        # Clamp direct overrides too: a negative/zero value would otherwise
+        # make the cap trigger immediately (resolving no LLM-confirmed conflicts).
+        max_llm_validations = max(1, int(max_llm_validations))
+
+        cursor = self.conn.cursor()
+        now = datetime.now().isoformat()
+
+        rows = []
+        truncated = False
+        scan_error = None
+        for table in ("working_memory", "episodic_memory"):
+            try:
+                # Fetch one extra row to detect truncation accurately: the flag
+                # is set only when the cap is actually hit (an exactly-full bank
+                # is not truncated).
+                cursor.execute(
+                    f"SELECT id, content, source, timestamp, scope, session_id, superseded_by "
+                    f"FROM {table} WHERE scope = 'global' "
+                    f"AND superseded_by IS NULL "
+                    f"AND (valid_until IS NULL OR valid_until > ?) "
+                    f"ORDER BY timestamp ASC LIMIT ?",
+                    (now, max_candidates + 1),
+                )
+                fetched = cursor.fetchall()
+                if len(fetched) > max_candidates:
+                    truncated = True
+                    fetched = fetched[:max_candidates]
+                for r in fetched:
+                    d = dict(r)
+                    d["_table"] = table
+                    rows.append(d)
+            except Exception as exc:
+                scan_error = (table, repr(exc))
+                break
+
+        if scan_error is not None:
+            # A bank query failed: abort before any resolution so we never
+            # mutate on a partial cross-bank scan, and surface the failure.
+            return {
+                "status": "failed",
+                "message": f"could not scan bank {scan_error[0]}: {scan_error[1]}",
+                "rows_scanned": len(rows),
+                "pairs_flagged": 0, "conflicts_resolved": 0, "invalidated": 0,
+                "llm_validations": 0, "llm_cap_reached": False,
+                "candidates_truncated": truncated,
+            }
+
+        # An id is only unique per bank, so the same id can legitimately appear in
+        # both working_memory and episodic_memory (or with different sources).
+        # Build the ambiguous set across ALL scanned rows before grouping so a
+        # duplicate anywhere makes every pair touching that id unactionable.
+        id_counts: Dict[str, int] = {}
+        for row in rows:
+            id_counts[row["id"]] = id_counts.get(row["id"], 0) + 1
+        ambiguous_ids = {mid for mid, count in id_counts.items() if count > 1}
+
+        grouped: Dict[str, List[Dict]] = {}
+        for row in rows:
+            grouped.setdefault(row.get("source") or "unknown", []).append(row)
+        for key in grouped:
+            grouped[key].sort(key=lambda x: (x.get("timestamp") or ""))
+
+        from mnemosyne.core.llm_conflict_detector import (
+            LLM_CONFLICT_DETECTION_ENABLED,
+            validate_conflict_pair,
+        )
+
+        pairs_flagged = 0
+        conflicts_resolved = 0
+        invalidated = 0
+        llm_validations = 0
+        llm_cap_reached = False
+        # IDs superseded, or used as a replacement/target, during THIS run.
+        # Rows are SELECTed once, so in-memory state is authoritative here.
+        # The sets guard chained detector pairs such as (A,B),(B,C): without
+        # them we would supersede A by B and then B by C, leaving A pointing at
+        # a row (B) that is itself hidden.
+        superseded_now: Set[str] = set()
+        replacement_now: Set[str] = set()
+        for source, items in grouped.items():
+            if len(items) < 2:
+                continue
+            conflicts = self._detect_conflicts(items, min_gap_hours=min_gap_hours)
+            pairs_flagged += len(conflicts)
+            if not conflicts:
+                continue
+            content_map = {i["id"]: i.get("content", "") for i in items}
+            for older_id, newer_id in conflicts:
+                if older_id in replacement_now or newer_id in replacement_now:
+                    continue
+                if older_id in superseded_now or newer_id in superseded_now:
+                    continue
+                # A duplicate id anywhere in the scanned rows is ambiguous —
+                # the detector's id-only pair can't tell which copy it means, so
+                # skip (never cross-supersede another bank's row).
+                if older_id in ambiguous_ids or newer_id in ambiguous_ids:
+                    continue
+                older = next((i for i in items if i["id"] == older_id), None)
+                newer = next((i for i in items if i["id"] == newer_id), None)
+                if older is None or newer is None:
+                    continue
+                if older.get("superseded_by") or newer.get("superseded_by"):
+                    continue
+                confirmed = True
+                # LLM confirmation runs on an explicit apply when the env flag
+                # is on; a dry run is deterministic by default but can opt into
+                # the same LLM vetting (no mutation) via llm_eval=True, so the
+                # reported parity with an apply can be tested first.
+                run_llm = LLM_CONFLICT_DETECTION_ENABLED and not dry_run
+                if dry_run and llm_eval:
+                    run_llm = True
+                if run_llm:
+                    if llm_validations >= max_llm_validations:
+                        llm_cap_reached = True
+                        break
+                    is_conflict, _, _ = validate_conflict_pair(
+                        content_map.get(older_id, ""),
+                        content_map.get(newer_id, ""),
+                        session_id=self.session_id,
+                        db_path=self.db_path,
+                    )
+                    llm_validations += 1
+                    confirmed = is_conflict
+                if not confirmed:
+                    continue
+                # Track chained pairs in BOTH dry-run and apply so a dry run
+                # reports exactly what an apply would do. A dry run only
+                # simulates the supersession (it never calls invalidate()).
+                mutated = dry_run
+                if not dry_run and self.invalidate(older_id, replacement_id=newer_id):
+                    invalidated += 1
+                    mutated = True
+                if mutated:
+                    superseded_now.add(older_id)
+                    replacement_now.add(newer_id)
+                    # Count only pairs that were actually resolved (or, for a
+                    # dry run, that would be): an invalidate() that returned
+                    # False is not a resolved conflict.
+                    conflicts_resolved += 1
+
+        if dry_run:
+            status = "dry_run"
+        elif invalidated:
+            status = "resolved"
+        elif conflicts_resolved:
+            status = "partial"
+        else:
+            status = "no_op"
+
+        return {
+            "status": status,
+            "pairs_flagged": pairs_flagged,
+            "conflicts_resolved": conflicts_resolved,
+            "invalidated": invalidated,
+            "rows_scanned": len(rows),
+            "llm_validations": llm_validations,
+            "llm_cap_reached": llm_cap_reached,
+            "candidates_truncated": truncated,
         }
 
     def get_consolidation_log(self, limit: int = 10) -> List[Dict]:
