@@ -327,8 +327,11 @@ def test_empty_db_path():
 def test_corrupted_json_snapshot():
     """Corrupted snapshot files are skipped without losing valid trends."""
     SNAP_DIR.mkdir(parents=True, exist_ok=True)
+    for snap in SNAP_DIR.glob("snap_*.json"):
+        snap.unlink()
     # Two valid snapshots so trends has data to report even after the
-    # corrupted file is skipped.
+    # corrupted file is skipped. The wm_total delta (1 -> 2) proves the
+    # valid snapshots were actually parsed.
     good_a = SNAP_DIR / "snap_a.json"
     good_b = SNAP_DIR / "snap_b.json"
     good_a.write_text(json.dumps({"timestamp": "2024-01-01T00:00:00", "wm_total": 1}))
@@ -339,6 +342,10 @@ def test_corrupted_json_snapshot():
         code, out, err = run("--trends")
         assert code == 0, f"Crashed on corrupted snapshot: {err}"
         assert "TRENDS" in out, "Valid snapshots must still produce trends: " + out
+        assert "No trend data yet" not in out, out
+        # +100.0% is the pct change derived from wm_total 1 -> 2, proving the
+        # two valid snapshots were parsed even though a corrupt file is present.
+        assert "+100.0%" in out, "Parsed wm_total trend missing: " + out
     finally:
         snap_file.unlink(missing_ok=True)
         good_a.unlink(missing_ok=True)
