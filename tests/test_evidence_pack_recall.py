@@ -186,7 +186,7 @@ def test_evidence_pack_polyphonic_candidate_only_pass_is_telemetry_neutral(tmp_p
         def __init__(self, results):
             self.results = results
 
-        def recall(self, *, query, query_embedding, top_k):
+        def recall(self, *, query, query_embedding, top_k, **kwargs):
             return self.results
 
     db_path = tmp_path / "polyphonic-telemetry.db"
