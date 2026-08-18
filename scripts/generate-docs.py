@@ -307,6 +307,16 @@ CONFIG_DESCRIPTIONS = {
     "host_llm_model": "Model override passed to the host backend.",
     "host_llm_n_ctx": "Context budget assumed for the host backend.",
 
+    # Modality providers (RFC 0002)
+    "modality_enabled": "Allow outbound calls to describe non-text media. Off by default; nothing is sent until this is set.",
+    "modality_base_url": "Base URL of an OpenAI-compatible vision endpoint. Any provider that speaks the protocol works.",
+    "modality_api_key": "API key for the modality endpoint.",
+    "modality_vision_model": "Model used to describe images and documents.",
+    "modality_video_model": "Model used to describe video.",
+    "modality_audio_model": "Model used to transcribe or describe audio.",
+    "modality_timeout": "Timeout in seconds for a modality describe call.",
+    "modality_max_moments": "Maximum moments retained per media asset.",
+
     # Conflict detection
     "llm_conflict_detection": "Enable LLM-based contradiction detection during sleep.",
     "conflict_llm_base_url": "Base URL for the conflict detection endpoint.",

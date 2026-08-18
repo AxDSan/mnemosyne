@@ -1,7 +1,7 @@
 ---
 title: "Configuration"
 version: 4.0.0
-config_key_count: 106
+config_key_count: 114
 env_only_count: 44
 generated_at: "auto"
 ---
@@ -23,13 +23,13 @@ and `wm_max_items` are equivalent.
 Keys marked **restart** are read once at startup. Changing them at runtime warns
 and does not take effect until the process restarts.
 
-There are **106 configuration keys**. A further
+There are **114 configuration keys**. A further
 **44 environment variables** are read directly from the
 environment and are **not** settable in `config.yaml`; they are listed separately below.
 
 ---
 
-## Configuration keys (106)
+## Configuration keys (114)
 
 | Config key | Environment variable | Default | Restart | Description |
 |------------|----------------------|---------|---------|-------------|
@@ -80,6 +80,14 @@ environment and are **not** settable in `config.yaml`; they are listed separatel
 | `llm_n_threads` | `MNEMOSYNE_LLM_N_THREADS` | `4` | no | CPU threads for local GGUF inference. |
 | `llm_repo` | `MNEMOSYNE_LLM_REPO` | *(unset)* | **yes** | Hugging Face repo holding the local GGUF model. |
 | `llm_timeout` | `MNEMOSYNE_LLM_TIMEOUT` | `60` | no | Per-request timeout in seconds for LLM calls. |
+| `modality_api_key` | `MNEMOSYNE_MODALITY_API_KEY` | *(unset)* | no | API key for the modality endpoint. |
+| `modality_audio_model` | `MNEMOSYNE_MODALITY_AUDIO_MODEL` | *(unset)* | **yes** | Model used to transcribe or describe audio. |
+| `modality_base_url` | `MNEMOSYNE_MODALITY_BASE_URL` | *(unset)* | **yes** | Base URL of an OpenAI-compatible vision endpoint. Any provider that speaks the protocol works. |
+| `modality_enabled` | `MNEMOSYNE_MODALITY_ENABLED` | `false` | no | Allow outbound calls to describe non-text media. Off by default; nothing is sent until this is set. |
+| `modality_max_moments` | `MNEMOSYNE_MODALITY_MAX_MOMENTS` | `12` | no | Maximum moments retained per media asset. |
+| `modality_timeout` | `MNEMOSYNE_MODALITY_TIMEOUT` | `60` | no | Timeout in seconds for a modality describe call. |
+| `modality_video_model` | `MNEMOSYNE_MODALITY_VIDEO_MODEL` | *(unset)* | **yes** | Model used to describe video. |
+| `modality_vision_model` | `MNEMOSYNE_MODALITY_VISION_MODEL` | *(unset)* | **yes** | Model used to describe images and documents. |
 | `no_embeddings` | `MNEMOSYNE_NO_EMBEDDINGS` | `false` | no | Disable dense retrieval entirely. Recall degrades to lexical FTS5. |
 | `persona_daily_sync_hour` | `MNEMOSYNE_PERSONA_DAILY_SYNC_HOUR` | `3` | no | Local hour at which the daily persona sync runs. |
 | `persona_enabled` | `MNEMOSYNE_PERSONA_ENABLED` | `true` | no | Inject L3 persona facts into the system prompt. |
