@@ -144,6 +144,18 @@ def test_evidence_pack_zero_skips_candidate_recall(tmp_path: Path, monkeypatch):
     assert packed["evidence_pack"] == []
 
 
+def test_zero_pack_allows_equal_candidate_and_top_k(tmp_path: Path):
+    beam = BeamMemory(session_id="equal-k", db_path=tmp_path / "equal-k.db")
+    memory_id = beam.remember("Orion equal k fixture", source="test", importance=0.8)
+
+    packed = beam.recall_with_evidence_pack(
+        "Orion equal k", top_k=2, candidate_k=2, pack_k=0
+    )
+
+    assert [row["id"] for row in packed["primary"]] == [memory_id]
+    assert packed["evidence_pack"] == []
+
+
 def test_cross_session_scope_can_produce_a_bounded_supplemental_pack(tmp_path: Path):
     db_path = tmp_path / "cross-session-pack.db"
     reader = BeamMemory(session_id="reader", db_path=db_path)
@@ -161,6 +173,31 @@ def test_cross_session_scope_can_produce_a_bounded_supplemental_pack(tmp_path: P
     assert {row["evidence_rank"] for row in packed["evidence_pack"]} == {2, 3}
     returned_ids = {row["id"] for row in packed["primary"] + packed["evidence_pack"]}
     assert {second_id, third_id}.issubset(returned_ids)
+
+
+def test_episodic_candidate_enters_pack_with_backfilled_session(tmp_path: Path):
+    db_path = tmp_path / "episodic-pack.db"
+    reader = BeamMemory(session_id="reader", db_path=db_path)
+    primary = BeamMemory(session_id="primary", db_path=db_path)
+    primary.remember("Orion episodic pack primary", source="test", importance=0.9, scope="global")
+    episodic_id = "orion-episodic-pack-candidate"
+    reader.conn.execute(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, importance, scope) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            episodic_id, "Orion episodic pack candidate", "test",
+            "2026-01-01T00:00:00", "episodic-writer", 0.8, "global",
+        ),
+    )
+    reader.conn.commit()
+
+    packed = reader.recall_with_evidence_pack(
+        "Orion episodic pack", top_k=1, candidate_k=5, pack_k=5, _cross_session=True
+    )
+    pack_row = next(row for row in packed["evidence_pack"] if row["id"] == episodic_id)
+
+    assert pack_row["tier"] == "episodic"
+    assert pack_row["session_id"] == "episodic-writer"
 
 
 def test_evidence_pack_honors_temporal_filters(tmp_path: Path):
@@ -248,6 +285,20 @@ def test_candidate_only_linear_recall_does_not_mutate_diagnostics(tmp_path: Path
     assert after["by_tier"] == before["by_tier"]
 
 
+def test_evidence_pack_linear_pass_records_one_diagnostic_call(tmp_path: Path):
+    db_path = tmp_path / "linear-diagnostics.db"
+    beam = BeamMemory(session_id="linear", db_path=db_path)
+    beam.remember("Orion linear diagnostics fixture", source="test", importance=0.8)
+    reset_recall_diagnostics()
+
+    beam.recall_with_evidence_pack(
+        "Orion linear diagnostics", top_k=1, candidate_k=5, pack_k=2
+    )
+
+    diagnostics = get_recall_diagnostics()
+    assert diagnostics["totals"]["calls"] == 1
+
+
 def test_evidence_pack_polyphonic_candidate_only_pass_is_telemetry_neutral(tmp_path: Path, monkeypatch):
     from mnemosyne.core.polyphonic_recall import PolyphonicResult
 
@@ -322,7 +373,10 @@ def test_vector_only_candidate_is_opt_in(tmp_path: Path, monkeypatch):
         _track_recall=False, _include_vector_only_candidates=True,
     )
     # The evidence-only vector-similarity floor is inclusive.
-    assert memory_id in [row["id"] for row in at_threshold]
+    candidate = next(row for row in at_threshold if row["id"] == memory_id)
+    assert candidate["keyword_score"] == 0.0
+    assert candidate["fts_score"] == 0.0
+    assert candidate["dense_score"] == 0.84
 
 
 def test_vector_only_candidate_obeys_session_scope(tmp_path: Path, monkeypatch):

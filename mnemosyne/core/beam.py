@@ -6589,6 +6589,7 @@ class BeamMemory:
                 # nearest neighbours in small banks.
                 and vec_sim >= 0.84
             )
+            lexical_relevance_reported = relevance
             if vector_only_rank_eligible:
                 relevance = max(relevance, vec_sim)
             if (
@@ -6637,9 +6638,9 @@ class BeamMemory:
                     "timestamp": row["timestamp"],
                     "tier": "working",
                     "score": round(score, 4),
-                    "keyword_score": round(relevance, 4),
+                    "keyword_score": round(lexical_relevance_reported, 4),
                     "dense_score": round(vec_sim, 4),
-                    "fts_score": round(relevance, 4) if wm_ranks else 0.0,
+                    "fts_score": round(lexical_relevance_reported, 4) if row["id"] in wm_ranks else 0.0,
                     "importance": row["importance"],
                     "recall_count": row["recall_count"] or 0,
                     "last_recalled": row["last_recalled"],
