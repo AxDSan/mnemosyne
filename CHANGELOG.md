@@ -20,7 +20,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
   **Breaking:** pointing `MNEMOSYNE_EMBEDDING_API_URL` at a custom endpoint with a model not in the built-in table now requires `MNEMOSYNE_EMBEDDING_DIM=<N>`, otherwise direct core/MCP-provider startup exits at import with an actionable error (the `mnemosyne-hermes` wrapper catches this and reports the provider unavailable instead of exiting). Blank/empty `MNEMOSYNE_EMBEDDING_DIM` and `MNEMOSYNE_EMBEDDING_MODEL` (common in Docker Compose and `.env` files) are normalized to unset/default rather than treated as explicit invalid values.
 
-  **Upgrade note for stores created under the old silent-384 fallback:** setting the model's true dimension can trigger the existing dimension-mismatch guard. Use the documented reindex/recovery path rather than treating the override as a one-step fix.
+  **Upgrade note for stores created under the old silent-384 fallback:** setting the model's true dimension can trigger the existing dimension-mismatch guard. Use the documented reindex/recovery path rather than treating the override as a one-step fix. See [docs/migration-4.0.md](docs/migration-4.0.md).
 
 ### Fixed
 
