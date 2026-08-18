@@ -308,6 +308,23 @@ def test_embed_raise_message_names_missing_openrouter_key(monkeypatch):
     assert "openrouter.ai" in str(excinfo.value)
 
 
+def test_custom_endpoint_with_openrouter_ai_in_query_needs_no_key(monkeypatch):
+    # Substring-based OpenRouter detection would misclassify this custom
+    # endpoint because its query contains "openrouter.ai", blocking it from
+    # the keyless custom path. Hostname matching must let it through.
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", "https://proxy.example.com/v1?upstream=openrouter.ai")
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDINGS_VIA_API", "1")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "")
+
+    with patch("urllib.request.urlopen", return_value=Response({"data": [{"embedding": [0.1, 0.2]}]})) as request:
+        result = embeddings.embed(["hello"])
+
+    assert result is not None
+    assert result.shape == (1, 2)
+    req = request.call_args[0][0]
+    assert "Authorization" not in req.headers
+
+
 def test_embed_api_no_key_path_logs_redacted_endpoint(monkeypatch, caplog):
     monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", "https://user:password@openrouter.ai/api/v1?token=secret")
     monkeypatch.setenv("MNEMOSYNE_EMBEDDINGS_VIA_API", "1")
