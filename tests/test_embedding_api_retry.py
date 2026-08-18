@@ -205,7 +205,18 @@ def test_embed_raises_on_empty_data_list(monkeypatch):
     _api_env(monkeypatch)
 
     with patch("urllib.request.urlopen", return_value=Response({"data": []})):
-        with pytest.raises(RuntimeError, match="empty vector list"):
+        with pytest.raises(RuntimeError, match="empty vector result"):
+            embeddings.embed(["anything"])
+
+
+def test_embed_raises_on_zero_length_embedding_row(monkeypatch):
+    # {"data": [{"embedding": []}]} yields a (1, 0) array: one response row
+    # with zero elements. Checking len() (row count) alone would miss this;
+    # result.size must be zero for the fail-loud guard to fire.
+    _api_env(monkeypatch)
+
+    with patch("urllib.request.urlopen", return_value=Response({"data": [{"embedding": []}]})):
+        with pytest.raises(RuntimeError, match="empty vector result"):
             embeddings.embed(["anything"])
 
 
@@ -257,8 +268,8 @@ def test_embed_raise_message_names_missing_openrouter_key(monkeypatch):
     assert "openrouter.ai" in str(excinfo.value)
 
 
-def test_embed_api_no_key_path_logs_warning_and_returns_none(monkeypatch, caplog):
-    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1")
+def test_embed_api_no_key_path_logs_redacted_endpoint(monkeypatch, caplog):
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", "https://user:password@openrouter.ai/api/v1?token=secret")
     monkeypatch.setenv("MNEMOSYNE_EMBEDDINGS_VIA_API", "1")
     monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "")
 
@@ -266,6 +277,9 @@ def test_embed_api_no_key_path_logs_warning_and_returns_none(monkeypatch, caplog
         assert embeddings._embed_api(["content"]) is None
 
     assert "no API key" in caplog.text
+    assert "openrouter.ai" in caplog.text
+    assert "user:password" not in caplog.text
+    assert "token=secret" not in caplog.text
 
 
 def test_embed_returns_none_on_non_api_path_when_model_unavailable(monkeypatch):
@@ -282,3 +296,84 @@ def test_embed_returns_none_on_non_api_path_when_model_unavailable(monkeypatch):
         assert embeddings.embed_query("hello") is None
 
     embeddings._embed_query_cached.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# #735 fail-soft consumers: when embed() raises, the best-effort call sites
+# must degrade gracefully instead of aborting the memory write / import.
+# ---------------------------------------------------------------------------
+
+def _raise_embedding_error(texts):
+    raise RuntimeError("endpoint down")
+
+
+def test_shmr_embed_degrades_to_zero_vector_when_embedding_raises(monkeypatch):
+    from mnemosyne.core import shmr
+
+    monkeypatch.setattr(shmr._embeddings, "available", lambda: True)
+    monkeypatch.setattr(shmr._embeddings, "embed", _raise_embedding_error)
+
+    vec = shmr._embed("content")
+
+    assert vec.shape == (shmr.EMBEDDING_DIM,)
+    assert not vec.any()
+
+
+def test_legacy_mnemosyne_remember_persists_without_vector_when_embedding_raises(monkeypatch, tmp_path):
+    import sqlite3
+
+    from mnemosyne.core import embeddings as emb
+    from mnemosyne.core.memory import Mnemosyne
+
+    monkeypatch.setattr(emb, "available", lambda: True)
+    monkeypatch.setattr(emb, "embed", _raise_embedding_error)
+
+    memory = Mnemosyne(session_id="legacy-735", db_path=tmp_path / "memory.db")
+    memory_id = memory.remember("best effort memory", source="test")
+
+    conn = sqlite3.connect(tmp_path / "memory.db")
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE id=?", (memory_id,)
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM memory_embeddings WHERE memory_id=?", (memory_id,)
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_hindsight_import_continues_without_vector_when_embedding_raises(monkeypatch, tmp_path):
+    import json
+    import sqlite3
+
+    from mnemosyne.core import embeddings as emb
+    from mnemosyne.core.importers import HindsightImporter
+    from mnemosyne.core.memory import Mnemosyne
+
+    export = tmp_path / "hs-export.json"
+    export.write_text(json.dumps({"items": [{
+        "id": "hs-735-1",
+        "text": "memory that must still import",
+        "fact_type": "world",
+        "mentioned_at": "2026-04-29T01:36:00+00:00",
+        "date": "2026-04-29",
+        "proof_count": 1,
+    }]}), encoding="utf-8")
+
+    monkeypatch.setattr(emb, "available", lambda: True)
+    monkeypatch.setattr(emb, "embed", _raise_embedding_error)
+
+    db_path = tmp_path / "hs.db"
+    mem = Mnemosyne(session_id="default", db_path=db_path)
+    result = HindsightImporter(file_path=str(export), bank="hermes", generate_embeddings=True).run(mem)
+
+    assert result.imported == 1
+    assert result.failed == 0
+
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM episodic_memory").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0] == 0
+    finally:
+        conn.close()
