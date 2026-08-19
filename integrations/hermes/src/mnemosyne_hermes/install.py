@@ -385,8 +385,10 @@ def _timeout_diagnostic(python: Path, timeout: float, *, retry_hint: bool = True
     message = f"wrapper validation timed out after {seconds} seconds for interpreter {python}."
     if not retry_hint:
         return message + (
-            " Status uses the default "
-            f"{DEFAULT_WRAPPER_IMPORT_TIMEOUT:g}-second wrapper validation timeout."
+            " Status validates wrapper imports with its fixed default "
+            f"{DEFAULT_WRAPPER_IMPORT_TIMEOUT:g}-second policy. Inspect the selected "
+            "interpreter and its import performance; --import-timeout only affects "
+            "installer validation."
         )
     retry_seconds = f"{max(timeout * 2, timeout + 1):g}"
     return (

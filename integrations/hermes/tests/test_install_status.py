@@ -440,8 +440,10 @@ def test_plugin_state_classifies_timed_out_wrapper_import_as_stale(tmp_path, mon
     assert state.wrapper_import_error is not None
     assert str(Path(sys.executable)) in state.wrapper_import_error
     assert observed_timeouts == [60.0]
-    assert "60 seconds" in state.wrapper_import_error
-    assert "Status uses the default 60-second wrapper validation timeout" in state.wrapper_import_error
+    assert "fixed default 60-second policy" in state.wrapper_import_error
+    assert "Inspect the selected interpreter and its import performance" in state.wrapper_import_error
+    assert "--import-timeout only affects installer validation" in state.wrapper_import_error
+    assert "--import-timeout 120" not in state.wrapper_import_error
     assert "Retry with:" not in state.wrapper_import_error
 
 
