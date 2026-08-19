@@ -404,7 +404,17 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
         )
         return None
 
-    url = f"{base_url.rstrip('/')}/embeddings"
+    # Append /embeddings to the path, preserving any query string. A naive
+    # string append would push the route into the query value (e.g.
+    # "?upstream=openrouter.ai/embeddings") and silently target the wrong
+    # endpoint. Malformed URLs keep the old behavior: the request still fails
+    # and degrades to None so _ensure_api_vectors raises the redacted error.
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+        path = parsed.path.rstrip("/") + "/embeddings"
+        url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
+    except ValueError:
+        url = f"{base_url.rstrip('/')}/embeddings"
     payload = json.dumps({
         "model": _DEFAULT_MODEL,
         "input": texts,

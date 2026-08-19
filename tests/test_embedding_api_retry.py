@@ -95,7 +95,7 @@ def test_embed_api_logs_final_client_error_without_input_or_credentials(monkeypa
         with caplog.at_level(logging.WARNING, logger="mnemosyne.core.embeddings"):
             assert embeddings._embed_api(["private memory content"]) is None
 
-    assert "endpoint=https://example.test/v1 status=401" in caplog.text
+    assert "endpoint=https://example.test/v1/embeddings status=401" in caplog.text
     assert "private memory content" not in caplog.text
     assert "secret-key" not in caplog.text
     assert "user:password" not in caplog.text
@@ -331,7 +331,9 @@ def test_embed_raises_redacted_runtime_error_on_malformed_endpoint_url(monkeypat
 def test_custom_endpoint_with_openrouter_ai_in_query_needs_no_key(monkeypatch):
     # Substring-based OpenRouter detection would misclassify this custom
     # endpoint because its query contains "openrouter.ai", blocking it from
-    # the keyless custom path. Hostname matching must let it through.
+    # the keyless custom path. Hostname matching must let it through, and the
+    # query string must survive route construction so the request hits
+    # .../embeddings?upstream=openrouter.ai rather than a corrupted target.
     monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", "https://proxy.example.com/v1?upstream=openrouter.ai")
     monkeypatch.setenv("MNEMOSYNE_EMBEDDINGS_VIA_API", "1")
     monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "")
@@ -342,6 +344,7 @@ def test_custom_endpoint_with_openrouter_ai_in_query_needs_no_key(monkeypatch):
     assert result is not None
     assert result.shape == (1, 2)
     req = request.call_args[0][0]
+    assert req.full_url == "https://proxy.example.com/v1/embeddings?upstream=openrouter.ai"
     assert "Authorization" not in req.headers
 
 
