@@ -833,28 +833,35 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 _provider_active = (_active_provider_count > 0)
 
     def _acquire_host_llm_backend_ownership(self) -> None:
-        """Record this initialized primary provider's backend lease once."""
+        """Register and record this initialized primary provider's lease once."""
         global _host_llm_owner_count
         with _provider_lock:
-            if not self._owns_host_llm_backend:
-                self._owns_host_llm_backend = True
-                _host_llm_owner_count += 1
+            if self._owns_host_llm_backend:
+                return
+            try:
+                from .hermes_llm_adapter import register_hermes_host_llm
+                if not register_hermes_host_llm():
+                    return
+            except Exception as exc:
+                logger.debug("Mnemosyne could not register Hermes auxiliary LLM backend: %s", exc)
+                return
+            self._owns_host_llm_backend = True
+            _host_llm_owner_count += 1
 
     def _release_host_llm_backend_ownership(self) -> None:
         """Release this provider's lease and clear only after the final owner."""
         global _host_llm_owner_count
-        unregister = False
         with _provider_lock:
-            if self._owns_host_llm_backend:
-                self._owns_host_llm_backend = False
-                _host_llm_owner_count = max(0, _host_llm_owner_count - 1)
-                unregister = _host_llm_owner_count == 0
-        if unregister:
-            try:
-                from .hermes_llm_adapter import unregister_hermes_host_llm
-                unregister_hermes_host_llm()
-            except Exception as exc:
-                logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
+            if not self._owns_host_llm_backend:
+                return
+            self._owns_host_llm_backend = False
+            _host_llm_owner_count = max(0, _host_llm_owner_count - 1)
+            if _host_llm_owner_count == 0:
+                try:
+                    from .hermes_llm_adapter import unregister_hermes_host_llm
+                    unregister_hermes_host_llm()
+                except Exception as exc:
+                    logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
 
     def _init_audit_log(self) -> None:
         """Initialize audit log co-located with the active provider DB."""
@@ -1422,6 +1429,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             logger.warning("Mnemosyne init failed: %s", e)
             self._beam = None
             self._init_error = e
+            # A failed re-initialization no longer supplies a live primary
+            # backend owner, even though _provider_active retains its existing
+            # fallback semantics.
+            self._release_host_llm_backend_ownership()
             # A transient SQLite failure (writer holding the lock at the exact
             # moment this session initialized) must not disable memory for the
             # session's whole lifetime. Stash the init args so the per-turn
@@ -1452,8 +1463,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             self._beam.canonical_owner_id = self._canonical_owner()
             self._beam.agent_context = self._agent_context
             self._activate_in_module()
-            if host_llm_registered:
-                self._acquire_host_llm_backend_ownership()
+            self._acquire_host_llm_backend_ownership()
             self._init_audit_log()
 
     def system_prompt_block(self) -> str:

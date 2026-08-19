@@ -93,3 +93,20 @@ def test_failed_initialization_never_releases_primary_owner(tmp_path, provider_c
 
 def _raise_init_failure(**kwargs):
     raise RuntimeError("synthetic initialization failure")
+
+
+def test_failed_reinitialization_releases_prior_owner(tmp_path, provider_class, monkeypatch):
+    provider = provider_class()
+    module = sys.modules[provider_class.__module__]
+    try:
+        provider.initialize("healthy", hermes_home=str(tmp_path / "healthy"), agent_context="primary")
+        assert get_host_llm_backend() is not None
+
+        monkeypatch.setattr(module, "_get_beam_class", lambda: _raise_init_failure)
+        provider.initialize("failed", hermes_home=str(tmp_path / "failed"), agent_context="primary")
+
+        assert provider._beam is None
+        assert get_host_llm_backend() is None
+    finally:
+        provider.shutdown()
+        set_host_llm_backend(None)
