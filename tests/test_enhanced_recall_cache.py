@@ -782,6 +782,34 @@ def test_mutations_keep_cache_invalidation_errors_before_caller_commit(
         _close_memory(memory)
 
 
+def test_invalidate_keeps_cache_invalidation_error_during_deferred_commit(
+    monkeypatch, tmp_path: Path
+):
+    """A deferred batch has not committed when invalidate() returns."""
+    memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+
+    def fail_invalidation():
+        raise RuntimeError("cache unavailable")
+
+    try:
+        memory_id = memory.remember("issue 594 deferred invalidate sentinel", source="test")
+        monkeypatch.setattr(memory, "_invalidate_query_cache", fail_invalidation)
+
+        with pytest.raises(RuntimeError, match="cache unavailable"):
+            with beam_module._deferred_commits(memory.conn):
+                assert memory.invalidate(memory_id) is True
+
+        row = memory.conn.execute(
+            "SELECT valid_until FROM working_memory WHERE id = ?", (memory_id,)
+        ).fetchone()
+        assert row is not None
+        assert row["valid_until"] is None
+    finally:
+        if memory.conn.in_transaction:
+            memory.conn.rollback()
+        _close_memory(memory)
+
+
 def test_successful_invalidate_episodic_memory_invalidates_enhanced_recall_cache(
     monkeypatch, tmp_path: Path
 ):

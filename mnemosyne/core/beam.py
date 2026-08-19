@@ -4618,7 +4618,10 @@ class BeamMemory:
         """, (now, replacement_id, memory_id, self.session_id))
         if cursor.rowcount > 0:
             self.conn.commit()
-            self._invalidate_query_cache_after_commit("invalidate")
+            if self.conn.in_transaction:
+                self._invalidate_query_cache()
+            else:
+                self._invalidate_query_cache_after_commit("invalidate")
             return True
         # Try episodic_memory
         cursor.execute("""
@@ -4629,7 +4632,10 @@ class BeamMemory:
         invalidated = cursor.rowcount > 0
         self.conn.commit()
         if invalidated:
-            self._invalidate_query_cache_after_commit("invalidate")
+            if self.conn.in_transaction:
+                self._invalidate_query_cache()
+            else:
+                self._invalidate_query_cache_after_commit("invalidate")
         return invalidated
 
     def _detect_conflicts(self, rows: List[Dict], similarity_threshold: float = 0.88) -> List[tuple]:
