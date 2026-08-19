@@ -701,6 +701,45 @@ def test_dedup_remember_write_survives_post_commit_cache_invalidation_failure(
         _close_memory(memory)
 
 
+@pytest.mark.parametrize("operation", ["invalidate", "forget_working"])
+def test_post_commit_mutations_survive_query_cache_invalidation_failure(
+    monkeypatch, tmp_path: Path, caplog, operation: str
+):
+    """#594: a committed public mutation is never reported as a cache failure."""
+    memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+
+    def fail_invalidation():
+        raise RuntimeError("cache unavailable")
+
+    try:
+        memory_id = memory.remember(
+            f"issue 594 {operation} cache invalidation failure sentinel", source="test"
+        )
+        monkeypatch.setattr(memory, "_invalidate_query_cache", fail_invalidation)
+
+        with caplog.at_level(logging.WARNING, logger=beam_module.__name__):
+            if operation == "invalidate":
+                assert memory.invalidate(memory_id) is True
+                row = memory.conn.execute(
+                    "SELECT valid_until FROM working_memory WHERE id = ?", (memory_id,)
+                ).fetchone()
+                assert row is not None
+                assert row["valid_until"] is not None
+            else:
+                assert memory.forget_working(memory_id) is True
+                row = memory.conn.execute(
+                    "SELECT 1 FROM working_memory WHERE id = ?", (memory_id,)
+                ).fetchone()
+                assert row is None
+
+        assert (
+            f"{operation}: query-cache invalidation failed after commit "
+            "(RuntimeError): cache unavailable"
+        ) in caplog.text
+    finally:
+        _close_memory(memory)
+
+
 def test_successful_invalidate_episodic_memory_invalidates_enhanced_recall_cache(
     monkeypatch, tmp_path: Path
 ):
