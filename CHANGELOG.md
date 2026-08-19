@@ -34,6 +34,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **Committed memory invalidations no longer report failure when enhanced-recall cache eviction fails (#594).** The mutation remains successful and the cache error is logged for reconciliation.
 - **Hermes providers no longer clear the shared host LLM backend while another primary provider remains active (#551).**
 - **The OpenAI-compatible modality retry test is deterministic under load (#798).** Its localhost stub handles one request at a time and records response statuses, so the 401/no-retry contract is checked against the response actually served.
 - **Raw dialog no longer starves distilled facts out of the dense recall voice (#696).** Conversational capture (`source='conversation'`, and legacy `honcho_*` imports) is topically identical to the queries that retrieve it, so those rows saturated the nearest-N working-memory vector pool and pushed distilled facts beyond it. An affected fact surfaced with `dense_score=0.0` or did not surface at all. Dialog sources are now excluded from the working-memory dense candidate pool while remaining fully reachable through FTS. #608 widened the candidate neighbourhood, which helps a shallow flood; this is what makes that capacity effective against the flood itself.
