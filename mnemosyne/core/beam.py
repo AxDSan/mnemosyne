@@ -4603,7 +4603,7 @@ class BeamMemory:
             else:
                 invalidated = validate_and_invalidate()
             if invalidated:
-                self._invalidate_query_cache()
+                self._invalidate_query_cache_after_commit("invalidate")
             return invalidated
 
         now = datetime.now(timezone.utc).isoformat()
@@ -4615,7 +4615,7 @@ class BeamMemory:
         """, (now, replacement_id, memory_id, self.session_id))
         if cursor.rowcount > 0:
             self.conn.commit()
-            self._invalidate_query_cache()
+            self._invalidate_query_cache_after_commit("invalidate")
             return True
         # Try episodic_memory
         cursor.execute("""
@@ -4626,7 +4626,7 @@ class BeamMemory:
         invalidated = cursor.rowcount > 0
         self.conn.commit()
         if invalidated:
-            self._invalidate_query_cache()
+            self._invalidate_query_cache_after_commit("invalidate")
         return invalidated
 
     def _detect_conflicts(self, rows: List[Dict], similarity_threshold: float = 0.88) -> List[tuple]:
@@ -4951,7 +4951,7 @@ class BeamMemory:
                     cursor.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
         forgotten = wm_rows > 0
         if forgotten:
-            self._invalidate_query_cache()
+            self._invalidate_query_cache_after_commit("forget_working")
         return forgotten
 
     # ------------------------------------------------------------------
