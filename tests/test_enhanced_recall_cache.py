@@ -782,6 +782,49 @@ def test_mutations_keep_cache_invalidation_errors_before_caller_commit(
         _close_memory(memory)
 
 
+@pytest.mark.parametrize("memory_store", ["working", "episodic"])
+def test_invalidate_without_replacement_keeps_cache_failure_in_caller_transaction(
+    monkeypatch, tmp_path: Path, memory_store: str
+):
+    """#594: caller-owned invalidations must remain rollbackable on cache failure."""
+    memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+
+    def fail_invalidation():
+        raise RuntimeError("cache unavailable")
+
+    try:
+        if memory_store == "working":
+            memory_id = memory.remember(
+                "issue 594 caller transaction working invalidation sentinel", source="test"
+            )
+            table = "working_memory"
+        else:
+            memory_id = memory.consolidate_to_episodic(
+                "issue 594 caller transaction episodic invalidation sentinel",
+                source_wm_ids=[],
+                source="test",
+            )
+            table = "episodic_memory"
+
+        monkeypatch.setattr(memory, "_invalidate_query_cache", fail_invalidation)
+        memory.conn.execute("BEGIN")
+
+        with pytest.raises(RuntimeError, match="cache unavailable"):
+            memory.invalidate(memory_id)
+
+        assert memory.conn.in_transaction
+        memory.conn.rollback()
+        row = memory.conn.execute(
+            f"SELECT valid_until FROM {table} WHERE id = ?", (memory_id,)
+        ).fetchone()
+        assert row is not None
+        assert row["valid_until"] is None
+    finally:
+        if memory.conn.in_transaction:
+            memory.conn.rollback()
+        _close_memory(memory)
+
+
 def test_invalidate_keeps_cache_invalidation_error_during_deferred_commit(
     monkeypatch, tmp_path: Path
 ):

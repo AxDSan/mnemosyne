@@ -4609,6 +4609,10 @@ class BeamMemory:
                     self._invalidate_query_cache()
             return invalidated
 
+        # The no-replacement path mutates a single row directly.  Snapshot
+        # ownership before its first UPDATE: a caller-owned transaction must
+        # retain both its commit boundary and cache-failure rollback behavior.
+        owns_transaction = not self.conn.in_transaction
         now = datetime.now(timezone.utc).isoformat()
         # Try working_memory first
         cursor.execute("""
@@ -4617,11 +4621,11 @@ class BeamMemory:
             WHERE id = ? AND (session_id = ? OR scope = 'global')
         """, (now, replacement_id, memory_id, self.session_id))
         if cursor.rowcount > 0:
-            self.conn.commit()
-            if self.conn.in_transaction:
-                self._invalidate_query_cache()
-            else:
+            if owns_transaction:
+                self.conn.commit()
                 self._invalidate_query_cache_after_commit("invalidate")
+            else:
+                self._invalidate_query_cache()
             return True
         # Try episodic_memory
         cursor.execute("""
@@ -4630,12 +4634,13 @@ class BeamMemory:
             WHERE id = ? AND (session_id = ? OR scope = 'global')
         """, (now, replacement_id, memory_id, self.session_id))
         invalidated = cursor.rowcount > 0
-        self.conn.commit()
+        if owns_transaction:
+            self.conn.commit()
         if invalidated:
-            if self.conn.in_transaction:
-                self._invalidate_query_cache()
-            else:
+            if owns_transaction:
                 self._invalidate_query_cache_after_commit("invalidate")
+            else:
+                self._invalidate_query_cache()
         return invalidated
 
     def _detect_conflicts(self, rows: List[Dict], similarity_threshold: float = 0.88) -> List[tuple]:
