@@ -34,6 +34,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **Windows Hermes symlink installs now explain WinError 1314 recovery (#807).** When Windows denies symbolic-link creation because Developer Mode or the symbolic-link privilege is unavailable, the installer fails closed and prints a command-safe persistent wrapper retry using the resolved Hermes Python; it does not switch modes automatically.
 - **Hermes wrapper validation timeout is configurable (#804).** `mnemosyne-hermes install --mode wrapper` now accepts `--import-timeout SECONDS` (default: 60) for both selected-Python validation probes, rejects non-positive/non-finite values, and gives a retry command when validation times out.
 - **Committed memory invalidations no longer report failure when enhanced-recall cache eviction fails (#594).** The mutation remains successful and the cache error is logged for reconciliation.
 - **Hermes providers no longer clear the shared host LLM backend while another primary provider remains active (#551).**
