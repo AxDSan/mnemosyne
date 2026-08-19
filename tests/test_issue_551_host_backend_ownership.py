@@ -95,6 +95,31 @@ def _raise_init_failure(**kwargs):
     raise RuntimeError("synthetic initialization failure")
 
 
+def test_first_primary_init_failure_clears_unowned_backend(tmp_path, provider_class, monkeypatch):
+    """A first failed primary init must not leave a registered unowned backend."""
+    provider = provider_class()
+    module = sys.modules[provider_class.__module__]
+    try:
+        assert module._host_llm_owner_count == 0
+        assert get_host_llm_backend() is None
+        monkeypatch.setattr(module, "_get_beam_class", lambda: _raise_init_failure)
+
+        provider.initialize("failed", hermes_home=str(tmp_path / "failed"), agent_context="primary")
+
+        assert provider._beam is None
+        assert provider._owns_host_llm_backend is False
+        assert module._host_llm_owner_count == 0
+        assert get_host_llm_backend() is None
+
+        provider.shutdown()
+        assert provider._owns_host_llm_backend is False
+        assert module._host_llm_owner_count == 0
+        assert get_host_llm_backend() is None
+    finally:
+        provider.shutdown()
+        set_host_llm_backend(None)
+
+
 def test_failed_reinitialization_releases_prior_owner(tmp_path, provider_class, monkeypatch):
     provider = provider_class()
     module = sys.modules[provider_class.__module__]

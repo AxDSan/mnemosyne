@@ -1431,8 +1431,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             self._init_error = e
             # A failed re-initialization no longer supplies a live primary
             # backend owner, even though _provider_active retains its existing
-            # fallback semantics.
+            # fallback semantics. A first failed primary init registered the
+            # process-global backend above but never acquired a lease, so clear
+            # that unowned registration when no peer owns it.
             self._release_host_llm_backend_ownership()
+            if host_llm_registered:
+                with _provider_lock:
+                    if _host_llm_owner_count == 0:
+                        try:
+                            from .hermes_llm_adapter import unregister_hermes_host_llm
+                            unregister_hermes_host_llm()
+                        except Exception as exc:
+                            logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
             # A transient SQLite failure (writer holding the lock at the exact
             # moment this session initialized) must not disable memory for the
             # session's whole lifetime. Stash the init args so the per-turn
