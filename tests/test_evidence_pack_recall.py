@@ -11,6 +11,12 @@ from mnemosyne.core.config import MnemosyneConfig
 from mnemosyne.core.recall_diagnostics import get_recall_diagnostics, reset_recall_diagnostics
 
 
+@pytest.fixture(autouse=True)
+def _reset_config_singleton_after_test():
+    yield
+    MnemosyneConfig.reset_instance()
+
+
 def _state(db_path: Path, memory_id: str) -> tuple[int, str | None]:
     with sqlite3.connect(str(db_path)) as conn:
         count, recalled_at = conn.execute(
