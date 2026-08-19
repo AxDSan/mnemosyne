@@ -120,3 +120,23 @@ def test_wrapper_import_timeout_diagnostic_names_interpreter_duration_and_retry(
     assert str(Path(sys.executable)) in error
     assert "75 seconds" in error
     assert "--import-timeout 150" in error
+
+
+def test_wrapper_import_timeout_diagnostic_quotes_windows_python_path(monkeypatch):
+    python = Path("C:/Program Files/Hermes/venv/python.exe")
+    retry_args = [
+        "mnemosyne-hermes",
+        "install",
+        "--mode",
+        "wrapper",
+        "--python",
+        str(python),
+        "--import-timeout",
+        "120",
+    ]
+    monkeypatch.setattr(install.os, "name", "nt")
+
+    error = install._timeout_diagnostic(python, 60)
+
+    assert error.endswith(f"Retry with: {subprocess.list2cmdline(retry_args)}")
+    assert '"C:/Program Files/Hermes/venv/python.exe"' in error

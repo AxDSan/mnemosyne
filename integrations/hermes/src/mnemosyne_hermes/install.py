@@ -391,11 +391,20 @@ def _timeout_diagnostic(python: Path, timeout: float, *, retry_hint: bool = True
             "installer validation."
         )
     retry_seconds = f"{max(timeout * 2, timeout + 1):g}"
-    return (
-        message + " "
-        "Retry with: mnemosyne-hermes install --mode wrapper "
-        f"--python {shlex.quote(str(python))} --import-timeout {retry_seconds}"
+    retry_args = [
+        "mnemosyne-hermes",
+        "install",
+        "--mode",
+        "wrapper",
+        "--python",
+        str(python),
+        "--import-timeout",
+        retry_seconds,
+    ]
+    retry_command = (
+        subprocess.list2cmdline(retry_args) if os.name == "nt" else shlex.join(retry_args)
     )
+    return message + f" Retry with: {retry_command}"
 
 
 def _site_packages_for_python(
