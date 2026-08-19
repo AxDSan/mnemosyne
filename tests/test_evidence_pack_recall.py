@@ -13,6 +13,7 @@ from mnemosyne.core.recall_diagnostics import get_recall_diagnostics, reset_reca
 
 @pytest.fixture(autouse=True)
 def _reset_config_singleton_after_test():
+    MnemosyneConfig.reset_instance()
     yield
     MnemosyneConfig.reset_instance()
 
