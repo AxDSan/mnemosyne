@@ -8,6 +8,7 @@ import hashlib
 import importlib
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 PLUGIN_NAME = "mnemosyne"
+DEFAULT_WRAPPER_IMPORT_TIMEOUT = 60.0
 SKILL_NAME = "mnemosyne-memory-override"
 SKILL_CATEGORY = "memory"
 BUNDLED_SKILL_RESOURCE = ("skills", SKILL_NAME, "SKILL.md")
@@ -358,14 +360,50 @@ def _wrapper_metadata(target: Path, init_file: Path) -> _WrapperMetadata:
     return _WrapperMetadata(python=python, site_packages=site_packages)
 
 
-def _site_packages_for_python(python: Path) -> Path:
-    """Ask an interpreter for its purelib/site-packages path."""
-    result = subprocess.run(
-        [str(python), "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
-        capture_output=True,
-        text=True,
-        timeout=10,
+def _validated_import_timeout(value: float | str) -> float:
+    """Return a safe wrapper-validation timeout in seconds."""
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("import timeout must be a positive finite number of seconds") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("import timeout must be a positive finite number of seconds")
+    return timeout
+
+
+def _parse_import_timeout(value: str) -> float:
+    """Argparse adapter that keeps invalid timeout diagnostics actionable."""
+    try:
+        return _validated_import_timeout(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _timeout_diagnostic(python: Path, timeout: float) -> str:
+    """Return an actionable timeout diagnostic for selected wrapper Python."""
+    seconds = f"{timeout:g}"
+    retry_seconds = f"{max(timeout * 2, timeout + 1):g}"
+    return (
+        f"wrapper validation timed out after {seconds} seconds for interpreter {python}. "
+        "Retry with: mnemosyne-hermes install --mode wrapper "
+        f"--python {python} --import-timeout {retry_seconds}"
     )
+
+
+def _site_packages_for_python(
+    python: Path, *, import_timeout: float = DEFAULT_WRAPPER_IMPORT_TIMEOUT
+) -> Path:
+    """Ask an interpreter for its purelib/site-packages path."""
+    import_timeout = _validated_import_timeout(import_timeout)
+    try:
+        result = subprocess.run(
+            [str(python), "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+            capture_output=True,
+            text=True,
+            timeout=import_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(_timeout_diagnostic(python, import_timeout)) from exc
     if result.returncode != 0:
         stderr = result.stderr.strip() or result.stdout.strip()
         raise RuntimeError(f"Could not resolve site-packages for {python}: {stderr}")
@@ -376,7 +414,10 @@ def _site_packages_for_python(python: Path) -> Path:
 
 
 def _check_wrapper_import(
-    site_packages: Path, python: Path | None = None
+    site_packages: Path,
+    python: Path | None = None,
+    *,
+    import_timeout: float = DEFAULT_WRAPPER_IMPORT_TIMEOUT,
 ) -> tuple[bool, str | None, bool]:
     """Return import success, error text, and whether the runtime is invalid."""
     if not site_packages.is_dir():
@@ -386,6 +427,7 @@ def _check_wrapper_import(
         return False, f"wrapper Python missing: {runner}", True
     if not os.access(runner, os.X_OK):
         return False, f"wrapper Python is not executable: {runner}", True
+    import_timeout = _validated_import_timeout(import_timeout)
     code = (
         "import site\n"
         "import sys\n"
@@ -406,7 +448,7 @@ def _check_wrapper_import(
             [str(runner), "-S", "-c", code],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=import_timeout,
             # -S and a selected site directory isolate imports from the runner's
             # ambient site/user directories. Filtering PYTHONPATH prevents a
             # caller-controlled package shadowing that contract; filtering
@@ -421,7 +463,7 @@ def _check_wrapper_import(
     except OSError as exc:
         return False, f"could not run wrapper Python {runner}: {exc}", True
     except subprocess.TimeoutExpired:
-        return False, f"wrapper Python import timed out: {runner}", False
+        return False, _timeout_diagnostic(runner, import_timeout), False
     if result.returncode == 0:
         return True, None, False
     return False, (result.stderr.strip() or result.stdout.strip() or "import failed")[:500], False
@@ -1421,13 +1463,18 @@ def _is_wrapper_plugin_target(target: Path) -> bool:
 
 def _validated_wrapper_environment(
     python: str | Path | None,
+    *,
+    import_timeout: float = DEFAULT_WRAPPER_IMPORT_TIMEOUT,
 ) -> tuple[Path, Path]:
     """Validate the selected wrapper runtime before touching an installed plugin."""
     wrapper_python = Path(python).expanduser() if python else Path(sys.executable)
     if not wrapper_python.is_file():
         raise FileNotFoundError(f"Python interpreter not found: {wrapper_python}")
-    site_packages = _site_packages_for_python(wrapper_python)
-    import_ok, import_error, _invalid_runtime = _check_wrapper_import(site_packages, wrapper_python)
+    import_timeout = _validated_import_timeout(import_timeout)
+    site_packages = _site_packages_for_python(wrapper_python, import_timeout=import_timeout)
+    import_ok, import_error, _invalid_runtime = _check_wrapper_import(
+        site_packages, wrapper_python, import_timeout=import_timeout
+    )
     if not import_ok:
         raise RuntimeError(
             f"Selected Python environment cannot import mnemosyne_hermes: {import_error}"
@@ -1662,6 +1709,7 @@ def install_plugin(
     force: bool = False,
     mode: str = "symlink",
     python: str | Path | None = None,
+    import_timeout: float = DEFAULT_WRAPPER_IMPORT_TIMEOUT,
     migrate_wrapper_to_symlink: bool = False,
     link_profiles: bool = True,
 ) -> Path:
@@ -1759,7 +1807,9 @@ def install_plugin(
     # Validate and fully write the replacement before removing a working wrapper.
     # In particular, a bad --python or a selected environment missing this package
     # must leave the existing wrapper and every profile link untouched.
-    wrapper_python, site_packages = _validated_wrapper_environment(python)
+    wrapper_python, site_packages = _validated_wrapper_environment(
+        python, import_timeout=import_timeout
+    )
     target.parent.mkdir(parents=True, exist_ok=True)
     staging_parent = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
     staged = staging_parent / target.name
@@ -1986,6 +2036,13 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     install.add_argument(
+        "--import-timeout",
+        type=_parse_import_timeout,
+        default=DEFAULT_WRAPPER_IMPORT_TIMEOUT,
+        metavar="SECONDS",
+        help="Wrapper validation timeout in seconds (default: 60).",
+    )
+    install.add_argument(
         "--migrate-wrapper-to-symlink",
         action="store_true",
         help=(
@@ -2037,6 +2094,7 @@ def run_install(
     no_bootstrap: bool = False,
     mode: str = "symlink",
     python: str | Path | None = None,
+    import_timeout: float = DEFAULT_WRAPPER_IMPORT_TIMEOUT,
     migrate_wrapper_to_symlink: bool = False,
     link_profiles: bool = True,
 ) -> int:
@@ -2113,6 +2171,7 @@ def run_install(
         force=force,
         mode=mode,
         python=python,
+        import_timeout=import_timeout,
         migrate_wrapper_to_symlink=migrate_wrapper_to_symlink,
         link_profiles=link_profiles,
     )
@@ -2186,7 +2245,11 @@ def main(argv: list[str] | None = None) -> int:
                     wrapper_python = Path(getattr(args, "python", None) or sys.executable).expanduser()
                     print(f"  Wrapper Python: {wrapper_python}")
                     if wrapper_python.is_file():
-                        print(f"  Wrapper site-packages: {_site_packages_for_python(wrapper_python)}")
+                        print(
+                            "  Wrapper site-packages: "
+                            f"{_site_packages_for_python(wrapper_python, import_timeout=args.import_timeout)}"
+                        )
+                    print(f"  Wrapper import timeout: {args.import_timeout:g} seconds")
                 print(f"  Will force: {bool(getattr(args, 'force', False))}")
                 if getattr(args, "migrate_wrapper_to_symlink", False):
                     print("  Will allow wrapper-to-symlink migration: yes")
@@ -2215,6 +2278,7 @@ def main(argv: list[str] | None = None) -> int:
                 no_bootstrap=getattr(args, "no_bootstrap", False),
                 mode=getattr(args, "mode", "symlink"),
                 python=getattr(args, "python", None),
+                import_timeout=getattr(args, "import_timeout", DEFAULT_WRAPPER_IMPORT_TIMEOUT),
                 migrate_wrapper_to_symlink=getattr(args, "migrate_wrapper_to_symlink", False),
                 link_profiles=getattr(args, "link_profiles", True),
             )

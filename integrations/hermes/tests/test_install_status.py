@@ -434,7 +434,10 @@ def test_plugin_state_classifies_timed_out_wrapper_import_as_stale(tmp_path, mon
     assert state.status == "stale_wrapper"
     assert state.installed is False
     assert state.wrapper_import_ok is False
-    assert state.wrapper_import_error == f"wrapper Python import timed out: {Path(sys.executable)}"
+    assert state.wrapper_import_error is not None
+    assert str(Path(sys.executable)) in state.wrapper_import_error
+    assert "60 seconds" in state.wrapper_import_error
+    assert "--import-timeout 120" in state.wrapper_import_error
 
 
 def test_plugin_state_reports_stale_wrapper_target(tmp_path):
