@@ -52,6 +52,33 @@ def test_wrapper_validation_default_timeout_reaches_both_probes(tmp_path, monkey
     assert observed_timeouts == [60.0, 60.0]
 
 
+def test_wrapper_install_timeout_preserves_existing_target(tmp_path, monkeypatch):
+    target = tmp_path / "plugins" / "mnemosyne"
+    target.mkdir(parents=True)
+    sentinel = target / "keep"
+    sentinel.write_text("existing wrapper", encoding="utf-8")
+    site_packages = tmp_path / "site-packages"
+    site_packages.mkdir()
+
+    def probe_with_slow_import(command, **kwargs):
+        if "-S" in command:
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        return subprocess.CompletedProcess(command, 0, f"{site_packages}\n", "")
+
+    monkeypatch.setattr(install.subprocess, "run", probe_with_slow_import)
+
+    with pytest.raises(RuntimeError, match="wrapper validation timed out"):
+        install.install_plugin(
+            hermes_home_path=tmp_path,
+            force=True,
+            mode="wrapper",
+            python=sys.executable,
+            link_profiles=False,
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "existing wrapper"
+
+
 def test_wrapper_import_timeout_diagnostic_names_interpreter_duration_and_retry(tmp_path, monkeypatch):
     def timed_out(command, **kwargs):
         raise subprocess.TimeoutExpired(command, kwargs["timeout"])

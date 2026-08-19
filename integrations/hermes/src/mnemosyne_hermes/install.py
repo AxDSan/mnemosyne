@@ -24,6 +24,7 @@ from typing import Optional
 
 PLUGIN_NAME = "mnemosyne"
 DEFAULT_WRAPPER_IMPORT_TIMEOUT = 60.0
+STATUS_WRAPPER_IMPORT_TIMEOUT = 10.0
 SKILL_NAME = "mnemosyne-memory-override"
 SKILL_CATEGORY = "memory"
 BUNDLED_SKILL_RESOURCE = ("skills", SKILL_NAME, "SKILL.md")
@@ -386,7 +387,7 @@ def _timeout_diagnostic(python: Path, timeout: float) -> str:
     return (
         f"wrapper validation timed out after {seconds} seconds for interpreter {python}. "
         "Retry with: mnemosyne-hermes install --mode wrapper "
-        f"--python {python} --import-timeout {retry_seconds}"
+        f"--python {shlex.quote(str(python))} --import-timeout {retry_seconds}"
     )
 
 
@@ -565,6 +566,7 @@ def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
             wrapper_import_ok, wrapper_import_error, invalid_runtime = _check_wrapper_import(
                 wrapper_site,
                 wrapper_python,
+                import_timeout=STATUS_WRAPPER_IMPORT_TIMEOUT,
             )
             if not wrapper_import_ok:
                 status = "invalid_wrapper" if invalid_runtime else "stale_wrapper"
@@ -2040,7 +2042,10 @@ def _parser() -> argparse.ArgumentParser:
         type=_parse_import_timeout,
         default=DEFAULT_WRAPPER_IMPORT_TIMEOUT,
         metavar="SECONDS",
-        help="Wrapper validation timeout in seconds (default: 60).",
+        help=(
+            "Wrapper validation timeout in seconds "
+            f"(default: {DEFAULT_WRAPPER_IMPORT_TIMEOUT:g})."
+        ),
     )
     install.add_argument(
         "--migrate-wrapper-to-symlink",
