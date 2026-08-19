@@ -13,7 +13,7 @@ environment variables changed, and it must work unmodified.
 import base64
 import json
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
@@ -32,6 +32,7 @@ class _Stub:
         self.replies = list(replies)
         self.models_payload = models_payload
         self.requests = []
+        self.response_statuses = []
         self.model_probes = 0
         outer = self
 
@@ -58,6 +59,7 @@ class _Stub:
                 outer.requests.append(json.loads(raw.decode()))
 
                 status, content = outer.replies.pop(0) if outer.replies else (200, "{}")
+                outer.response_statuses.append(status)
                 if status >= 400:
                     body = json.dumps({"error": content}).encode()
                 else:
@@ -70,7 +72,7 @@ class _Stub:
                 self.end_headers()
                 self.wfile.write(body)
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server = HTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
@@ -433,14 +435,17 @@ def test_server_errors_are_retried_then_given_up_on(stub, configured, monkeypatc
     assert len(server.requests) == 3, "bounded at three attempts"
 
 
-def test_client_errors_are_not_retried(stub, configured, monkeypatch):
-    """A 401 will be a 401 again. Retrying it just triples the log noise."""
+@pytest.mark.parametrize("status", [401, 403])
+def test_client_errors_are_not_retried(stub, configured, monkeypatch, status):
+    """Terminal client errors are not retried."""
     monkeypatch.setattr(adapter.time, "sleep", lambda _s: None)
-    server = stub([(401, "bad key"), (200, _OK_REPLY)])
+    server = stub([(status, "bad key"), (200, _OK_REPLY)])
     configured(server.base_url)
 
     assert adapter.OpenAICompatModalityBackend().describe(_request()) is None
     assert len(server.requests) == 1
+    assert server.response_statuses == [status]
+    assert server.replies == [(200, _OK_REPLY)]
 
 
 def test_an_unreachable_endpoint_degrades_to_none(configured, monkeypatch):
