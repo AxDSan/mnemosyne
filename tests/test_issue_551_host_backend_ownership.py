@@ -50,3 +50,46 @@ def test_primary_peer_shutdown_keeps_host_backend_until_final_owner(
         for provider in providers:
             provider.shutdown()
         set_host_llm_backend(None)
+
+
+def test_skip_context_never_releases_primary_owner(tmp_path, provider_class):
+    owner = provider_class()
+    skipped = provider_class()
+    try:
+        owner.initialize("owner", hermes_home=str(tmp_path / "owner"), agent_context="primary")
+        skipped.initialize("skip", hermes_home=str(tmp_path / "skip"), agent_context="cron")
+
+        skipped.shutdown()
+        assert get_host_llm_backend() is not None
+
+        owner.shutdown()
+        assert get_host_llm_backend() is None
+    finally:
+        skipped.shutdown()
+        owner.shutdown()
+        set_host_llm_backend(None)
+
+
+def test_failed_initialization_never_releases_primary_owner(tmp_path, provider_class, monkeypatch):
+    owner = provider_class()
+    failed = provider_class()
+    module = sys.modules[provider_class.__module__]
+    try:
+        owner.initialize("owner", hermes_home=str(tmp_path / "owner"), agent_context="primary")
+        monkeypatch.setattr(module, "_get_beam_class", lambda: _raise_init_failure)
+        failed.initialize("failed", hermes_home=str(tmp_path / "failed"), agent_context="primary")
+        assert failed._beam is None
+
+        failed.shutdown()
+        assert get_host_llm_backend() is not None
+
+        owner.shutdown()
+        assert get_host_llm_backend() is None
+    finally:
+        failed.shutdown()
+        owner.shutdown()
+        set_host_llm_backend(None)
+
+
+def _raise_init_failure(**kwargs):
+    raise RuntimeError("synthetic initialization failure")
