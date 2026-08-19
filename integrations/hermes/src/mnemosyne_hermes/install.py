@@ -87,6 +87,22 @@ class SkillInstallResult:
     message: str
 
 
+class _WindowsSymlinkPrivilegeError(RuntimeError):
+    """A Windows symlink failure for which the CLI has a safe retry."""
+
+
+def _is_windows_symlink_privilege_error(error: OSError) -> bool:
+    """Return whether ``error`` is Windows ERROR_PRIVILEGE_NOT_HELD (1314)."""
+    return getattr(error, "winerror", None) == 1314
+
+
+def _windows_wrapper_retry_command(hermes_python: Path) -> str:
+    """Format a Windows-command-line-safe wrapper retry for a selected Python."""
+    return subprocess.list2cmdline(
+        ["mnemosyne-hermes", "install", "--mode", "wrapper", "--python", str(hermes_python)]
+    )
+
+
 def hermes_home() -> Path:
     """Return the Hermes home directory used for user-installed plugins."""
     return Path(os.environ.get("HERMES_HOME") or "~/.hermes").expanduser()
@@ -1804,7 +1820,12 @@ def install_plugin(
         _write_profile_links_preference(link_profiles, hermes_home_path=hermes_home_path)
         try:
             _prepare_plugin_target(base, target, force=force)
-            os.symlink(str(source), str(target))
+            try:
+                os.symlink(str(source), str(target))
+            except OSError as error:
+                if _is_windows_symlink_privilege_error(error):
+                    raise _WindowsSymlinkPrivilegeError from error
+                raise
         except Exception:
             try:
                 _restore_profile_links_preference(preference_path, previous_preference)
@@ -2189,15 +2210,39 @@ def run_install(
         else:
             print(f"  Hermes' Python: mnemosyne-memory {hermes_core} OK")
 
-    target = install_plugin(
-        hermes_home_path=hermes_home_path,
-        force=force,
-        mode=mode,
-        python=python,
-        import_timeout=import_timeout,
-        migrate_wrapper_to_symlink=migrate_wrapper_to_symlink,
-        link_profiles=link_profiles,
-    )
+    try:
+        target = install_plugin(
+            hermes_home_path=hermes_home_path,
+            force=force,
+            mode=mode,
+            python=python,
+            import_timeout=import_timeout,
+            migrate_wrapper_to_symlink=migrate_wrapper_to_symlink,
+            link_profiles=link_profiles,
+        )
+    except _WindowsSymlinkPrivilegeError:
+        print(
+            "\n  ⚠ Windows symbolic-link privilege is unavailable (WinError 1314).\n"
+            "     Enable Developer Mode or run with an account granted the "
+            "symbolic-link privilege.\n"
+            "     The installer did not switch install modes automatically.\n",
+            file=sys.stderr,
+        )
+        if hermes_python is not None:
+            print(
+                "  Persistent no-symlink-privilege alternative:\n"
+                f"    {_windows_wrapper_retry_command(hermes_python)}\n",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "  A safe wrapper retry cannot be generated because Hermes' Python was "
+                "not resolved.\n"
+                "  Locate the Hermes interpreter, then re-run with --python "
+                "<path-to-hermes-python>.\n",
+                file=sys.stderr,
+            )
+        return 1
     skill_result = install_bundled_skill(
         hermes_home_path=hermes_home_path,
         force=force,
