@@ -116,6 +116,19 @@ class TestScoreNoise:
         assert score >= 0.9
         assert any("secret" in r for r in reasons)
 
+    def test_cjk_secret_flagged(self):
+        """CJK-labelled secrets must be flagged by the hygiene scorer (issue #806)."""
+        # nosec - test fixture
+        score, reasons = _score_noise("数据库密码：s3cr3t_pa55word_x1y2z3w4", 0.5, "user")
+        assert score >= 0.9
+        assert any("secret" in r for r in reasons)
+        assert _suggest_action(score, []) in ("delete", "flag")
+
+    def test_cjk_policy_prose_not_flagged(self):
+        """Ordinary Chinese policy prose after a label must stay clean."""
+        score, reasons = _score_noise("密码：建议每90天更换一次", 0.5, "user")
+        assert not any("secret" in r for r in reasons)
+
     def test_secret_with_value_keyword_not_dampened(self):
         """Secret + value keyword should NOT dampen the score."""
         # nosec - test fixture

@@ -437,6 +437,32 @@ def test_runtime_metadata_is_retained_in_safe_doctor_artifacts(
         assert detail in markdown_artifact
 
 
+def test_safe_preview_redacts_cjk_labeled_secret():
+    """CJK-labelled secrets must be redacted in doctor previews (issue #806)."""
+    # nosec - test fixture
+    raw_secret = "s3cr3t_pa55word_x1y2z3w4"
+    preview = doctor.safe_preview(f"数据库密码：{raw_secret}", max_length=120)
+    assert raw_secret not in preview
+    assert "<redact" in preview
+
+
+def test_safe_preview_keeps_cjk_policy_prose():
+    """Ordinary Chinese policy prose after a label must not be redacted."""
+    prose = "密码：建议每90天更换一次"
+    preview = doctor.safe_preview(prose, max_length=120)
+    assert prose in preview
+    assert "<redact" not in preview
+
+
+def test_safe_preview_redacts_cjk_secret_before_truncating():
+    """Truncation must not let a CJK-labelled secret value survive."""
+    # nosec - test fixture
+    raw_secret = "s3cr3t_pa55word_x1y2z3w4"
+    preview = doctor.safe_preview("x" * 90 + f" 数据库密码：{raw_secret}" + " trailing", max_length=120)
+    assert len(preview) <= 120
+    assert raw_secret not in preview
+
+
 def test_safe_preview_caps_raw_text_before_regex_redaction(monkeypatch):
     """Unbounded input must not be handed to Doctor's regex redactors."""
 

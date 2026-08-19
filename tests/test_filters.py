@@ -120,6 +120,68 @@ class TestDetectSecrets:
 
 
 # ---------------------------------------------------------------------------
+# detect_secrets — CJK-labelled secrets (issue #806, lane 1)
+# ---------------------------------------------------------------------------
+
+class TestDetectSecretsCJK:
+    def test_chinese_fullwidth_colon(self):
+        # nosec - test fixture
+        hits = detect_secrets("数据库密码：s3cr3t_pa55word_x1y2z3w4")
+        assert "cjk_secret_assignment" in hits
+
+    def test_chinese_fullwidth_equals(self):
+        # nosec - test fixture
+        hits = detect_secrets("数据库密钥＝AbCdEfGhIjKlMnOp")
+        assert "cjk_secret_assignment" in hits
+
+    def test_chinese_quoted_value(self):
+        # nosec - test fixture
+        hits = detect_secrets('令牌："ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123"')
+        assert "cjk_secret_assignment" in hits
+
+    def test_japanese_password(self):
+        # nosec - test fixture
+        hits = detect_secrets("パスワード：abcdefgh1234")
+        assert "cjk_secret_assignment" in hits
+
+    def test_korean_password(self):
+        # nosec - test fixture
+        hits = detect_secrets("비밀번호: qwerty123456")
+        assert "cjk_secret_assignment" in hits
+
+    def test_chinese_private_key(self):
+        # nosec - test fixture
+        hits = detect_secrets("私钥：MIIEvQIBADANBgkqhkiG9w0BAQEFAASC")
+        assert "cjk_secret_assignment" in hits
+
+    def test_negative_chinese_policy_prose_after_label(self):
+        """Ordinary Chinese policy prose after a label must not be a secret."""
+        hits = detect_secrets("密码：建议每90天更换一次")
+        assert hits == []
+
+    def test_negative_chinese_architecture_prose(self):
+        hits = detect_secrets("配置：采用微服务架构部署项目，并约定所有配置走环境变量")
+        assert hits == []
+
+    def test_negative_chinese_plain_name(self):
+        hits = detect_secrets("名称：Alice 的昵称")
+        assert hits == []
+
+    def test_negative_value_too_short(self):
+        hits = detect_secrets("数据库密码：abc1234")
+        assert hits == []
+
+    def test_negative_symbols_only_value(self):
+        hits = detect_secrets("密码：！！！！！！！！")
+        assert hits == []
+
+    def test_negative_mixed_cjk_value(self):
+        """A value mixing CJK prose with digits is still prose, not a secret."""
+        hits = detect_secrets("数据库密码：我的密码是12345678")
+        assert hits == []
+
+
+# ---------------------------------------------------------------------------
 # classify_memory_write
 # ---------------------------------------------------------------------------
 
