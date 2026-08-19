@@ -6090,7 +6090,7 @@ class BeamMemory:
             raise ValueError("candidate_k must exceed top_k when pack_k is positive")
         if kwargs.get("explain"):
             raise ValueError("explain is not supported by recall_with_evidence_pack")
-        if "_track_recall" in kwargs:
+        if any(name.startswith("_") for name in kwargs):
             raise ValueError("internal recall controls are managed by recall_with_evidence_pack")
 
         primary = self.recall(query, top_k=top_k, **kwargs)
