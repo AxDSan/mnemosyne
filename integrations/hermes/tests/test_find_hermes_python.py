@@ -750,3 +750,109 @@ def test_run_install_honours_explicit_python(hermes_world, tmp_path, monkeypatch
 
     assert rc == 0
     assert bootstrapped == [chosen]
+
+
+def _make_windows_venv(root: Path) -> Path:
+    """Create a native Windows venv layout without changing ``os.name``."""
+    scripts = root / "Scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (root / "pyvenv.cfg").write_text("home = C:/Python\n", encoding="utf-8")
+    return _write_executable(scripts / "python.exe", "#!/bin/sh\nexit 0\n")
+
+
+def _isolate_windows_discovery(tmp_path, monkeypatch):
+    """Neutralize every implicit route; each test enables one route explicitly."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-home"))
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "user-home"))
+    # Keep the simulated layout local to the installer module. In particular,
+    # changing process-global ``os.name`` would make pathlib and shutil act as
+    # though this Linux test process were Windows.
+    monkeypatch.setattr(install, "_is_windows_platform", lambda: True, raising=False)
+
+
+def test_windows_launcher_sibling_discovers_scripts_python_exe(tmp_path, monkeypatch):
+    """Route 1: a native launcher sibling must find its validated Windows venv."""
+    _isolate_windows_discovery(tmp_path, monkeypatch)
+    venv = tmp_path / "launcher-venv"
+    python = _make_windows_venv(venv)
+    launcher = _write_executable(venv / "Scripts" / "hermes.exe", "#!/bin/sh\nexit 0\n")
+    monkeypatch.setattr(install.shutil, "which", lambda _: str(launcher))
+
+    assert install._find_hermes_python() == python
+
+
+def test_windows_known_root_discovers_scripts_python_exe(tmp_path, monkeypatch):
+    """Route 2: a known Hermes install root must support ``Scripts/python.exe``."""
+    _isolate_windows_discovery(tmp_path, monkeypatch)
+    home = tmp_path / "hermes-home"
+    python = _make_windows_venv(home / "hermes-agent" / "venv")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    assert install._find_hermes_python() == python
+
+
+def test_windows_active_prefix_discovers_scripts_python_exe(tmp_path, monkeypatch):
+    """Route 3: the active venv prefix must find its native Windows runtime."""
+    _isolate_windows_discovery(tmp_path, monkeypatch)
+    prefix = tmp_path / "active-venv"
+    python = _make_windows_venv(prefix)
+    monkeypatch.setattr(sys, "prefix", str(prefix))
+
+    assert install._find_hermes_python() == python
+
+
+def test_windows_virtual_env_discovers_scripts_python_exe(tmp_path, monkeypatch):
+    """Route 4: VIRTUAL_ENV must find its validated native Windows runtime."""
+    _isolate_windows_discovery(tmp_path, monkeypatch)
+    venv = tmp_path / "virtual-env"
+    python = _make_windows_venv(venv)
+    monkeypatch.setenv("VIRTUAL_ENV", str(venv))
+
+    assert install._find_hermes_python() == python
+
+
+@pytest.mark.parametrize("kind", ["missing", "nonexecutable", "unrelated"])
+def test_windows_known_root_rejects_invalid_scripts_candidates(tmp_path, monkeypatch, kind):
+    """Windows-shaped candidates retain the existing marker and executable checks."""
+    _isolate_windows_discovery(tmp_path, monkeypatch)
+    home = tmp_path / "hermes-home"
+    root = home / "hermes-agent" / "venv"
+    candidate = root / "Scripts" / "python.exe"
+    if kind == "nonexecutable":
+        _make_windows_venv(root).chmod(0o644)
+    elif kind == "unrelated":
+        _write_executable(candidate, "#!/bin/sh\nexit 0\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    assert install._find_hermes_python() is None
+
+
+def test_windows_explicit_python_still_precedes_implicit_discovery(tmp_path, monkeypatch):
+    """An explicit path remains authoritative over a valid Windows route."""
+    _isolate_windows_discovery(tmp_path, monkeypatch)
+    discovered = _make_windows_venv(tmp_path / "virtual-env")
+    chosen = tmp_path / "chosen" / "python.exe"
+    monkeypatch.setenv("VIRTUAL_ENV", str(discovered.parent.parent))
+
+    assert install._find_hermes_python(explicit_python=chosen) == chosen
+
+
+def test_posix_known_root_precedence_stays_python_then_python3(tmp_path, monkeypatch):
+    """Windows support does not alter the established POSIX candidate order."""
+    home = tmp_path / "hermes-home"
+    venv = home / "hermes-agent" / "venv"
+    python = _make_venv(venv)
+    python3 = _write_executable(venv / "bin" / "python3", "#!/bin/sh\nexit 0\n")
+    windows_python = _make_windows_venv(venv)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "user-home"))
+    monkeypatch.setattr(install, "_is_windows_platform", lambda: False, raising=False)
+
+    assert install._find_hermes_python() == python
+    assert python != python3 != windows_python

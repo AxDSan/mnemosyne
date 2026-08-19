@@ -857,14 +857,33 @@ def _resolve_hermes_bin(hermes_bin: str) -> Path | None:
     return None
 
 
+def _is_windows_platform() -> bool:
+    """Return whether the installer is running on native Windows."""
+    return os.name == "nt"
+
+
+def _venv_python_candidates(venv_root: Path) -> tuple[Path, ...]:
+    """Return supported interpreter paths in platform-appropriate order.
+
+    Native Windows virtual environments keep their interpreter in
+    ``Scripts/python.exe``. POSIX layouts remain ``bin/python`` followed by
+    ``bin/python3``. The predicate that consumes these candidates still requires
+    the adjacent ``pyvenv.cfg`` marker and executability.
+    """
+    posix = (venv_root / "bin" / "python", venv_root / "bin" / "python3")
+    if _is_windows_platform():
+        return (venv_root / "Scripts" / "python.exe", *posix)
+    return posix
+
+
 def _is_venv_bin_dir(bin_dir: Path) -> bool:
-    """Return whether ``bin_dir`` is the ``bin/`` of a real virtual environment.
+    """Return whether ``bin_dir`` is an interpreter directory of a real venv.
 
     ``pyvenv.cfg`` is what separates a venv from a directory that merely holds
     executables. It is the only cheap signal that discriminates the #618 case:
     ``~/.local/bin`` holds both a ``hermes`` launcher and an unrelated
     ``python``, so "the launcher sits next to a python" proves nothing on its
-    own.
+    own. The same marker applies to native Windows ``Scripts/`` layouts.
     """
     return (bin_dir.parent / "pyvenv.cfg").is_file()
 
@@ -951,9 +970,7 @@ def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[P
     if hermes_bin:
         resolved = _resolve_hermes_bin(hermes_bin)
         if resolved:
-            bin_dir = resolved.parent
-            for py_name in ("python", "python3"):
-                candidate = bin_dir / py_name
+            for candidate in _venv_python_candidates(resolved.parent.parent):
                 if _is_validated_venv_python(candidate):
                     return candidate
 
@@ -971,18 +988,18 @@ def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[P
         Path("/usr/lib/hermes-agent"),
     ]:
         for venv_name in ("venv", ".venv"):
-            candidate = root / venv_name / "bin" / "python"
-            if _is_validated_venv_python(candidate):
-                return candidate
+            for candidate in _venv_python_candidates(root / venv_name):
+                if _is_validated_venv_python(candidate):
+                    return candidate
 
     # 3. Check if we're running inside Hermes' venv ourselves.
     #    `sys.prefix != sys.base_prefix` says the *running* interpreter is in a
     #    venv; it says nothing about the bin/python being asked for here, which
     #    can be absent or non-executable in a partially built environment.
     if sys.prefix != sys.base_prefix:
-        venv_python = Path(sys.prefix) / "bin" / "python"
-        if _is_validated_venv_python(venv_python):
-            return venv_python
+        for candidate in _venv_python_candidates(Path(sys.prefix)):
+            if _is_validated_venv_python(candidate):
+                return candidate
 
     # 4. Check VIRTUAL_ENV env var (uv-managed or explicit).
     #    This is an ordinary environment variable, not an assertion that a venv
@@ -991,9 +1008,9 @@ def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[P
     #    this function exists to prevent.
     ve = os.environ.get("VIRTUAL_ENV")
     if ve:
-        candidate = Path(ve) / "bin" / "python"
-        if _is_validated_venv_python(candidate):
-            return candidate
+        for candidate in _venv_python_candidates(Path(ve)):
+            if _is_validated_venv_python(candidate):
+                return candidate
 
     # Nothing validated. Better to stop and let the caller ask for --python
     # than to bootstrap into an interpreter that only looked plausible.
