@@ -220,6 +220,35 @@ def test_is_installed_stays_false_for_broken_symlink(tmp_path):
     assert install.is_installed(hermes_home_path=tmp_path) is False
 
 
+def test_wrapper_install_accepts_an_11_second_import_with_60_second_timeout(tmp_path, monkeypatch):
+    """A slow but healthy selected runtime must not inherit the old 10s ceiling."""
+    site_packages = tmp_path / "site-packages"
+    site_packages.mkdir()
+    observed_timeouts = []
+
+    def simulated_subprocess(command, **kwargs):
+        timeout = kwargs["timeout"]
+        observed_timeouts.append(timeout)
+        if "-S" in command and timeout < 11:
+            raise subprocess.TimeoutExpired(command, timeout)
+        if "-S" in command:
+            return subprocess.CompletedProcess(command, 0, "0.0-test\n", "")
+        return subprocess.CompletedProcess(command, 0, f"{site_packages}\n", "")
+
+    monkeypatch.setattr(install.subprocess, "run", simulated_subprocess)
+
+    target = install.install_plugin(
+        hermes_home_path=tmp_path,
+        mode="wrapper",
+        python=sys.executable,
+        import_timeout=60.0,
+        link_profiles=False,
+    )
+
+    assert target.is_dir()
+    assert observed_timeouts == [60.0, 60.0]
+
+
 def test_install_plugin_wrapper_creates_persistent_shim(tmp_path):
     target = install.install_plugin(
         hermes_home_path=tmp_path,
