@@ -4603,7 +4603,10 @@ class BeamMemory:
             else:
                 invalidated = validate_and_invalidate()
             if invalidated:
-                self._invalidate_query_cache_after_commit("invalidate")
+                if owns_transaction:
+                    self._invalidate_query_cache_after_commit("invalidate")
+                else:
+                    self._invalidate_query_cache()
             return invalidated
 
         now = datetime.now(timezone.utc).isoformat()
@@ -4927,6 +4930,7 @@ class BeamMemory:
         # uncommitted on the connection for a later unrelated commit to
         # silently include.
         cursor = self.conn.cursor()
+        owns_transaction = not self.conn.in_transaction
         with _guarded_transaction(self.conn):
             authorized_row = cursor.execute(
                 "SELECT rowid FROM working_memory WHERE id = ? AND (session_id = ? OR scope = 'global')",
@@ -4951,7 +4955,10 @@ class BeamMemory:
                     cursor.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
         forgotten = wm_rows > 0
         if forgotten:
-            self._invalidate_query_cache_after_commit("forget_working")
+            if owns_transaction:
+                self._invalidate_query_cache_after_commit("forget_working")
+            else:
+                self._invalidate_query_cache()
         return forgotten
 
     # ------------------------------------------------------------------

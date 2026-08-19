@@ -740,6 +740,48 @@ def test_post_commit_mutations_survive_query_cache_invalidation_failure(
         _close_memory(memory)
 
 
+@pytest.mark.parametrize("operation", ["invalidate", "forget_working"])
+def test_mutations_keep_cache_invalidation_errors_before_caller_commit(
+    monkeypatch, tmp_path: Path, operation: str
+):
+    """#594's warning-only contract starts only after this instance commits."""
+    memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+
+    def fail_invalidation():
+        raise RuntimeError("cache unavailable")
+
+    try:
+        memory_id = memory.remember(
+            f"issue 594 {operation} caller transaction sentinel", source="test"
+        )
+        replacement_id = memory.remember(
+            "issue 594 caller transaction replacement sentinel", source="test"
+        )
+        monkeypatch.setattr(memory, "_invalidate_query_cache", fail_invalidation)
+        memory.conn.execute("BEGIN")
+
+        with pytest.raises(RuntimeError, match="cache unavailable"):
+            if operation == "invalidate":
+                memory.invalidate(memory_id, replacement_id=replacement_id)
+            else:
+                memory.forget_working(memory_id)
+
+        assert memory.conn.in_transaction
+        memory.conn.rollback()
+        if operation == "invalidate":
+            row = memory.conn.execute(
+                "SELECT valid_until FROM working_memory WHERE id = ?", (memory_id,)
+            ).fetchone()
+            assert row is not None
+            assert row["valid_until"] is None
+        else:
+            assert memory.get(memory_id) is not None
+    finally:
+        if memory.conn.in_transaction:
+            memory.conn.rollback()
+        _close_memory(memory)
+
+
 def test_successful_invalidate_episodic_memory_invalidates_enhanced_recall_cache(
     monkeypatch, tmp_path: Path
 ):
