@@ -34,6 +34,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **Hermes wrapper validation timeout is configurable (#804).** `mnemosyne-hermes install --mode wrapper` now accepts `--import-timeout SECONDS` (default: 60) for both selected-Python validation probes, rejects non-positive/non-finite values, and gives a retry command when validation times out.
 - **Committed memory invalidations no longer report failure when enhanced-recall cache eviction fails (#594).** The mutation remains successful and the cache error is logged for reconciliation.
 - **Hermes providers no longer clear the shared host LLM backend while another primary provider remains active (#551).**
 - **The OpenAI-compatible modality retry test is deterministic under load (#798).** Its localhost stub handles one request at a time and records response statuses, so the 401/no-retry contract is checked against the response actually served.
