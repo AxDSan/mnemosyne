@@ -3,6 +3,7 @@
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -34,7 +35,8 @@ def test_install_cli_rejects_non_positive_or_nonfinite_import_timeout(value, cap
     assert "positive finite number" in capsys.readouterr().err
 
 
-def test_wrapper_validation_default_timeout_reaches_both_probes(tmp_path, monkeypatch):
+@pytest.mark.parametrize("import_timeout", [60.0, 90.0])
+def test_wrapper_validation_timeout_reaches_both_probes(tmp_path, monkeypatch, import_timeout):
     observed_timeouts = []
 
     def successful_probe(command, **kwargs):
@@ -45,11 +47,13 @@ def test_wrapper_validation_default_timeout_reaches_both_probes(tmp_path, monkey
 
     monkeypatch.setattr(install.subprocess, "run", successful_probe)
 
-    python, site_packages = install._validated_wrapper_environment(Path(sys.executable))
+    python, site_packages = install._validated_wrapper_environment(
+        Path(sys.executable), import_timeout=import_timeout
+    )
 
     assert python == Path(sys.executable)
     assert site_packages == tmp_path
-    assert observed_timeouts == [60.0, 60.0]
+    assert observed_timeouts == [import_timeout, import_timeout]
 
 
 def test_plugin_state_accepts_11_second_healthy_wrapper_import(tmp_path, monkeypatch):
@@ -134,7 +138,7 @@ def test_wrapper_import_timeout_diagnostic_quotes_windows_python_path(monkeypatc
         "--import-timeout",
         "120",
     ]
-    monkeypatch.setattr(install.os, "name", "nt")
+    monkeypatch.setattr(install, "os", SimpleNamespace(name="nt"))
 
     error = install._timeout_diagnostic(python, 60)
 

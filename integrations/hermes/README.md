@@ -184,7 +184,8 @@ from.
 For a wrapper install, `--import-timeout SECONDS` sets the timeout for both
 selected-`--python` validation probes. It defaults to 60 seconds. Use it when
 that selected interpreter needs longer to resolve its site-packages or import
-`mnemosyne_hermes`:
+`mnemosyne_hermes`. `SECONDS` must be positive and finite: zero, negative,
+`NaN`, and infinite values are rejected.
 
 ```bash
 mnemosyne-hermes install --mode wrapper --python /path/to/hermes/venv/bin/python --import-timeout 90
