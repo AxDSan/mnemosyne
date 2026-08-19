@@ -52,6 +52,31 @@ def test_wrapper_validation_default_timeout_reaches_both_probes(tmp_path, monkey
     assert observed_timeouts == [60.0, 60.0]
 
 
+def test_plugin_state_accepts_11_second_healthy_wrapper_import(tmp_path, monkeypatch):
+    """Status must share the 60-second wrapper-validation policy with install."""
+    target = tmp_path / "plugins" / "mnemosyne"
+    site_packages = tmp_path / "site-packages"
+    site_packages.mkdir()
+    install._write_wrapper_plugin(target, python=Path(sys.executable), site_packages=site_packages)
+    observed_timeouts = []
+
+    def slow_but_healthy_import(command, **kwargs):
+        timeout = kwargs["timeout"]
+        observed_timeouts.append(timeout)
+        if timeout < 11:
+            raise subprocess.TimeoutExpired(command, timeout)
+        return subprocess.CompletedProcess(command, 0, "0.0-test\n", "")
+
+    monkeypatch.setattr(install.subprocess, "run", slow_but_healthy_import)
+
+    state = install.plugin_state(hermes_home_path=tmp_path)
+
+    assert observed_timeouts == [60.0]
+    assert state.status == "installed"
+    assert state.installed is True
+    assert state.wrapper_import_ok is True
+
+
 def test_wrapper_install_timeout_preserves_existing_target(tmp_path, monkeypatch):
     target = tmp_path / "plugins" / "mnemosyne"
     target.mkdir(parents=True)

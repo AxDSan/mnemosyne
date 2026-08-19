@@ -424,8 +424,11 @@ def test_plugin_state_classifies_timed_out_wrapper_import_as_stale(tmp_path, mon
     site_packages = install._site_packages_for_python(Path(sys.executable))
     install._write_wrapper_plugin(target, python=Path(sys.executable), site_packages=site_packages)
 
+    observed_timeouts = []
+
     def raise_timeout(*args, **kwargs):
-        raise subprocess.TimeoutExpired(args[0], 10)
+        observed_timeouts.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
 
     monkeypatch.setattr(install.subprocess, "run", raise_timeout)
 
@@ -436,8 +439,10 @@ def test_plugin_state_classifies_timed_out_wrapper_import_as_stale(tmp_path, mon
     assert state.wrapper_import_ok is False
     assert state.wrapper_import_error is not None
     assert str(Path(sys.executable)) in state.wrapper_import_error
-    assert "10 seconds" in state.wrapper_import_error
-    assert "--import-timeout 20" in state.wrapper_import_error
+    assert observed_timeouts == [60.0]
+    assert "60 seconds" in state.wrapper_import_error
+    assert "Status uses the default 60-second wrapper validation timeout" in state.wrapper_import_error
+    assert "Retry with:" not in state.wrapper_import_error
 
 
 def test_plugin_state_reports_stale_wrapper_target(tmp_path):

@@ -24,7 +24,6 @@ from typing import Optional
 
 PLUGIN_NAME = "mnemosyne"
 DEFAULT_WRAPPER_IMPORT_TIMEOUT = 60.0
-STATUS_WRAPPER_IMPORT_TIMEOUT = 10.0
 SKILL_NAME = "mnemosyne-memory-override"
 SKILL_CATEGORY = "memory"
 BUNDLED_SKILL_RESOURCE = ("skills", SKILL_NAME, "SKILL.md")
@@ -380,12 +379,18 @@ def _parse_import_timeout(value: str) -> float:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
-def _timeout_diagnostic(python: Path, timeout: float) -> str:
+def _timeout_diagnostic(python: Path, timeout: float, *, retry_hint: bool = True) -> str:
     """Return an actionable timeout diagnostic for selected wrapper Python."""
     seconds = f"{timeout:g}"
+    message = f"wrapper validation timed out after {seconds} seconds for interpreter {python}."
+    if not retry_hint:
+        return message + (
+            " Status uses the default "
+            f"{DEFAULT_WRAPPER_IMPORT_TIMEOUT:g}-second wrapper validation timeout."
+        )
     retry_seconds = f"{max(timeout * 2, timeout + 1):g}"
     return (
-        f"wrapper validation timed out after {seconds} seconds for interpreter {python}. "
+        message + " "
         "Retry with: mnemosyne-hermes install --mode wrapper "
         f"--python {shlex.quote(str(python))} --import-timeout {retry_seconds}"
     )
@@ -419,6 +424,7 @@ def _check_wrapper_import(
     python: Path | None = None,
     *,
     import_timeout: float = DEFAULT_WRAPPER_IMPORT_TIMEOUT,
+    retry_hint: bool = True,
 ) -> tuple[bool, str | None, bool]:
     """Return import success, error text, and whether the runtime is invalid."""
     if not site_packages.is_dir():
@@ -464,7 +470,7 @@ def _check_wrapper_import(
     except OSError as exc:
         return False, f"could not run wrapper Python {runner}: {exc}", True
     except subprocess.TimeoutExpired:
-        return False, _timeout_diagnostic(runner, import_timeout), False
+        return False, _timeout_diagnostic(runner, import_timeout, retry_hint=retry_hint), False
     if result.returncode == 0:
         return True, None, False
     return False, (result.stderr.strip() or result.stdout.strip() or "import failed")[:500], False
@@ -566,7 +572,8 @@ def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
             wrapper_import_ok, wrapper_import_error, invalid_runtime = _check_wrapper_import(
                 wrapper_site,
                 wrapper_python,
-                import_timeout=STATUS_WRAPPER_IMPORT_TIMEOUT,
+                import_timeout=DEFAULT_WRAPPER_IMPORT_TIMEOUT,
+                retry_hint=False,
             )
             if not wrapper_import_ok:
                 status = "invalid_wrapper" if invalid_runtime else "stale_wrapper"
