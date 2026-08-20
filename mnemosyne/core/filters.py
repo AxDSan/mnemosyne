@@ -122,6 +122,7 @@ _CJK_IDEOGRAPHIC = (
     "\u1100-\u11ff"  # Hangul Jamo
     "\u3130-\u318f"  # Hangul Compatibility Jamo
     "\u31f0-\u31ff"  # Katakana Phonetic Extensions
+    "\u3005-\u3007"  # Ideographic iteration/closing marks and number zero
     "\u3400-\u4dbf"  # CJK Extension A
     "\uf900-\ufaff"  # CJK Compatibility Ideographs
     "\U00020000-\U0003347f"  # CJK Extensions B-J (non-BMP Han)

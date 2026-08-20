@@ -479,7 +479,10 @@ def test_safe_preview_keeps_cjk_non_bmp_prefix_then_prose():
     assert "<redact" not in preview
 
 
-@pytest.mark.parametrize("character", ["\u31f0", "\U000323b0", "\U0003347f"])
+@pytest.mark.parametrize(
+    "character",
+    ["\u3005", "\u3006", "\u3007", "\u31f0", "\U000323b0", "\U0003347f"],
+)
 def test_safe_preview_keeps_cjk_extension_j_prefix_then_prose(character):
     """CJK Extension J after an ASCII prefix must not be redacted."""
     prose = f"密码：abc12345{character}"

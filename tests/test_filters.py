@@ -225,6 +225,9 @@ class TestDetectSecretsCJK:
             "\uff86",  # halfwidth Katakana
             "\u2e80",  # CJK Radicals Supplement
             "\u2f00",  # Kangxi Radical
+            "\u3005",  # Ideographic iteration mark
+            "\u3006",  # Ideographic closing mark
+            "\u3007",  # Ideographic number zero
             "\u31f0",  # Katakana Phonetic Extensions
             "\U000323b0",  # CJK Extension J boundary
             "\U0003347f",  # CJK Extension J upper boundary
