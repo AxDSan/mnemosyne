@@ -188,6 +188,31 @@ def _source_to_trust_tier(source: str) -> str:
     # Conservative default: treat as direct user input
     return "STATED"
 
+
+def _clamp_memory_type(value: Optional[str]) -> Optional[str]:
+    """Validate an explicit memory_type label, or return None.
+
+    None passes through, which is the signal to fall back to the content
+    classifier. An unrecognized label also returns None, with a WARNING: a
+    typo should degrade to classification, not strip the type off the row.
+
+    Mirrors the posture of clamp_veracity -- validate at the lowest public
+    ingest path rather than trusting callers, since the value reaches a
+    column that recall filters on.
+    """
+    if value is None:
+        return None
+    if MemoryType is None:  # typed_memory unavailable; nothing to validate against
+        return None
+    candidate = str(value).strip().lower()
+    if candidate in {m.value for m in MemoryType}:
+        return candidate
+    logger.warning(
+        "remember: unknown memory_type %r; falling back to the classifier", value
+    )
+    return None
+
+
 try:
     import numpy as np
 except ImportError:
@@ -3461,6 +3486,13 @@ class BeamMemory:
         from mnemosyne.core.canonical import CanonicalStore
         self.canonical = CanonicalStore(db_path=self.db_path, conn=self.conn)
 
+        # Media assets + moment index (RFC 0003 phase 0). Wired exactly like
+        # CanonicalStore above: the store owns its own idempotent DDL, so
+        # existing banks acquire the tables on next open with no migration
+        # module. Zero lines in init_beam, which holds only first-party DDL.
+        from mnemosyne.core.media import MediaStore
+        self.media = MediaStore(db_path=self.db_path, conn=self.conn)
+
         # Phase 3: Episodic graph (shared connection)
         self.episodic_graph = None
         if EpisodicGraph is not None:
@@ -3635,7 +3667,9 @@ class BeamMemory:
                  extract_entities: bool = False,
                  extract: bool = False,
                  veracity: str = "unknown",
-                 trust_tier: str = None) -> str:
+                 trust_tier: str = None,
+                 memory_type: str = None,
+                 dedupe: bool = True) -> str:
         """Store into working_memory. Deduplicates exact content matches.
 
         When called from the legacy-compatible Mnemosyne.remember() path,
@@ -3657,6 +3691,29 @@ class BeamMemory:
             veracity: Confidence level -- 'stated', 'inferred', 'tool', 'imported', 'unknown'.
                 Non-canonical labels are clamped to 'unknown' with a WARNING
                 (mirrors the C12.b clamp at the hermes_memory_provider boundary).
+            memory_type: Optional explicit MemoryType value (e.g. 'artifact').
+                Overrides the content classifier entirely -- the classifier is
+                not consulted when this is supplied. Unrecognized labels log a
+                WARNING and fall back to classification, so a typo degrades to
+                default behaviour rather than stripping the type. Callers that
+                *know* what they are writing (a media caption is an artifact,
+                whatever its words look like) should set this.
+            dedupe: When False, skip the exact-content duplicate check and
+                always write a new row.
+
+                Callers writing programmatically-generated text need this. The
+                dedup key is (session_id, content), and generated text collides
+                far more readily than prose -- "a black frame", "a screenshot
+                of a terminal window", a repeated slide. Two such rows
+                describing *different* sources would otherwise collapse into
+                one, and any sidecar table binding to the returned id would
+                bind the second source's row to the first source's memory.
+                Nothing raises and the counts all look right, which is what
+                makes it worth an explicit opt-out.
+
+                Leaving dedupe on has a second effect worth knowing: the
+                dedup-update path applies memory_type via COALESCE, so an
+                explicit type on a colliding write retypes the existing row.
         """
         # Clamp veracity at the BeamMemory.remember entry too -- the
         # method is the lowest-level public ingest path under BeamMemory,
@@ -3683,8 +3740,12 @@ class BeamMemory:
             trust_tier = "STATED"
 
         # --- Typed memory classification (Phase 1 -- zero overhead) ---
-        memory_type = None
-        if classify_memory is not None:
+        # An explicit memory_type wins outright and short-circuits the
+        # classifier: a caller that declares the type knows something the
+        # content does not say. An unrecognized label degrades to
+        # classification rather than to NULL.
+        memory_type = _clamp_memory_type(memory_type)
+        if memory_type is None and classify_memory is not None:
             try:
                 result = classify_memory(content)
                 memory_type = result.memory_type.value
@@ -3692,7 +3753,7 @@ class BeamMemory:
                 pass  # Classifier failures are non-blocking
 
         # --- Deduplication: exact match ---
-        existing_id = self._find_duplicate(content)
+        existing_id = self._find_duplicate(content) if dedupe else None
         if existing_id:
             cursor = self.conn.cursor()
             # Dedup-update clears consolidated_at so a re-remembered row
@@ -3846,6 +3907,21 @@ class BeamMemory:
             # Enrichment can refill enhanced recall after the early post-commit eviction.
             self._invalidate_query_cache_after_remember_commit()
 
+    def remember_media(self, ref: str, **kwargs):
+        """Register a piece of media and, if configured, describe it.
+
+        Delegates to :func:`mnemosyne.core.media.remember_media`, which owns the
+        flow. Keeping the body here to one line is deliberate: `beam.py` is
+        already ~8,000 lines, and the ingest path is far easier to test as a
+        free function against a stub than as a method on this class.
+
+        Returns a ``MediaIngestResult``, not a bare id -- the degradation ladder
+        produces a status (``ok``/``partial``/``unavailable``/``refused``) that a
+        string return would discard, and ``unavailable`` is a success.
+        """
+        from mnemosyne.core.media import remember_media as _remember_media
+        return _remember_media(self, ref=ref, **kwargs)
+
     def remember_batch(self, items: List[Dict],
                        *,
                        veracity: Optional[str] = None,
@@ -3957,8 +4033,11 @@ class BeamMemory:
             memory_id = _generate_id(item["content"])
             ids.append(memory_id)
             # Typed memory classification
-            item_type = None
-            if classify_memory is not None:
+            # Per-item explicit type wins and short-circuits the classifier,
+            # matching remember(). There is no method-level default: a batch
+            # is heterogeneous by nature.
+            item_type = _clamp_memory_type(item.get("memory_type"))
+            if item_type is None and classify_memory is not None:
                 try:
                     result = classify_memory(item["content"])
                     item_type = result.memory_type.value
@@ -4524,9 +4603,16 @@ class BeamMemory:
             else:
                 invalidated = validate_and_invalidate()
             if invalidated:
-                self._invalidate_query_cache()
+                if owns_transaction:
+                    self._invalidate_query_cache_after_commit("invalidate")
+                else:
+                    self._invalidate_query_cache()
             return invalidated
 
+        # The no-replacement path mutates a single row directly.  Snapshot
+        # ownership before its first UPDATE: a caller-owned transaction must
+        # retain both its commit boundary and cache-failure rollback behavior.
+        owns_transaction = not self.conn.in_transaction
         now = datetime.now(timezone.utc).isoformat()
         # Try working_memory first
         cursor.execute("""
@@ -4535,8 +4621,11 @@ class BeamMemory:
             WHERE id = ? AND (session_id = ? OR scope = 'global')
         """, (now, replacement_id, memory_id, self.session_id))
         if cursor.rowcount > 0:
-            self.conn.commit()
-            self._invalidate_query_cache()
+            if owns_transaction:
+                self.conn.commit()
+                self._invalidate_query_cache_after_commit("invalidate")
+            else:
+                self._invalidate_query_cache()
             return True
         # Try episodic_memory
         cursor.execute("""
@@ -4545,9 +4634,13 @@ class BeamMemory:
             WHERE id = ? AND (session_id = ? OR scope = 'global')
         """, (now, replacement_id, memory_id, self.session_id))
         invalidated = cursor.rowcount > 0
-        self.conn.commit()
+        if owns_transaction:
+            self.conn.commit()
         if invalidated:
-            self._invalidate_query_cache()
+            if owns_transaction:
+                self._invalidate_query_cache_after_commit("invalidate")
+            else:
+                self._invalidate_query_cache()
         return invalidated
 
     def _detect_conflicts(self, rows: List[Dict], similarity_threshold: float = 0.88) -> List[tuple]:
@@ -4831,7 +4924,7 @@ class BeamMemory:
 
     def forget_working(self, memory_id: str) -> bool:
         """Delete a session-authorized working memory row and its cascade
-        (vector, annotations, embeddings) atomically."""
+        (vector, annotations, embeddings, gists) atomically."""
         # E6.a: the cascade-delete of annotations must be authorized by the
         # session-scoped working_memory DELETE. The annotations table has no
         # session_id column, so an unconditional `DELETE FROM annotations
@@ -4848,6 +4941,7 @@ class BeamMemory:
         # uncommitted on the connection for a later unrelated commit to
         # silently include.
         cursor = self.conn.cursor()
+        owns_transaction = not self.conn.in_transaction
         with _guarded_transaction(self.conn):
             authorized_row = cursor.execute(
                 "SELECT rowid FROM working_memory WHERE id = ? AND (session_id = ? OR scope = 'global')",
@@ -4865,9 +4959,17 @@ class BeamMemory:
                     "DELETE FROM annotations WHERE memory_id = ?", (memory_id,)
                 )
                 cursor.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
+                gists_table = cursor.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gists'"
+                ).fetchone()
+                if gists_table is not None:
+                    cursor.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
         forgotten = wm_rows > 0
         if forgotten:
-            self._invalidate_query_cache()
+            if owns_transaction:
+                self._invalidate_query_cache_after_commit("forget_working")
+            else:
+                self._invalidate_query_cache()
         return forgotten
 
     # ------------------------------------------------------------------

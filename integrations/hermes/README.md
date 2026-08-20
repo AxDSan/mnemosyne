@@ -179,6 +179,23 @@ mnemosyne-hermes install --dry-run          # shows which interpreter would be u
 symlink install, and selects the site-packages a `--mode wrapper` install imports
 from.
 
+#### Wrapper validation timeout
+
+For a wrapper install, `--import-timeout SECONDS` sets the timeout for both
+selected-`--python` validation probes. It defaults to 60 seconds. Use it when
+that selected interpreter needs longer to resolve its site-packages or import
+`mnemosyne_hermes`. `SECONDS` must be positive and finite: zero, negative,
+`NaN`, and infinite values are rejected.
+
+```bash
+mnemosyne-hermes install --mode wrapper --python /path/to/hermes/venv/bin/python --import-timeout 90
+mnemosyne-hermes install --mode wrapper --python /path/to/hermes/venv/bin/python --no-bootstrap --import-timeout 90
+```
+
+The second form still validates the selected wrapper interpreter; `--no-bootstrap`
+only skips automatic package installation. `mnemosyne-hermes status` intentionally
+uses its fixed 60-second validation policy, independent of an install-time override.
+
 The installer also deploys the bundled `mnemosyne-memory-override` skill to
 `$HERMES_HOME/skills/memory/mnemosyne-memory-override/SKILL.md`. The skill is a
 behavioral guardrail that nudges agents away from the legacy `memory` tool for

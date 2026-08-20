@@ -220,6 +220,35 @@ def test_is_installed_stays_false_for_broken_symlink(tmp_path):
     assert install.is_installed(hermes_home_path=tmp_path) is False
 
 
+def test_wrapper_install_accepts_an_11_second_import_with_60_second_timeout(tmp_path, monkeypatch):
+    """A slow but healthy selected runtime must not inherit the old 10s ceiling."""
+    site_packages = tmp_path / "site-packages"
+    site_packages.mkdir()
+    observed_timeouts = []
+
+    def simulated_subprocess(command, **kwargs):
+        timeout = kwargs["timeout"]
+        observed_timeouts.append(timeout)
+        if "-S" in command and timeout < 11:
+            raise subprocess.TimeoutExpired(command, timeout)
+        if "-S" in command:
+            return subprocess.CompletedProcess(command, 0, "0.0-test\n", "")
+        return subprocess.CompletedProcess(command, 0, f"{site_packages}\n", "")
+
+    monkeypatch.setattr(install.subprocess, "run", simulated_subprocess)
+
+    target = install.install_plugin(
+        hermes_home_path=tmp_path,
+        mode="wrapper",
+        python=sys.executable,
+        import_timeout=60.0,
+        link_profiles=False,
+    )
+
+    assert target.is_dir()
+    assert observed_timeouts == [60.0, 60.0]
+
+
 def test_install_plugin_wrapper_creates_persistent_shim(tmp_path):
     target = install.install_plugin(
         hermes_home_path=tmp_path,
@@ -395,8 +424,11 @@ def test_plugin_state_classifies_timed_out_wrapper_import_as_stale(tmp_path, mon
     site_packages = install._site_packages_for_python(Path(sys.executable))
     install._write_wrapper_plugin(target, python=Path(sys.executable), site_packages=site_packages)
 
+    observed_timeouts = []
+
     def raise_timeout(*args, **kwargs):
-        raise subprocess.TimeoutExpired(args[0], 10)
+        observed_timeouts.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
 
     monkeypatch.setattr(install.subprocess, "run", raise_timeout)
 
@@ -405,7 +437,14 @@ def test_plugin_state_classifies_timed_out_wrapper_import_as_stale(tmp_path, mon
     assert state.status == "stale_wrapper"
     assert state.installed is False
     assert state.wrapper_import_ok is False
-    assert state.wrapper_import_error == f"wrapper Python import timed out: {Path(sys.executable)}"
+    assert state.wrapper_import_error is not None
+    assert str(Path(sys.executable)) in state.wrapper_import_error
+    assert observed_timeouts == [60.0]
+    assert "fixed default 60-second policy" in state.wrapper_import_error
+    assert "Inspect the selected interpreter and its import performance" in state.wrapper_import_error
+    assert "--import-timeout only affects installer validation" in state.wrapper_import_error
+    assert "--import-timeout 120" not in state.wrapper_import_error
+    assert "Retry with:" not in state.wrapper_import_error
 
 
 def test_plugin_state_reports_stale_wrapper_target(tmp_path):
