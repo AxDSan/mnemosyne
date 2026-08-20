@@ -252,10 +252,14 @@ class TestDetectSecretsCJK:
             "\u31f0",  # Katakana Phonetic Extensions
             "\U000323b0",  # CJK Extension J boundary
             "\U0003347f",  # CJK Extension J upper boundary
+            "\uff10",  # fullwidth digit
+            "\uff21",  # fullwidth Latin uppercase letter
+            "\uff41",  # fullwidth Latin lowercase letter
+            "\uffa0",  # halfwidth Hangul filler
         ],
     )
     def test_negative_ascii_prefix_then_cjk_block(self, char):
-        """Any CJK block in the value, BMP or non-BMP, must reject it."""
+        """CJK or fullwidth prose after an ASCII prefix must reject it."""
         hits = detect_secrets(f"密码：abc12345{char}")
         assert hits == []
 

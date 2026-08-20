@@ -112,12 +112,20 @@ _CJK_PROSE_RANGES = (
 )
 
 # CJK prose characters that must not directly follow a credential token:
-# ideographs, kana, hangul, and radicals. Excludes CJK punctuation and fullwidth
-# forms so a token followed by "，请勿外传" (comma + prose) is still detected.
+# ideographs, kana, hangul, radicals, and word-like fullwidth forms. Excludes
+# CJK/fullwidth punctuation so "，请勿外传" after a token is still detected.
 _CJK_IDEOGRAPHIC = (
     "\u4e00-\u9fff"  # Han ideographs
     "\u3040-\u30ff"  # Hiragana + Katakana
     "\uff66-\uff9f"  # Halfwidth Katakana
+    "\uff10-\uff19"  # Fullwidth digits
+    "\uff21-\uff3a"  # Fullwidth Latin uppercase
+    "\uff41-\uff5a"  # Fullwidth Latin lowercase
+    "\uffa0-\uffbe"  # Halfwidth Hangul filler + letters
+    "\uffc2-\uffc7"  # Halfwidth Hangul letters
+    "\uffca-\uffcf"  # Halfwidth Hangul letters
+    "\uffd2-\uffd7"  # Halfwidth Hangul letters
+    "\uffda-\uffdc"  # Halfwidth Hangul letters
     "\uac00-\ud7af"  # Hangul syllables
     "\u1100-\u11ff"  # Hangul Jamo
     "\u3130-\u318f"  # Hangul Compatibility Jamo
