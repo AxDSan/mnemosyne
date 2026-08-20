@@ -1081,11 +1081,11 @@ def cmd_restore(args):
     try:
         result = restore_backup(Path(args[0]))
         status = "valid" if result["integrity_check"] else "corrupt"
+        if not result["integrity_check"]:
+            _fail("restore_failed", exit_code=1)
         print(f"Restored from: {result['backup_used']}")
         print(f"  Database:     {result['database_path']}")
         print(f"  Integrity:    {status}")
-        if not result["integrity_check"]:
-            _fail("restore_failed", exit_code=1)
     except Exception:
         _fail("restore_failed", exit_code=1)
 
@@ -1455,13 +1455,16 @@ def cmd_hygiene(args):
         if not db_path.exists():
             _fail("hygiene_clean_failed", exit_code=1)
 
-        result = clean_noise(
-            db_path=db_path,
-            candidates=candidates,
-            action=action,
-            confirm=confirm,
-            dry_run=dry_run,
-        )
+        try:
+            result = clean_noise(
+                db_path=db_path,
+                candidates=candidates,
+                action=action,
+                confirm=confirm,
+                dry_run=dry_run,
+            )
+        except Exception:
+            _fail("hygiene_clean_failed", exit_code=1)
 
         mode = "DRY RUN" if dry_run else "APPLIED"
         print(f"[{mode}] deleted={result.deleted} archived={result.archived} "
@@ -1484,7 +1487,10 @@ def cmd_hygiene(args):
         if not db_path.exists():
             _fail("hygiene_restore_failed", exit_code=1)
 
-        restored = restore_archived(db_path=db_path, limit=restore_limit)
+        try:
+            restored = restore_archived(db_path=db_path, limit=restore_limit)
+        except Exception:
+            _fail("hygiene_restore_failed", exit_code=1)
         print(f"Restored {restored} archived memories.")
 
     else:
@@ -1791,8 +1797,6 @@ def run_cli():
         return
 
     command = sys.argv[1]
-    if command not in {"doctor", "repair"}:
-        os.makedirs(DATA_DIR, exist_ok=True)
     handler = COMMANDS.get(command)
 
     if handler:
@@ -1800,6 +1804,8 @@ def run_cli():
         # machine-readable code, never a traceback (which leaks absolute
         # paths and library internals into logs).
         try:
+            if command not in {"doctor", "repair"}:
+                os.makedirs(DATA_DIR, exist_ok=True)
             handler(sys.argv[2:])
         except SystemExit:
             raise

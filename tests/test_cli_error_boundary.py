@@ -162,6 +162,23 @@ def test_restore_injected_failure_is_static(tmp_path):
     _assert_static_failure(result, "restore_failed", tmp_path)
 
 
+def test_restore_integrity_failure_does_not_leak_result_paths(tmp_path):
+    script = (
+        "import mnemosyne.dr.recovery as _rec\n"
+        "def _failed_restore(*a, **k):\n"
+        "    return {'integrity_check': False, "
+        "'backup_used': 'TASK18_BACKUP_PATH', "
+        "'database_path': 'TASK18_DATABASE_PATH'}\n"
+        "_rec.restore_backup = _failed_restore\n"
+    )
+    result = _run_cli_script(
+        script, tmp_path, argv_tail=["restore", "ignored-backup.db.gz"]
+    )
+    _assert_static_failure(result, "restore_failed", tmp_path)
+    assert "TASK18_BACKUP_PATH" not in result.stdout + result.stderr
+    assert "TASK18_DATABASE_PATH" not in result.stdout + result.stderr
+
+
 # ---------------------------------------------------------------------------
 # verify
 # ---------------------------------------------------------------------------
@@ -215,6 +232,48 @@ def test_hygiene_audit_corrupt_database_is_static(tmp_path):
 def test_hygiene_status_missing_database_is_static(tmp_path):
     result = _run_cli_script("", tmp_path, argv_tail=["hygiene", "status"])
     _assert_static_failure(result, "hygiene_status_failed", tmp_path)
+
+
+def test_hygiene_clean_backend_failure_is_command_specific(tmp_path):
+    data_dir = tmp_path / "mnemosyne-data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "mnemosyne.db").touch()
+    candidates = tmp_path / "candidates.json"
+    candidates.write_text("[]")
+    script = (
+        "import mnemosyne.core.hygiene as _hygiene\n"
+        "def _boom(*a, **k):\n"
+        f"    raise RuntimeError('{CANARY}')\n"
+        "_hygiene.clean_noise = _boom\n"
+    )
+    result = _run_cli_script(
+        script,
+        tmp_path,
+        argv_tail=["hygiene", "clean", "--dry-run", str(candidates)],
+    )
+    _assert_static_failure(result, "hygiene_clean_failed", tmp_path)
+
+
+def test_hygiene_restore_backend_failure_is_command_specific(tmp_path):
+    data_dir = tmp_path / "mnemosyne-data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "mnemosyne.db").touch()
+    script = (
+        "import mnemosyne.core.hygiene as _hygiene\n"
+        "def _boom(*a, **k):\n"
+        f"    raise RuntimeError('{CANARY}')\n"
+        "_hygiene.restore_archived = _boom\n"
+    )
+    result = _run_cli_script(
+        script, tmp_path, argv_tail=["hygiene", "restore"]
+    )
+    _assert_static_failure(result, "hygiene_restore_failed", tmp_path)
+
+
+def test_existing_data_dir_file_is_contained(tmp_path):
+    script = "_Path(_os.environ['MNEMOSYNE_DATA_DIR']).write_text('not a directory')"
+    result = _run_cli_script(script, tmp_path, argv_tail=["store", "content"])
+    _assert_static_failure(result, "cli_unexpected_failure", tmp_path)
 
 
 # ---------------------------------------------------------------------------
