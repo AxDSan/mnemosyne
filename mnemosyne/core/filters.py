@@ -106,6 +106,7 @@ _CJK_PROSE_RANGES = (
     "\U00020000-\U0003347f"  # CJK Extensions B-J (non-BMP Han)
     "\u1100-\u11ff"  # Hangul Jamo
     "\u3130-\u318f"  # Hangul Compatibility Jamo
+    "\u31f0-\u31ff"  # Katakana Phonetic Extensions
     "\u2e80-\u2eff"  # CJK Radicals Supplement
     "\u2f00-\u2fdf"  # Kangxi Radicals
 )
@@ -120,6 +121,7 @@ _CJK_IDEOGRAPHIC = (
     "\uac00-\ud7af"  # Hangul syllables
     "\u1100-\u11ff"  # Hangul Jamo
     "\u3130-\u318f"  # Hangul Compatibility Jamo
+    "\u31f0-\u31ff"  # Katakana Phonetic Extensions
     "\u3400-\u4dbf"  # CJK Extension A
     "\uf900-\ufaff"  # CJK Compatibility Ideographs
     "\U00020000-\U0003347f"  # CJK Extensions B-J (non-BMP Han)

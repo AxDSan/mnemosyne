@@ -188,6 +188,19 @@ class TestDetectSecretsCJK:
         hits = detect_secrets("密码：!!!!!!!! nextword")
         assert hits == []
 
+    def test_exact_eight_character_alphanumeric_value_is_detected(self):
+        # nosec - test fixture
+        assert "cjk_secret_assignment" in detect_secrets("密码：Abc12345")
+
+    def test_exact_eight_character_ascii_symbol_value_is_rejected(self):
+        assert detect_secrets("密码：!!!!!!!!") == []
+
+    def test_japanese_policy_prose_is_not_detected(self):
+        assert detect_secrets("パスワード：定期的に変更してください") == []
+
+    def test_korean_policy_prose_is_not_detected(self):
+        assert detect_secrets("비밀번호: 90일마다변경") == []
+
     def test_negative_mixed_cjk_value(self):
         """A value mixing CJK prose with digits is still prose, not a secret."""
         hits = detect_secrets("数据库密码：我的密码是12345678")
@@ -212,6 +225,7 @@ class TestDetectSecretsCJK:
             "\uff86",  # halfwidth Katakana
             "\u2e80",  # CJK Radicals Supplement
             "\u2f00",  # Kangxi Radical
+            "\u31f0",  # Katakana Phonetic Extensions
             "\U000323b0",  # CJK Extension J boundary
             "\U0003347f",  # CJK Extension J upper boundary
         ],
