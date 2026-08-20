@@ -2784,6 +2784,27 @@ class TestConsolidationHealth:
         assert h["status"] == "healthy"
         assert h["last_successful_consolidation"] is not None
 
+    def test_health_error_count_only_counts_zero_item_error_or_fail(self, temp_db):
+        """Successful rows mentioning 'fail' must not count as errors."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        conn = sqlite3.connect(temp_db)
+        conn.executemany(
+            "INSERT INTO consolidation_log (session_id, items_consolidated, summary_preview) VALUES (?, ?, ?)",
+            [
+                ("s1", 5, "consolidated successfully"),
+                ("s1", 5, "a sub-step failed once, then succeeded"),
+                ("s1", 5, "completed with no error after retry"),
+                ("s1", 0, "nothing to consolidate"),
+                ("s1", 0, "ERROR: LLM unavailable"),
+                ("s1", 0, "consolidation FAILED: timeout"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        h = beam.health()
+        assert h["error_count"] == 2
+
 
 class TestUpdateRefreshesDerivedState:
     """Issue #110: update() must reindex FTS5 + recompute vector embeddings."""
