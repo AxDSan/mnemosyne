@@ -9,13 +9,9 @@ Covers:
 - Backward compat: classifier off = only regex patterns apply
 """
 
-import os
 import pytest
 
 from mnemosyne.core.filters import (
-    DEFAULT_NOISE_PATTERNS,
-    SECRET_PATTERNS,
-    WriteDecision,
     classify_memory_write,
     detect_secrets,
     matches_patterns,
