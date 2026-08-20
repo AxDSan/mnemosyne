@@ -104,10 +104,12 @@ _CJK_PROSE_RANGES = (
 )
 
 # Credential-value predicate: 8+ characters, no whitespace / quotes / brackets,
-# no CJK characters, and at least one ASCII letter or digit. Keeps CJK-labelled
-# assignment detection from classifying ordinary Chinese policy prose as a
-# secret while still catching tokens like "s3cr3t_pa55word_x1y2z3w4".
+# no CJK characters anywhere in the complete non-delimited value, and at least
+# one ASCII letter or digit. The CJK rejections apply to the whole token, so
+# mixed prose like "abc12345我的密码" (ASCII prefix followed by CJK) is never
+# treated as a secret, while "s3cr3t_pa55word_x1y2z3w4" still is.
 _CREDENTIAL_VALUE = (
+    r"(?![^\s'\"<>{}]*[" + _CJK_PROSE_RANGES + r"])"
     r"(?=(?:(?![" + _CJK_PROSE_RANGES + r"])[^\s'\"<>{}])*[A-Za-z0-9])"
     r"(?:(?![" + _CJK_PROSE_RANGES + r"])[^\s'\"<>{}]){8,}"
 )

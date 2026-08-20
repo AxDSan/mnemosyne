@@ -180,6 +180,11 @@ class TestDetectSecretsCJK:
         hits = detect_secrets("数据库密码：我的密码是12345678")
         assert hits == []
 
+    def test_negative_ascii_prefix_then_cjk(self):
+        """An ASCII prefix followed by CJK prose must not be a secret."""
+        hits = detect_secrets("密码：abc12345我的密码")
+        assert hits == []
+
 
 # ---------------------------------------------------------------------------
 # classify_memory_write
