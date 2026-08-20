@@ -158,7 +158,9 @@ SECRET_LABELED_PATTERNS: List[tuple] = [
     ("google_api_key", r"AIza[0-9A-Za-z_\-]{35}"),
     ("jwt_token", r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
     ("secret_assignment", r"(?i)(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)"
-                          r"\s*[=:：＝]\s*['\"]?[^\s'\"<>{}]{8,}"),
+                          r"\s*(?:"
+                          r"[=:]\s*['\"]?[^\s'\"<>{}]{8,}|"
+                          r"[：＝]\s*['\"]?" + _CREDENTIAL_VALUE + r"['\"]?)"),
     ("cjk_secret_assignment",
      r"(?:" + _CJK_SECRET_LABELS + r")"
      r"\s*[:=：＝]\s*['\"]?" + _CREDENTIAL_VALUE + r"['\"]?"),

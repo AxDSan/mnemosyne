@@ -135,6 +135,18 @@ class TestScoreNoise:
         score, reasons = _score_noise("密码：建议每90天更换一次", 0.5, "user")
         assert not any("secret" in r for r in reasons)
 
+    @pytest.mark.parametrize(
+        "prose",
+        [
+            "password：建议每90天更换一次",
+            "password＝建议每90天更换一次",
+        ],
+    )
+    def test_english_label_fullwidth_separator_policy_prose_not_flagged(self, prose):
+        """English labels with fullwidth separators must not flag CJK prose."""
+        _score, reasons = _score_noise(prose, 0.5, "user")
+        assert "secret_detected:secret_assignment" not in reasons
+
     def test_cjk_ascii_prefix_then_prose_not_flagged(self):
         """ASCII prefix followed by CJK prose must not be flagged."""
         score, reasons = _score_noise("密码：abc12345我的密码", 0.5, "user")

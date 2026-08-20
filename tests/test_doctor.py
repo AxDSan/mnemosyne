@@ -463,6 +463,18 @@ def test_safe_preview_keeps_cjk_policy_prose():
     assert "<redact" not in preview
 
 
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "password：建议每90天更换一次",
+        "password＝建议每90天更换一次",
+    ],
+)
+def test_safe_preview_keeps_english_label_fullwidth_separator_policy_prose(prose):
+    """English labels with fullwidth separators must not redact CJK prose."""
+    assert doctor.safe_preview(prose, max_length=120) == prose
+
+
 def test_safe_preview_keeps_cjk_ascii_prefix_then_prose():
     """ASCII prefix followed by CJK prose must not be redacted."""
     prose = "密码：abc12345我的密码"

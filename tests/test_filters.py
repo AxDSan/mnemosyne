@@ -163,6 +163,17 @@ class TestDetectSecretsCJK:
         hits = detect_secrets("password：s3cr3t_pa55word_x1y2z3w4")
         assert "secret_assignment" in hits
 
+    @pytest.mark.parametrize(
+        "prose",
+        [
+            "password：建议每90天更换一次",
+            "password＝建议每90天更换一次",
+        ],
+    )
+    def test_english_label_fullwidth_separator_policy_prose_not_detected(self, prose):
+        """Fullwidth separators must not make English labels match CJK prose."""
+        assert detect_secrets(prose) == []
+
     def test_negative_chinese_policy_prose_after_label(self):
         """Ordinary Chinese policy prose after a label must not be a secret."""
         hits = detect_secrets("密码：建议每90天更换一次")
