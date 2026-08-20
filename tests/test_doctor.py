@@ -446,6 +446,15 @@ def test_safe_preview_redacts_cjk_labeled_secret():
     assert "<redact" in preview
 
 
+def test_safe_preview_redacts_cjk_secret_with_trailing_prose():
+    """Trailing CJK prose must not let a CJK-labelled secret survive."""
+    # nosec - test fixture
+    raw_secret = "s3cr3t_pa55word_x1y2z3w4"
+    preview = doctor.safe_preview(f"数据库密码：{raw_secret}，请勿外传", max_length=120)
+    assert raw_secret not in preview
+    assert "<redact" in preview
+
+
 def test_safe_preview_keeps_cjk_policy_prose():
     """Ordinary Chinese policy prose after a label must not be redacted."""
     prose = "密码：建议每90天更换一次"

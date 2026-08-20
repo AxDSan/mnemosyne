@@ -124,6 +124,12 @@ class TestScoreNoise:
         assert "secret_detected:cjk_secret_assignment" in reasons
         assert _suggest_action(score, ["cjk_secret_assignment"]) == "flag"
 
+    def test_cjk_secret_with_trailing_prose_flagged(self):
+        """Trailing CJK prose must not hide a CJK-labelled secret."""
+        # nosec - test fixture
+        score, reasons = _score_noise("数据库密码：s3cr3t_pa55word_x1y2z3w4，请勿外传", 0.5, "user")
+        assert "secret_detected:cjk_secret_assignment" in reasons
+
     def test_cjk_policy_prose_not_flagged(self):
         """Ordinary Chinese policy prose after a label must stay clean."""
         score, reasons = _score_noise("密码：建议每90天更换一次", 0.5, "user")

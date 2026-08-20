@@ -146,6 +146,23 @@ class TestDetectSecretsCJK:
         hits = detect_secrets('令牌："ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123"')
         assert "cjk_secret_assignment" in hits
 
+    def test_positive_secret_with_trailing_cjk_prose(self):
+        """Trailing CJK punctuation + prose must not hide a secret."""
+        # nosec - test fixture
+        hits = detect_secrets("数据库密码：s3cr3t_pa55word_x1y2z3w4，请勿外传")
+        assert "cjk_secret_assignment" in hits
+
+    def test_positive_secret_with_trailing_cjk_period(self):
+        # nosec - test fixture
+        hits = detect_secrets("数据库密码：s3cr3t_pa55word_x1y2z3w4。")
+        assert "cjk_secret_assignment" in hits
+
+    def test_positive_english_label_fullwidth_separator(self):
+        """An English label with a fullwidth separator must be detected."""
+        # nosec - test fixture
+        hits = detect_secrets("password：s3cr3t_pa55word_x1y2z3w4")
+        assert "secret_assignment" in hits
+
     def test_negative_chinese_policy_prose_after_label(self):
         """Ordinary Chinese policy prose after a label must not be a secret."""
         hits = detect_secrets("密码：建议每90天更换一次")
@@ -193,6 +210,8 @@ class TestDetectSecretsCJK:
             "\u1100",  # Hangul Jamo
             "\u3130",  # Hangul Compatibility Jamo
             "\uff86",  # halfwidth Katakana
+            "\u2e80",  # CJK Radicals Supplement
+            "\u2f00",  # Kangxi Radical
         ],
     )
     def test_negative_ascii_prefix_then_cjk_block(self, char):

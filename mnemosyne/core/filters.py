@@ -106,17 +106,37 @@ _CJK_PROSE_RANGES = (
     "\U00020000-\U000323af"  # CJK Extensions B-H (non-BMP Han)
     "\u1100-\u11ff"  # Hangul Jamo
     "\u3130-\u318f"  # Hangul Compatibility Jamo
+    "\u2e80-\u2eff"  # CJK Radicals Supplement
+    "\u2f00-\u2fdf"  # Kangxi Radicals
+)
+
+# CJK prose characters that must not directly follow a credential token:
+# ideographs, kana, hangul, and radicals. Excludes CJK punctuation and fullwidth
+# forms so a token followed by "，请勿外传" (comma + prose) is still detected.
+_CJK_IDEOGRAPHIC = (
+    "\u4e00-\u9fff"  # Han ideographs
+    "\u3040-\u30ff"  # Hiragana + Katakana
+    "\uff66-\uff9f"  # Halfwidth Katakana
+    "\uac00-\ud7af"  # Hangul syllables
+    "\u1100-\u11ff"  # Hangul Jamo
+    "\u3130-\u318f"  # Hangul Compatibility Jamo
+    "\u3400-\u4dbf"  # CJK Extension A
+    "\uf900-\ufaff"  # CJK Compatibility Ideographs
+    "\U00020000-\U000323af"  # CJK Extensions B-H (non-BMP Han)
+    "\u2e80-\u2eff"  # CJK Radicals Supplement
+    "\u2f00-\u2fdf"  # Kangxi Radicals
 )
 
 # Credential-value predicate: 8+ characters, no whitespace / quotes / brackets,
-# no CJK characters anywhere in the complete non-delimited value, and at least
-# one ASCII letter or digit. The CJK rejections apply to the whole token, so
-# mixed prose like "abc12345我的密码" (ASCII prefix followed by CJK) is never
-# treated as a secret, while "s3cr3t_pa55word_x1y2z3w4" still is.
+# no CJK characters, and at least one ASCII letter or digit. The token is the
+# contiguous non-CJK run after the separator, and it must not be directly
+# followed by CJK prose, so mixed prose like "abc12345我的密码" is never treated
+# as a secret while "s3cr3t_pa55word_x1y2z3w4" (even with trailing "，请勿外传")
+# still is.
 _CREDENTIAL_VALUE = (
-    r"(?![^\s'\"<>{}]*[" + _CJK_PROSE_RANGES + r"])"
     r"(?=(?:(?![" + _CJK_PROSE_RANGES + r"])[^\s'\"<>{}])*[A-Za-z0-9])"
     r"(?:(?![" + _CJK_PROSE_RANGES + r"])[^\s'\"<>{}]){8,}"
+    r"(?![" + _CJK_IDEOGRAPHIC + r"])"
 )
 
 # Curated CJK secret labels (exact labels only, never generic substrings).
@@ -135,7 +155,7 @@ SECRET_LABELED_PATTERNS: List[tuple] = [
     ("google_api_key", r"AIza[0-9A-Za-z_\-]{35}"),
     ("jwt_token", r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
     ("secret_assignment", r"(?i)(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)"
-                          r"\s*[=:]\s*['\"]?[^\s'\"<>{}]{8,}"),
+                          r"\s*[=:：＝]\s*['\"]?[^\s'\"<>{}]{8,}"),
     ("cjk_secret_assignment",
      r"(?:" + _CJK_SECRET_LABELS + r")"
      r"\s*[:=：＝]\s*['\"]?" + _CREDENTIAL_VALUE + r"['\"]?"),
