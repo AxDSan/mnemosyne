@@ -479,6 +479,15 @@ def test_safe_preview_keeps_cjk_non_bmp_prefix_then_prose():
     assert "<redact" not in preview
 
 
+@pytest.mark.parametrize("character", ["\U000323b0", "\U0003347f"])
+def test_safe_preview_keeps_cjk_extension_j_prefix_then_prose(character):
+    """CJK Extension J after an ASCII prefix must not be redacted."""
+    prose = f"密码：abc12345{character}"
+    preview = doctor.safe_preview(prose, max_length=120)
+    assert prose in preview
+    assert "<redact" not in preview
+
+
 def test_safe_preview_redacts_cjk_secret_before_truncating():
     """Truncation must not let a CJK-labelled secret value survive."""
     # nosec - test fixture

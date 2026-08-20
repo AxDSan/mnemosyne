@@ -145,6 +145,12 @@ class TestScoreNoise:
         score, reasons = _score_noise("密码：abc12345\U00020000", 0.5, "user")
         assert not any("secret" in r for r in reasons)
 
+    @pytest.mark.parametrize("character", ["\U000323b0", "\U0003347f"])
+    def test_cjk_extension_j_prefix_then_prose_not_flagged(self, character):
+        """CJK Extension J after an ASCII prefix must not be flagged."""
+        score, reasons = _score_noise(f"密码：abc12345{character}", 0.5, "user")
+        assert not any("secret" in r for r in reasons)
+
     def test_secret_with_value_keyword_not_dampened(self):
         """Secret + value keyword should NOT dampen the score."""
         # nosec - test fixture

@@ -103,7 +103,7 @@ _CJK_PROSE_RANGES = (
     "\uff00-\uffef"  # Fullwidth forms
     "\u3400-\u4dbf"  # CJK Extension A
     "\uf900-\ufaff"  # CJK Compatibility Ideographs
-    "\U00020000-\U000323af"  # CJK Extensions B-H (non-BMP Han)
+    "\U00020000-\U0003347f"  # CJK Extensions B-J (non-BMP Han)
     "\u1100-\u11ff"  # Hangul Jamo
     "\u3130-\u318f"  # Hangul Compatibility Jamo
     "\u2e80-\u2eff"  # CJK Radicals Supplement
@@ -122,7 +122,7 @@ _CJK_IDEOGRAPHIC = (
     "\u3130-\u318f"  # Hangul Compatibility Jamo
     "\u3400-\u4dbf"  # CJK Extension A
     "\uf900-\ufaff"  # CJK Compatibility Ideographs
-    "\U00020000-\U000323af"  # CJK Extensions B-H (non-BMP Han)
+    "\U00020000-\U0003347f"  # CJK Extensions B-J (non-BMP Han)
     "\u2e80-\u2eff"  # CJK Radicals Supplement
     "\u2f00-\u2fdf"  # Kangxi Radicals
 )

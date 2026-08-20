@@ -212,6 +212,8 @@ class TestDetectSecretsCJK:
             "\uff86",  # halfwidth Katakana
             "\u2e80",  # CJK Radicals Supplement
             "\u2f00",  # Kangxi Radical
+            "\U000323b0",  # CJK Extension J boundary
+            "\U0003347f",  # CJK Extension J upper boundary
         ],
     )
     def test_negative_ascii_prefix_then_cjk_block(self, char):
