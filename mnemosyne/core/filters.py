@@ -122,9 +122,13 @@ _CJK_IDEOGRAPHIC = (
     "\uff21-\uff3a"  # Fullwidth Latin uppercase
     "\uff41-\uff5a"  # Fullwidth Latin lowercase
     "\uffa0-\uffbe"  # Halfwidth Hangul filler + letters
+    "\uffbf-\uffc1"  # Reserved allocation gap
     "\uffc2-\uffc7"  # Halfwidth Hangul letters
+    "\uffc8-\uffc9"  # Reserved allocation gap
     "\uffca-\uffcf"  # Halfwidth Hangul letters
+    "\uffd0-\uffd1"  # Reserved allocation gap
     "\uffd2-\uffd7"  # Halfwidth Hangul letters
+    "\uffd8-\uffd9"  # Reserved allocation gap
     "\uffda-\uffdc"  # Halfwidth Hangul letters
     "\uac00-\ud7af"  # Hangul syllables
     "\u1100-\u11ff"  # Hangul Jamo

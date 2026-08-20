@@ -256,6 +256,14 @@ class TestDetectSecretsCJK:
             "\uff21",  # fullwidth Latin uppercase letter
             "\uff41",  # fullwidth Latin lowercase letter
             "\uffa0",  # halfwidth Hangul filler
+            "\uffbf",
+            "\uffc1",
+            "\uffc8",
+            "\uffc9",
+            "\uffd0",
+            "\uffd1",
+            "\uffd8",
+            "\uffd9",
         ],
     )
     def test_negative_ascii_prefix_then_cjk_block(self, char):

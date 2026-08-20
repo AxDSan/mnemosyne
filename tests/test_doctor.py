@@ -502,6 +502,14 @@ def test_safe_preview_keeps_cjk_non_bmp_prefix_then_prose():
         "\U0003347f",
         "\uff21",
         "\uffa0",
+        "\uffbf",
+        "\uffc1",
+        "\uffc8",
+        "\uffc9",
+        "\uffd0",
+        "\uffd1",
+        "\uffd8",
+        "\uffd9",
     ],
 )
 def test_safe_preview_keeps_cjk_boundary_prefix_then_prose(character):

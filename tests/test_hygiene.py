@@ -168,6 +168,14 @@ class TestScoreNoise:
             "\U0003347f",
             "\uff21",
             "\uffa0",
+            "\uffbf",
+            "\uffc1",
+            "\uffc8",
+            "\uffc9",
+            "\uffd0",
+            "\uffd1",
+            "\uffd8",
+            "\uffd9",
         ],
     )
     def test_cjk_boundary_prefix_then_prose_not_flagged(self, character):
