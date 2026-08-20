@@ -157,10 +157,11 @@ class TestDetectSecretsCJK:
         hits = detect_secrets("数据库密码：s3cr3t_pa55word_x1y2z3w4。")
         assert "cjk_secret_assignment" in hits
 
-    def test_positive_english_label_fullwidth_separator(self):
+    @pytest.mark.parametrize("separator", ["：", "＝"])
+    def test_positive_english_label_fullwidth_separator(self, separator):
         """An English label with a fullwidth separator must be detected."""
         # nosec - test fixture
-        hits = detect_secrets("password：s3cr3t_pa55word_x1y2z3w4")
+        hits = detect_secrets(f"password{separator}s3cr3t_pa55word_x1y2z3w4")
         assert "secret_assignment" in hits
 
     @pytest.mark.parametrize(
@@ -203,8 +204,17 @@ class TestDetectSecretsCJK:
         # nosec - test fixture
         assert "cjk_secret_assignment" in detect_secrets("密码：Abc12345")
 
+    def test_exact_eight_character_all_digit_value_is_detected(self):
+        # nosec - test fixture
+        assert "cjk_secret_assignment" in detect_secrets("密码：12345678")
+
     def test_exact_eight_character_ascii_symbol_value_is_rejected(self):
         assert detect_secrets("密码：!!!!!!!!") == []
+
+    @pytest.mark.parametrize("character", ["ſ", "ı", "İ", "K"])
+    def test_unicode_casefold_equivalent_is_not_ascii_alphanumeric(self, character):
+        """Unicode case-fold equivalents must not satisfy the ASCII boundary."""
+        assert detect_secrets(f"密码：!!!!!!!!{character}") == []
 
     def test_japanese_policy_prose_is_not_detected(self):
         assert detect_secrets("パスワード：定期的に変更してください") == []

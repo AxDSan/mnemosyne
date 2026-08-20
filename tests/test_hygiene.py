@@ -166,6 +166,12 @@ class TestScoreNoise:
         score, reasons = _score_noise(f"密码：abc12345{character}", 0.5, "user")
         assert not any("secret" in r for r in reasons)
 
+    @pytest.mark.parametrize("character", ["ſ", "ı", "İ", "K"])
+    def test_unicode_casefold_equivalent_not_flagged_as_secret(self, character):
+        """Unicode case-fold equivalents are not ASCII credential characters."""
+        _score, reasons = _score_noise(f"密码：!!!!!!!!{character}", 0.5, "user")
+        assert not any(reason.startswith("secret_detected:") for reason in reasons)
+
     def test_secret_with_value_keyword_not_dampened(self):
         """Secret + value keyword should NOT dampen the score."""
         # nosec - test fixture

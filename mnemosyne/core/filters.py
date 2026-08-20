@@ -137,7 +137,7 @@ _CJK_IDEOGRAPHIC = (
 # as a secret while "s3cr3t_pa55word_x1y2z3w4" (even with trailing "，请勿外传")
 # still is.
 _CREDENTIAL_VALUE = (
-    r"(?=(?:(?![" + _CJK_PROSE_RANGES + r"])[^\s'\"<>{}])*[A-Za-z0-9])"
+    r"(?=(?:(?![" + _CJK_PROSE_RANGES + r"])[^\s'\"<>{}])*(?-i:[A-Za-z0-9]))"
     r"(?:(?![" + _CJK_PROSE_RANGES + r"])[^\s'\"<>{}]){8,}"
     r"(?![" + _CJK_IDEOGRAPHIC + r"])"
 )

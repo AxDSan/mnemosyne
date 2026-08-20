@@ -503,6 +503,13 @@ def test_safe_preview_keeps_cjk_extension_j_prefix_then_prose(character):
     assert "<redact" not in preview
 
 
+@pytest.mark.parametrize("character", ["ſ", "ı", "İ", "K"])
+def test_safe_preview_keeps_unicode_casefold_equivalent_values(character):
+    """Unicode case-fold equivalents are not ASCII credential characters."""
+    prose = f"密码：!!!!!!!!{character}"
+    assert doctor.safe_preview(prose, max_length=120) == prose
+
+
 def test_safe_preview_redacts_cjk_secret_before_truncating():
     """Truncation must not let a CJK-labelled secret value survive."""
     # nosec - test fixture
