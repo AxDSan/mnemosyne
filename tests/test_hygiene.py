@@ -134,6 +134,11 @@ class TestScoreNoise:
         score, reasons = _score_noise("密码：abc12345我的密码", 0.5, "user")
         assert not any("secret" in r for r in reasons)
 
+    def test_cjk_non_bmp_prefix_then_prose_not_flagged(self):
+        """Non-BMP CJK after an ASCII prefix must not be flagged."""
+        score, reasons = _score_noise("密码：abc12345\U00020000", 0.5, "user")
+        assert not any("secret" in r for r in reasons)
+
     def test_secret_with_value_keyword_not_dampened(self):
         """Secret + value keyword should NOT dampen the score."""
         # nosec - test fixture

@@ -462,6 +462,14 @@ def test_safe_preview_keeps_cjk_ascii_prefix_then_prose():
     assert "<redact" not in preview
 
 
+def test_safe_preview_keeps_cjk_non_bmp_prefix_then_prose():
+    """Non-BMP CJK after an ASCII prefix must not be redacted."""
+    prose = "密码：abc12345\U00020000"
+    preview = doctor.safe_preview(prose, max_length=120)
+    assert prose in preview
+    assert "<redact" not in preview
+
+
 def test_safe_preview_redacts_cjk_secret_before_truncating():
     """Truncation must not let a CJK-labelled secret value survive."""
     # nosec - test fixture

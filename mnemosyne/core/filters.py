@@ -101,6 +101,11 @@ _CJK_PROSE_RANGES = (
     "\uac00-\ud7af"  # Hangul syllables (Korean)
     "\u3000-\u303f"  # CJK symbols / punctuation
     "\uff00-\uffef"  # Fullwidth forms
+    "\u3400-\u4dbf"  # CJK Extension A
+    "\uf900-\ufaff"  # CJK Compatibility Ideographs
+    "\U00020000-\U000323af"  # CJK Extensions B-H (non-BMP Han)
+    "\u1100-\u11ff"  # Hangul Jamo
+    "\u3130-\u318f"  # Hangul Compatibility Jamo
 )
 
 # Credential-value predicate: 8+ characters, no whitespace / quotes / brackets,

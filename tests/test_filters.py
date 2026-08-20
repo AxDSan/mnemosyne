@@ -181,6 +181,25 @@ class TestDetectSecretsCJK:
         hits = detect_secrets("密码：abc12345我的密码")
         assert hits == []
 
+    @pytest.mark.parametrize(
+        "char",
+        [
+            "\u4e00",  # Han unified (Chinese)
+            "\u3042",  # Hiragana (Japanese)
+            "\uac00",  # Hangul syllable (Korean)
+            "\u3400",  # CJK Extension A
+            "\uf900",  # CJK Compatibility Ideograph
+            "\U00020000",  # CJK Extension B (non-BMP)
+            "\u1100",  # Hangul Jamo
+            "\u3130",  # Hangul Compatibility Jamo
+            "\uff86",  # halfwidth Katakana
+        ],
+    )
+    def test_negative_ascii_prefix_then_cjk_block(self, char):
+        """Any CJK block in the value, BMP or non-BMP, must reject it."""
+        hits = detect_secrets(f"密码：abc12345{char}")
+        assert hits == []
+
 
 # ---------------------------------------------------------------------------
 # classify_memory_write
