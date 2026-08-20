@@ -124,34 +124,30 @@ class TestDetectSecrets:
 # ---------------------------------------------------------------------------
 
 class TestDetectSecretsCJK:
-    def test_chinese_fullwidth_colon(self):
-        # nosec - test fixture
-        hits = detect_secrets("数据库密码：s3cr3t_pa55word_x1y2z3w4")
-        assert "cjk_secret_assignment" in hits
-
-    def test_chinese_fullwidth_equals(self):
-        # nosec - test fixture
-        hits = detect_secrets("数据库密钥＝AbCdEfGhIjKlMnOp")
+    @pytest.mark.parametrize(
+        ("label", "value"),
+        [
+            ("密码", "s3cr3t_pa55word_x1y2z3w4"),
+            ("密钥", "AbCdEfGhIjKlMnOp"),
+            ("令牌", "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123"),
+            ("口令", "qwerty1234567890"),
+            ("私钥", "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC"),
+            ("パスワード", "abcdefgh1234"),
+            ("秘密鍵", "Jw8kLm2pQr7sVx9z"),
+            ("トークン", "token_AbCdEfGhIjKlMn"),
+            ("비밀번호", "qwerty123456"),
+            ("키", "key_AbCdEfGhIjKlMn"),
+        ],
+    )
+    @pytest.mark.parametrize("separator", [":", "=", "：", "＝"])
+    def test_all_cjk_labels_and_separators(self, label, value, separator):
+        # nosec - test fixtures
+        hits = detect_secrets(f"{label}{separator}{value}")
         assert "cjk_secret_assignment" in hits
 
     def test_chinese_quoted_value(self):
         # nosec - test fixture
         hits = detect_secrets('令牌："ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123"')
-        assert "cjk_secret_assignment" in hits
-
-    def test_japanese_password(self):
-        # nosec - test fixture
-        hits = detect_secrets("パスワード：abcdefgh1234")
-        assert "cjk_secret_assignment" in hits
-
-    def test_korean_password(self):
-        # nosec - test fixture
-        hits = detect_secrets("비밀번호: qwerty123456")
-        assert "cjk_secret_assignment" in hits
-
-    def test_chinese_private_key(self):
-        # nosec - test fixture
-        hits = detect_secrets("私钥：MIIEvQIBADANBgkqhkiG9w0BAQEFAASC")
         assert "cjk_secret_assignment" in hits
 
     def test_negative_chinese_policy_prose_after_label(self):
@@ -173,6 +169,10 @@ class TestDetectSecretsCJK:
 
     def test_negative_symbols_only_value(self):
         hits = detect_secrets("密码：！！！！！！！！")
+        assert hits == []
+
+    def test_negative_ascii_symbols_followed_by_text(self):
+        hits = detect_secrets("密码：!!!!!!!! nextword")
         assert hits == []
 
     def test_negative_mixed_cjk_value(self):

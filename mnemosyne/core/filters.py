@@ -108,7 +108,7 @@ _CJK_PROSE_RANGES = (
 # assignment detection from classifying ordinary Chinese policy prose as a
 # secret while still catching tokens like "s3cr3t_pa55word_x1y2z3w4".
 _CREDENTIAL_VALUE = (
-    r"(?=.*[A-Za-z0-9])"
+    r"(?=(?:(?![" + _CJK_PROSE_RANGES + r"])[^\s'\"<>{}])*[A-Za-z0-9])"
     r"(?:(?![" + _CJK_PROSE_RANGES + r"])[^\s'\"<>{}]){8,}"
 )
 

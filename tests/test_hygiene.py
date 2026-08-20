@@ -121,8 +121,8 @@ class TestScoreNoise:
         # nosec - test fixture
         score, reasons = _score_noise("数据库密码：s3cr3t_pa55word_x1y2z3w4", 0.5, "user")
         assert score >= 0.9
-        assert any("secret" in r for r in reasons)
-        assert _suggest_action(score, []) in ("delete", "flag")
+        assert "secret_detected:cjk_secret_assignment" in reasons
+        assert _suggest_action(score, ["cjk_secret_assignment"]) == "flag"
 
     def test_cjk_policy_prose_not_flagged(self):
         """Ordinary Chinese policy prose after a label must stay clean."""

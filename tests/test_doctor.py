@@ -460,6 +460,8 @@ def test_safe_preview_redacts_cjk_secret_before_truncating():
     raw_secret = "s3cr3t_pa55word_x1y2z3w4"
     preview = doctor.safe_preview("x" * 90 + f" 数据库密码：{raw_secret}" + " trailing", max_length=120)
     assert len(preview) <= 120
+    assert "<redacted>" in preview
+    assert raw_secret[:8] not in preview
     assert raw_secret not in preview
 
 
