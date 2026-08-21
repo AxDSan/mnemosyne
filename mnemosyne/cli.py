@@ -1466,13 +1466,12 @@ def cmd_hygiene(args):
         except Exception:
             _fail("hygiene_clean_failed", exit_code=1)
 
+        if result.errors:
+            _fail("hygiene_clean_failed", exit_code=1)
+
         mode = "DRY RUN" if dry_run else "APPLIED"
         print(f"[{mode}] deleted={result.deleted} archived={result.archived} "
               f"flagged={result.flagged} kept={result.kept}")
-        if result.errors:
-            print(f"Errors ({len(result.errors)}):")
-            for e in result.errors[:10]:
-                print(f"  {e}")
 
     elif sub == "restore":
         restore_limit = 100
@@ -1754,9 +1753,7 @@ def run_cli():
         return
 
     if len(sys.argv) < 2 or sys.argv[1] in ("--help", "-h", "help"):
-        # Keep historical setup behavior for non-doctor CLI entry points while
-        # leaving module import and the doctor path free of mkdir side effects.
-        os.makedirs(DATA_DIR, exist_ok=True)
+        # Help/version paths are side-effect-free; command setup is guarded below.
         print("Mnemosyne - Local AI Memory System\n")
         print("Usage: mnemosyne <command> [args]\n")
         print("Commands:")

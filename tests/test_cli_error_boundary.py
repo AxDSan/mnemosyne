@@ -254,6 +254,28 @@ def test_hygiene_clean_backend_failure_is_command_specific(tmp_path):
     _assert_static_failure(result, "hygiene_clean_failed", tmp_path)
 
 
+def test_hygiene_clean_returned_error_is_static_and_redacted(tmp_path):
+    data_dir = tmp_path / "mnemosyne-data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "mnemosyne.db").touch()
+    candidates = tmp_path / "candidates.json"
+    candidates.write_text("[]")
+    script = (
+        "import mnemosyne.core.hygiene as _hygiene\n"
+        "from mnemosyne.core.hygiene import CleanResult\n"
+        "def _failed(*a, **k):\n"
+        "    return CleanResult(errors=['TASK18_BACKEND_ERROR'])\n"
+        "_hygiene.clean_noise = _failed\n"
+    )
+    result = _run_cli_script(
+        script,
+        tmp_path,
+        argv_tail=["hygiene", "clean", "--dry-run", str(candidates)],
+    )
+    _assert_static_failure(result, "hygiene_clean_failed", tmp_path)
+    assert "TASK18_BACKEND_ERROR" not in result.stdout + result.stderr
+
+
 def test_hygiene_restore_backend_failure_is_command_specific(tmp_path):
     data_dir = tmp_path / "mnemosyne-data"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -268,6 +290,14 @@ def test_hygiene_restore_backend_failure_is_command_specific(tmp_path):
         script, tmp_path, argv_tail=["hygiene", "restore"]
     )
     _assert_static_failure(result, "hygiene_restore_failed", tmp_path)
+
+
+def test_help_with_file_data_dir_is_side_effect_free(tmp_path):
+    data_dir = tmp_path / "mnemosyne-data"
+    data_dir.write_text("not a directory")
+    result = _run_cli_script("", tmp_path, argv_tail=["--help"])
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Traceback" not in result.stdout + result.stderr
 
 
 def test_existing_data_dir_file_is_contained(tmp_path):
