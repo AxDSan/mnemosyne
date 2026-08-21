@@ -57,6 +57,8 @@ For automation, do not treat a non-zero exit from a non-dry-run `mnemosyne reind
 
 Import is idempotent: annotation collisions are skipped rather than aborting the run, so re-running is safe.
 
+`export` is a portable JSON transfer, not automatically a lossless database snapshot. Its completeness manifest names populated persisted surfaces omitted entirely and exported sections that omit populated fields. `import` restores supported data and reports that partial-state evidence for the source artifact; retain a database backup until a dedicated portability contract covers the missing data. Older exports remain importable but have unknown completeness.
+
 ## Banks
 
 | Command | Usage |
