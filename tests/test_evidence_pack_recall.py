@@ -189,7 +189,11 @@ def test_cross_session_scope_can_produce_a_bounded_supplemental_pack(tmp_path: P
     second_id = second.remember("Orion cross session beta", source="test", importance=0.8, scope="global")
     third_id = third.remember("Orion cross session gamma", source="test", importance=0.8, scope="global")
 
-    packed = reader.recall_with_evidence_pack("Orion cross session", top_k=1, candidate_k=5, pack_k=2)
+    plain_primary = reader.recall("Orion cross session", top_k=1)
+    packed = reader.recall_with_evidence_pack("Orion cross session", top_k=1, candidate_k=5, pack_k=10)
+
+    assert [row["id"] for row in packed["primary"]] == [row["id"] for row in plain_primary]
+    # Only the two non-primary global rows are eligible, even when pack_k is larger.
     assert len(packed["evidence_pack"]) == 2
     assert {row["evidence_rank"] for row in packed["evidence_pack"]} == {2, 3}
     returned_ids = {row["id"] for row in packed["primary"] + packed["evidence_pack"]}
