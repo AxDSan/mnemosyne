@@ -163,7 +163,50 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
   The path now deletes all dependent rows before removing the parent,
   with guarded vec_working handling for sqlite-vec-unavailable environments.
 
-## [3.12.0] — 2026-07-11
+## [3.12.2] - 2026-07-11
+
+### Fixed
+
+- **Config reload now bridges to the Hermes provider.** `mnemosyne config
+  set` and `mnemosyne config reload` previously wrote to the Mnemosyne
+  config.yaml but the Hermes provider only read from the Hermes config.yaml
+  (`memory.mnemosyne.<key>`). The two files never connected, so config
+  changes appeared to do nothing. Now the provider falls back to the
+  Mnemosyne config singleton when the Hermes config has no value, and
+  `MnemosyneConfig.get()` auto-reloads on file mtime changes so `config set`
+  takes effect immediately without an explicit reload.
+
+- **Config.yaml auto-seed on all entry points.** The auto-seed now fires on
+  `Mnemosyne()` and `BeamMemory()` init, not just explicit config imports.
+  Idempotent — checks file existence first.
+
+- **Test isolation for config auto-seed.** Config profile tests now create
+  an empty config.yaml before init so the auto-seed doesn't override test
+  env vars with defaults.
+
+## [3.12.1] - 2026-07-11
+
+### Added
+
+- **Config.yaml auto-seed on first access.** Mnemosyne now creates a
+  `config.yaml` at the standard location with all 106 known keys and their
+  default values. The file is created automatically on first access — no
+  manual setup needed. For each key, if the corresponding env var is set,
+  its value is used instead of the default, ensuring existing env var
+  configurations are never silently overridden. Hot-reload with
+  `mnemosyne config reload`. Precedence unchanged: config.yaml > env vars
+  > hardcoded defaults.
+
+### Fixed
+
+- **Config.yaml auto-seed respects existing env vars.** The initial
+  implementation wrote all defaults blindly, which would silently override
+  any `MNEMOSYNE_*` env vars the user had set (since config.yaml takes
+  precedence over env vars). Now each key checks for an active env var
+  before writing. Type coercion is applied: env var strings are parsed as
+  bool/int/float to match the default type.
+
+## [3.12.0] - 2026-07-11
 
 ### Added
 
@@ -303,50 +346,7 @@ layered memory roadmap
 @PlainWu, @ClaytonChew, @bruvv, @justanotherAIcontributor, @BurakBayır,
 @Iman-Sharif, @webtecnica — bug reports, fixes, and docs improvements
 
-## [3.12.1] — 2026-07-11
-
-### Added
-
-- **Config.yaml auto-seed on first access.** Mnemosyne now creates a
-  `config.yaml` at the standard location with all 106 known keys and their
-  default values. The file is created automatically on first access — no
-  manual setup needed. For each key, if the corresponding env var is set,
-  its value is used instead of the default, ensuring existing env var
-  configurations are never silently overridden. Hot-reload with
-  `mnemosyne config reload`. Precedence unchanged: config.yaml > env vars
-  > hardcoded defaults.
-
-### Fixed
-
-- **Config.yaml auto-seed respects existing env vars.** The initial
-  implementation wrote all defaults blindly, which would silently override
-  any `MNEMOSYNE_*` env vars the user had set (since config.yaml takes
-  precedence over env vars). Now each key checks for an active env var
-  before writing. Type coercion is applied: env var strings are parsed as
-  bool/int/float to match the default type.
-
-## [3.12.2] — 2026-07-11
-
-### Fixed
-
-- **Config reload now bridges to the Hermes provider.** `mnemosyne config
-  set` and `mnemosyne config reload` previously wrote to the Mnemosyne
-  config.yaml but the Hermes provider only read from the Hermes config.yaml
-  (`memory.mnemosyne.<key>`). The two files never connected, so config
-  changes appeared to do nothing. Now the provider falls back to the
-  Mnemosyne config singleton when the Hermes config has no value, and
-  `MnemosyneConfig.get()` auto-reloads on file mtime changes so `config set`
-  takes effect immediately without an explicit reload.
-
-- **Config.yaml auto-seed on all entry points.** The auto-seed now fires on
-  `Mnemosyne()` and `BeamMemory()` init, not just explicit config imports.
-  Idempotent — checks file existence first.
-
-- **Test isolation for config auto-seed.** Config profile tests now create
-  an empty config.yaml before init so the auto-seed doesn't override test
-  env vars with defaults.
-
-## [3.11.0] — 2026-06-30
+## [3.11.0] - 2026-06-30
 
 ### Added
 
@@ -427,7 +427,7 @@ layered memory roadmap
   sleep's model-refresh pass now handles edge cases around session boundaries
   and empty proposal sets.
 
-## [3.10.1] — 2026-06-22
+## [3.10.1] - 2026-06-22
 
 ### Security
 
@@ -464,7 +464,7 @@ endpoint.
   explicit `--bank`) instead of always reading the default bank, which reported empty
   state when the profile bank held the data. (#362, #363)
 
-## [3.10.0] — 2026-06-18
+## [3.10.0] - 2026-06-18
 
 ### Added
 
@@ -494,7 +494,7 @@ endpoint.
 - Default OFF to preserve opt-in upgrade story; turn on with
   `MNEMOSYNE_PERSONA_ENABLED=true` after upgrading.
 
-## [3.9.0] — 2026-06-18
+## [3.9.0] - 2026-06-18
 
 ### Added
 
@@ -586,7 +586,7 @@ endpoint.
   session queries with targeted indexes instead of a broad OR or
   temporary-sort query shape.
 
-## [3.7.0] — 2026-06-13
+## [3.7.0] - 2026-06-13
 
 ### Added
 
@@ -613,7 +613,7 @@ endpoint.
 - **Packaging cleanup:** `openclaw` dependency removed from `[all]` extra.
   Python 3.9 classifier dropped (3.10+ only).
 
-## [3.6.0] — 2026-06-10
+## [3.6.0] - 2026-06-10
 
 ### Added
 
@@ -707,7 +707,7 @@ endpoint.
   Locks in the invariant that importance may boost ordering only after a candidate
   has passed relevance, instead of rescuing unrelated rows.
 
-## [3.4.0] — 2026-06-01
+## [3.4.0] - 2026-06-01
 
 ### Added
 
@@ -722,7 +722,7 @@ endpoint.
   gates now keep diacritics inside tokens, so words like `Stoßlüften`,
   `Bürgeramt`, and `Primärquellen` are no longer split into ASCII fragments.
 
-## [3.3.0] — 2026-06-01
+## [3.3.0] - 2026-06-01
 
 ### Added
 
@@ -878,13 +878,13 @@ endpoint.
 - `.githooks/pre-push` hook validates tags match `__version__` and SemVer format.
 - Git hooks path set to `.githooks` (run `git config core.hooksPath .githooks` on clones).
 
-## [3.1.1] — 2026-05-28
+## [3.1.1] - 2026-05-28
 
 ### Added
 
 - **Preferred embedding env vars.** `MNEMOSYNE_EMBEDDING_API_URL` and `MNEMOSYNE_EMBEDDING_API_KEY` are now the preferred names for custom embedding endpoints. The old `OPENROUTER_BASE_URL` and `OPENROUTER_API_KEY` names still work as fallbacks for backward compatibility. Restores the v2.8.x naming convention. ([#193](https://github.com/AxDSan/mnemosyne/issues/193))
 
-## [3.1.0] — 2026-05-26
+## [3.1.0] - 2026-05-26
 
 ### Added
 
@@ -928,7 +928,7 @@ endpoint.
 - **Local scratch and benchmark artifacts.** Cleaned up development artifacts from the repo. (`7826de9`)
 - **Personal emails from source files.** PII filter-repo scrub with .mailmap and PII pre-commit hook added. (`58507ea`)
 
-## [3.0.0] — 2026-05-18
+## [3.0.0] - 2026-05-18
 
 ### Added
 
@@ -982,7 +982,7 @@ endpoint.
 - IE: 91.5%, MR: 87.5%, KU: 50%, TR: 75%, ABS: 100%
 - Ingestion: 36s for 188 messages with full MEMORIA extraction
 
-## [2.9.0] — 2026-05-17
+## [2.9.0] - 2026-05-17
 
 ### Fixed
 
@@ -993,7 +993,7 @@ endpoint.
   Pydantic objects instead of raw dicts, matching the SDK 1.x `list_tools`
   handler signature. Both stdio and SSE transports are patched.
 
-## [2.8.0] — 2026-05-14
+## [2.8.0] - 2026-05-14
 
 ### Added
 
@@ -1018,7 +1018,7 @@ endpoint.
 - **CI embedding timeout.** `fastembed` model downloads blocked subprocess tests. Added `MNEMOSYNE_NO_EMBEDDINGS` env guard and lazy-loading in `available()`.
 - **Provider export/import routing.** Fixed handlers to route through the `Mnemosyne` wrapper instead of `BeamMemory` directly.
 - **Stale version references.** Six files across the repo still displayed v2.7 after the initial v2.8.0 build (plugin yamls, docs pages, README badge, codebase surface). All corrected.
-## [2.7.0] — 2026-05-12
+## [2.7.0] - 2026-05-12
 
 ### Fixed
 
@@ -1054,7 +1054,7 @@ endpoint.
 - `scripts/mnemosyne-stats.py` — new `annotations` section in JSON output alongside the existing `triples` section
 - 30+ new tests covering the new store, the migration script, the auto-migrate hook, and end-to-end production-path regression guards
 
-## [2.5] — 2026-05-10
+## [2.5] - 2026-05-10
 
 ### Added
 
@@ -1088,7 +1088,7 @@ endpoint.
 - Polyphonic recall voice combination: weighted average → position-based RRF
 - `mnemosyne/__init__.py`: version bump to 2.5.0
 
-## [2.4] — 2026-05-07
+## [2.4] - 2026-05-07
 
 ### Added
 
@@ -1123,7 +1123,7 @@ endpoint.
 
 ---
 
-## [2.3.1] — 2026-05-06
+## [2.3.1] - 2026-05-06
 
 ### Fixed
 
@@ -1131,7 +1131,7 @@ endpoint.
 - `MNEMOSYNE_AUTO_SLEEP_ENABLED` env var now controls auto-sleep behavior. Default is `false` (disabled) for interactive safety. Set to `true` to re-enable.
 - Config schema updated to reflect new default.
 
-## [2.3] — 2026-05-05
+## [2.3] - 2026-05-05
 
 ### Added
 
@@ -1160,7 +1160,7 @@ endpoint.
 - SQLite connection conflicts in batch degradation tests
 - Removed hallucinated Phase 2 from roadmap
 
-## [2.2] — 2026-05-02
+## [2.2] - 2026-05-02
 
 ### Added
 
@@ -1188,7 +1188,7 @@ endpoint.
 
 - README: added "Migrate from other memory providers" section with examples
 
-## [2.1] — 2026-05-02
+## [2.1] - 2026-05-02
 
 ### Added
 
@@ -1206,7 +1206,7 @@ endpoint.
 - MCP `_get_instance()` renamed to `_create_instance()` — creates fresh instances per connection
 - Episodic memory SELECTs and recall-tracking UPDATEs use dynamic session/channel scope
 
-## [2.0] — 2026-04-29
+## [2.0] - 2026-04-29
 
 ### Added
 
@@ -1282,7 +1282,7 @@ endpoint.
 
 ---
 
-## [1.13] — 2026-04-28
+## [1.13] - 2026-04-28
 
 ### Added
 
@@ -1300,7 +1300,7 @@ endpoint.
 
 ---
 
-## [1.12] — 2026-04-26
+## [1.12] - 2026-04-26
 
 ### Added
 
@@ -1313,7 +1313,7 @@ endpoint.
 
 ---
 
-## [1.11] — 2026-04-25
+## [1.11] - 2026-04-25
 
 ### Added
 
@@ -1326,7 +1326,7 @@ endpoint.
 
 ---
 
-## [1.10] — 2026-04-24
+## [1.10] - 2026-04-24
 
 ### Added
 
@@ -1342,7 +1342,7 @@ endpoint.
 
 ---
 
-## [1.9] — 2026-04-23
+## [1.9] - 2026-04-23
 
 ### Added
 
@@ -1359,7 +1359,7 @@ endpoint.
 
 ---
 
-## [1.8] — 2026-04-22
+## [1.8] - 2026-04-22
 
 ### Added
 
@@ -1372,7 +1372,7 @@ endpoint.
 
 ---
 
-## [1.7] — 2026-04-22
+## [1.7] - 2026-04-22
 
 ### Added
 
@@ -1385,7 +1385,7 @@ endpoint.
 
 ---
 
-## [1.6] — 2026-04-21
+## [1.6] - 2026-04-21
 
 ### Added
 
@@ -1399,7 +1399,7 @@ endpoint.
 
 ---
 
-## [1.5] — 2026-04-20
+## [1.5] - 2026-04-20
 
 ### Added
 
@@ -1415,7 +1415,7 @@ endpoint.
 
 ---
 
-## [1.4] — 2026-04-19
+## [1.4] - 2026-04-19
 
 ### Added
 
@@ -1432,7 +1432,7 @@ endpoint.
 
 ---
 
-## [1.3] — 2026-04-17
+## [1.3] - 2026-04-17
 
 ### Added
 
@@ -1441,7 +1441,7 @@ endpoint.
 
 ---
 
-## [1.2] — 2026-04-13
+## [1.2] - 2026-04-13
 
 ### Added
 
@@ -1454,7 +1454,7 @@ endpoint.
 
 ---
 
-## [1.1] — 2026-04-10
+## [1.1] - 2026-04-10
 
 ### Added
 
@@ -1470,7 +1470,7 @@ endpoint.
 
 ---
 
-## [1.0] — 2026-04-05
+## [1.0] - 2026-04-05
 
 ### Added
 
