@@ -1253,7 +1253,6 @@ def cmd_reindex(args):
 
 def cmd_hygiene(args):
     """hygiene audit|clean|restore — noise detection and safe cleanup (issue #428)."""
-    import sqlite3
 
     from mnemosyne.core.hygiene import (
         NoiseCandidate,
@@ -1319,7 +1318,7 @@ def cmd_hygiene(args):
                 batch_size=batch_size,
                 conn=conn,
             )
-        except (ValueError, sqlite3.Error):
+        except Exception:
             _fail("hygiene_audit_failed", exit_code=1)
         finally:
             if conn is not None:
@@ -1364,7 +1363,7 @@ def cmd_hygiene(args):
         try:
             conn = open_readonly_doctor_db(db_path)
             status = hygiene_status(db_path=db_path, limit=limit, conn=conn)
-        except (ValueError, sqlite3.Error):
+        except Exception:
             _fail("hygiene_status_failed", exit_code=1)
         finally:
             if conn is not None:

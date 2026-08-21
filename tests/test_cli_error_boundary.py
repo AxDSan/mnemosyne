@@ -20,6 +20,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 CANARY = "TASK18_PRIVATE_EXCEPTION_CANARY"
 
 
@@ -61,7 +63,8 @@ def _run_cli_script(
 def _assert_static_failure(result, code, tmp_path):
     output = result.stdout + result.stderr
     assert result.returncode == 1, output
-    assert f"Error: {code}" in result.stderr, output
+    assert result.stdout == "", output
+    assert result.stderr.strip() == f"Error: {code}", output
     assert "Traceback" not in output, output
     assert CANARY not in output, output
     assert str(tmp_path) not in output, output
@@ -234,6 +237,30 @@ def test_hygiene_status_missing_database_is_static(tmp_path):
     _assert_static_failure(result, "hygiene_status_failed", tmp_path)
 
 
+def test_hygiene_audit_oserror_is_command_specific(tmp_path):
+    script = (
+        "_Path(_os.environ['MNEMOSYNE_DATA_DIR']).mkdir(parents=True)\n"
+        "(_Path(_os.environ['MNEMOSYNE_DATA_DIR']) / 'mnemosyne.db').touch()\n"
+        "import mnemosyne.doctor as _doctor\n"
+        f"def _boom(*a, **k):\n    raise OSError('{CANARY}')\n"
+        "_doctor.open_readonly_doctor_db = _boom\n"
+    )
+    result = _run_cli_script(script, tmp_path, argv_tail=["hygiene", "audit"])
+    _assert_static_failure(result, "hygiene_audit_failed", tmp_path)
+
+
+def test_hygiene_status_oserror_is_command_specific(tmp_path):
+    script = (
+        "_Path(_os.environ['MNEMOSYNE_DATA_DIR']).mkdir(parents=True)\n"
+        "(_Path(_os.environ['MNEMOSYNE_DATA_DIR']) / 'mnemosyne.db').touch()\n"
+        "import mnemosyne.doctor as _doctor\n"
+        f"def _boom(*a, **k):\n    raise OSError('{CANARY}')\n"
+        "_doctor.open_readonly_doctor_db = _boom\n"
+    )
+    result = _run_cli_script(script, tmp_path, argv_tail=["hygiene", "status"])
+    _assert_static_failure(result, "hygiene_status_failed", tmp_path)
+
+
 def test_hygiene_clean_backend_failure_is_command_specific(tmp_path):
     data_dir = tmp_path / "mnemosyne-data"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -292,12 +319,45 @@ def test_hygiene_restore_backend_failure_is_command_specific(tmp_path):
     _assert_static_failure(result, "hygiene_restore_failed", tmp_path)
 
 
-def test_help_with_file_data_dir_is_side_effect_free(tmp_path):
+@pytest.mark.parametrize("alias", ["--help", "-h", "help"])
+def test_help_alias_with_file_data_dir_is_side_effect_free(tmp_path, alias):
     data_dir = tmp_path / "mnemosyne-data"
     data_dir.write_text("not a directory")
-    result = _run_cli_script("", tmp_path, argv_tail=["--help"])
+    result = _run_cli_script("", tmp_path, argv_tail=[alias])
     assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ""
     assert "Traceback" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("alias", ["--help", "-h", "help"])
+def test_help_alias_with_absent_data_dir_does_not_create_it(tmp_path, alias):
+    data_dir = tmp_path / "mnemosyne-data"
+    assert not data_dir.exists()
+    result = _run_cli_script("", tmp_path, argv_tail=[alias])
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ""
+    assert not data_dir.exists()
+
+
+@pytest.mark.parametrize("alias", ["--version", "version"])
+def test_version_alias_with_file_data_dir_is_side_effect_free(tmp_path, alias):
+    data_dir = tmp_path / "mnemosyne-data"
+    data_dir.write_text("not a directory")
+    result = _run_cli_script("", tmp_path, argv_tail=[alias])
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.startswith("Mnemosyne "), result.stdout
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize("alias", ["--version", "version"])
+def test_version_alias_with_absent_data_dir_does_not_create_it(tmp_path, alias):
+    data_dir = tmp_path / "mnemosyne-data"
+    assert not data_dir.exists()
+    result = _run_cli_script("", tmp_path, argv_tail=[alias])
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.startswith("Mnemosyne "), result.stdout
+    assert result.stderr == ""
+    assert not data_dir.exists()
 
 
 def test_existing_data_dir_file_is_contained(tmp_path):
