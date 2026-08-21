@@ -303,6 +303,24 @@ def test_hygiene_clean_returned_error_is_static_and_redacted(tmp_path):
     assert "TASK18_BACKEND_ERROR" not in result.stdout + result.stderr
 
 
+def test_hygiene_clean_directory_candidate_file_is_static(tmp_path):
+    candidates = tmp_path / "candidates-directory"
+    candidates.mkdir()
+    result = _run_cli_script(
+        "", tmp_path, argv_tail=["hygiene", "clean", str(candidates)]
+    )
+    _assert_static_failure(result, "hygiene_clean_failed", tmp_path)
+
+
+def test_hygiene_clean_invalid_utf8_candidate_file_is_static(tmp_path):
+    candidates = tmp_path / "candidates-invalid.json"
+    candidates.write_bytes(b"\xff\xfe\xfd")
+    result = _run_cli_script(
+        "", tmp_path, argv_tail=["hygiene", "clean", str(candidates)]
+    )
+    _assert_static_failure(result, "hygiene_clean_failed", tmp_path)
+
+
 def test_hygiene_restore_backend_failure_is_command_specific(tmp_path):
     data_dir = tmp_path / "mnemosyne-data"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -424,11 +442,15 @@ def test_sync_status_group_readable_api_key_file_is_cli_unexpected_failure(tmp_p
     traceback. Uses the parser's real ``--api-key-file`` flag form.
     """
     key_file = tmp_path / "api-key.txt"
-    key_file.write_text("leaked-sync-secret-task18")
-    key_file.chmod(0o640)  # group-readable -> PermissionError from _read_secret_file
+    key_file.write_text("portable-test-secret")
     db_path = tmp_path / "sync.db"
+    script = (
+        "def _deny_secret_file(*a, **k):\n"
+        f"    raise PermissionError('{CANARY}')\n"
+        "_cli._read_secret_file = _deny_secret_file\n"
+    )
     result = _run_cli_script(
-        "",
+        script,
         tmp_path,
         argv_tail=[
             "sync-status",

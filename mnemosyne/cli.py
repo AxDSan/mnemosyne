@@ -1412,9 +1412,7 @@ def cmd_hygiene(args):
         try:
             with open(candidates_file) as f:
                 raw = json.load(f)
-        except FileNotFoundError:
-            _fail("hygiene_clean_failed", exit_code=1)
-        except json.JSONDecodeError:
+        except (OSError, UnicodeError, json.JSONDecodeError):
             _fail("hygiene_clean_failed", exit_code=1)
 
         # audit --json emits an envelope {"total_scanned": N, "candidates": [...]};
