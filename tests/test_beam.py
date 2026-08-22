@@ -2965,6 +2965,15 @@ class TestSameUtcDayFuture:
         assert _same_utc_day_future(self._at(23, 59, 58, 999000)) is None
         assert _same_utc_day_future(self._at(23, 59, 59)) is None
 
+    def test_margin_boundary_is_exact(self):
+        """The 30s margin is the contract, so pin both sides of it."""
+        # Exactly 30s of validity is not enough: the margin is inclusive.
+        assert _same_utc_day_future(self._at(23, 59, 29)) is None
+        # One microsecond more than the margin is enough.
+        assert _same_utc_day_future(self._at(23, 59, 28, 999999)) == self._at(
+            23, 59, 59
+        )
+
     def test_returned_value_always_sorts_before_aware_utc_now(self):
         """The property the fixture actually depends on, swept minute by minute."""
         for hh in range(24):
