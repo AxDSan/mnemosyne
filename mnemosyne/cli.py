@@ -568,7 +568,25 @@ def cmd_export(args):
     sync_count = result.get("sync_events_count", 0)
     if sync_count:
         print(f"  + {sync_count} sync events")
+    if result.get("complete") is False:
+        omitted = result.get("omitted_surfaces", [])
+        partial = result.get("partial_surfaces", [])
+        details = [f"{surface.get('table')} ({surface.get('row_count')})" for surface in omitted]
+        details.extend(
+            f"{surface.get('section')} missing {', '.join(_format_partial_omitted_field(field) for field in surface.get('omitted_fields', []))}"
+            for surface in partial
+        )
+        print(f"  WARNING: portable export is partial; {'; '.join(details)}")
     print(f"  to {output_path}")
+
+
+def _format_partial_omitted_field(field):
+    """Render a partial-export field and its valid affected-row count."""
+    name = field.get("field", "")
+    affected_rows = field.get("affected_rows")
+    if isinstance(affected_rows, int) and not isinstance(affected_rows, bool) and affected_rows >= 0:
+        return f"{name} ({affected_rows})"
+    return name
 
 
 def cmd_import(args):
@@ -628,6 +646,14 @@ def cmd_import(args):
             f"        "
             f"{_format_store_stats(se_stats, 'sync events')}"
         )
+    if result.get("restore_complete") is False:
+        print(
+            "        WARNING: imported supported data only; source export reported "
+            f"{len(result.get('omitted_surfaces', []))} omitted and "
+            f"{len(result.get('partial_surfaces', []))} partial surface(s)"
+        )
+    elif result.get("restore_complete") is None:
+        print("        NOTE: source export predates completeness reporting")
     print(f"        from {args[0]}")
 
 
