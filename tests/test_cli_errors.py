@@ -5,6 +5,9 @@ import os
 import sqlite3
 import subprocess
 import sys
+import types
+
+from mnemosyne import cli
 
 
 COMMANDS = [
@@ -129,6 +132,8 @@ def test_export_manifest_reports_omitted_and_partial_persisted_data(tmp_path):
     assert "WARNING: portable export is partial" in export_result.stdout
     assert "facts (1)" in export_result.stdout
     assert "working_memory missing" in export_result.stdout
+    assert "author_id (1)" in export_result.stdout
+    assert "pinned (1)" in export_result.stdout
 
     manifest = json.loads(export_path.read_text(encoding="utf-8"))["mnemosyne_export"]["completeness"]
     assert manifest["complete"] is False
@@ -145,6 +150,38 @@ def test_export_manifest_reports_omitted_and_partial_persisted_data(tmp_path):
     with sqlite3.connect(target_db) as conn:
         assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
         assert conn.execute("SELECT pinned, author_id FROM working_memory").fetchone() == (0, None)
+
+
+def test_export_warning_omits_invalid_partial_affected_row_counts(monkeypatch, capsys):
+    """Only non-boolean non-negative integer counts belong in CLI output."""
+    monkeypatch.setattr(
+        cli,
+        "_get_memory",
+        lambda: types.SimpleNamespace(
+            export_to_file=lambda *_args, **_kwargs: {
+                "complete": False,
+                "omitted_surfaces": [],
+                "partial_surfaces": [
+                    {
+                        "section": "working_memory",
+                        "omitted_fields": [
+                            {"field": "author_id", "affected_rows": 3},
+                            {"field": "negative", "affected_rows": -1},
+                            {"field": "boolean", "affected_rows": True},
+                            {"field": "malformed", "affected_rows": "3"},
+                        ],
+                    }
+                ],
+            }
+        ),
+    )
+
+    cli.cmd_export(["partial.json"])
+
+    assert (
+        "working_memory missing author_id (3), negative, boolean, malformed"
+        in capsys.readouterr().out
+    )
 
 
 def test_export_manifest_ignores_default_and_null_omitted_fields(tmp_path):

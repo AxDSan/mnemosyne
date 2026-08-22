@@ -97,9 +97,16 @@ def _completeness_details(result: object) -> str:
             if isinstance(fields, list):
                 for field in fields[:20]:
                     if isinstance(field, dict):
-                        field_names.append(
-                            _safe_completeness_label(field.get("field"), "field")
-                        )
+                        field_name = _safe_completeness_label(field.get("field"), "field")
+                        affected_rows = field.get("affected_rows")
+                        if (
+                            isinstance(affected_rows, int)
+                            and not isinstance(affected_rows, bool)
+                            and affected_rows >= 0
+                        ):
+                            field_names.append(f"{field_name} ({affected_rows})")
+                        else:
+                            field_names.append(field_name)
             details.append(
                 f"{section} missing {', '.join(field_names)}" if field_names else section
             )

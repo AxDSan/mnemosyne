@@ -27,6 +27,7 @@ from mnemosyne_hermes.cli import (
     _BANK_RESOLUTION_FAILED,
     _EXPORT_REQUIRED_COLUMNS,
     _EXPORT_REQUIRED_TABLES,
+    _completeness_details,
     _export_schema_is_complete_read_only,
     _get_provider_class,
     _resolve_cli_bank,
@@ -299,6 +300,8 @@ def test_file_export_and_import_warn_about_partial_portable_data(tmp_path, monke
     assert "WARNING: portable export is partial" in export_output
     assert "facts (1)" in export_output
     assert "working_memory missing" in export_output
+    assert "author_id (1)" in export_output
+    assert "pinned (1)" in export_output
 
     monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(target_data))
     assert mnemosyne_command(_file_import_args(export_path)) == 0
@@ -306,6 +309,29 @@ def test_file_export_and_import_warn_about_partial_portable_data(tmp_path, monke
     assert "WARNING: imported supported data only" in import_output
     assert "facts (1)" in import_output
     assert "working_memory missing" in import_output
+    assert "author_id (1)" in import_output
+    assert "pinned (1)" in import_output
+
+
+def test_completeness_details_omits_invalid_partial_affected_row_counts():
+    """Manifest counts are terminal-safe only when they are real row counts."""
+    details = _completeness_details(
+        {
+            "partial_surfaces": [
+                {
+                    "section": "working_memory",
+                    "omitted_fields": [
+                        {"field": "author_id", "affected_rows": 3},
+                        {"field": "negative", "affected_rows": -1},
+                        {"field": "boolean", "affected_rows": True},
+                        {"field": "malformed", "affected_rows": "3"},
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert details == "working_memory missing author_id (3), negative, boolean, malformed"
 
 
 def test_file_import_completeness_warnings_are_terminal_safe_and_handle_unknown(
