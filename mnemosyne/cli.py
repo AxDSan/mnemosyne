@@ -319,8 +319,8 @@ def cmd_diagnose(args):
                     print(f"  ❌ {item['label']}: {item['error']}")
             if not fix_result["fixed"] and not fix_result["failed"]:
                 print("  Nothing to fix - all dependencies are healthy.")
-    except Exception as e:
-        print(f"Diagnostic failed: {e}")
+    except Exception:
+        _fail("diagnose_failed", exit_code=1)
 
 
 def cmd_doctor(args):
@@ -463,8 +463,8 @@ def cmd_doctor(args):
             print(f"Doctor Markdown: {resolved_markdown_path}")
         else:
             print(markdown_text, end="")
-    except (OSError, ValueError) as error:
-        _fail(f"Doctor report failed: {error}", exit_code=1)
+    except Exception:
+        _fail("doctor_report_failed", exit_code=1)
 
 
 def cmd_repair(args):
@@ -1059,13 +1059,18 @@ def cmd_backup(args):
     from mnemosyne.dr.recovery import create_backup
     try:
         output_dir = Path(_normalize_backup_output_dir_arg(args[0])) if args else None
+    except ValueError as e:
+        # Rejected at the CLI boundary before the backend runs: keep the
+        # caller-visible message (arg-validation contract, exit 2).
+        _fail(str(e))
+    try:
         result = create_backup(backup_dir=output_dir)
         print(f"Backup created: {result['backup_path']}")
         print(f"  Original size: {result['original_size']:,} bytes")
         print(f"  Backup size:   {result['backup_size']:,} bytes")
         print(f"  Checksum:      {result['db_checksum']}")
-    except Exception as e:
-        _fail(str(e))
+    except Exception:
+        _fail("backup_failed", exit_code=1)
 
 
 def cmd_restore(args):
@@ -1076,13 +1081,13 @@ def cmd_restore(args):
     try:
         result = restore_backup(Path(args[0]))
         status = "valid" if result["integrity_check"] else "corrupt"
+        if not result["integrity_check"]:
+            _fail("restore_failed", exit_code=1)
         print(f"Restored from: {result['backup_used']}")
         print(f"  Database:     {result['database_path']}")
         print(f"  Integrity:    {status}")
-        if not result["integrity_check"]:
-            _fail("Restored database failed integrity check. Emergency backup preserved.")
-    except FileNotFoundError as e:
-        _fail(str(e))
+    except Exception:
+        _fail("restore_failed", exit_code=1)
 
 
 def cmd_verify(args):
@@ -1107,8 +1112,8 @@ def cmd_verify(args):
         else:
             print("Database is corrupt. Run 'mnemosyne restore' from a backup.")
             raise SystemExit(1)
-    except Exception as e:
-        _fail(str(e))
+    except Exception:
+        _fail("verify_failed", exit_code=1)
 
 
 def cmd_backups_list(args):
@@ -1248,7 +1253,6 @@ def cmd_reindex(args):
 
 def cmd_hygiene(args):
     """hygiene audit|clean|restore — noise detection and safe cleanup (issue #428)."""
-    import sqlite3
 
     from mnemosyne.core.hygiene import (
         NoiseCandidate,
@@ -1300,7 +1304,7 @@ def cmd_hygiene(args):
 
         db_path = Path(DATA_DIR) / "mnemosyne.db"
         if not db_path.exists():
-            _fail(f"Database not found at {db_path}")
+            _fail("hygiene_audit_failed", exit_code=1)
 
         conn = None
         try:
@@ -1314,8 +1318,8 @@ def cmd_hygiene(args):
                 batch_size=batch_size,
                 conn=conn,
             )
-        except (ValueError, sqlite3.Error) as e:
-            _fail(str(e))
+        except Exception:
+            _fail("hygiene_audit_failed", exit_code=1)
         finally:
             if conn is not None:
                 conn.close()
@@ -1354,13 +1358,13 @@ def cmd_hygiene(args):
                 _fail(f"Unknown hygiene status option: {rest[i]}")
         db_path = Path(DATA_DIR) / "mnemosyne.db"
         if not db_path.exists():
-            _fail(f"Database not found at {db_path}")
+            _fail("hygiene_status_failed", exit_code=1)
         conn = None
         try:
             conn = open_readonly_doctor_db(db_path)
             status = hygiene_status(db_path=db_path, limit=limit, conn=conn)
-        except (ValueError, sqlite3.Error) as e:
-            _fail(str(e))
+        except Exception:
+            _fail("hygiene_status_failed", exit_code=1)
         finally:
             if conn is not None:
                 conn.close()
@@ -1406,12 +1410,10 @@ def cmd_hygiene(args):
             _fail("candidates JSON file required: mnemosyne hygiene clean <candidates.json>")
 
         try:
-            with open(candidates_file) as f:
+            with open(candidates_file, encoding="utf-8") as f:
                 raw = json.load(f)
-        except FileNotFoundError:
-            _fail(f"Candidates file not found: {candidates_file}")
-        except json.JSONDecodeError as e:
-            _fail(f"Invalid JSON in candidates file: {e}")
+        except Exception:
+            _fail("hygiene_clean_failed", exit_code=1)
 
         # audit --json emits an envelope {"total_scanned": N, "candidates": [...]};
         # clean expects the candidates array.
@@ -1448,23 +1450,25 @@ def cmd_hygiene(args):
 
         db_path = Path(DATA_DIR) / "mnemosyne.db"
         if not db_path.exists():
-            _fail(f"Database not found at {db_path}")
+            _fail("hygiene_clean_failed", exit_code=1)
 
-        result = clean_noise(
-            db_path=db_path,
-            candidates=candidates,
-            action=action,
-            confirm=confirm,
-            dry_run=dry_run,
-        )
+        try:
+            result = clean_noise(
+                db_path=db_path,
+                candidates=candidates,
+                action=action,
+                confirm=confirm,
+                dry_run=dry_run,
+            )
+        except Exception:
+            _fail("hygiene_clean_failed", exit_code=1)
+
+        if result.errors:
+            _fail("hygiene_clean_failed", exit_code=1)
 
         mode = "DRY RUN" if dry_run else "APPLIED"
         print(f"[{mode}] deleted={result.deleted} archived={result.archived} "
               f"flagged={result.flagged} kept={result.kept}")
-        if result.errors:
-            print(f"Errors ({len(result.errors)}):")
-            for e in result.errors[:10]:
-                print(f"  {e}")
 
     elif sub == "restore":
         restore_limit = 100
@@ -1477,9 +1481,12 @@ def cmd_hygiene(args):
 
         db_path = Path(DATA_DIR) / "mnemosyne.db"
         if not db_path.exists():
-            _fail(f"Database not found at {db_path}")
+            _fail("hygiene_restore_failed", exit_code=1)
 
-        restored = restore_archived(db_path=db_path, limit=restore_limit)
+        try:
+            restored = restore_archived(db_path=db_path, limit=restore_limit)
+        except Exception:
+            _fail("hygiene_restore_failed", exit_code=1)
         print(f"Restored {restored} archived memories.")
 
     else:
@@ -1686,8 +1693,8 @@ def cmd_migrate(args):
 
     try:
         report = migrate_311_tables(db_path)
-    except Exception as e:
-        _fail(f"Migration failed: {e}", exit_code=1)
+    except Exception:
+        _fail("migrate_failed", exit_code=1)
 
     print(f"migrate 311: bank={bank} db={db_path}")
     print(f"  tables added: {', '.join(report['tables_added']) or '(none)'}")
@@ -1743,9 +1750,7 @@ def run_cli():
         return
 
     if len(sys.argv) < 2 or sys.argv[1] in ("--help", "-h", "help"):
-        # Keep historical setup behavior for non-doctor CLI entry points while
-        # leaving module import and the doctor path free of mkdir side effects.
-        os.makedirs(DATA_DIR, exist_ok=True)
+        # Help/version paths are side-effect-free; command setup is guarded below.
         print("Mnemosyne - Local AI Memory System\n")
         print("Usage: mnemosyne <command> [args]\n")
         print("Commands:")
@@ -1786,12 +1791,20 @@ def run_cli():
         return
 
     command = sys.argv[1]
-    if command not in {"doctor", "repair"}:
-        os.makedirs(DATA_DIR, exist_ok=True)
     handler = COMMANDS.get(command)
 
     if handler:
-        handler(sys.argv[2:])
+        # Error containment: unexpected failures must surface as a static
+        # machine-readable code, never a traceback (which leaks absolute
+        # paths and library internals into logs).
+        try:
+            if command not in {"doctor", "repair"}:
+                os.makedirs(DATA_DIR, exist_ok=True)
+            handler(sys.argv[2:])
+        except SystemExit:
+            raise
+        except Exception:
+            _fail("cli_unexpected_failure", exit_code=1)
     else:
         print(f"Unknown command: {command}", file=sys.stderr)
         print("Run 'mnemosyne --help' for usage.", file=sys.stderr)

@@ -33,6 +33,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
   **Upgrade note for stores created under the old silent-384 fallback:** setting the model's true dimension can trigger the existing dimension-mismatch guard. Use the documented reindex/recovery path rather than treating the override as a one-step fix. See [docs/migration-4.0.md](docs/migration-4.0.md).
 
 ### Fixed
+- **CLI failure boundaries now emit stable sanitized error codes.**
 
 - **Native Windows Hermes venv discovery now finds `Scripts/python.exe` (#809).** Implicit `mnemosyne-hermes install` discovery now supports validated native Windows virtual-environment layouts through launcher siblings, known Hermes roots, the active prefix, and `VIRTUAL_ENV`; explicit `--python` remains authoritative.
 - **Windows Hermes symlink installs now explain WinError 1314 recovery (#807).** When Windows denies symbolic-link creation because Developer Mode or the symbolic-link privilege is unavailable, the installer fails closed and prints a command-safe persistent wrapper retry using the resolved Hermes Python; it does not switch modes automatically.

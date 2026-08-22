@@ -913,7 +913,12 @@ class TestAuditNoise:
         assert connection is not None
         with pytest.raises(sqlite3.ProgrammingError):
             connection.execute("SELECT 1")
-        assert "hygiene read failed" in capsys.readouterr().err
+        expected_code = (
+            "hygiene_audit_failed"
+            if function_name == "audit_noise"
+            else "hygiene_status_failed"
+        )
+        assert capsys.readouterr().err == f"Error: {expected_code}\n"
 
     @pytest.mark.parametrize("command_args", [["audit"], ["status"]])
     def test_cmd_hygiene_read_commands_report_readonly_open_errors(
@@ -931,7 +936,7 @@ class TestAuditNoise:
         with pytest.raises(SystemExit):
             cmd_hygiene(command_args)
 
-        assert "readonly connection failed" in capsys.readouterr().err
+        assert capsys.readouterr().err == f"Error: hygiene_{command_args[0]}_failed\n"
 
     def test_noise_summary_is_pii_safe(self, temp_db):
         db_path, beam = temp_db
