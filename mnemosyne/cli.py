@@ -1410,9 +1410,9 @@ def cmd_hygiene(args):
             _fail("candidates JSON file required: mnemosyne hygiene clean <candidates.json>")
 
         try:
-            with open(candidates_file) as f:
+            with open(candidates_file, encoding="utf-8") as f:
                 raw = json.load(f)
-        except (OSError, UnicodeError, json.JSONDecodeError):
+        except Exception:
             _fail("hygiene_clean_failed", exit_code=1)
 
         # audit --json emits an envelope {"total_scanned": N, "candidates": [...]};

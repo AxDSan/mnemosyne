@@ -64,7 +64,7 @@ def _assert_static_failure(result, code, tmp_path):
     output = result.stdout + result.stderr
     assert result.returncode == 1, output
     assert result.stdout == "", output
-    assert result.stderr.strip() == f"Error: {code}", output
+    assert result.stderr == f"Error: {code}\n", output
     assert "Traceback" not in output, output
     assert CANARY not in output, output
     assert str(tmp_path) not in output, output
@@ -314,9 +314,23 @@ def test_hygiene_clean_directory_candidate_file_is_static(tmp_path):
 
 def test_hygiene_clean_invalid_utf8_candidate_file_is_static(tmp_path):
     candidates = tmp_path / "candidates-invalid.json"
-    candidates.write_bytes(b"\xff\xfe\xfd")
+    candidates.write_bytes(b'["\xe9"]')
     result = _run_cli_script(
         "", tmp_path, argv_tail=["hygiene", "clean", str(candidates)]
+    )
+    _assert_static_failure(result, "hygiene_clean_failed", tmp_path)
+
+
+def test_hygiene_clean_unexpected_decode_failure_is_command_specific(tmp_path):
+    candidates = tmp_path / "candidates.json"
+    candidates.write_text("[]", encoding="utf-8")
+    script = (
+        "import json as _json\n"
+        f"def _boom(*a, **k):\n    raise RecursionError('{CANARY}')\n"
+        "_json.load = _boom\n"
+    )
+    result = _run_cli_script(
+        script, tmp_path, argv_tail=["hygiene", "clean", str(candidates)]
     )
     _assert_static_failure(result, "hygiene_clean_failed", tmp_path)
 
@@ -434,12 +448,12 @@ def test_store_memory_construction_failure_is_cli_unexpected_failure(tmp_path):
     _assert_static_failure(result, "cli_unexpected_failure", tmp_path)
 
 
-def test_sync_status_group_readable_api_key_file_is_cli_unexpected_failure(tmp_path):
-    """A group-readable API-key file must not leak its path or a traceback.
+def test_sync_status_secret_file_read_failure_is_cli_unexpected_failure(tmp_path):
+    """A secret-file read failure must not leak its path or a traceback.
 
-    The secret-file guard raises ``PermissionError``; the ``run_cli()``
-    boundary must contain it as ``cli_unexpected_failure`` rather than a raw
-    traceback. Uses the parser's real ``--api-key-file`` flag form.
+    The injected ``PermissionError`` from ``_read_secret_file`` must be
+    contained as ``cli_unexpected_failure`` rather than a raw traceback.
+    Uses the parser's real ``--api-key-file`` flag form.
     """
     key_file = tmp_path / "api-key.txt"
     key_file.write_text("portable-test-secret")
