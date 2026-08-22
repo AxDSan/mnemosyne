@@ -946,12 +946,27 @@ class TestWorkingMemory:
                 past_mid,
             ),
         )
+        # A space separator only sorts before a "T" separator when the date
+        # components match, so a naive future value that rolls into tomorrow
+        # sorts *after* aware-UTC now and stops misleading the lexical filter.
+        # Between 22:00 and 00:00 UTC a flat +2h did exactly that and the
+        # sanity assertion below failed on an unchanged tree. Keep the value
+        # on today's UTC date so the trap it is meant to set actually holds.
+        _now = datetime.now(timezone.utc)
+        _space_future = _now + timedelta(hours=2)
+        if _space_future.date() != _now.date():
+            _space_future = _now.replace(
+                hour=23, minute=59, second=59, microsecond=0
+            )
+        if _space_future <= _now:
+            pytest.skip(
+                "within the final second of the UTC day: no naive value can be "
+                "both chronologically future and lexically earlier than now"
+            )
         beam.conn.execute(
             "UPDATE working_memory SET valid_until = ? WHERE id = ?",
             (
-                (datetime.now(timezone.utc) + timedelta(hours=2)).replace(
-                    tzinfo=None
-                ).strftime("%Y-%m-%d %H:%M:%S"),
+                _space_future.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S"),
                 space_mid,
             ),
         )
