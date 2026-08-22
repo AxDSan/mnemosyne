@@ -128,7 +128,7 @@ def _is_api_model(model_name: str) -> bool:
     # Custom endpoint: if MNEMOSYNE_EMBEDDING_API_URL is set to a non-OpenRouter URL,
     # assume the user has their own API server and any model name should route there.
     base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "")
-    if base_url and "openrouter.ai" not in base_url:
+    if base_url and not _is_openrouter_url(base_url):
         return True
     # Explicit opt-in for non-OpenAI embedding models hosted on OpenRouter
     # (qwen/qwen3-embedding-*, baai/bge-*, jina-embeddings-*, nvidia/*-embed-*, etc.).
@@ -325,16 +325,96 @@ def _safe_api_endpoint(url: str) -> str:
         return "<invalid-url>"
 
 
+def _is_openrouter_url(base_url: str) -> bool:
+    """Whether the embedding endpoint is OpenRouter proper (hostname-based).
+
+    Substring matching misclassifies custom endpoints whose URL merely
+    contains ``openrouter.ai`` in the path or query, blocking them from the
+    keyless custom-endpoint path. Match the resolved hostname instead.
+    Malformed URLs (e.g. ``http://[``) raise ``ValueError`` from
+    ``urlsplit``; treat those as non-OpenRouter so the request still reaches
+    the API path and fails loud with the redacted ``RuntimeError``.
+    """
+    try:
+        hostname = urllib.parse.urlsplit(base_url).hostname or ""
+    except ValueError:
+        return False
+    return hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai")
+
+
+def _ensure_api_vectors(result: Optional[np.ndarray], base_url: str, expected: int) -> np.ndarray:
+    """Validate that the API embedding result matches the request contract.
+
+    ``embed()`` / ``embed_query()`` must fail loud here: a bare ``None`` is
+    indistinguishable from "embeddings unavailable", so callers (e.g.
+    ``BeamMemory.remember``) would silently skip vector storage without
+    their ``except Exception`` warning ever firing. The result must be a
+    rank-two array with exactly ``expected`` non-empty vectors (one per
+    requested input), so partial, malformed or rank-invalid responses fail
+    here too instead of being silently consumed. The message carries only
+    the redacted endpoint and model name -- never the input text or any
+    credential.
+    """
+    if result is None:
+        if _is_openrouter_url(base_url) and not _OPENAI_API_KEY:
+            hint = (
+                "no API key is configured; set MNEMOSYNE_EMBEDDING_API_KEY "
+                "or OPENAI_API_KEY"
+            )
+        else:
+            hint = (
+                "the endpoint failed or returned no vectors; the warning "
+                "logs above give the HTTP/network reason"
+            )
+        raise RuntimeError(
+            f"Embedding API returned no vectors (endpoint={_safe_api_endpoint(base_url)}, "
+            f"model={_DEFAULT_MODEL}): {hint}."
+        )
+    if result.size == 0:
+        raise RuntimeError(
+            f"Embedding API returned an empty vector result "
+            f"(endpoint={_safe_api_endpoint(base_url)}, model={_DEFAULT_MODEL}); "
+            f"the endpoint may not support embeddings for the given input."
+        )
+    if result.ndim != 2:
+        raise RuntimeError(
+            f"Embedding API returned an unexpected rank-{result.ndim} result "
+            f"(endpoint={_safe_api_endpoint(base_url)}, model={_DEFAULT_MODEL}); "
+            f"expected a rank-2 array with one vector per input."
+        )
+    if len(result) != expected:
+        raise RuntimeError(
+            f"Embedding API returned {len(result)} vector(s) for {expected} input(s) "
+            f"(endpoint={_safe_api_endpoint(base_url)}, model={_DEFAULT_MODEL}); "
+            f"the endpoint may be returning a partial or misaligned response."
+        )
+    return result
+
+
 def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     """Embed texts via OpenAI-compatible API (OpenRouter or custom endpoint)."""
     global _API_CALL_COUNT
     # Require API key for OpenRouter; custom endpoints may not need one.
     base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1")
-    is_custom = "openrouter.ai" not in base_url
+    is_custom = not _is_openrouter_url(base_url)
     if not is_custom and not _OPENAI_API_KEY:
+        logger.warning(
+            "embedding API: no API key set for OpenRouter endpoint %s, returning None vectors",
+            _safe_api_endpoint(base_url),
+        )
         return None
 
-    url = f"{base_url.rstrip('/')}/embeddings"
+    # Append /embeddings to the path, preserving any query string. A naive
+    # string append would push the route into the query value (e.g.
+    # "?upstream=openrouter.ai/embeddings") and silently target the wrong
+    # endpoint. Malformed URLs keep the old behavior: the request still fails
+    # and degrades to None so _ensure_api_vectors raises the redacted error.
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+        path = parsed.path.rstrip("/") + "/embeddings"
+        url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
+    except ValueError:
+        url = f"{base_url.rstrip('/')}/embeddings"
     payload = json.dumps({
         "model": _DEFAULT_MODEL,
         "input": texts,
@@ -417,7 +497,7 @@ def available() -> bool:
     if _is_api_model(_DEFAULT_MODEL):
         # Custom endpoints (non-OpenRouter) may not require an API key
         base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "")
-        if base_url and "openrouter.ai" not in base_url:
+        if base_url and not _is_openrouter_url(base_url):
             return True
         return bool(_OPENAI_API_KEY)
     return _FASTEMBED_AVAILABLE
@@ -442,7 +522,8 @@ def embed_query(text: str) -> Optional[np.ndarray]:
 def _embed_query_cached(prefixed: str) -> Optional[np.ndarray]:
     if _is_api_model(_DEFAULT_MODEL):
         result = _embed_api([prefixed])
-        return result[0] if result is not None else None
+        _ensure_api_vectors(result, os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1"), 1)
+        return result[0]
 
     model = _get_model()
     if model is None or model == "api":
@@ -463,7 +544,8 @@ def embed(texts: List[str]) -> Optional[np.ndarray]:
     prefixed = [doc_prefix + t for t in texts]
 
     if _is_api_model(_DEFAULT_MODEL):
-        return _embed_api(prefixed)
+        result = _embed_api(prefixed)
+        return _ensure_api_vectors(result, os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1"), len(prefixed))
 
     model = _get_model()
     if model is None or model == "api":
