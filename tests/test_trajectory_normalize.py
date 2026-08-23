@@ -140,3 +140,66 @@ def test_normalize_omits_ok_when_source_has_none():
     assert "ok" not in result
     assert result["id"] == "call_x"
     assert result["name"] == "terminal"
+
+
+def test_normalize_tool_calls_from_json_string():
+    # state.db stores tool_calls as TEXT; rows arrive as a JSON string.
+    raw = json.dumps(
+        [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "terminal",
+                    "arguments": '{"command": "ls"}',
+                },
+            }
+        ]
+    )
+    records = normalize(
+        [{"role": "assistant", "content": "", "tool_calls": raw}],
+        session_id="json-string",
+    )
+    tool_calls = [record for record in records if record["type"] == "tool_call"]
+    assert tool_calls == [
+        {
+            "type": "tool_call",
+            "name": "terminal",
+            "arguments": {"command": "ls"},
+            "id": "call_1",
+        }
+    ]
+
+
+def test_normalize_malformed_tool_calls_json_emits_no_tool_call():
+    records = normalize(
+        [{"role": "assistant", "content": "hi", "tool_calls": "{not-json"}],
+        session_id="bad-json",
+    )
+    assert [record["type"] for record in records] == ["meta", "assistant"]
+
+
+def test_normalize_tool_call_missing_name_arguments_and_id():
+    records = normalize(
+        [{"role": "assistant", "content": "", "tool_calls": [{}]}],
+        session_id="missing-fields",
+    )
+    tool_calls = [record for record in records if record["type"] == "tool_call"]
+    assert tool_calls == [{"type": "tool_call", "name": "", "arguments": {}}]
+
+
+def test_normalize_ok_string_false_is_false():
+    records = normalize(
+        [
+            {
+                "role": "tool",
+                "tool_name": "terminal",
+                "tool_call_id": "call_x",
+                "content": "err",
+                "ok": "false",
+            }
+        ],
+        session_id="ok-false",
+    )
+    result = next(record for record in records if record["type"] == "tool_result")
+    assert result["ok"] is False

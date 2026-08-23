@@ -106,7 +106,7 @@ def _normalize_tool_result(message: Message, ts: Any | None) -> Record:
     if call_id:
         record["id"] = call_id
     if "ok" in message:
-        record["ok"] = bool(message["ok"])
+        record["ok"] = _coerce_ok(message["ok"])
     if ts is not None:
         record["ts"] = ts
     return record
@@ -125,6 +125,12 @@ def _optional_ts(message: Message) -> Any | None:
     if "ts" in message and message["ts"] is not None:
         return message["ts"]
     return None
+
+
+def _coerce_ok(value: Any) -> bool:
+    if isinstance(value, str) and value.strip().lower() == "false":
+        return False
+    return bool(value)
 
 
 def _content_text(value: Any) -> str:
