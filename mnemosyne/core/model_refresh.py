@@ -15,12 +15,62 @@ import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 
+# Compact canonical slot bodies only. Transcript dumps and oversized
+# prose are rejected at parse time so they never become pending proposals.
+MAX_CANONICAL_SLOT_BODY_CHARS = 400
+
+DURABLE_SLOT_CATEGORIES: Set[str] = {
+    "preference",
+    "identity",
+    "environment",
+}
+
 DEFAULT_MODEL_CATEGORIES: Set[str] = {
     "model:user",
     "model:workflow",
     "model:project",
     "model:agent",
+    *DURABLE_SLOT_CATEGORIES,
 }
+
+CANONICAL_SLOT_BODY_CONTRACT = (
+    f"Durable facts only. Each canonical slot body must be at most "
+    f"{MAX_CANONICAL_SLOT_BODY_CHARS} characters. "
+    "Refuse transcript dumps and chat logs. Never write or update SOUL.md."
+)
+
+_TRANSCRIPT_TURN_RE = re.compile(
+    r"(?im)(?:^|\n)\s*(?:user|assistant|system|human)\s*:"
+)
+_TRANSCRIPT_MARKER_RE = re.compile(
+    r"(?i)<\|?(?:im_start|im_end)\|?>|\bid=wm-"
+)
+
+
+def slot_body_is_invalid(body: str) -> bool:
+    """True when a proposal body is too long or looks like a chat log."""
+
+    text = (body or "").strip()
+    if not text:
+        return True
+    if len(text) > MAX_CANONICAL_SLOT_BODY_CHARS:
+        return True
+    if _TRANSCRIPT_MARKER_RE.search(text):
+        return True
+    if len(_TRANSCRIPT_TURN_RE.findall(text)) >= 2:
+        return True
+    return False
+
+
+def consolidation_system_prompt() -> str:
+    """Shared sleep / consolidation system prompt (dual-provider adapters)."""
+
+    return (
+        "You are a memory consolidation engine. Follow the user prompt exactly. "
+        "Preserve durable facts, names, preferences, decisions, and chronology. "
+        "Do not add facts not present in the input. "
+        f"{CANONICAL_SLOT_BODY_CONTRACT}"
+    )
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -133,6 +183,8 @@ def parse_model_update_proposals(
             continue
         if category not in allowed:
             continue
+        if slot_body_is_invalid(body):
+            continue
         confidence = coerce_confidence(item.get("confidence", 0.0), 0.0)
         if confidence <= 0.0:
             continue
@@ -179,10 +231,11 @@ Allowed categories: {', '.join(categories)}
 Allowed actions: update, keep, ignore.
 
 Rules:
-- Propose only stable preferences, identity/profile facts, workflow rules, project models, or agent operating models.
+- Propose only durable facts: stable preferences, identity/profile facts, environment facts, workflow rules, project models, or agent operating models.
+- {CANONICAL_SLOT_BODY_CONTRACT}
+- Each slot body must be at most {MAX_CANONICAL_SLOT_BODY_CHARS} characters. Compact facts only — never dump a transcript or raw memory text into a slot.
 - Do not propose one-off task progress, temporary debugging state, deadlines, issue numbers, commit hashes, or secrets.
 - Each proposal must cite at least one evidence id from the input.
-- Prefer compact slot bodies that can be stored as canonical facts.
 - If nothing is durable enough, return [].
 
 Memories:
@@ -478,6 +531,13 @@ def maybe_auto_apply_model_refresh_proposal(
         reject_model_refresh_proposal(
             beam, proposal_id,
             reason="ephemeral or sensitive content is not eligible for canonical model refresh",
+            validator="sleep_model_refresh_auto_validation",
+        )
+        return False
+    if slot_body_is_invalid(str(metadata.get("body") or "")):
+        reject_model_refresh_proposal(
+            beam, proposal_id,
+            reason="oversized or transcript-like slot body is not eligible for canonical model refresh",
             validator="sleep_model_refresh_auto_validation",
         )
         return False
