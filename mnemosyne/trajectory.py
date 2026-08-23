@@ -228,6 +228,35 @@ def from_messages(
     return records, record_counts(records)
 
 
+def has_session_trajectory(records: Sequence[Mapping[str, Any]] | None) -> bool:
+    """True when records include user/assistant/tool turns (not meta-only)."""
+    if not records:
+        return False
+    return any(record.get("type") in COUNT_TYPES for record in records)
+
+
+def attach_sleep_trajectory(
+    beam: Any,
+    *,
+    session_id: str | None = None,
+    messages: Sequence[Message] | None = None,
+) -> None:
+    """Attach usable session records onto ``beam.sleep_trajectory_records``.
+
+    Meta-only / empty sessions are left unset so sleep falls back to
+    working-memory for model-refresh.
+    """
+    try:
+        if messages is not None:
+            records, _counts = from_messages(messages, session_id=session_id or "")
+        else:
+            records, _counts = resolve_sleep_trajectory(session_id)
+        if has_session_trajectory(records):
+            beam.sleep_trajectory_records = records
+    except Exception:
+        pass
+
+
 def format_count_line(counts: Mapping[str, int] | None) -> str:
     """Dry-run line after the aux slot. Never includes raw tool XML."""
     if counts is None:
@@ -294,7 +323,10 @@ def resolve_sleep_trajectory(
         if not loaded:
             return None, None
         sid = "" if not session_id or session_id == DEFAULT_SESSION else session_id
-        return from_messages(loaded, session_id=sid)
+        records, counts = from_messages(loaded, session_id=sid)
+        if not has_session_trajectory(records):
+            return None, None
+        return records, counts
     except Exception:
         return None, None
 

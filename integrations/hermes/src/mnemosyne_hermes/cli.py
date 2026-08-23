@@ -201,11 +201,9 @@ def _print_sleep_trajectory(session_id: str | None) -> None:
 def _attach_sleep_trajectory(beam, session_id: str | None) -> None:
     """Feed normalized records into beam.sleep when session messages exist."""
     try:
-        from mnemosyne.trajectory import resolve_sleep_trajectory
+        from mnemosyne.trajectory import attach_sleep_trajectory
 
-        records, _counts = resolve_sleep_trajectory(session_id)
-        if records:
-            beam.sleep_trajectory_records = records
+        attach_sleep_trajectory(beam, session_id=session_id)
     except Exception:
         pass
 

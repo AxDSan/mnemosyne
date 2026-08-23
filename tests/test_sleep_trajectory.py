@@ -279,3 +279,197 @@ def test_sleep_model_refresh_uses_trajectory_not_working_memory_xml(tmp_path, mo
     assert xml not in prompt
     assert "tool_call" in prompt
     assert '"type":"user"' in prompt or "List the repo root" in prompt
+
+
+def test_from_messages_empty_is_meta_only_not_session_trajectory():
+    """Empty sessions still emit [meta]; that must not count as a trajectory."""
+    from mnemosyne.trajectory import from_messages, has_session_trajectory
+
+    records, counts = from_messages([], session_id="empty")
+    assert records
+    assert all(record["type"] == "meta" for record in records)
+    assert counts == {"user": 0, "assistant": 0, "tool_call": 0, "tool_result": 0}
+    assert has_session_trajectory(records) is False
+    assert has_session_trajectory(None) is False
+    assert has_session_trajectory([]) is False
+
+
+def test_attach_sleep_trajectory_skips_meta_only_and_attaches_real_turns():
+    from mnemosyne.trajectory import attach_sleep_trajectory, has_session_trajectory
+
+    empty_beam = types.SimpleNamespace()
+    attach_sleep_trajectory(empty_beam, session_id="empty", messages=[])
+    assert getattr(empty_beam, "sleep_trajectory_records", None) is None
+
+    live = types.SimpleNamespace()
+    attach_sleep_trajectory(live, session_id=SESSION_ID, messages=FIXTURE_MESSAGES)
+    assert has_session_trajectory(live.sleep_trajectory_records)
+
+
+def test_sleep_model_refresh_falls_back_to_wm_when_trajectory_is_meta_only(
+    tmp_path, monkeypatch
+):
+    """Meta-only records must not replace working-memory for model-refresh."""
+    from datetime import datetime, timedelta
+
+    from mnemosyne.core import local_llm
+    from mnemosyne.core.beam import BeamMemory
+    from mnemosyne.trajectory import from_messages
+
+    db_path = tmp_path / "mnemo.db"
+    beam = BeamMemory(session_id="sleep-wm", db_path=db_path)
+    old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
+    wm_fact = "User prefers dark mode in the editor."
+    beam.conn.execute(
+        "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("wm-dark-1", wm_fact, "conversation", old_ts, "sleep-wm"),
+    )
+    beam.conn.commit()
+
+    records, _counts = from_messages([], session_id="sleep-wm")
+    beam.sleep_trajectory_records = records
+
+    captured: list[str] = []
+
+    def _host(prompt, **_kwargs):
+        captured.append(prompt)
+        return True, "[]"
+
+    monkeypatch.setattr(local_llm, "_try_host_llm", _host)
+    monkeypatch.setattr(local_llm, "_call_remote_llm", MagicMock())
+    monkeypatch.setattr(local_llm, "llm_available", lambda: False)
+
+    result = beam.sleep(dry_run=False)
+    assert result["status"] == "consolidated"
+    assert captured, "model-refresh should have been invoked"
+    assert wm_fact in captured[0]
+
+
+def _provider_modules():
+    integration_src = REPO_ROOT / "integrations" / "hermes" / "src"
+    import hermes_memory_provider
+
+    if str(integration_src) not in sys.path:
+        sys.path.insert(0, str(integration_src))
+    import mnemosyne_hermes
+
+    return (
+        ("hermes_memory_provider", hermes_memory_provider),
+        ("mnemosyne_hermes", mnemosyne_hermes),
+    )
+
+
+@pytest.mark.parametrize("mod_name,module", _provider_modules())
+def test_on_session_end_skips_meta_only_and_attaches_real_turns(monkeypatch, mod_name, module):
+    created: list[object] = []
+
+    class WorkerBeam:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            created.append(self)
+
+        def sleep(self, *args, **kwargs):
+            return {"status": "consolidated"}
+
+    monkeypatch.setattr(module, "_get_beam_class", lambda: WorkerBeam)
+
+    provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+    provider._beam = types.SimpleNamespace(
+        session_id="sess-fixture-1",
+        db_path="/tmp/test.db",
+        author_id="agent_1",
+        author_type="hermes",
+        channel_id="test:channel",
+        canonical_owner_id="default",
+        agent_context="primary",
+    )
+    provider._audit = None
+    provider._session_id = "sess-fixture-1"
+    provider.SESSION_END_SLEEP_TIMEOUT_SECONDS = 5
+    if hasattr(provider, "_reserve_reflection_budget"):
+        monkeypatch.setattr(provider, "_reserve_reflection_budget", lambda name: None)
+    if hasattr(provider, "_reserve_reflection_budget_locked"):
+        monkeypatch.setattr(provider, "_reserve_reflection_budget_locked", lambda name: None)
+
+    created.clear()
+    provider.on_session_end(messages=[])
+    assert created, f"{mod_name} should create an isolated sleep beam"
+    assert getattr(created[0], "sleep_trajectory_records", None) is None
+
+    created.clear()
+    provider.on_session_end(messages=FIXTURE_MESSAGES)
+    assert created, f"{mod_name} should create an isolated sleep beam"
+    from mnemosyne.trajectory import has_session_trajectory
+
+    assert has_session_trajectory(created[0].sleep_trajectory_records)
+
+
+@pytest.mark.parametrize("mod_name,module", _provider_modules())
+def test_handle_sleep_and_auto_sleep_attach_resolved_trajectory(
+    monkeypatch, mod_name, module
+):
+    from mnemosyne import trajectory
+    from mnemosyne.trajectory import has_session_trajectory
+
+    trajectory.set_injected_session_messages(FIXTURE_MESSAGES)
+
+    class SourceBeam:
+        session_id = "sess-fixture-1"
+        db_path = "/tmp/test.db"
+        author_id = "agent_1"
+        author_type = "hermes"
+        channel_id = "test:channel"
+        canonical_owner_id = "default"
+        agent_context = "primary"
+
+        def get_working_stats(self):
+            return {"total": 50}
+
+        def get_episodic_stats(self):
+            return {}
+
+        def _count_unconsolidated_before(self, _cutoff):
+            return 5
+
+        def sleep(self, dry_run=False, force=False):
+            return {"status": "consolidated"}
+
+        def sleep_all_sessions(self, dry_run=False, force=False):
+            raise AssertionError("must not sweep all sessions")
+
+    created: list[object] = []
+
+    class WorkerBeam:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            created.append(self)
+
+        def sleep(self, *args, **kwargs):
+            return {"status": "consolidated"}
+
+    monkeypatch.setattr(module, "_get_beam_class", lambda: WorkerBeam)
+
+    provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+    source = SourceBeam()
+    provider._beam = source
+    provider._audit = None
+    provider._session_id = "sess-fixture-1"
+    provider._auto_sleep_threshold = 10
+    provider._AUTO_SLEEP_TIMEOUT_SECONDS = 5
+    if hasattr(provider, "_reserve_reflection_budget"):
+        monkeypatch.setattr(provider, "_reserve_reflection_budget", lambda name: None)
+    if hasattr(provider, "_reserve_reflection_budget_locked"):
+        monkeypatch.setattr(provider, "_reserve_reflection_budget_locked", lambda name: None)
+
+    provider._handle_sleep({"dry_run": False})
+    assert has_session_trajectory(getattr(source, "sleep_trajectory_records", None)), (
+        f"{mod_name} _handle_sleep must attach resolved session records"
+    )
+
+    created.clear()
+    provider._maybe_auto_sleep()
+    assert created, f"{mod_name} auto-sleep should create an isolated beam"
+    assert has_session_trajectory(getattr(created[0], "sleep_trajectory_records", None)), (
+        f"{mod_name} _maybe_auto_sleep must attach resolved session records"
+    )

@@ -9317,8 +9317,11 @@ class BeamMemory:
                     trajectory_records = getattr(self, "sleep_trajectory_records", None)
                     if trajectory_records:
                         # Trajectory-first: compact JSON records, not raw tool XML
-                        # and not working-memory transcript dumps.
-                        refresh_items = sleep_prompt_items(trajectory_records)
+                        # and not working-memory transcript dumps. Meta-only is
+                        # not a trajectory — keep working-memory items.
+                        traj_items = sleep_prompt_items(trajectory_records)
+                        if traj_items:
+                            refresh_items = traj_items
                     proposals = model_refresh.infer_model_update_proposals(refresh_items)
                 except Exception:
                     proposals = []

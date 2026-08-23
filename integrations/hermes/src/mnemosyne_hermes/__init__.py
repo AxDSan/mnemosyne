@@ -2126,6 +2126,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                             # collapsing a replica's entire mcp_{bank} backlog
                             # into a gist on one write (issue #771).
                             with _sleep_aux_context():
+                                from mnemosyne.trajectory import attach_sleep_trajectory
+
+                                attach_sleep_trajectory(
+                                    sleep_beam,
+                                    session_id=sleep_args.get("session_id"),
+                                )
                                 sleep_beam.sleep()
                     except Exception as inner:
                         logger.debug("Mnemosyne auto-sleep worker failed: %s", inner)
@@ -2603,6 +2609,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         dry_run = bool(args.get("dry_run", False))
         force = bool(args.get("force", False))
         all_sessions = bool(args.get("all_sessions", False))
+        try:
+            from mnemosyne.trajectory import attach_sleep_trajectory
+
+            attach_sleep_trajectory(
+                self._beam,
+                session_id=getattr(self._beam, "session_id", None),
+            )
+        except Exception:
+            pass
         with _sleep_aux_context():
             if all_sessions and hasattr(self._beam, "sleep_all_sessions"):
                 result = self._beam.sleep_all_sessions(dry_run=dry_run, force=force)
@@ -3428,13 +3443,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         sleep_beam.canonical_owner_id = canonical_owner_id
                         sleep_beam.agent_context = agent_context
                         try:
-                            from mnemosyne.trajectory import from_messages
+                            from mnemosyne.trajectory import attach_sleep_trajectory
 
-                            records, _counts = from_messages(
-                                messages or [], session_id=sleep_args["session_id"]
+                            attach_sleep_trajectory(
+                                sleep_beam,
+                                session_id=sleep_args["session_id"],
+                                messages=messages or [],
                             )
-                            if records:
-                                sleep_beam.sleep_trajectory_records = records
                         except Exception:
                             pass
                         with _sleep_aux_context():
