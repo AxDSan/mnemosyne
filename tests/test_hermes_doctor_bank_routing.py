@@ -7,16 +7,10 @@ Related: #362, #373.
 """
 
 import json
-import os
 import sqlite3
 import sys
 import types
-from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-import pytest
-
-from mnemosyne_hermes.cli import _resolve_cli_bank
 
 
 # ---------------------------------------------------------------------------
@@ -446,8 +440,8 @@ class TestDoctorBankEdgeCases:
         existing routing. We assert that:
           * the resolved bank beam is bound to the profile/implicit bank
             ("work"), not the default bank,
-          * `beam.sleep(dry_run=True)` is actually invoked on that beam
-            (not merely that the command returns without raising),
+          * `--dry-run` returns before `beam.sleep` (prints aux/trajectory
+            only; no LLM, no consolidation),
           * the doctor guard is NOT applied to sleep (no rejection / no
             `return 1`),
           * no real consolidation or DB mutation occurs (mocked beam).
@@ -491,6 +485,6 @@ class TestDoctorBankEdgeCases:
             f"sleep bound to wrong bank: expected 'work', got {call_bank!r}"
         )
 
-        # The resolved-bank beam must have received the dry-run sleep call.
-        mock_beam.sleep.assert_called_once_with(dry_run=True)
+        # Dry-run must not call beam.sleep; it prints and returns first.
+        mock_beam.sleep.assert_not_called()
 
