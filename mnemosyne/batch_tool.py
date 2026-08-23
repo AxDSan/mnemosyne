@@ -13,6 +13,10 @@ from mnemosyne.core.veracity_consolidation import clamp_veracity
 logger = logging.getLogger(__name__)
 
 _ALLOWED_BATCH_ACTIONS = {"remember", "update", "forget", "invalidate"}
+_BATCH_ERROR_CODES = {
+    "validation": "batch_validation_failed",
+    "execution": "batch_failed",
+}
 _FUZZY_BATCH_FIELDS = {"old_text", "query", "content_match"}
 _BATCH_MAX_OPS = 50
 
@@ -94,10 +98,14 @@ def dry_run_batch(normalized: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def batch_validation_error_payload(exc: BatchValidationError) -> dict[str, Any]:
-    payload: dict[str, Any] = {"status": "error", "error": str(exc)}
+    payload: dict[str, Any] = {
+        "status": "error",
+        "error": "batch_validation_failed",
+        "action": None,
+    }
     if exc.failed_index is not None:
         payload["failed_index"] = exc.failed_index
-    if exc.action:
+    if exc.action and exc.action in _ALLOWED_BATCH_ACTIONS:
         payload["action"] = exc.action
     return payload
 
@@ -127,17 +135,17 @@ def apply_beam_batch(
                     audit_events=audit_events,
                     extract_defaults_global=extract_defaults_global,
                 ))
-    except Exception as exc:
-        logger.exception(
+    except Exception:
+        logger.error(
             "mnemosyne_batch failed at index=%s action=%s",
             current.get("index"),
             current.get("action"),
         )
         return {
             "status": "error",
+            "error": "batch_failed",
             "failed_index": current.get("index"),
             "action": current.get("action"),
-            "error": f"{type(exc).__name__}: {exc}",
         }
     if audit_event:
         for event_name, event_kwargs in audit_events:

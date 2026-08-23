@@ -297,12 +297,13 @@ def _build_mcp_server() -> Server:
         try:
             result = handle_tool_call(params.name, params.arguments or {})
             content = [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
-            return CallToolResult(content=content)
+            is_error = (
+                isinstance(result, dict)
+                and result.get("status") == "error"
+                and result.get("error", "").startswith("batch_")
+            )
+            return CallToolResult(content=content, is_error=is_error)
         except Exception as e:
-            # SDK 2.x contract: return a CallToolResult with is_error=True so
-            # clients can distinguish implementation failures from successful
-            # calls. Preserves the existing error payload shape for backward
-            # compatibility with any caller already parsing the error content.
             content = [TextContent(type="text", text=json.dumps({"status": "error", "message": str(e)}, indent=2))]
             return CallToolResult(content=content, is_error=True)
 
