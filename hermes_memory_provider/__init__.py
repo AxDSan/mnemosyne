@@ -1479,6 +1479,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # negative count when shutdown is called on a never-activated
         # instance.
         self._is_active_in_module: bool = False
+        # Interactive tool-set mode. Default "full" preserves the historical
+        # advertised surface; a later config key can select slim/none.
+        self._interactive_mode = "full"
 
     def _activate_in_module(self) -> None:
         """Bump the module-level active-provider count exactly once per
@@ -1740,15 +1743,17 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def _configured_tool_schemas(self) -> List[Dict[str, Any]]:
         """Return schemas filtered by memory.mnemosyne.tools, if configured.
 
-        ``tools`` omitted/None preserves the historical behavior and exposes all
-        Mnemosyne tools. ``tools: []`` exposes no tools while still allowing the
-        provider's memory context/prefetch surface to initialize. Unknown names
+        ``tools`` omitted/None uses ``schemas_for_mode(self._interactive_mode)``
+        (default mode ``full``, the historical all-tools surface). An explicit
+        ``tools`` list — including ``[]`` — wins over the mode. Unknown names
         fail loudly so operators catch typos during Hermes startup instead of
         silently losing tools.
         """
+        from hermes_memory_provider.tool_sets import schemas_for_mode
+
         configured = self._read_config_key("tools")
         if configured is None:
-            return list(ALL_TOOL_SCHEMAS)
+            return schemas_for_mode(getattr(self, "_interactive_mode", "full"))
         if isinstance(configured, str):
             configured = [name.strip() for name in configured.replace(",", "\n").split("\n") if name.strip()]
         if not isinstance(configured, list):
@@ -1917,6 +1922,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._platform = kwargs.get("platform", "cli")
         self._hermes_home = kwargs.get("hermes_home", "")
         self._agent_identity = kwargs.get("agent_identity", None) or ""
+        # Default "full" so this commit does not change the live tool tax.
+        self._interactive_mode = "full"
 
         # Apply provider-specific config from kwargs (Hermes-passed) or config.yaml fallback
         self._apply_provider_config(kwargs)
