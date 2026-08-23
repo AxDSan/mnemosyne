@@ -3427,6 +3427,16 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         sleep_beam = BeamClass(**sleep_args)
                         sleep_beam.canonical_owner_id = canonical_owner_id
                         sleep_beam.agent_context = agent_context
+                        try:
+                            from mnemosyne.trajectory import from_messages
+
+                            records, _counts = from_messages(
+                                messages or [], session_id=sleep_args["session_id"]
+                            )
+                            if records:
+                                sleep_beam.sleep_trajectory_records = records
+                        except Exception:
+                            pass
                         with _sleep_aux_context():
                             sleep_beam.sleep()
                 except Exception as inner:

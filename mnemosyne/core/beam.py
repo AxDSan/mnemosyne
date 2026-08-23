@@ -9311,7 +9311,15 @@ class BeamMemory:
             if agent_context != "cron":
                 try:
                     from mnemosyne.core import model_refresh
-                    proposals = model_refresh.infer_model_update_proposals(items)
+                    from mnemosyne.trajectory import sleep_prompt_items
+
+                    refresh_items = items
+                    trajectory_records = getattr(self, "sleep_trajectory_records", None)
+                    if trajectory_records:
+                        # Trajectory-first: compact JSON records, not raw tool XML
+                        # and not working-memory transcript dumps.
+                        refresh_items = sleep_prompt_items(trajectory_records)
+                    proposals = model_refresh.infer_model_update_proposals(refresh_items)
                 except Exception:
                     proposals = []
             model_refresh_proposals += len(proposals)

@@ -21,10 +21,38 @@ input produce identical ``dumps(..., sort_keys=True)`` bytes.
 from __future__ import annotations
 
 import json
+import os
+import re
+import sqlite3
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 Record = dict[str, Any]
 Message = Mapping[str, Any]
+
+# Count line printed by ``hermes mnemosyne sleep --dry-run``.
+COUNT_TYPES = ("user", "assistant", "tool_call", "tool_result")
+
+# Default when --session is omitted: most recently active Hermes session.
+DEFAULT_SESSION = "latest"
+
+_TOOL_XML_BLOCK_RE = re.compile(
+    r"</?tool_calls?>",
+    re.IGNORECASE,
+)
+_TOOL_XML_PAIR_RE = re.compile(
+    r"<tool_calls?\b[^>]*>.*?</tool_calls?>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Test hook: inject messages so CI never opens ~/.hermes/state.db.
+_injected_session_messages: Sequence[Message] | None = None
+
+
+def set_injected_session_messages(messages: Sequence[Message] | None) -> None:
+    """Replace (or clear) the in-process session-message override."""
+    global _injected_session_messages
+    _injected_session_messages = messages
 
 
 def dumps(records: Sequence[Mapping[str, Any]]) -> str:
@@ -178,3 +206,138 @@ def _arguments(raw: Any) -> Any:
             return parsed
         return raw
     return raw
+
+
+def record_counts(records: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    """Count user/assistant/tool_call/tool_result records (ignore meta/reasoning)."""
+    counts = {kind: 0 for kind in COUNT_TYPES}
+    for record in records:
+        kind = record.get("type")
+        if kind in counts:
+            counts[kind] += 1
+    return counts
+
+
+def from_messages(
+    messages: Sequence[Message],
+    *,
+    session_id: str = "",
+) -> tuple[list[Record], dict[str, int]]:
+    """Normalize session messages and return (records, type counts)."""
+    records = normalize(messages, session_id=session_id)
+    return records, record_counts(records)
+
+
+def format_count_line(counts: Mapping[str, int] | None) -> str:
+    """Dry-run line after the aux slot. Never includes raw tool XML."""
+    if counts is None:
+        return "trajectory: unavailable"
+    return (
+        "trajectory: "
+        f"user={int(counts.get('user', 0))} "
+        f"assistant={int(counts.get('assistant', 0))} "
+        f"tool_call={int(counts.get('tool_call', 0))} "
+        f"tool_result={int(counts.get('tool_result', 0))}"
+    )
+
+
+def _strip_tool_xml(text: str) -> str:
+    cleaned = _TOOL_XML_PAIR_RE.sub("", text)
+    cleaned = _TOOL_XML_BLOCK_RE.sub("", cleaned)
+    return cleaned.strip()
+
+
+def _sanitize_record(record: Mapping[str, Any]) -> Record:
+    sanitized: Record = {}
+    for key, value in record.items():
+        if isinstance(value, str):
+            sanitized[key] = _strip_tool_xml(value)
+        else:
+            sanitized[key] = value
+    return sanitized
+
+
+def sleep_prompt_items(records: Sequence[Mapping[str, Any]]) -> list[Record]:
+    """Model-refresh items: compact JSON records, never raw tool XML."""
+    items: list[Record] = []
+    for index, record in enumerate(records):
+        if record.get("type") == "meta":
+            continue
+        clean = _sanitize_record(record)
+        items.append(
+            {
+                "id": str(clean.get("id") or f"traj-{index}"),
+                "content": dumps([clean]),
+            }
+        )
+    return items
+
+
+def resolve_sleep_trajectory(
+    session_id: str | None = None,
+    *,
+    messages: Sequence[Message] | None = None,
+) -> tuple[list[Record] | None, dict[str, int] | None]:
+    """Load messages (injected, explicit, or state.db) and normalize.
+
+    Returns ``(None, None)`` when no session messages are available so
+    callers can print ``trajectory: unavailable`` instead of crashing.
+    Default session is the most recently active Hermes session
+    (``DEFAULT_SESSION`` / ``latest``).
+    """
+    try:
+        loaded = messages
+        if loaded is None:
+            loaded = _injected_session_messages
+        if loaded is None:
+            loaded = _load_hermes_session_messages(session_id)
+        if not loaded:
+            return None, None
+        sid = "" if not session_id or session_id == DEFAULT_SESSION else session_id
+        return from_messages(loaded, session_id=sid)
+    except Exception:
+        return None, None
+
+
+def _hermes_state_db() -> Path | None:
+    home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+    path = Path(home) / "state.db"
+    return path if path.is_file() else None
+
+
+def _load_hermes_session_messages(session_id: str | None) -> list[Record] | None:
+    """Best-effort read of Hermes ``state.db``. Never raises to callers."""
+    db_path = _hermes_state_db()
+    if db_path is None:
+        return None
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        sid = session_id
+        if not sid or sid == DEFAULT_SESSION:
+            row = conn.execute(
+                "SELECT id FROM sessions "
+                "ORDER BY COALESCE(last_activity_at, started_at, 0) DESC "
+                "LIMIT 1"
+            ).fetchone()
+            if row is None:
+                return None
+            sid = row["id"]
+        rows = conn.execute(
+            "SELECT role, content, tool_calls, tool_name, tool_call_id, "
+            "reasoning, reasoning_content, timestamp, id, active "
+            "FROM messages WHERE session_id = ? ORDER BY id ASC",
+            (sid,),
+        ).fetchall()
+        if not rows:
+            return None
+        messages: list[Record] = []
+        for row in rows:
+            message = {key: row[key] for key in row.keys() if row[key] is not None}
+            messages.append(message)
+        return messages
+    except Exception:
+        return None
+    finally:
+        conn.close()
+

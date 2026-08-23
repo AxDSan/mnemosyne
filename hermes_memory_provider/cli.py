@@ -90,6 +90,29 @@ def _sleep_aux_context():
     return sleep_aux_context()
 
 
+def _print_sleep_trajectory(session_id: str | None) -> None:
+    """Print trajectory record counts. Never raises; never dumps tool XML."""
+    try:
+        from mnemosyne.trajectory import format_count_line, resolve_sleep_trajectory
+
+        _records, counts = resolve_sleep_trajectory(session_id)
+        print(format_count_line(counts))
+    except Exception:
+        print("trajectory: unavailable")
+
+
+def _attach_sleep_trajectory(beam, session_id: str | None) -> None:
+    """Feed normalized records into beam.sleep when session messages exist."""
+    try:
+        from mnemosyne.trajectory import resolve_sleep_trajectory
+
+        records, _counts = resolve_sleep_trajectory(session_id)
+        if records:
+            beam.sleep_trajectory_records = records
+    except Exception:
+        pass
+
+
 def register_cli(subparser):
     """Register CLI subcommands for ``hermes mnemosyne``."""
     mn_cmds = subparser.add_subparsers(dest="mnemosyne_cmd")
@@ -100,6 +123,17 @@ def register_cli(subparser):
     sleep_cmd = mn_cmds.add_parser("sleep", help="Run consolidation cycle")
     sleep_cmd.add_argument("--all-sessions", action="store_true", help="Consolidate eligible old working memories across all sessions")
     sleep_cmd.add_argument("--dry-run", action="store_true", help="Report resolved aux slot without calling the LLM or writing changes")
+    sleep_cmd.add_argument(
+        "--session",
+        dest="session",
+        type=str,
+        default=None,
+        help=(
+            "Hermes session id for trajectory records. "
+            "Default: latest session in $HERMES_HOME/state.db. "
+            "Prints 'trajectory: unavailable' if messages cannot be loaded."
+        ),
+    )
     mn_cmds.add_parser("version", help="Show Mnemosyne version")
 
     inspect_cmd = mn_cmds.add_parser("inspect", help="Search memories")
@@ -183,9 +217,12 @@ def mnemosyne_command(args):
 
     elif cmd == "sleep":
         dry_run = bool(getattr(args, "dry_run", False))
+        session_id = getattr(args, "session", None)
         if dry_run:
             _print_sleep_aux_resolution()
+            _print_sleep_trajectory(session_id)
             return 0
+        _attach_sleep_trajectory(beam, session_id)
         with _sleep_aux_context():
             if getattr(args, "all_sessions", False):
                 result = beam.sleep_all_sessions()
