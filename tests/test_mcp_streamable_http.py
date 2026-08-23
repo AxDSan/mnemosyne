@@ -13,6 +13,8 @@ Run with: pytest tests/test_mcp_streamable_http.py -v
 from __future__ import annotations
 
 import asyncio
+import json
+import threading
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -25,6 +27,25 @@ def _starlette_available() -> bool:
         return True
     except ImportError:
         return False
+
+
+def _parse_mcp_response(response):
+    """Decode a streamable-HTTP response by its Content-Type.
+
+    The SDK answers with either ``application/json`` or
+    ``text/event-stream``; the JSON-RPC payload must be asserted on either
+    way, never on raw body substrings. SSE frames carry the payload on a
+    ``data:`` line.
+    """
+    content_type = response.headers.get("content-type", "")
+    if content_type.startswith("application/json"):
+        return response.json()
+    if content_type.startswith("text/event-stream"):
+        for line in response.text.splitlines():
+            if line.startswith("data:"):
+                return json.loads(line[len("data:"):].strip())
+        raise AssertionError(f"SSE response had no data: payload: {response.text!r}")
+    raise AssertionError(f"unexpected response content-type: {content_type!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -355,9 +376,13 @@ class TestStreamableHttpBearerRejection:
         """A valid bearer completes MCP operations behind the middleware.
 
         Drives the full token-gated non-loopback app through an initialize
-        handshake and a tools/list call, asserting JSON-RPC success plus the
-        operation result. The rejection tests above are the isolation control
-        proving the middleware is what blocks unauthorized requests.
+        handshake and a tools/list call, decoding each response by its
+        Content-Type and asserting the JSON-RPC id, successful result shape,
+        serverInfo, and a non-empty tools list. Then exercises the
+        authenticated GET session stream and proves DELETE terminates the
+        session: a later request on it is rejected with 404. The rejection
+        tests above are the isolation control proving the middleware is what
+        blocks unauthorized requests.
         """
         from starlette.testclient import TestClient
 
@@ -367,7 +392,7 @@ class TestStreamableHttpBearerRejection:
             "MCP-Protocol-Version": "2025-03-26",
         }
         # One lifespan per app instance: the session manager's run() can only
-        # be entered once, so the handshake and the follow-up share the block.
+        # be entered once, so the handshake and the follow-ups share the block.
         with TestClient(authed_app, base_url="http://localhost:8080") as client:
             init = client.post(
                 "/mcp",
@@ -384,17 +409,106 @@ class TestStreamableHttpBearerRejection:
                 headers=headers,
             )
             assert init.status_code == 200
+            init_body = _parse_mcp_response(init)
+            assert init_body["jsonrpc"] == "2.0"
+            assert init_body["id"] == 1
+            assert "result" in init_body and "error" not in init_body
+            assert init_body["result"]["protocolVersion"] == "2025-03-26"
+            assert init_body["result"]["serverInfo"]["name"] == "mnemosyne"
+
             session_id = init.headers.get("mcp-session-id")
             assert session_id, "initialize must mint a session id"
-            assert "serverInfo" in init.text
 
             listed = client.post(
                 "/mcp",
                 json={"jsonrpc": "2.0", "method": "tools/list", "id": 2},
                 headers={**headers, "Mcp-Session-Id": session_id},
             )
-        assert listed.status_code == 200
-        assert "tools" in listed.text
+            assert listed.status_code == 200
+            listed_body = _parse_mcp_response(listed)
+            assert listed_body["jsonrpc"] == "2.0"
+            assert listed_body["id"] == 2
+            assert "result" in listed_body and "error" not in listed_body
+            tools = listed_body["result"]["tools"]
+            assert isinstance(tools, list) and tools, (
+                "tools/list must return a non-empty tools list"
+            )
+
+            # The authenticated GET opens the session's SSE stream. The stream
+            # is long-lived, so drive it in a portal thread and wait for the
+            # response start before terminating the session with DELETE.
+            portal = client.portal
+            get_started = threading.Event()
+            get_result = {}
+
+            def _drive_get():
+                scope = {
+                    "type": "http",
+                    "asgi": {"version": "3.0"},
+                    "http_version": "1.1",
+                    "method": "GET",
+                    "scheme": "http",
+                    "path": "/mcp",
+                    "raw_path": b"/mcp",
+                    "query_string": b"",
+                    "root_path": "",
+                    "headers": [
+                        (b"host", b"localhost:8080"),
+                        (b"authorization", b"Bearer supersecret"),
+                        (b"accept", b"text/event-stream"),
+                        (b"mcp-session-id", session_id.encode()),
+                    ],
+                    "client": ("testclient", 50000),
+                    "server": ("localhost", 8080),
+                }
+
+                async def receive():
+                    while True:
+                        await asyncio.sleep(3600)
+
+                async def send(message):
+                    if message["type"] == "http.response.start":
+                        get_result["status"] = message["status"]
+                        get_result["content_type"] = dict(
+                            (k.decode(), v.decode())
+                            for k, v in message.get("headers", [])
+                        ).get("content-type")
+                        get_started.set()
+
+                try:
+                    portal.call(authed_app, scope, receive, send)
+                except BaseException as exc:  # pragma: no cover - defensive
+                    get_result["exc"] = repr(exc)
+                    get_started.set()
+
+            get_thread = threading.Thread(target=_drive_get, daemon=True)
+            get_thread.start()
+            assert get_started.wait(10), "authenticated GET stream never started"
+            assert get_result["status"] == 200
+            assert (get_result.get("content_type") or "").startswith(
+                "text/event-stream"
+            )
+
+            # DELETE terminates the session (SDK 2.0.0 answers 200 with a JSON
+            # body)...
+            deleted = client.delete(
+                "/mcp", headers={**headers, "Mcp-Session-Id": session_id}
+            )
+            assert deleted.status_code == 200
+            assert deleted.headers["content-type"].startswith("application/json")
+
+            get_thread.join(10)
+            assert not get_thread.is_alive(), (
+                "GET stream did not close after DELETE"
+            )
+
+            # ...and any later request on the terminated session is rejected.
+            stale = client.post(
+                "/mcp",
+                json={"jsonrpc": "2.0", "method": "ping", "id": 3},
+                headers={**headers, "Mcp-Session-Id": session_id},
+            )
+            assert stale.status_code == 404
 
     def _drive_middleware(self, header_value: bytes):
         """Run the bearer middleware directly against a stub downstream app.
