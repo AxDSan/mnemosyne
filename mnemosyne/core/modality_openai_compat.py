@@ -477,11 +477,15 @@ class OpenAICompatModalityBackend:
             text, status, exc = _post_chat(url, headers, payload, timeout)
             if text is not None:
                 break
-            transient = (
-                (status is not None and (status == 429 or 500 <= status < 600))
-                or (exc is not None and _is_rate_limit_error(exc))
-                or (status is None and exc is not None)
-            )
+            if status is None:
+                # No HTTP response was received, so this was a transport
+                # failure. Retry it regardless of how an exception is worded.
+                transient = exc is not None
+            else:
+                # A received HTTP status is authoritative. In particular, do
+                # not let an incidental "429" in the exception text turn a
+                # terminal client error into a retry.
+                transient = status == 429 or 500 <= status < 600
             if transient and attempt < _MAX_ATTEMPTS - 1:
                 time.sleep(_retry_delay(attempt))
                 continue

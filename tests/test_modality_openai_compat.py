@@ -448,6 +448,23 @@ def test_client_errors_are_not_retried(stub, configured, monkeypatch, status):
     assert server.replies == [(200, _OK_REPLY)]
 
 
+def test_known_client_status_beats_429_in_exception_text(stub, configured, monkeypatch):
+    server = stub([(403, "forbidden"), (200, _OK_REPLY)])
+    configured(server.base_url)
+    post_chat = adapter._post_chat
+
+    def _post_with_misleading_exception(*args, **kwargs):
+        text, status, _ = post_chat(*args, **kwargs)
+        return text, status, RuntimeError("request URL included port 429")
+
+    monkeypatch.setattr(adapter, "_post_chat", _post_with_misleading_exception)
+
+    assert adapter.OpenAICompatModalityBackend().describe(_request()) is None
+    assert len(server.requests) == 1
+    assert server.response_statuses == [403]
+    assert server.replies == [(200, _OK_REPLY)]
+
+
 def test_an_unreachable_endpoint_degrades_to_none(configured, monkeypatch):
     monkeypatch.setattr(adapter.time, "sleep", lambda _s: None)
     configured("http://127.0.0.1:1/v1")
