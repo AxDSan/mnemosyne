@@ -9,6 +9,7 @@ import argparse
 import contextlib
 import importlib.util
 import io
+import sqlite3
 import sys
 import types
 from pathlib import Path
@@ -473,3 +474,111 @@ def test_handle_sleep_and_auto_sleep_attach_resolved_trajectory(
     assert has_session_trajectory(getattr(created[0], "sleep_trajectory_records", None)), (
         f"{mod_name} _maybe_auto_sleep must attach resolved session records"
     )
+
+
+def _write_hermes_state_db(home: Path, sessions: list[tuple], messages: list[dict]) -> None:
+    """Create a Hermes-shaped state.db (sessions + messages) under home."""
+    home.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(home / "state.db")
+    try:
+        conn.execute(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL DEFAULT 'cli',
+                started_at REAL NOT NULL,
+                last_activity_at REAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                tool_calls TEXT,
+                tool_name TEXT,
+                tool_call_id TEXT,
+                reasoning TEXT,
+                reasoning_content TEXT,
+                timestamp REAL NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO sessions (id, source, started_at, last_activity_at) "
+            "VALUES (?, 'cli', ?, ?)",
+            sessions,
+        )
+        for message in messages:
+            conn.execute(
+                "INSERT INTO messages ("
+                "session_id, role, content, tool_calls, tool_name, tool_call_id, "
+                "reasoning, reasoning_content, timestamp, active"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    message["session_id"],
+                    message["role"],
+                    message.get("content"),
+                    message.get("tool_calls"),
+                    message.get("tool_name"),
+                    message.get("tool_call_id"),
+                    message.get("reasoning"),
+                    message.get("reasoning_content"),
+                    message["timestamp"],
+                    message.get("active", 1),
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_attach_sleep_trajectory_maps_hermes_prefix_and_falls_back_to_latest(
+    tmp_path, monkeypatch
+):
+    """Beam session_id is hermes_<raw>; state.db stores the raw Hermes id."""
+    from mnemosyne.trajectory import attach_sleep_trajectory, has_session_trajectory
+
+    older_id = "20260822_100000_aaaaaa"
+    latest_id = "20260823_120000_bbbbbb"
+    hermes_home = tmp_path / "hermes-home"
+    _write_hermes_state_db(
+        hermes_home,
+        sessions=[
+            (older_id, 1_700_000_000.0, 1_700_000_100.0),
+            (latest_id, 1_700_100_000.0, 1_700_100_200.0),
+        ],
+        messages=[
+            {
+                "session_id": older_id,
+                "role": "user",
+                "content": "older session unique fact",
+                "timestamp": 1_700_000_050.0,
+            },
+            {
+                "session_id": latest_id,
+                "role": "user",
+                "content": "latest session unique fact",
+                "timestamp": 1_700_100_050.0,
+            },
+        ],
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    prefixed = types.SimpleNamespace()
+    attach_sleep_trajectory(prefixed, session_id=f"hermes_{older_id}")
+    assert has_session_trajectory(getattr(prefixed, "sleep_trajectory_records", None))
+    contents = [record.get("content") for record in prefixed.sleep_trajectory_records]
+    assert "older session unique fact" in contents
+    assert "latest session unique fact" not in contents
+
+    unknown = types.SimpleNamespace()
+    attach_sleep_trajectory(unknown, session_id="hermes_no_such_session")
+    assert has_session_trajectory(getattr(unknown, "sleep_trajectory_records", None))
+    contents = [record.get("content") for record in unknown.sleep_trajectory_records]
+    assert "latest session unique fact" in contents
+    assert "older session unique fact" not in contents

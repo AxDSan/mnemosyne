@@ -337,6 +337,61 @@ def _hermes_state_db() -> Path | None:
     return path if path.is_file() else None
 
 
+def _latest_hermes_session_id(conn: sqlite3.Connection) -> str | None:
+    row = conn.execute(
+        "SELECT id FROM sessions "
+        "ORDER BY COALESCE(last_activity_at, started_at, 0) DESC "
+        "LIMIT 1"
+    ).fetchone()
+    return None if row is None else row["id"]
+
+
+def _session_has_messages(conn: sqlite3.Connection, sid: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
+        (sid,),
+    ).fetchone()
+    return row is not None
+
+
+def _messages_for_session(conn: sqlite3.Connection, sid: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT role, content, tool_calls, tool_name, tool_call_id, "
+        "reasoning, reasoning_content, timestamp, id, active "
+        "FROM messages WHERE session_id = ? ORDER BY id ASC",
+        (sid,),
+    ).fetchall()
+
+
+def _resolve_state_db_session_id(
+    conn: sqlite3.Connection,
+    session_id: str | None,
+) -> str | None:
+    """Map Beam/provider ids onto Hermes ``state.db`` session ids.
+
+    ``beam.session_id`` is ``hermes_{scope}``; ``messages.session_id`` is
+    the raw Hermes id (``20260823_…``). Strip a ``hermes_`` prefix and
+    retry. Unknown ``hermes_*`` ids fall back to latest, same as omitting
+    ``--session``.
+    """
+    if not session_id or session_id == DEFAULT_SESSION:
+        return _latest_hermes_session_id(conn)
+
+    candidates = [session_id]
+    if session_id.startswith("hermes_"):
+        stripped = session_id[len("hermes_") :]
+        if stripped and stripped not in candidates:
+            candidates.append(stripped)
+
+    for sid in candidates:
+        if _session_has_messages(conn, sid):
+            return sid
+
+    if session_id.startswith("hermes_"):
+        return _latest_hermes_session_id(conn)
+    return session_id
+
+
 def _load_hermes_session_messages(session_id: str | None) -> list[Record] | None:
     """Best-effort read of Hermes ``state.db``. Never raises to callers."""
     db_path = _hermes_state_db()
@@ -345,22 +400,10 @@ def _load_hermes_session_messages(session_id: str | None) -> list[Record] | None
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         conn.row_factory = sqlite3.Row
-        sid = session_id
-        if not sid or sid == DEFAULT_SESSION:
-            row = conn.execute(
-                "SELECT id FROM sessions "
-                "ORDER BY COALESCE(last_activity_at, started_at, 0) DESC "
-                "LIMIT 1"
-            ).fetchone()
-            if row is None:
-                return None
-            sid = row["id"]
-        rows = conn.execute(
-            "SELECT role, content, tool_calls, tool_name, tool_call_id, "
-            "reasoning, reasoning_content, timestamp, id, active "
-            "FROM messages WHERE session_id = ? ORDER BY id ASC",
-            (sid,),
-        ).fetchall()
+        sid = _resolve_state_db_session_id(conn, session_id)
+        if not sid:
+            return None
+        rows = _messages_for_session(conn, sid)
         if not rows:
             return None
         messages: list[Record] = []
