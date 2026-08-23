@@ -173,6 +173,15 @@ def _get_beam_class():
     return BeamMemory
 
 
+def _sleep_aux_context():
+    """Adapter-local flag so host-LLM complete() may resolve auxiliary.sleep."""
+    try:
+        from .hermes_llm_adapter import sleep_aux_context
+    except ImportError:
+        from hermes_memory_provider.hermes_llm_adapter import sleep_aux_context
+    return sleep_aux_context()
+
+
 def _get_triple_module():
     from mnemosyne.core.triples import add_triple, query_triples
     return add_triple, query_triples
@@ -2625,7 +2634,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                             channel_id=beam_ref.channel_id,
                         )
                         with beam_lock:
-                            sleep_beam.sleep()
+                            with _sleep_aux_context():
+                                sleep_beam.sleep()
                     except Exception as inner:
                         logger.debug("Mnemosyne auto-sleep worker failed: %s", inner)
                 sleep_thread = threading.Thread(target=_sleep_isolated, daemon=True)
@@ -3077,10 +3087,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         dry_run = bool(args.get("dry_run", False))
         force = bool(args.get("force", False))
         all_sessions = bool(args.get("all_sessions", False))
-        if all_sessions and hasattr(self._beam, "sleep_all_sessions"):
-            result = self._beam.sleep_all_sessions(dry_run=dry_run, force=force)
-        else:
-            result = self._beam.sleep(dry_run=dry_run, force=force)
+        with _sleep_aux_context():
+            if all_sessions and hasattr(self._beam, "sleep_all_sessions"):
+                result = self._beam.sleep_all_sessions(dry_run=dry_run, force=force)
+            else:
+                result = self._beam.sleep(dry_run=dry_run, force=force)
         working = self._beam.get_working_stats()
         episodic = self._beam.get_episodic_stats()
         if not dry_run:
@@ -3855,7 +3866,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         author_type=beam_ref.author_type,
                         channel_id=beam_ref.channel_id,
                     )
-                    sleep_beam.sleep()
+                    with _sleep_aux_context():
+                        sleep_beam.sleep()
                 except Exception as inner:
                     logger.debug("Mnemosyne session-end sleep failed: %s", inner)
 

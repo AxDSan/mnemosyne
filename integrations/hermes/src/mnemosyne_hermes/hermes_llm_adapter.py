@@ -13,10 +13,13 @@ Why this lives in ``mnemosyne_hermes`` and not in ``mnemosyne.core``:
 
 Behavior:
 
-- ``HermesAuxLLMBackend.complete()`` is the host-LLM entry point. Sleep /
-  consolidation resolves ``auxiliary.sleep`` when that slot has a provider or
-  model, otherwise ``auxiliary.compression``. Blindly passing task=sleep
-  without a configured slot would fall through to the main model.
+- ``HermesAuxLLMBackend.complete()`` is the host-LLM entry point. Default
+  ``complete()`` stays ``task=compression`` so ``extract_facts`` / model
+  refresh do not inherit the idle sleep model. Sleep / consolidation
+  callers wrap work in ``sleep_aux_context()``; only then does
+  ``complete()`` resolve ``auxiliary.sleep`` (when that slot has a
+  provider or model) else ``auxiliary.compression``. Blindly passing
+  task=sleep without a configured slot would fall through to the main model.
 - ``register_hermes_host_llm()`` installs the backend in the registry.
 - ``unregister_hermes_host_llm()`` removes it (called from
   ``MnemosyneMemoryProvider.shutdown()`` so a process that later runs Mnemosyne
@@ -30,14 +33,41 @@ extractable content) returns ``None``. The Mnemosyne caller treats that as
 
 from __future__ import annotations
 
+import contextvars
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
 SLEEP_AUX_TASK = "sleep"
 COMPRESSION_AUX_TASK = "compression"
+
+_SLEEP_AUX_ACTIVE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "mnemosyne_sleep_aux_active", default=False
+)
+
+
+def is_sleep_aux_active() -> bool:
+    """True while a sleep / consolidation caller has entered sleep_aux_context()."""
+    return bool(_SLEEP_AUX_ACTIVE.get())
+
+
+@contextmanager
+def sleep_aux_context() -> Iterator[None]:
+    """Mark host-LLM calls in this context as sleep / consolidation.
+
+    Set this around beam.sleep / CLI sleep / auto-sleep / session-end so
+    ``complete()`` may resolve ``auxiliary.sleep``. Default ``complete()``
+    stays compression. Contextvars are not copied into new threads — enter
+    this manager *inside* the worker thread that calls ``beam.sleep()``.
+    """
+    token = _SLEEP_AUX_ACTIVE.set(True)
+    try:
+        yield
+    finally:
+        _SLEEP_AUX_ACTIVE.reset(token)
 
 
 @dataclass(frozen=True)
@@ -137,9 +167,10 @@ def format_sleep_aux_resolution(resolved: Optional[SleepAuxResolution] = None) -
 class HermesAuxLLMBackend:
     """LLMBackend implementation that routes through Hermes' aux client.
 
-    Sleep / consolidation uses ``auxiliary.sleep`` when that slot is configured,
-    otherwise ``auxiliary.compression``. ``self.task`` remains the compression
-    fallback name.
+    Default ``complete()`` uses ``auxiliary.compression``. Sleep /
+    consolidation callers wrap ``beam.sleep`` in ``sleep_aux_context()``
+    so ``complete()`` may resolve ``auxiliary.sleep`` when that slot is
+    configured. ``self.task`` remains the compression fallback name.
     """
 
     name = "hermes"
@@ -161,11 +192,15 @@ class HermesAuxLLMBackend:
             logger.debug("Hermes aux LLM unavailable: %s", exc)
             return None
 
-        resolved = resolve_sleep_aux_task()
-        logger.info(resolved.log_message())
+        if is_sleep_aux_active():
+            resolved = resolve_sleep_aux_task()
+            logger.info(resolved.log_message())
+            task = resolved.task or self.task
+        else:
+            task = self.task
 
         kwargs = {
-            "task": resolved.task or self.task,
+            "task": task,
             "messages": [
                 {
                     "role": "system",
@@ -182,7 +217,7 @@ class HermesAuxLLMBackend:
             "timeout": timeout,
         }
         # Optional non-secret overrides — only include when set, so Hermes' own
-        # auxiliary slot resolution remains the default.
+        # auxiliary.compression resolution remains the default.
         if provider:
             kwargs["provider"] = provider
         if model:

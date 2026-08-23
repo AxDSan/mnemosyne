@@ -81,6 +81,15 @@ def _print_sleep_aux_resolution() -> None:
         print("sleep aux: task=compression model=(unset) provider=(unset)")
 
 
+def _sleep_aux_context():
+    """Import-tolerant wrapper around adapter sleep_aux_context()."""
+    try:
+        from .hermes_llm_adapter import sleep_aux_context
+    except ImportError:
+        from hermes_memory_provider.hermes_llm_adapter import sleep_aux_context
+    return sleep_aux_context()
+
+
 def register_cli(subparser):
     """Register CLI subcommands for ``hermes mnemosyne``."""
     mn_cmds = subparser.add_subparsers(dest="mnemosyne_cmd")
@@ -90,7 +99,7 @@ def register_cli(subparser):
 
     sleep_cmd = mn_cmds.add_parser("sleep", help="Run consolidation cycle")
     sleep_cmd.add_argument("--all-sessions", action="store_true", help="Consolidate eligible old working memories across all sessions")
-    sleep_cmd.add_argument("--dry-run", action="store_true", help="Report resolved aux slot and what would be consolidated without writing changes")
+    sleep_cmd.add_argument("--dry-run", action="store_true", help="Report resolved aux slot without calling the LLM or writing changes")
     mn_cmds.add_parser("version", help="Show Mnemosyne version")
 
     inspect_cmd = mn_cmds.add_parser("inspect", help="Search memories")
@@ -176,10 +185,12 @@ def mnemosyne_command(args):
         dry_run = bool(getattr(args, "dry_run", False))
         if dry_run:
             _print_sleep_aux_resolution()
-        if getattr(args, "all_sessions", False):
-            result = beam.sleep_all_sessions(dry_run=dry_run)
-        else:
-            result = beam.sleep(dry_run=dry_run)
+            return 0
+        with _sleep_aux_context():
+            if getattr(args, "all_sessions", False):
+                result = beam.sleep_all_sessions()
+            else:
+                result = beam.sleep()
         print(json.dumps(result, indent=2))
 
     elif cmd == "inspect":

@@ -78,6 +78,7 @@ def test_resolve_sleep_aux_task_timeout_only_sleep_slot_stays_compression():
 
 def test_resolve_sleep_aux_task_missing_config_does_not_raise(monkeypatch):
     adapter = _import_adapter()
+    monkeypatch.setattr(adapter, "_load_hermes_config", lambda: {})
     assert adapter.resolve_sleep_aux_task(None).task == "compression"
     assert adapter.resolve_sleep_aux_task({}).task == "compression"
     assert adapter.resolve_sleep_aux_task(object()).task == "compression"
@@ -90,8 +91,12 @@ def test_resolve_sleep_aux_task_missing_config_does_not_raise(monkeypatch):
 # HermesAuxLLMBackend.complete()
 # ---------------------------------------------------------------------------
 
-def test_complete_calls_call_llm_with_compression_task(fake_agent_module):
-    """Adapter must invoke call_llm(task='compression', ...) with passed args."""
+def test_complete_calls_call_llm_with_compression_task(fake_agent_module, monkeypatch):
+    """Adapter must invoke call_llm(task='compression', ...) with passed args.
+
+    Isolated from live ~/.hermes/config.yaml: even if auxiliary.sleep exists,
+    default complete() must stay compression.
+    """
     captured = {}
 
     def fake_call_llm(**kwargs):
@@ -101,6 +106,11 @@ def test_complete_calls_call_llm_with_compression_task(fake_agent_module):
     fake_agent_module.call_llm = fake_call_llm
 
     adapter = _import_adapter()
+    monkeypatch.setattr(
+        adapter,
+        "_load_hermes_config",
+        lambda: {"auxiliary": {"sleep": {"provider": "xai-oauth", "model": "grok-4.6"}}},
+    )
     backend = adapter.HermesAuxLLMBackend()
     out = backend.complete(
         "the prompt",
@@ -180,9 +190,26 @@ def test_complete_uses_sleep_task_when_aux_sleep_model_configured(fake_agent_mod
     )
     backend = adapter.HermesAuxLLMBackend()
     with caplog.at_level("INFO"):
-        backend.complete("x", max_tokens=64, temperature=0.0, timeout=5.0)
+        with adapter.sleep_aux_context():
+            backend.complete("x", max_tokens=64, temperature=0.0, timeout=5.0)
     assert captured["task"] == "sleep"
     assert any("task=sleep" in rec.getMessage() and "model=grok-4.6" in rec.getMessage() for rec in caplog.records)
+
+
+def test_complete_stays_compression_outside_sleep_context(fake_agent_module, monkeypatch):
+    """extract_facts / model refresh must not inherit auxiliary.sleep."""
+    captured = {}
+    fake_agent_module.call_llm = lambda **kw: (captured.update(kw) or {"choices": [{"message": {"content": "ok"}}]})
+    adapter = _import_adapter()
+    monkeypatch.setattr(
+        adapter,
+        "_load_hermes_config",
+        lambda: {"auxiliary": {"sleep": {"provider": "xai-oauth", "model": "grok-4.6"}}},
+    )
+    backend = adapter.HermesAuxLLMBackend()
+    backend.complete("x", max_tokens=64, temperature=0.0, timeout=5.0)
+    assert captured["task"] == "compression"
+    assert adapter.is_sleep_aux_active() is False
 
 
 # ---------------------------------------------------------------------------

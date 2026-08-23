@@ -155,3 +155,59 @@ def test_sleep_dry_run_prints_resolved_aux_slot(fake_agent_module, monkeypatch, 
     out = buf.getvalue()
     assert "sleep aux:" in out
     assert "task=" in out
+
+
+@pytest.mark.parametrize("cli_path", CLI_COPIES, ids=[str(p.relative_to(REPO_ROOT)) for p in CLI_COPIES])
+def test_sleep_dry_run_does_not_call_llm(fake_agent_module, monkeypatch, cli_path):
+    """`hermes mnemosyne sleep --dry-run` must not invoke call_llm or beam.sleep."""
+    call_llm = MagicMock(return_value={"choices": [{"message": {"content": "ok"}}]})
+    fake_agent_module.call_llm = call_llm
+
+    mod_name = f"_test_sleep_dryrun_nollm_{cli_path.stem}_{hash(str(cli_path)) & 0xFFFFFFFF:x}"
+    mod = _load_cli_standalone(cli_path, mod_name)
+
+    for name in (
+        "hermes_memory_provider.hermes_llm_adapter",
+        "mnemosyne_hermes.hermes_llm_adapter",
+    ):
+        adapter_mod = sys.modules.get(name)
+        if adapter_mod is not None:
+            monkeypatch.setattr(adapter_mod, "_load_hermes_config", lambda: {})
+
+    sleep_called = {"n": 0}
+
+    class FakeBeam:
+        def sleep(self, dry_run=False):
+            sleep_called["n"] += 1
+            backend = get_host_llm_backend()
+            if backend is not None:
+                backend.complete("would summarize", max_tokens=8, temperature=0.0, timeout=1.0)
+            return {"dry_run": dry_run, "consolidated": 0}
+
+        def sleep_all_sessions(self, dry_run=False):
+            return self.sleep(dry_run=dry_run)
+
+    from mnemosyne.core import beam as beam_module
+
+    monkeypatch.setattr(beam_module, "BeamMemory", lambda *_args, **_kwargs: FakeBeam())
+
+    import argparse
+    import contextlib
+    import io
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = mod.mnemosyne_command(argparse.Namespace(
+            mnemosyne_cmd="sleep",
+            dry_run=True,
+            all_sessions=False,
+            bank=None,
+        ))
+    assert rc == 0
+    out = buf.getvalue()
+    assert "sleep aux:" in out
+    assert "task=" in out
+    assert "model=" in out
+    assert "provider=" in out
+    call_llm.assert_not_called()
+    assert sleep_called["n"] == 0
