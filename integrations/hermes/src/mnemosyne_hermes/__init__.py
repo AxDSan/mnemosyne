@@ -1804,10 +1804,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 source_tag = f", source {source}" if source and source != "conversation" else ""
                 lines.append(f"  [{ts}] (importance {imp:.2f}{source_tag}){trust_tag} {content}")
             assembled = "\n".join(lines)
-            return apply_assembled_prefetch_budget(
+            capped = apply_assembled_prefetch_budget(
                 assembled,
                 getattr(self, "_prefetch_char_limit", DEFAULT_PREFETCH_CHAR_LIMIT),
             )
+            logger.debug("Mnemosyne prefetch assembled chars=%d", len(capped))
+            return capped
         except Exception as e:
             logger.debug("Mnemosyne prefetch failed: %s", e)
             return ""

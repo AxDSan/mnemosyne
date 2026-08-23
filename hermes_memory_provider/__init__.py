@@ -2231,10 +2231,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if profile.dedup:
             blocks = _dedup_blocks(blocks)
         assembled = "\n\n".join(b for b in blocks if b)
-        return apply_assembled_prefetch_budget(
+        capped = apply_assembled_prefetch_budget(
             assembled,
             getattr(self, "_prefetch_char_limit", DEFAULT_PREFETCH_CHAR_LIMIT),
         )
+        logger.debug("Mnemosyne prefetch assembled chars=%d", len(capped))
+        return capped
 
     def _prefetch_identity(self, existing_blocks: List[str], profile: "PrefetchProfile") -> str:
         """Render the always-inject identity block for the active session.
