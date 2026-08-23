@@ -259,17 +259,17 @@ memory:
 
 ## Tools
 
-Named tool surface: **full 40** (library default, upstream-safe) / **slim 21** / **none 14**. An explicit `tools:` list — including `[]` — wins over the mode. This machine may set slim via `hermes config set`; restart required; do not flip mid-session. Operator details (prefetch 3000 + footer, sleep aux resolution, ship gate) live in [`hermes_memory_provider/README.md`](../../hermes_memory_provider/README.md).
+Named tool surface: **full 40** (library default, upstream-safe) / **slim 21** / **none 14**. An explicit `tools:` list — including `[]` — wins over the mode. Slim is opt-in via `hermes config set memory.mnemosyne.interactive_writes slim`; restart required; do not flip mid-session. The library default stays `full`. Operator details (prefetch 3000 + footer, sleep aux resolution, ship gate) live in [`hermes_memory_provider/README.md`](../../hermes_memory_provider/README.md).
 
-**Core memory:** `remember`, `recall`, `sleep`, `stats`, `get`, `update`, `forget`, `invalidate`, `validate`
+Everyday auto-injected surface is the **slim 21**:
 
-**Knowledge graph:** `triple_add`, `triple_query`, `graph_query`, `graph_link`
+**Core memory:** `remember`, `recall`, `stats`, `get`, `update`, `forget`, `invalidate`, `batch`
+
+**Reads:** `recall_canonical`, `model_card`, `scratchpad_read`, `diagnose`, `recall_diagnostics`, `graph_query`, `sync_status`, `persona_list`, `triple_query`
 
 **Multi-agent:** `shared_remember`, `shared_recall`, `shared_forget`, `shared_stats`
 
-**Working notes:** `scratchpad_write`, `scratchpad_read`, `scratchpad_clear`
-
-**Ops:** `export`, `import`, `diagnose`
+`full` also advertises extras such as `sleep`, `export`, `import`, and `scratchpad_write`.
 
 ## Test the Memory Loop
 

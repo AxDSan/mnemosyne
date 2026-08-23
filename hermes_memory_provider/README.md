@@ -54,7 +54,7 @@ Interactive turns and sleep-time writes are split so the live model does not pay
 | `slim` | 21 | Everyday reads plus remember / update / forget (and the rest of the slim write set). |
 | `none` | 14 | Read-only. |
 
-This machine may opt into `slim` with `hermes config set memory.mnemosyne.interactive_writes slim`. Restart Hermes after changing it. Do not flip the mode mid-session — that invalidates the cached tool-schema prefix.
+Slim is opt-in: `hermes config set memory.mnemosyne.interactive_writes slim`, then restart Hermes. The library default remains `full`. Do not flip the mode mid-session — that invalidates the cached tool-schema prefix.
 
 An explicit `tools:` list — including `[]` — wins over the mode.
 
@@ -68,7 +68,7 @@ An explicit `tools:` list — including `[]` — wins over the mode.
 
 Sleep honors `auxiliary.sleep` when that slot has a provider or model, then falls back to `auxiliary.compression`. A missing sleep slot must **not** use bare `task=sleep` (that would fall through to the main model).
 
-Do not copy a live `auxiliary.sleep` YAML block onto this machine as if it were required. Inspect resolution with:
+An `auxiliary.sleep` YAML block is not required. Inspect resolution with:
 
 ```bash
 hermes mnemosyne sleep --dry-run
@@ -111,27 +111,35 @@ The provider is discovered by `plugins.memory.discover_memory_providers()` which
 
 User plugins take precedence over bundled plugins on name collision.
 
-## Tools (Auto-Injected)
+## Tools (everyday slim 21)
 
-Full advertised surface is **40** schemas. `slim` keeps **21**; `none` keeps **14**. The table below is the original everyday set, not the full inventory.
+Library default is **full** (40 schemas). Everyday auto-injected surface is **slim 21**; `none` is read-only (**14**). The table is that slim 21.
 
 | Tool | Purpose |
 |------|---------|
-| `mnemosyne_remember` | Store durable memory with importance, scope, expiry |
 | `mnemosyne_recall` | Hybrid search (50% vector + 30% FTS + 20% importance) |
+| `mnemosyne_shared_recall` | Search the shared surface DB |
+| `mnemosyne_shared_stats` | Shared surface DB path and counts |
 | `mnemosyne_stats` | Show working + episodic counts |
-| `mnemosyne_triple_add` | Add temporal facts to the knowledge graph |
+| `mnemosyne_get` | Retrieve one memory by ID |
 | `mnemosyne_triple_query` | Query temporal knowledge graph facts |
-| `mnemosyne_sleep` | Consolidate working → episodic memory |
-| `mnemosyne_scratchpad_write` | Write short-lived scratchpad context |
+| `mnemosyne_recall_canonical` | Read canonical self-facts |
+| `mnemosyne_model_card` | Render canonical slots as a model card |
 | `mnemosyne_scratchpad_read` | Read scratchpad context |
-| `mnemosyne_scratchpad_clear` | Clear scratchpad context |
-| `mnemosyne_invalidate` | Mark memory as expired/superseded |
-| `mnemosyne_export` | Export memories for backup or migration |
-| `mnemosyne_import` | Import memories from backup files or providers |
+| `mnemosyne_diagnose` | Run diagnostics on the memory store |
+| `mnemosyne_recall_diagnostics` | Recall-path hit counts and fallback rates |
+| `mnemosyne_graph_query` | Traverse the memory graph from a seed |
+| `mnemosyne_sync_status` | Show sync status |
+| `mnemosyne_persona_list` | List L3 persona facts |
+| `mnemosyne_remember` | Store durable memory with importance, scope, expiry |
 | `mnemosyne_update` | Update an existing memory |
 | `mnemosyne_forget` | Delete a memory |
-| `mnemosyne_diagnose` | Run diagnostics on the memory store |
+| `mnemosyne_invalidate` | Mark memory as expired/superseded |
+| `mnemosyne_batch` | Apply remember / update / forget / invalidate atomically |
+| `mnemosyne_shared_remember` | Store compact cross-agent surface memory |
+| `mnemosyne_shared_forget` | Delete one shared-surface memory |
+
+`full` also advertises extras such as `mnemosyne_sleep`, `mnemosyne_export`, `mnemosyne_import`, and `mnemosyne_scratchpad_write`.
 
 ## Undeploy
 
