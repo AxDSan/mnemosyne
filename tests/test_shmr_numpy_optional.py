@@ -157,6 +157,10 @@ def test_no_state_mutation_before_capability_error(tmp_path):
             recall_beliefs(_Beam(), "query")
         except ShmrDenseCapabilityUnavailable:
             pass
+        else:
+            raise AssertionError(
+                "recall_beliefs unexpectedly returned without raising"
+            )
 
         tables = [
             row[0]
