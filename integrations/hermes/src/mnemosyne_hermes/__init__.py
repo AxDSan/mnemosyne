@@ -267,7 +267,11 @@ def prefetch_omit_footer(n: int) -> str:
 
 
 def apply_prefetch_char_budget(hits, limit: int = DEFAULT_PREFETCH_CHAR_LIMIT, *, joiner: str = "\n") -> str:
-    """Concatenate ranked formatted hits until ``limit``, keeping the prefix."""
+    """Concatenate ranked formatted hits until ``limit``, keeping the prefix.
+
+    The first non-empty hit is always kept (identity-first) and hard-sliced
+    when it exceeds ``limit``. Later hits that do not fit are omitted.
+    """
     parts = [h for h in hits if h]
     if not parts:
         return ""
@@ -278,15 +282,21 @@ def apply_prefetch_char_budget(hits, limit: int = DEFAULT_PREFETCH_CHAR_LIMIT, *
     if cap <= 0:
         cap = DEFAULT_PREFETCH_CHAR_LIMIT
 
-    kept: List[str] = []
+    first = parts[0]
+    first_truncated = len(first) > cap
+    if first_truncated:
+        first = first[:cap]
+    kept: List[str] = [first]
     omitted = 0
-    for i, part in enumerate(parts):
-        candidate = joiner.join(kept + [part]) if kept else part
-        if not kept or len(candidate) <= cap:
+    for i, part in enumerate(parts[1:], start=1):
+        candidate = joiner.join(kept + [part])
+        if len(candidate) <= cap:
             kept.append(part)
             continue
         omitted = len(parts) - i
         break
+    if first_truncated:
+        omitted += 1
     text = joiner.join(kept)
     if omitted:
         text += "\n" + prefetch_omit_footer(omitted)

@@ -94,11 +94,11 @@ def test_under_budget_has_no_omit_footer():
 def test_twenty_hits_cannot_exceed_limit_plus_footer():
     limit = DEFAULT_PREFETCH_CHAR_LIMIT
     block = apply_prefetch_char_budget(_twenty_hits(pad=200), limit=limit)
-    footer = prefetch_omit_footer(1)
-    assert len(block) <= limit + len("\n") + len(footer) + 8  # N can be two digits
     assert OMIT_NEEDLE in block
-    assert block.splitlines()[-1].startswith("…")
-    assert "call mnemosyne_recall." in block.splitlines()[-1]
+    footer_line = block.splitlines()[-1]
+    assert len(block) <= limit + len("\n") + len(footer_line)
+    assert footer_line.startswith("…")
+    assert "call mnemosyne_recall." in footer_line
 
 
 def test_truncated_footer_counts_omitted_hits():
@@ -121,13 +121,26 @@ def test_keeps_prefix_when_later_hits_overflow():
     assert "later-hit-11" not in block
 
 
+def test_oversized_first_hit_is_hard_sliced_to_cap():
+    identity = "[IDENTITY] Ada Lovelace " + ("A" * 8000)
+    later = [f"later-hit-{i} " + ("b" * 100) for i in range(3)]
+    limit = DEFAULT_PREFETCH_CHAR_LIMIT
+    block = apply_prefetch_char_budget([identity, *later], limit=limit)
+    remaining_whole = 3
+    footer = prefetch_omit_footer(remaining_whole + 1)
+    assert len(block) <= limit + len("\n") + len(footer)
+    assert block.startswith("[IDENTITY] Ada Lovelace")
+    assert footer in block
+    assert "later-hit-0" not in block
+
+
 def test_prefetch_twenty_recall_hits_respect_budget():
     p = _provider(_recall_rows(20, pad=200))
     block = p.prefetch("Paris capital France")
-    footer = prefetch_omit_footer(1)
     assert block
-    assert len(block) <= p._prefetch_char_limit + len("\n") + len(footer) + 8
     assert OMIT_NEEDLE in block
+    footer_line = block.splitlines()[-1]
+    assert len(block) <= p._prefetch_char_limit + len("\n") + len(footer_line)
 
 
 def test_prefetch_keeps_identity_omits_later_bank_hits():

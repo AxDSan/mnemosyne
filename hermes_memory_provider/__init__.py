@@ -209,7 +209,8 @@ def apply_prefetch_char_budget(hits, limit: int = DEFAULT_PREFETCH_CHAR_LIMIT, *
 
     Later hits that do not fit are omitted and replaced with a footer that
     points the model at ``mnemosyne_recall``. The first non-empty hit is always
-    kept (identity-first). Invalid or non-positive limits fall back to 3000.
+    kept (identity-first) and hard-sliced when it exceeds ``limit``. Invalid
+    or non-positive limits fall back to 3000.
     """
     parts = [h for h in hits if h]
     if not parts:
@@ -221,15 +222,21 @@ def apply_prefetch_char_budget(hits, limit: int = DEFAULT_PREFETCH_CHAR_LIMIT, *
     if cap <= 0:
         cap = DEFAULT_PREFETCH_CHAR_LIMIT
 
-    kept: List[str] = []
+    first = parts[0]
+    first_truncated = len(first) > cap
+    if first_truncated:
+        first = first[:cap]
+    kept: List[str] = [first]
     omitted = 0
-    for i, part in enumerate(parts):
-        candidate = joiner.join(kept + [part]) if kept else part
-        if not kept or len(candidate) <= cap:
+    for i, part in enumerate(parts[1:], start=1):
+        candidate = joiner.join(kept + [part])
+        if len(candidate) <= cap:
             kept.append(part)
             continue
         omitted = len(parts) - i
         break
+    if first_truncated:
+        omitted += 1
     text = joiner.join(kept)
     if omitted:
         text += "\n" + prefetch_omit_footer(omitted)
@@ -1554,7 +1561,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # slim/none at initialize() time.
         self._interactive_mode = "full"
         # Total assembled per-turn injection budget (not the per-item
-        # MNEMOSYNE_PREFETCH_CONTENT_CHARS cap). Default matches MEMORY.md.
+        # MNEMOSYNE_PREFETCH_CONTENT_CHARS cap). Default 3000 (MEMORY.md is 2200).
         self._prefetch_char_limit = DEFAULT_PREFETCH_CHAR_LIMIT
 
     def _activate_in_module(self) -> None:
