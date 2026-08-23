@@ -4,7 +4,7 @@
 
 # Mnemosyne for Hermes Agent
 
-*Local-first memory provider for Hermes Agent. 23 tools. Zero cloud. Zero latency.*
+*Local-first memory provider for Hermes Agent. Tool surface full 40 / slim 21 / none 14. Zero cloud. Zero latency.*
 
 [![PyPI](https://img.shields.io/pypi/v/mnemosyne-hermes.svg)](https://pypi.org/project/mnemosyne-hermes/)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
@@ -42,7 +42,7 @@ It gives Hermes:
 - **Shared surface**: compact cross-agent metadata for multi-agent workflows.
 - **Zero cloud**: SQLite on your machine. No network calls. No API keys. No quota limits.
 
-When using Mnemosyne, disable Hermes' built-in MEMORY.md/USER.md system to avoid duplication. Do NOT use `hermes tools disable memory` — that also kills all 23 Mnemosyne-registered tools (the memory toolset gates both built-in AND provider injection at `agent_init.py:1163-1172`).
+When using Mnemosyne, disable Hermes' built-in MEMORY.md/USER.md system to avoid duplication. Do NOT use `hermes tools disable memory` — that also kills the Mnemosyne-registered tool surface (the memory toolset gates both built-in AND provider injection at `agent_init.py:1163-1172`).
 
 Edit `~/.hermes/config.yaml`:
 
@@ -259,7 +259,7 @@ memory:
 
 ## Tools
 
-23 tools. All surfaced through Hermes' tool system.
+Named tool surface: **full 40** (library default, upstream-safe) / **slim 21** / **none 14**. An explicit `tools:` list — including `[]` — wins over the mode. This machine may set slim via `hermes config set`; restart required; do not flip mid-session. Operator details (prefetch 3000 + footer, sleep aux resolution, ship gate) live in [`hermes_memory_provider/README.md`](../../hermes_memory_provider/README.md).
 
 **Core memory:** `remember`, `recall`, `sleep`, `stats`, `get`, `update`, `forget`, `invalidate`, `validate`
 
