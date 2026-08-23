@@ -86,7 +86,14 @@ from mnemosyne.mcp_tools import get_tool_definitions, handle_tool_call
 # ---------------------------------------------------------------------------
 
 # Hosts treated as loopback-only; safe to expose without auth.
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "ip6-localhost"})
+#
+# NOTE: ``ip6-localhost`` is deliberately NOT in this set. The mcp SDK
+# auto-enables DNS-rebinding protection only for ``127.0.0.1``,
+# ``localhost``, and ``::1`` -- not for the ``ip6-localhost`` alias -- so a
+# tokenless ``ip6-localhost`` bind would accept arbitrary Host/Origin
+# headers. Treating it as non-loopback fails closed (bearer token + explicit
+# Host policy required); tokenless loopback stays available via ``::1``.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 _TOKEN_ENV = "MNEMOSYNE_MCP_TOKEN"
 _ALLOWED_HOSTS_ENV = "MNEMOSYNE_MCP_ALLOWED_HOSTS"

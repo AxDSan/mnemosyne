@@ -78,6 +78,20 @@ class TestResolveHttpAuth:
         from mnemosyne.mcp_server import _resolve_http_auth
         assert _resolve_http_auth("::1") == (False, None)
 
+    def test_ip6_localhost_requires_token(self, monkeypatch):
+        """ip6-localhost is fail-closed: the SDK's DNS-rebinding protection
+        does not cover the alias, so a bearer token is mandatory."""
+        monkeypatch.delenv("MNEMOSYNE_MCP_TOKEN", raising=False)
+        from mnemosyne.mcp_server import _resolve_http_auth
+        with pytest.raises(RuntimeError, match="MNEMOSYNE_MCP_TOKEN"):
+            _resolve_http_auth("ip6-localhost")
+
+    def test_ip6_localhost_with_token_requires_auth(self, monkeypatch):
+        """With a token set, ip6-localhost is treated like any non-loopback."""
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKEN", "real-secret-123")
+        from mnemosyne.mcp_server import _resolve_http_auth
+        assert _resolve_http_auth("ip6-localhost") == (True, "real-secret-123")
+
     def test_non_loopback_without_token_raises(self, monkeypatch):
         """0.0.0.0 with no token must refuse to start. The error message
         names the env var so operators can fix it without grepping."""
@@ -141,6 +155,13 @@ class TestResolveTransportSecurity:
         from mnemosyne.mcp_server import _resolve_transport_security
         with pytest.raises(RuntimeError, match="MNEMOSYNE_MCP_ALLOWED_HOSTS"):
             _resolve_transport_security("0.0.0.0")
+
+    def test_ip6_localhost_requires_host_policy(self, monkeypatch):
+        """ip6-localhost needs an explicit Host policy: the SDK's built-in
+        DNS-rebinding protection does not cover the alias."""
+        from mnemosyne.mcp_server import _resolve_transport_security
+        with pytest.raises(RuntimeError, match="MNEMOSYNE_MCP_ALLOWED_HOSTS"):
+            _resolve_transport_security("ip6-localhost")
 
     def test_origins_alone_do_not_satisfy_host_policy(self, monkeypatch):
         """Origins without a Host allowlist still refuse to start."""
@@ -293,6 +314,27 @@ class TestBuildStreamableHttpApp:
         from mnemosyne.mcp_server import _build_streamable_http_app
         with pytest.raises(RuntimeError, match="MNEMOSYNE_MCP_ALLOWED_HOSTS"):
             _build_streamable_http_app(host="0.0.0.0")
+
+    def test_ip6_localhost_build_fails_closed(self, monkeypatch):
+        """ip6-localhost cannot be brought up tokenlessly.
+
+        The build refuses without a token, and once configured with a token
+        and Host policy it installs the bearer middleware -- so the alias can
+        never serve an arbitrary Host/Origin request unauthenticated.
+        """
+        monkeypatch.delenv("MNEMOSYNE_MCP_TOKEN", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_MCP_ALLOWED_HOSTS", raising=False)
+        from mnemosyne.mcp_server import _build_streamable_http_app
+        with pytest.raises(RuntimeError, match="MNEMOSYNE_MCP_TOKEN"):
+            _build_streamable_http_app(host="ip6-localhost")
+
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKEN", "supersecret")
+        monkeypatch.setenv("MNEMOSYNE_MCP_ALLOWED_HOSTS", "localhost:*")
+        app = _build_streamable_http_app(host="ip6-localhost")
+        names = [m.cls.__name__ for m in app.user_middleware]
+        assert any("Bearer" in n for n in names), (
+            f"ip6-localhost app should install bearer middleware, got: {names}"
+        )
 
     def test_builder_forwards_transport_security(self, monkeypatch):
         """Non-loopback forwards the operator's Host/Origin policy to the SDK."""
