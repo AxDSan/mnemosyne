@@ -34,7 +34,10 @@ memory:
     auto_sleep: true
     sleep_threshold: 50
     vector_type: float32  # float32 | int8 | bit
+    interactive_writes: full  # full | slim | none
 ```
+
+`interactive_writes` is an init-time named preset over the advertised tool surface (`full` default, upstream-safe). `slim` keeps everyday reads plus remember/update/forget; `none` is read-only. An explicit `tools:` list — including `[]` — still wins over the mode. Changing the knob mid-conversation invalidates Hermes' cached tool-schema prefix, so restart after editing it; do not flip the mode in `on_turn_start`.
 
 ## Verify
 

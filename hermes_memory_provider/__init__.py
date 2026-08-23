@@ -1480,7 +1480,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # instance.
         self._is_active_in_module: bool = False
         # Interactive tool-set mode. Default "full" preserves the historical
-        # advertised surface; a later config key can select slim/none.
+        # advertised surface; memory.mnemosyne.interactive_writes can select
+        # slim/none at initialize() time.
         self._interactive_mode = "full"
 
     def _activate_in_module(self) -> None:
@@ -1703,6 +1704,21 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             else:
                 logger.warning("Mnemosyne: invalid default_scope=%r, must be 'session' or 'global'", default_scope)
 
+        # interactive_writes: named tool-set preset. Init-time only.
+        # Code default remains "full" (set in __init__/initialize). An explicit
+        # memory.mnemosyne.tools list — including [] — still wins over the mode.
+        interactive_writes = kwargs.get("interactive_writes")
+        if interactive_writes is None:
+            interactive_writes = self._read_config_key("interactive_writes")
+        if interactive_writes is not None:
+            mode = str(interactive_writes).strip().lower()
+            if mode not in ("full", "slim", "none"):
+                raise ValueError(
+                    f"Unknown interactive_writes {interactive_writes!r}. "
+                    "Expected one of: full, slim, none"
+                )
+            self._interactive_mode = mode
+
 
     def _should_filter(self, content: str) -> bool:
         """Check if content matches any ignore pattern. Returns True if it should be skipped."""
@@ -1813,7 +1829,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             {"key": "skip_contexts", "description": "Agent contexts where Mnemosyne should skip initialization. Comma-separated list. Defaults to 'cron,flush,subagent,background,skill_loop'. Set to empty string to enable all contexts. Also configurable via MNEMOSYNE_SKIP_CONTEXTS env var.", "default": "cron,flush,subagent,background,skill_loop"},
             {"key": "sync_roles", "description": "Conversation roles to autosave in sync_turn(). List of role names: 'user', 'assistant'. Default ['user'] saves user turns only to avoid assistant transcript noise. Set to ['user', 'assistant'] only if assistant transcript autosave is explicitly wanted, or [] to disable conversation autosave entirely. Does not affect explicit mnemosyne_remember calls. Identity signal capture is gated by user sync — excluding 'user' also disables identity extraction. Also configurable via MNEMOSYNE_SYNC_ROLES env var.", "default": ["user"]},
             {"key": "default_scope", "description": "Default scope for remember() calls when not explicitly specified. 'session' (default) limits memories to the current session. 'global' persists memories across sessions.", "choices": ["session", "global"], "default": "session"},
-            {"key": "tools", "description": "Optional list of Mnemosyne tool names to expose to Hermes. Omit or set null to expose all tools. Set [] to expose no tools while keeping memory context/prefetch enabled. Unknown names raise a clear startup/config error.", "default": None},
+            {"key": "interactive_writes", "description": "Interactive tool-set mode selected at initialize() only. 'full' (default) exposes every Mnemosyne tool. 'slim' keeps everyday reads plus remember/update/forget. 'none' is read-only. Changing this mid-conversation invalidates the cached tool-schema prefix — restart Hermes rather than flipping it in on_turn_start. An explicit tools list (including []) wins over this mode.", "choices": ["full", "slim", "none"], "default": "full"},
+            {"key": "tools", "description": "Optional list of Mnemosyne tool names to expose to Hermes. Omit or set null to use the interactive_writes mode. Set [] to expose no tools while keeping memory context/prefetch enabled. An explicit list — including [] — wins over interactive_writes. Unknown names raise a clear startup/config error.", "default": None},
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
@@ -1922,7 +1939,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._platform = kwargs.get("platform", "cli")
         self._hermes_home = kwargs.get("hermes_home", "")
         self._agent_identity = kwargs.get("agent_identity", None) or ""
-        # Default "full" so this commit does not change the live tool tax.
+        # Reset to "full" on every init so a re-init without the key is
+        # upstream-safe. _apply_provider_config may then select slim/none.
         self._interactive_mode = "full"
 
         # Apply provider-specific config from kwargs (Hermes-passed) or config.yaml fallback
