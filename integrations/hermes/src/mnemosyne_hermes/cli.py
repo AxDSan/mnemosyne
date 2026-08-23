@@ -160,6 +160,21 @@ def _distribution_version(distribution: str) -> str:
         return "unavailable"
 
 
+def _print_sleep_aux_resolution() -> None:
+    """Print which Hermes aux slot sleep would use. Never raises."""
+    try:
+        try:
+            from .hermes_llm_adapter import format_sleep_aux_resolution
+        except ImportError:
+            try:
+                from mnemosyne_hermes.hermes_llm_adapter import format_sleep_aux_resolution
+            except ImportError:
+                from hermes_memory_provider.hermes_llm_adapter import format_sleep_aux_resolution
+        print(format_sleep_aux_resolution())
+    except Exception:
+        print("sleep aux: task=compression model=(unset) provider=(unset)")
+
+
 def register_cli(subparser):
     """Register CLI subcommands for ``hermes mnemosyne``."""
     mn_cmds = subparser.add_subparsers(dest="mnemosyne_cmd")
@@ -170,7 +185,7 @@ def register_cli(subparser):
 
     sleep_cmd = mn_cmds.add_parser("sleep", help="Run consolidation cycle")
     sleep_cmd.add_argument("--all-sessions", action="store_true", help="Consolidate eligible old working memories across all sessions")
-    sleep_cmd.add_argument("--dry-run", action="store_true", help="Report what would be consolidated without writing changes")
+    sleep_cmd.add_argument("--dry-run", action="store_true", help="Report resolved aux slot and what would be consolidated without writing changes")
     sleep_cmd.add_argument("--bank", type=str, help=_BANK_HELP)
     mn_cmds.add_parser("version", help="Show Mnemosyne version")
 
@@ -365,7 +380,10 @@ def mnemosyne_command(args):
         try:
             from .hermes_llm_adapter import register_hermes_host_llm
         except ImportError:
-            from mnemosyne_hermes.hermes_llm_adapter import register_hermes_host_llm
+            try:
+                from mnemosyne_hermes.hermes_llm_adapter import register_hermes_host_llm
+            except ImportError:
+                from hermes_memory_provider.hermes_llm_adapter import register_hermes_host_llm
         register_hermes_host_llm()
     except Exception:
         pass
@@ -394,6 +412,8 @@ def mnemosyne_command(args):
 
     elif cmd == "sleep":
         dry_run = bool(getattr(args, "dry_run", False))
+        if dry_run:
+            _print_sleep_aux_resolution()
         if getattr(args, "all_sessions", False):
             result = beam.sleep_all_sessions(dry_run=dry_run)
         else:

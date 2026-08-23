@@ -69,6 +69,18 @@ def _distribution_version(distribution: str) -> str:
         return "unavailable"
 
 
+def _print_sleep_aux_resolution() -> None:
+    """Print which Hermes aux slot sleep would use. Never raises."""
+    try:
+        try:
+            from .hermes_llm_adapter import format_sleep_aux_resolution
+        except ImportError:
+            from hermes_memory_provider.hermes_llm_adapter import format_sleep_aux_resolution
+        print(format_sleep_aux_resolution())
+    except Exception:
+        print("sleep aux: task=compression model=(unset) provider=(unset)")
+
+
 def register_cli(subparser):
     """Register CLI subcommands for ``hermes mnemosyne``."""
     mn_cmds = subparser.add_subparsers(dest="mnemosyne_cmd")
@@ -78,7 +90,7 @@ def register_cli(subparser):
 
     sleep_cmd = mn_cmds.add_parser("sleep", help="Run consolidation cycle")
     sleep_cmd.add_argument("--all-sessions", action="store_true", help="Consolidate eligible old working memories across all sessions")
-    sleep_cmd.add_argument("--dry-run", action="store_true", help="Report what would be consolidated without writing changes")
+    sleep_cmd.add_argument("--dry-run", action="store_true", help="Report resolved aux slot and what would be consolidated without writing changes")
     mn_cmds.add_parser("version", help="Show Mnemosyne version")
 
     inspect_cmd = mn_cmds.add_parser("inspect", help="Search memories")
@@ -162,6 +174,8 @@ def mnemosyne_command(args):
 
     elif cmd == "sleep":
         dry_run = bool(getattr(args, "dry_run", False))
+        if dry_run:
+            _print_sleep_aux_resolution()
         if getattr(args, "all_sessions", False):
             result = beam.sleep_all_sessions(dry_run=dry_run)
         else:

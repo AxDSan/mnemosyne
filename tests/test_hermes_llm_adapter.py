@@ -44,6 +44,49 @@ def _import_adapter():
 
 
 # ---------------------------------------------------------------------------
+# resolve_sleep_aux_task()
+# ---------------------------------------------------------------------------
+
+def test_resolve_sleep_aux_task_defaults_to_compression_without_sleep_slot():
+    adapter = _import_adapter()
+    resolved = adapter.resolve_sleep_aux_task({"auxiliary": {"compression": {"model": "gemini-flash"}}})
+    assert resolved.task == "compression"
+    assert resolved.model == "gemini-flash"
+
+
+def test_resolve_sleep_aux_task_uses_sleep_when_model_set():
+    adapter = _import_adapter()
+    resolved = adapter.resolve_sleep_aux_task(
+        {"auxiliary": {"sleep": {"model": "grok-4.6"}, "compression": {"model": "gemini-flash"}}}
+    )
+    assert resolved.task == "sleep"
+    assert resolved.model == "grok-4.6"
+
+
+def test_resolve_sleep_aux_task_uses_sleep_when_provider_set():
+    adapter = _import_adapter()
+    resolved = adapter.resolve_sleep_aux_task({"auxiliary": {"sleep": {"provider": "xai-oauth"}}})
+    assert resolved.task == "sleep"
+    assert resolved.provider == "xai-oauth"
+
+
+def test_resolve_sleep_aux_task_timeout_only_sleep_slot_stays_compression():
+    adapter = _import_adapter()
+    resolved = adapter.resolve_sleep_aux_task({"auxiliary": {"sleep": {"timeout": 300}}})
+    assert resolved.task == "compression"
+
+
+def test_resolve_sleep_aux_task_missing_config_does_not_raise(monkeypatch):
+    adapter = _import_adapter()
+    assert adapter.resolve_sleep_aux_task(None).task == "compression"
+    assert adapter.resolve_sleep_aux_task({}).task == "compression"
+    assert adapter.resolve_sleep_aux_task(object()).task == "compression"
+    assert adapter.resolve_sleep_aux_task({"auxiliary": "nope"}).task == "compression"
+    monkeypatch.setattr(adapter, "_load_hermes_config", lambda: (_ for _ in ()).throw(RuntimeError("no config")))
+    assert adapter.resolve_sleep_aux_task().task == "compression"
+
+
+# ---------------------------------------------------------------------------
 # HermesAuxLLMBackend.complete()
 # ---------------------------------------------------------------------------
 
@@ -124,6 +167,22 @@ def test_complete_returns_none_when_response_has_no_content(fake_agent_module):
     adapter = _import_adapter()
     backend = adapter.HermesAuxLLMBackend()
     assert backend.complete("x", max_tokens=64, temperature=0.0, timeout=5.0) is None
+
+
+def test_complete_uses_sleep_task_when_aux_sleep_model_configured(fake_agent_module, monkeypatch, caplog):
+    captured = {}
+    fake_agent_module.call_llm = lambda **kw: (captured.update(kw) or {"choices": [{"message": {"content": "ok"}}]})
+    adapter = _import_adapter()
+    monkeypatch.setattr(
+        adapter,
+        "_load_hermes_config",
+        lambda: {"auxiliary": {"sleep": {"provider": "xai-oauth", "model": "grok-4.6"}}},
+    )
+    backend = adapter.HermesAuxLLMBackend()
+    with caplog.at_level("INFO"):
+        backend.complete("x", max_tokens=64, temperature=0.0, timeout=5.0)
+    assert captured["task"] == "sleep"
+    assert any("task=sleep" in rec.getMessage() and "model=grok-4.6" in rec.getMessage() for rec in caplog.records)
 
 
 # ---------------------------------------------------------------------------

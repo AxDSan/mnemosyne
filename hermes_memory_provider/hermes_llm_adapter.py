@@ -13,9 +13,10 @@ Why this lives in ``hermes_memory_provider`` and not ``mnemosyne.core``:
 
 Behavior:
 
-- ``HermesAuxLLMBackend.complete()`` is the host-LLM entry point. It calls
-  ``call_llm(task="compression", ...)`` so Hermes handles auth, OAuth refresh,
-  Codex Responses API translation, and provider fallback.
+- ``HermesAuxLLMBackend.complete()`` is the host-LLM entry point. Sleep /
+  consolidation resolves ``auxiliary.sleep`` when that slot has a provider or
+  model, otherwise ``auxiliary.compression``. Blindly passing task=sleep
+  without a configured slot would fall through to the main model.
 - ``register_hermes_host_llm()`` installs the backend in the registry.
 - ``unregister_hermes_host_llm()`` removes it (called from
   ``MnemosyneMemoryProvider.shutdown()`` so a process that later runs Mnemosyne
@@ -30,21 +31,119 @@ extractable content) returns ``None``. The Mnemosyne caller treats that as
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from dataclasses import dataclass
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+SLEEP_AUX_TASK = "sleep"
+COMPRESSION_AUX_TASK = "compression"
+
+
+@dataclass(frozen=True)
+class SleepAuxResolution:
+    """Resolved Hermes auxiliary slot for sleep / consolidation."""
+
+    task: str
+    model: Optional[str] = None
+    provider: Optional[str] = None
+
+    def log_message(self) -> str:
+        return (
+            f"Hermes memory aux resolved task={self.task} "
+            f"model={self.model or '(unset)'} provider={self.provider or '(unset)'}"
+        )
+
+    def cli_line(self) -> str:
+        return (
+            f"sleep aux: task={self.task} "
+            f"model={self.model or '(unset)'} provider={self.provider or '(unset)'}"
+        )
+
+
+def _nonempty_str(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    return None
+
+
+def _mapping_get(obj: Any, key: str, default: Any = None) -> Any:
+    if obj is None or isinstance(obj, (str, bytes)):
+        return default
+    getter = getattr(obj, "get", None)
+    if not callable(getter):
+        return default
+    try:
+        value = getter(key, default)
+    except TypeError:
+        try:
+            value = getter(key)
+        except Exception:
+            return default
+    except Exception:
+        return default
+    return default if value is None else value
+
+
+def _aux_slot(config: Any, name: str) -> Any:
+    auxiliary = _mapping_get(config, "auxiliary", {})
+    return _mapping_get(auxiliary, name, {})
+
+
+def _slot_provider_model(slot: Any) -> tuple[Optional[str], Optional[str]]:
+    return (
+        _nonempty_str(_mapping_get(slot, "provider")),
+        _nonempty_str(_mapping_get(slot, "model")),
+    )
+
+
+def _load_hermes_config() -> Any:
+    try:
+        from hermes_cli.config import load_config
+        return load_config()
+    except Exception:
+        return {}
+
+
+def resolve_sleep_aux_task(config: Any = None) -> SleepAuxResolution:
+    """Return ``sleep`` only when ``auxiliary.sleep`` has provider or model.
+
+    Missing config, unreadable config, or a sleep slot with neither provider
+    nor model (timeout-only / empty strings) falls back to ``compression``.
+    Never raises — a missing sleep slot must not crash the sleep worker.
+    """
+    try:
+        if config is None:
+            config = _load_hermes_config()
+        provider, model = _slot_provider_model(_aux_slot(config, SLEEP_AUX_TASK))
+        if provider or model:
+            return SleepAuxResolution(task=SLEEP_AUX_TASK, model=model, provider=provider)
+        c_provider, c_model = _slot_provider_model(_aux_slot(config, COMPRESSION_AUX_TASK))
+        return SleepAuxResolution(
+            task=COMPRESSION_AUX_TASK, model=c_model, provider=c_provider
+        )
+    except Exception:
+        return SleepAuxResolution(task=COMPRESSION_AUX_TASK)
+
+
+def format_sleep_aux_resolution(resolved: Optional[SleepAuxResolution] = None) -> str:
+    """One-line CLI description of the resolved sleep aux slot."""
+    if resolved is None:
+        resolved = resolve_sleep_aux_task()
+    return resolved.cli_line()
 
 
 class HermesAuxLLMBackend:
     """LLMBackend implementation that routes through Hermes' aux client.
 
-    The ``task`` attribute pins the Hermes auxiliary slot used for memory ops.
-    ``compression`` is the closest existing fit; introducing a Hermes-side
-    ``memory`` task is left as a follow-up.
+    Sleep / consolidation uses ``auxiliary.sleep`` when that slot is configured,
+    otherwise ``auxiliary.compression``. ``self.task`` remains the compression
+    fallback name.
     """
 
     name = "hermes"
-    task = "compression"
+    task = COMPRESSION_AUX_TASK
 
     def complete(
         self,
@@ -62,8 +161,11 @@ class HermesAuxLLMBackend:
             logger.debug("Hermes aux LLM unavailable: %s", exc)
             return None
 
+        resolved = resolve_sleep_aux_task()
+        logger.info(resolved.log_message())
+
         kwargs = {
-            "task": self.task,
+            "task": resolved.task or self.task,
             "messages": [
                 {
                     "role": "system",
