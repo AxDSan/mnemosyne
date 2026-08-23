@@ -35,9 +35,12 @@ memory:
     sleep_threshold: 50
     vector_type: float32  # float32 | int8 | bit
     interactive_writes: full  # full | slim | none
+    prefetch_char_limit: 3000  # total assembled per-turn injection budget
 ```
 
 `interactive_writes` is an init-time named preset over the advertised tool surface (`full` default, upstream-safe). `slim` keeps everyday reads plus remember/update/forget; `none` is read-only. An explicit `tools:` list — including `[]` — still wins over the mode. Changing the knob mid-conversation invalidates Hermes' cached tool-schema prefix, so restart after editing it; do not flip the mode in `on_turn_start`.
+
+`prefetch_char_limit` caps the assembled per-turn injection (identity first, then later hits) at 3000 characters by default; omitted hits append a footer pointing at `mnemosyne_recall`.
 
 ## Verify
 

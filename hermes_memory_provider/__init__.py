@@ -197,6 +197,76 @@ def _prefetch_content_char_limit() -> int:
         return 0
 
 
+DEFAULT_PREFETCH_CHAR_LIMIT = 3000
+
+
+def prefetch_omit_footer(n: int) -> str:
+    return f"… {n} more hits omitted; call mnemosyne_recall."
+
+
+def apply_prefetch_char_budget(hits, limit: int = DEFAULT_PREFETCH_CHAR_LIMIT, *, joiner: str = "\n") -> str:
+    """Concatenate ranked formatted hits until ``limit``, keeping the prefix.
+
+    Later hits that do not fit are omitted and replaced with a footer that
+    points the model at ``mnemosyne_recall``. The first non-empty hit is always
+    kept (identity-first). Invalid or non-positive limits fall back to 3000.
+    """
+    parts = [h for h in hits if h]
+    if not parts:
+        return ""
+    try:
+        cap = int(limit)
+    except (TypeError, ValueError):
+        cap = DEFAULT_PREFETCH_CHAR_LIMIT
+    if cap <= 0:
+        cap = DEFAULT_PREFETCH_CHAR_LIMIT
+
+    kept: List[str] = []
+    omitted = 0
+    for i, part in enumerate(parts):
+        candidate = joiner.join(kept + [part]) if kept else part
+        if not kept or len(candidate) <= cap:
+            kept.append(part)
+            continue
+        omitted = len(parts) - i
+        break
+    text = joiner.join(kept)
+    if omitted:
+        text += "\n" + prefetch_omit_footer(omitted)
+    return text
+
+
+def _split_assembled_prefetch_hits(text: str) -> List[str]:
+    """Split a joined prefetch block into prefix-preserving hit units.
+
+    Headers and blank lines attach to the following hit so identity stays first
+    and section titles are not left orphaned when later hits are omitted.
+    """
+    units: List[str] = []
+    pending: List[str] = []
+    for line in text.split("\n"):
+        is_hit = bool(line.strip()) and not line.lstrip().startswith("##")
+        pending.append(line)
+        if is_hit:
+            units.append("\n".join(pending))
+            pending = []
+    return units
+
+
+def apply_assembled_prefetch_budget(text: str, limit: int = DEFAULT_PREFETCH_CHAR_LIMIT) -> str:
+    """Cap an already-joined prefetch block without re-ranking its hits."""
+    if not text:
+        return ""
+    try:
+        cap = int(limit)
+    except (TypeError, ValueError):
+        cap = DEFAULT_PREFETCH_CHAR_LIMIT
+    if cap <= 0:
+        cap = DEFAULT_PREFETCH_CHAR_LIMIT
+    if len(text) <= cap:
+        return text
+    return apply_prefetch_char_budget(_split_assembled_prefetch_hits(text), cap)
+
 
 def _sync_turn_user_limit() -> int:
     """Return the per-turn user content truncation limit.
@@ -1483,6 +1553,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # advertised surface; memory.mnemosyne.interactive_writes can select
         # slim/none at initialize() time.
         self._interactive_mode = "full"
+        # Total assembled per-turn injection budget (not the per-item
+        # MNEMOSYNE_PREFETCH_CONTENT_CHARS cap). Default matches MEMORY.md.
+        self._prefetch_char_limit = DEFAULT_PREFETCH_CHAR_LIMIT
 
     def _activate_in_module(self) -> None:
         """Bump the module-level active-provider count exactly once per
@@ -1719,6 +1792,25 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 )
             self._interactive_mode = mode
 
+        # prefetch_char_limit: total assembled injection budget. kwargs >
+        # config.yaml > default 3000. Invalid values warn and keep 3000.
+        prefetch_char_limit = kwargs.get("prefetch_char_limit")
+        if prefetch_char_limit is None:
+            prefetch_char_limit = self._read_config_key("prefetch_char_limit")
+        if prefetch_char_limit is not None:
+            try:
+                value = int(prefetch_char_limit)
+                if value <= 0:
+                    raise ValueError("prefetch_char_limit must be a positive integer")
+                self._prefetch_char_limit = value
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Mnemosyne: invalid prefetch_char_limit=%r, using default %d",
+                    prefetch_char_limit,
+                    DEFAULT_PREFETCH_CHAR_LIMIT,
+                )
+                self._prefetch_char_limit = DEFAULT_PREFETCH_CHAR_LIMIT
+
 
     def _should_filter(self, content: str) -> bool:
         """Check if content matches any ignore pattern. Returns True if it should be skipped."""
@@ -1833,6 +1925,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             {"key": "sync_roles", "description": "Conversation roles to autosave in sync_turn(). List of role names: 'user', 'assistant'. Default ['user'] saves user turns only to avoid assistant transcript noise. Set to ['user', 'assistant'] only if assistant transcript autosave is explicitly wanted, or [] to disable conversation autosave entirely. Does not affect explicit mnemosyne_remember calls. Identity signal capture is gated by user sync — excluding 'user' also disables identity extraction. Also configurable via MNEMOSYNE_SYNC_ROLES env var.", "default": ["user"]},
             {"key": "default_scope", "description": "Default scope for remember() calls when not explicitly specified. 'session' (default) limits memories to the current session. 'global' persists memories across sessions.", "choices": ["session", "global"], "default": "session"},
             {"key": "interactive_writes", "description": "Interactive tool-set mode selected at initialize() only. 'full' (default) exposes every Mnemosyne tool. 'slim' keeps everyday reads plus remember/update/forget. 'none' is read-only. Changing this mid-conversation invalidates the cached tool-schema prefix — restart Hermes rather than flipping it in on_turn_start. An explicit tools list (including []) wins over this mode.", "choices": ["full", "slim", "none"], "default": "full"},
+            {"key": "prefetch_char_limit", "description": "Max characters of assembled per-turn Mnemosyne injection. Ranked hits are concatenated until this budget; omitted hits append a footer pointing at mnemosyne_recall. Default 3000. Invalid values warn and fall back to 3000.", "default": 3000},
             {"key": "tools", "description": "Optional list of Mnemosyne tool names to expose to Hermes. Omit or set null to use the interactive_writes mode. Set [] to expose no tools while keeping memory context/prefetch enabled. An explicit list — including [] — wins over interactive_writes. Unknown names raise a clear startup/config error.", "default": None},
         ]
 
@@ -1945,6 +2038,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Reset to "full" on every init so a re-init without the key is
         # upstream-safe. _apply_provider_config may then select slim/none.
         self._interactive_mode = "full"
+        self._prefetch_char_limit = DEFAULT_PREFETCH_CHAR_LIMIT
 
         # Apply provider-specific config from kwargs (Hermes-passed) or config.yaml fallback
         self._apply_provider_config(kwargs)
@@ -2120,7 +2214,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             blocks.insert(0, identity_block)
         if profile.dedup:
             blocks = _dedup_blocks(blocks)
-        return "\n\n".join(b for b in blocks if b)
+        assembled = "\n\n".join(b for b in blocks if b)
+        return apply_assembled_prefetch_budget(
+            assembled,
+            getattr(self, "_prefetch_char_limit", DEFAULT_PREFETCH_CHAR_LIMIT),
+        )
 
     def _prefetch_identity(self, existing_blocks: List[str], profile: "PrefetchProfile") -> str:
         """Render the always-inject identity block for the active session.
