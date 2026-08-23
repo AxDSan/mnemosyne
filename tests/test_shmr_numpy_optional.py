@@ -90,6 +90,7 @@ def test_non_dense_surface_usable_without_numpy():
 
 
 def test_dense_entry_points_fail_deterministically_without_numpy(tmp_path):
+    db = str(tmp_path / "harmonize.db")
     result = _run_without_numpy(
         f"""
         from mnemosyne.core.shmr import (
@@ -102,7 +103,7 @@ def test_dense_entry_points_fail_deterministically_without_numpy(tmp_path):
         )
         import sqlite3
 
-        db = r"{tmp_path / "harmonize.db"}"
+        db = {db!r}
         beam_conn = sqlite3.connect(db)
 
         class _Beam:
@@ -138,12 +139,13 @@ def test_dense_entry_points_fail_deterministically_without_numpy(tmp_path):
 
 def test_no_state_mutation_before_capability_error(tmp_path):
     """The dense guard must run before schema creation or row writes."""
+    db = str(tmp_path / "state.db")
     result = _run_without_numpy(
         f"""
         from mnemosyne.core.shmr import recall_beliefs, ShmrDenseCapabilityUnavailable
         import sqlite3
 
-        db = r"{tmp_path / "state.db"}"
+        db = {db!r}
         beam_conn = sqlite3.connect(db)
         beam_conn.row_factory = sqlite3.Row
 
