@@ -87,12 +87,15 @@ from mnemosyne.mcp_tools import get_tool_definitions, handle_tool_call
 
 # Hosts treated as loopback-only; safe to expose without auth.
 #
-# NOTE: ``ip6-localhost`` is deliberately NOT in this set. The mcp SDK
-# auto-enables DNS-rebinding protection only for ``127.0.0.1``,
-# ``localhost``, and ``::1`` -- not for the ``ip6-localhost`` alias -- so a
-# tokenless ``ip6-localhost`` bind would accept arbitrary Host/Origin
-# headers. Treating it as non-loopback fails closed (bearer token + explicit
-# Host policy required); tokenless loopback stays available via ``::1``.
+# Matches the mcp SDK's exact tokenless-loopback values, and nothing else.
+# The SDK arms its built-in DNS-rebinding protection only when it sees one
+# of these exact strings as the host, so recognition must be an exact
+# comparison. Normalizing before the SDK sees the host (case folding,
+# whitespace stripping, or alias expansion like ``ip6-localhost``) would
+# admit binds the SDK does not protect -- tokenless but unprotected against
+# arbitrary Host/Origin requests. Any deviation therefore fails closed
+# (bearer token + explicit Host policy required); tokenless loopback stays
+# available via the exact ``127.0.0.1`` / ``localhost`` / ``::1`` spellings.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 _TOKEN_ENV = "MNEMOSYNE_MCP_TOKEN"
@@ -101,8 +104,14 @@ _ALLOWED_ORIGINS_ENV = "MNEMOSYNE_MCP_ALLOWED_ORIGINS"
 
 
 def _is_loopback(host: str) -> bool:
-    """Return True if `host` is a loopback bind that needs no auth."""
-    return host.strip().lower() in _LOOPBACK_HOSTS
+    """Return True if `host` is a loopback bind that needs no auth.
+
+    Exact match against ``_LOOPBACK_HOSTS`` (the SDK's tokenless-loopback
+    allowlist). Aliases and case/whitespace variants are NOT loopback here:
+    the mcp SDK only arms its DNS-rebinding protection for these exact host
+    strings, so anything else must fail closed.
+    """
+    return host in _LOOPBACK_HOSTS
 
 
 def _parse_csv_env(name: str) -> list[str]:

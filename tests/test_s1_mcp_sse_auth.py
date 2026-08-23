@@ -31,8 +31,7 @@ class TestIsLoopback:
 
     @pytest.mark.parametrize(
         "host",
-        ["127.0.0.1", "localhost", "::1",
-         "LOCALHOST", "  127.0.0.1  ", "LocalHost"],
+        ["127.0.0.1", "localhost", "::1"],
     )
     def test_loopback_aliases(self, host):
         from mnemosyne.mcp_server import _is_loopback
@@ -41,7 +40,8 @@ class TestIsLoopback:
     @pytest.mark.parametrize(
         "host",
         ["0.0.0.0", "192.168.1.10", "10.0.0.5", "::",
-         "example.com", "fd00::1", "ip6-localhost"],
+         "example.com", "fd00::1", "ip6-localhost",
+         "LOCALHOST", "  127.0.0.1  ", "LocalHost"],
     )
     def test_non_loopback(self, host):
         from mnemosyne.mcp_server import _is_loopback

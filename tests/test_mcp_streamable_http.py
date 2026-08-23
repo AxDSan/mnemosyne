@@ -92,6 +92,20 @@ class TestResolveHttpAuth:
         from mnemosyne.mcp_server import _resolve_http_auth
         assert _resolve_http_auth("ip6-localhost") == (True, "real-secret-123")
 
+    def test_uppercase_localhost_requires_token(self, monkeypatch):
+        """LOCALHOST is not loopback: case variants are not in the SDK's
+        exact tokenless allowlist, so a bearer token is mandatory."""
+        monkeypatch.delenv("MNEMOSYNE_MCP_TOKEN", raising=False)
+        from mnemosyne.mcp_server import _resolve_http_auth
+        with pytest.raises(RuntimeError, match="MNEMOSYNE_MCP_TOKEN"):
+            _resolve_http_auth("LOCALHOST")
+
+    def test_uppercase_localhost_with_token_requires_auth(self, monkeypatch):
+        """With a token set, LOCALHOST is treated like any non-loopback."""
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKEN", "real-secret-123")
+        from mnemosyne.mcp_server import _resolve_http_auth
+        assert _resolve_http_auth("LOCALHOST") == (True, "real-secret-123")
+
     def test_non_loopback_without_token_raises(self, monkeypatch):
         """0.0.0.0 with no token must refuse to start. The error message
         names the env var so operators can fix it without grepping."""
@@ -162,6 +176,13 @@ class TestResolveTransportSecurity:
         from mnemosyne.mcp_server import _resolve_transport_security
         with pytest.raises(RuntimeError, match="MNEMOSYNE_MCP_ALLOWED_HOSTS"):
             _resolve_transport_security("ip6-localhost")
+
+    def test_uppercase_localhost_requires_host_policy(self, monkeypatch):
+        """LOCALHOST needs an explicit Host policy: only the exact lowercase
+        value arms the SDK's built-in DNS-rebinding protection."""
+        from mnemosyne.mcp_server import _resolve_transport_security
+        with pytest.raises(RuntimeError, match="MNEMOSYNE_MCP_ALLOWED_HOSTS"):
+            _resolve_transport_security("LOCALHOST")
 
     def test_origins_alone_do_not_satisfy_host_policy(self, monkeypatch):
         """Origins without a Host allowlist still refuse to start."""
@@ -334,6 +355,28 @@ class TestBuildStreamableHttpApp:
         names = [m.cls.__name__ for m in app.user_middleware]
         assert any("Bearer" in n for n in names), (
             f"ip6-localhost app should install bearer middleware, got: {names}"
+        )
+
+    def test_uppercase_localhost_build_fails_closed(self, monkeypatch):
+        """LOCALHOST cannot be brought up tokenlessly, mirroring ip6-localhost.
+
+        The build refuses without a token, and once configured with a token
+        and Host policy it installs the bearer middleware -- so the case
+        variant can never serve an arbitrary Host/Origin request
+        unauthenticated.
+        """
+        monkeypatch.delenv("MNEMOSYNE_MCP_TOKEN", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_MCP_ALLOWED_HOSTS", raising=False)
+        from mnemosyne.mcp_server import _build_streamable_http_app
+        with pytest.raises(RuntimeError, match="MNEMOSYNE_MCP_TOKEN"):
+            _build_streamable_http_app(host="LOCALHOST")
+
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKEN", "supersecret")
+        monkeypatch.setenv("MNEMOSYNE_MCP_ALLOWED_HOSTS", "localhost:*")
+        app = _build_streamable_http_app(host="LOCALHOST")
+        names = [m.cls.__name__ for m in app.user_middleware]
+        assert any("Bearer" in n for n in names), (
+            f"LOCALHOST app should install bearer middleware, got: {names}"
         )
 
     def test_builder_forwards_transport_security(self, monkeypatch):
