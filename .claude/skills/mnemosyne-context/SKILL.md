@@ -36,7 +36,7 @@ Any point-in-time fact here (open issues/PRs, endpoints, versions) may be stale 
 - To actually share existing memories you must put them on the surface (`sync-init --claim-existing` on an all-global DB, or write global memories to the surface). To mirror an entire DB (incl. session memories) use **export/import**, not sync.
 
 ## Dev workflow
-- **Local `mnemosyne` CLI + MCP server run from the pipx install** (`~/.local/share/pipx/venvs/mnemosyne-memory`), **NOT** the repo. Editing the repo does not affect them unless installed editable. (On hermes-vps the install *is* editable at `/root/.hermes/projects/mnemosyne`.)
+- **Local `mnemosyne` CLI + MCP server run from the pipx install** (`~/.local/share/pipx/venvs/mnemosyne-memory`), **NOT** the repo. Editing the repo does not affect them unless installed editable. (Some operator deployments install it editable instead, in which case repo edits do take effect; check before assuming either.)
 - **Tests**: use the repo venv — `.venv/bin/python -m pytest tests/<file> -q`. Running from the repo dir makes `import mnemosyne` resolve to the repo source (shadows pipx). pytest lives in `.venv`, not pipx.
 - Set **`MNEMOSYNE_NO_EMBEDDINGS=1`** for fast test runs; embedding-dependent tests are flaky because Hugging Face rate-limits (`429`) the `BAAI/bge-small-en-v1.5` download. CI defaults to this and caches `~/.hermes/cache/fastembed`.
 - **`tests/test_temporal_recall.py::...::test_performance_overhead` is a flaky wall-clock gate** (<10ms). A single-version red on it is almost always load noise — re-run the job.
