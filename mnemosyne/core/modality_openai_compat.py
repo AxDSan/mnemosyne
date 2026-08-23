@@ -317,6 +317,7 @@ def _post_chat(
     Same return contract as ``local_llm._call_remote_llm_with_model`` so the
     retry decision above can be made on status alone.
     """
+    status: Optional[int] = None
     try:
         import httpx
         has_httpx = True
@@ -350,7 +351,7 @@ def _post_chat(
             except urllib.error.HTTPError as exc:
                 return (None, exc.code, exc)
             except Exception as exc:
-                return (None, None, exc)
+                return (None, status, exc)
 
         choices = data.get("choices", []) if isinstance(data, dict) else []
         if choices:
@@ -359,7 +360,7 @@ def _post_chat(
                 return (str(content), status, None)
         return (None, status, None)
     except Exception as exc:
-        return (None, None, exc)
+        return (None, status, exc)
 
 
 # ---------------------------------------------------------------------------
