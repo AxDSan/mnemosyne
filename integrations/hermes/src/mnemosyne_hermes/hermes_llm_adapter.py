@@ -165,7 +165,7 @@ def format_sleep_aux_resolution(resolved: Optional[SleepAuxResolution] = None) -
 
 
 def _consolidation_system_prompt() -> str:
-    """Sleep / consolidation system prompt; core model_refresh is the source of truth."""
+    """Generic consolidation system prompt; slot-body rules stay off complete()."""
     try:
         from mnemosyne.core.model_refresh import consolidation_system_prompt
     except Exception:
@@ -173,8 +173,7 @@ def _consolidation_system_prompt() -> str:
             "You are a memory consolidation engine. Follow the user prompt exactly. "
             "Preserve durable facts, names, preferences, decisions, and chronology. "
             "Do not add facts not present in the input. "
-            "Durable facts only. Each canonical slot body must be at most 400 characters. "
-            "Refuse transcript dumps and chat logs. Never write or update SOUL.md."
+            "Never write or update SOUL.md."
         )
     return consolidation_system_prompt()
 

@@ -63,13 +63,18 @@ def slot_body_is_invalid(body: str) -> bool:
 
 
 def consolidation_system_prompt() -> str:
-    """Shared sleep / consolidation system prompt (dual-provider adapters)."""
+    """Generic host-LLM system prompt for summarize / extract / sleep.
+
+    Slot-body rules (≤400 chars, refuse transcripts) belong only on
+    ``build_model_refresh_prompt`` and ``slot_body_is_invalid``. ``complete()``
+    also serves summarize_memories / extract_facts and must not inherit them.
+    """
 
     return (
         "You are a memory consolidation engine. Follow the user prompt exactly. "
         "Preserve durable facts, names, preferences, decisions, and chronology. "
         "Do not add facts not present in the input. "
-        f"{CANONICAL_SLOT_BODY_CONTRACT}"
+        "Never write or update SOUL.md."
     )
 
 

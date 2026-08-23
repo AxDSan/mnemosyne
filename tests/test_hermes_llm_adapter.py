@@ -127,6 +127,9 @@ def test_complete_calls_call_llm_with_compression_task(fake_agent_module, monkey
     msgs = captured["messages"]
     assert msgs[0]["role"] == "system"
     assert "memory consolidation engine" in msgs[0]["content"].lower()
+    # Slot-body rules belong on model_refresh, not every host-LLM complete().
+    assert "400" not in msgs[0]["content"]
+    assert "transcript" not in msgs[0]["content"].lower()
     assert msgs[1] == {"role": "user", "content": "the prompt"}
     # Optional overrides not passed when None.
     assert "provider" not in captured

@@ -248,3 +248,10 @@ def test_model_refresh_prompt_documents_slot_contract():
     assert str(model_refresh.MAX_CANONICAL_SLOT_BODY_CHARS) in prompt
     assert "transcript" in prompt.lower()
     assert "SOUL.md" in prompt
+
+
+def test_consolidation_system_prompt_omits_slot_body_rules():
+    text = model_refresh.consolidation_system_prompt()
+    assert "memory consolidation engine" in text.lower()
+    assert "400" not in text
+    assert "transcript" not in text.lower()
