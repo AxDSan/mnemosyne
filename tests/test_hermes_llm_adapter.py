@@ -4,12 +4,9 @@ from __future__ import annotations
 
 import sys
 import types
-from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
-from mnemosyne.core import llm_backends
 from mnemosyne.core.llm_backends import get_host_llm_backend
 
 
