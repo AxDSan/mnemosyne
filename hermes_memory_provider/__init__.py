@@ -1769,7 +1769,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
         configured = self._read_config_key("tools")
         if configured is None:
-            return schemas_for_mode(getattr(self, "_interactive_mode", "full"))
+            return schemas_for_mode(
+                getattr(self, "_interactive_mode", "full"),
+                schemas=ALL_TOOL_SCHEMAS,
+            )
         if isinstance(configured, str):
             configured = [name.strip() for name in configured.replace(",", "\n").split("\n") if name.strip()]
         if not isinstance(configured, list):

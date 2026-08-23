@@ -34,6 +34,16 @@ def test_unknown_mode_fails_loudly():
         schemas_for_mode("not-a-mode")
 
 
+def test_schemas_for_mode_filters_explicit_schema_list():
+    custom = [
+        {"name": "mnemosyne_recall"},
+        {"name": "mnemosyne_remember"},
+        {"name": "mnemosyne_export"},
+    ]
+    names = {schema["name"] for schema in schemas_for_mode("none", schemas=custom)}
+    assert names == {"mnemosyne_recall"}
+
+
 def test_default_interactive_mode_is_full():
     provider = MnemosyneMemoryProvider()
     assert provider._interactive_mode == "full"
@@ -66,6 +76,28 @@ def test_explicit_tools_allowlist_wins_over_mode(tmp_path):
     provider._hermes_home = str(tmp_path)
     provider._interactive_mode = "full"
     assert provider._configured_tool_schemas() == []
+
+
+def test_explicit_empty_tools_wins_over_interactive_writes(tmp_path):
+    _write_mnemosyne_block(
+        tmp_path,
+        (
+            "memory:\n"
+            "  provider: mnemosyne\n"
+            "  mnemosyne:\n"
+            "    interactive_writes: full\n"
+            "    tools: []\n"
+        ),
+    )
+    provider = MnemosyneMemoryProvider()
+    provider.initialize(
+        "interactive-writes-empty-tools",
+        hermes_home=str(tmp_path),
+        agent_context="subagent",
+    )
+    assert provider._interactive_mode == "full"
+    assert provider._configured_tool_schemas() == []
+    assert "mnemosyne_recall" not in _schema_names(provider)
 
 
 def test_omitted_tools_uses_interactive_mode(tmp_path):

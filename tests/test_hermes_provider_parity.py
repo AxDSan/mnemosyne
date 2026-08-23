@@ -184,6 +184,28 @@ def test_provider_config_defaults_match(provider_modules):
     assert root_config["default_scope"]["choices"] == ["session", "global"]
     assert root_config["default_scope"]["default"] == "session"
     assert root_config["tools"]["default"] is None
+    assert root_config["interactive_writes"]["choices"] == ["full", "slim", "none"]
+    assert root_config["interactive_writes"]["default"] == "full"
+    assert integration_config["interactive_writes"]["choices"] == ["full", "slim", "none"]
+    assert integration_config["interactive_writes"]["default"] == "full"
+
+
+def test_interactive_writes_none_hides_remember_on_both_providers(tmp_path, provider_modules):
+    (tmp_path / "config.yaml").write_text(
+        "memory:\n  provider: mnemosyne\n  mnemosyne:\n    interactive_writes: none\n"
+    )
+
+    for name, module in provider_modules.items():
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize(
+            f"interactive-writes-none-{name}",
+            hermes_home=str(tmp_path),
+            agent_context="subagent",
+        )
+        names = set(_schema_names(provider))
+        assert provider._interactive_mode == "none", name
+        assert "mnemosyne_recall" in names, name
+        assert "mnemosyne_remember" not in names, name
 
 
 def test_auto_sleep_runtime_default_enabled(monkeypatch, provider_modules):

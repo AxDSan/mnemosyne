@@ -6,8 +6,9 @@ Modes are data, not scattered conditionals:
 * ``slim`` — reads plus everyday writes (``READ_TOOLS | SLIM_WRITE_TOOLS``)
 * ``full`` — every advertised schema (``ALL_TOOL_SCHEMAS``)
 
-``schemas_for_mode`` looks names up in ``ALL_TOOL_SCHEMAS`` and preserves
-that inventory's order. Unknown modes fail loudly.
+``schemas_for_mode`` looks names up in the provided ``schemas`` list (default:
+``hermes_memory_provider.ALL_TOOL_SCHEMAS``) and preserves that inventory's
+order. Unknown modes fail loudly.
 """
 
 from __future__ import annotations
@@ -64,15 +65,23 @@ def __getattr__(name: str) -> FrozenSet[str]:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def schemas_for_mode(mode: str) -> List[Dict[str, Any]]:
-    """Return ``ALL_TOOL_SCHEMAS`` entries advertised for ``mode``."""
+def schemas_for_mode(
+    mode: str,
+    schemas: List[Dict[str, Any]] | None = None,
+) -> List[Dict[str, Any]]:
+    """Return advertised schemas for ``mode``.
+
+    ``schemas`` defaults to ``hermes_memory_provider.ALL_TOOL_SCHEMAS``. Callers
+    with their own inventory (the pip ``mnemosyne_hermes`` provider) pass it
+    explicitly so the same name sets filter a different copy.
+    """
     if mode not in _MODE_NAME_SETS:
         known = ", ".join(sorted(_MODE_NAME_SETS))
         raise ValueError(
             f"Unknown interactive tool mode {mode!r}. Expected one of: {known}"
         )
     names = _MODE_NAME_SETS[mode]
-    schemas = _all_tool_schemas()
+    inventory = list(schemas) if schemas is not None else _all_tool_schemas()
     if names is None:
-        return schemas
-    return [schema for schema in schemas if schema["name"] in names]
+        return inventory
+    return [schema for schema in inventory if schema["name"] in names]

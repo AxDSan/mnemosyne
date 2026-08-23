@@ -74,6 +74,65 @@ except Exception as _tool_schema_import_exc:  # pragma: no cover - broken instal
     )
     ALL_TOOL_SCHEMAS = []
 
+
+_READ_TOOLS = frozenset(
+    {
+        "mnemosyne_recall",
+        "mnemosyne_shared_recall",
+        "mnemosyne_shared_stats",
+        "mnemosyne_stats",
+        "mnemosyne_get",
+        "mnemosyne_triple_query",
+        "mnemosyne_recall_canonical",
+        "mnemosyne_model_card",
+        "mnemosyne_scratchpad_read",
+        "mnemosyne_diagnose",
+        "mnemosyne_recall_diagnostics",
+        "mnemosyne_graph_query",
+        "mnemosyne_sync_status",
+        "mnemosyne_persona_list",
+    }
+)
+_SLIM_WRITE_TOOLS = frozenset(
+    {
+        "mnemosyne_remember",
+        "mnemosyne_update",
+        "mnemosyne_forget",
+        "mnemosyne_invalidate",
+        "mnemosyne_batch",
+        "mnemosyne_shared_remember",
+        "mnemosyne_shared_forget",
+    }
+)
+_MODE_NAME_SETS = {
+    "none": _READ_TOOLS,
+    "slim": _READ_TOOLS | _SLIM_WRITE_TOOLS,
+    "full": None,
+}
+
+
+def _schemas_for_mode(mode: str, schemas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Filter ``schemas`` by interactive mode.
+
+    Prefer the shared ``hermes_memory_provider.tool_sets`` implementation when
+    the in-tree plugin is importable (tests / monorepo). Fall back to a local
+    copy so the pip package does not depend on that module.
+    """
+    try:
+        from hermes_memory_provider.tool_sets import schemas_for_mode
+    except ImportError:
+        if mode not in _MODE_NAME_SETS:
+            known = ", ".join(sorted(_MODE_NAME_SETS))
+            raise ValueError(
+                f"Unknown interactive tool mode {mode!r}. Expected one of: {known}"
+            )
+        names = _MODE_NAME_SETS[mode]
+        inventory = list(schemas)
+        if names is None:
+            return inventory
+        return [schema for schema in inventory if schema["name"] in names]
+    return schemas_for_mode(mode, schemas=schemas)
+
 try:
     from mnemosyne.batch_tool import (
         BatchValidationError,
@@ -808,6 +867,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # It is intentionally not inferred from _is_active_in_module because
         # that counter governs legacy prefetch deferral, not backend lifetime.
         self._owns_host_llm_backend: bool = False
+        # Interactive tool-set mode. Default "full" preserves the historical
+        # advertised surface; memory.mnemosyne.interactive_writes can select
+        # slim/none at initialize() time.
+        self._interactive_mode = "full"
 
     def _activate_in_module(self) -> None:
         """Bump the module-level active-provider count exactly once per
@@ -1101,6 +1164,21 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             else:
                 logger.warning("Mnemosyne: invalid default_scope=%r, must be 'session' or 'global'", default_scope)
 
+        # interactive_writes: named tool-set preset. Init-time only.
+        # Code default remains "full" (set in __init__/initialize). An explicit
+        # memory.mnemosyne.tools list — including [] — still wins over the mode.
+        interactive_writes = kwargs.get("interactive_writes")
+        if interactive_writes is None:
+            interactive_writes = self._read_config_key("interactive_writes")
+        if interactive_writes is not None:
+            mode = str(interactive_writes).strip().lower()
+            if mode not in ("full", "slim", "none"):
+                raise ValueError(
+                    f"Unknown interactive_writes {interactive_writes!r}. "
+                    "Expected one of: full, slim, none"
+                )
+            self._interactive_mode = mode
+
     def _should_filter(self, content: str) -> bool:
         """Check if content matches any ignore pattern. Returns True if it should be skipped."""
         if not self._ignore_patterns:
@@ -1142,15 +1220,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def _configured_tool_schemas(self) -> List[Dict[str, Any]]:
         """Return schemas filtered by memory.mnemosyne.tools, if configured.
 
-        ``tools`` omitted/None preserves the historical behavior and exposes all
-        Mnemosyne tools. ``tools: []`` exposes no tools while still allowing the
-        provider's memory context/prefetch surface to initialize. Unknown names
+        ``tools`` omitted/None uses ``schemas_for_mode(self._interactive_mode)``
+        (default mode ``full``, the historical all-tools surface). An explicit
+        ``tools`` list — including ``[]`` — wins over the mode. Unknown names
         fail loudly so operators catch typos during Hermes startup instead of
         silently losing tools.
         """
         configured = self._read_config_key("tools")
         if configured is None:
-            return list(ALL_TOOL_SCHEMAS)
+            return _schemas_for_mode(
+                getattr(self, "_interactive_mode", "full"),
+                ALL_TOOL_SCHEMAS,
+            )
         if isinstance(configured, str):
             configured = [name.strip() for name in configured.replace(",", "\n").split("\n") if name.strip()]
         if not isinstance(configured, list):
@@ -1342,6 +1423,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._agent_identity = kwargs.get("agent_identity", None) or ""
         self._gateway_session_key = kwargs.get("gateway_session_key") or ""
         self._channel_id_explicit = bool(kwargs.get("channel_id"))
+        # Reset to "full" on every init so a re-init without the key is
+        # upstream-safe. _apply_provider_config may then select slim/none.
+        self._interactive_mode = "full"
 
         # Apply provider-specific config from kwargs (Hermes-passed) or config.yaml fallback
         self._apply_provider_config(kwargs)
