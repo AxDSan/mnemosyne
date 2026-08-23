@@ -89,9 +89,9 @@ def test_non_dense_surface_usable_without_numpy():
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_dense_entry_points_fail_deterministically_without_numpy():
+def test_dense_entry_points_fail_deterministically_without_numpy(tmp_path):
     result = _run_without_numpy(
-        """
+        f"""
         from mnemosyne.core.shmr import (
             _cosine_similarity,
             _embed,
@@ -100,12 +100,21 @@ def test_dense_entry_points_fail_deterministically_without_numpy():
             recall_beliefs,
             ShmrDenseCapabilityUnavailable,
         )
+        import sqlite3
+
+        db = r"{tmp_path / "harmonize.db"}"
+        beam_conn = sqlite3.connect(db)
+
+        class _Beam:
+            conn = beam_conn
+            session_id = "test"
 
         for call in (
             lambda: _embed("probe"),
             lambda: _cosine_similarity(None, None),
             lambda: _compute_harmony_score([], []),
-            lambda: recall_beliefs(None, "query"),
+            lambda: recall_beliefs(_Beam(), "query"),
+            lambda: harmonize(_Beam()),
         ):
             try:
                 call()
@@ -114,15 +123,14 @@ def test_dense_entry_points_fail_deterministically_without_numpy():
             else:
                 raise AssertionError("dense call unexpectedly succeeded")
 
-        class _FakeBeam:
-            session_id = "test"
-
-        try:
-            harmonize(_FakeBeam())
-        except ShmrDenseCapabilityUnavailable:
-            pass
-        else:
-            raise AssertionError("harmonize unexpectedly succeeded")
+        tables = [
+            row[0]
+            for row in beam_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        ]
+        assert "harmonic_beliefs" not in tables
+        assert "memory_resonance_log" not in tables
         """
     )
     assert result.returncode == 0, result.stdout + result.stderr
