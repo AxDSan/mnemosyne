@@ -58,9 +58,12 @@ class _Stub:
                 raw = self.rfile.read(length)
                 outer.requests.append(json.loads(raw.decode()))
 
-                status, content = outer.replies.pop(0) if outer.replies else (200, "{}")
+                reply = outer.replies.pop(0) if outer.replies else (200, "{}")
+                status, content, *raw_body = reply
                 outer.response_statuses.append(status)
-                if status >= 400:
+                if raw_body:
+                    body = content.encode()
+                elif status >= 400:
                     body = json.dumps({"error": content}).encode()
                 else:
                     body = json.dumps(
@@ -445,6 +448,34 @@ def test_client_errors_are_not_retried(stub, configured, monkeypatch, status):
     assert adapter.OpenAICompatModalityBackend().describe(_request()) is None
     assert len(server.requests) == 1
     assert server.response_statuses == [status]
+    assert server.replies == [(200, _OK_REPLY)]
+
+
+def test_known_client_status_beats_429_in_exception_text(stub, configured, monkeypatch):
+    server = stub([(403, "forbidden"), (200, _OK_REPLY)])
+    configured(server.base_url)
+    post_chat = adapter._post_chat
+
+    def _post_with_misleading_exception(*args, **kwargs):
+        text, status, _ = post_chat(*args, **kwargs)
+        return text, status, RuntimeError("request URL included port 429")
+
+    monkeypatch.setattr(adapter, "_post_chat", _post_with_misleading_exception)
+
+    assert adapter.OpenAICompatModalityBackend().describe(_request()) is None
+    assert len(server.requests) == 1
+    assert server.response_statuses == [403]
+    assert server.replies == [(200, _OK_REPLY)]
+
+
+def test_received_malformed_json_is_not_retried(stub, configured, monkeypatch):
+    monkeypatch.setattr(adapter.time, "sleep", lambda _s: None)
+    server = stub([(200, "not JSON", True), (200, _OK_REPLY)])
+    configured(server.base_url)
+
+    assert adapter.OpenAICompatModalityBackend().describe(_request()) is None
+    assert len(server.requests) == 1
+    assert server.response_statuses == [200]
     assert server.replies == [(200, _OK_REPLY)]
 
 
