@@ -294,17 +294,33 @@ def _build_mcp_server() -> Server:
         return ListToolsResult(tools=[Tool(**t) for t in raw])
 
     async def _on_call_tool(ctx, params):  # noqa: ARG001 — ctx unused
+        tool_name = ""
         try:
-            result = handle_tool_call(params.name, params.arguments or {})
+            candidate_name = getattr(params, "name", "")
+            if type(candidate_name) is str:
+                tool_name = candidate_name
+            result = handle_tool_call(tool_name, params.arguments or {})
             content = [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+            error_code = result.get("error") if isinstance(result, dict) else None
             is_error = (
                 isinstance(result, dict)
                 and result.get("status") == "error"
-                and result.get("error", "").startswith("batch_")
+                and type(error_code) is str
+                and error_code in {"batch_validation_failed", "batch_failed"}
             )
             return CallToolResult(content=content, is_error=is_error)
         except Exception as e:
-            content = [TextContent(type="text", text=json.dumps({"status": "error", "message": str(e)}, indent=2))]
+            if tool_name == "mnemosyne_batch":
+                logger.error("mnemosyne_batch MCP dispatch failed")
+                payload = {
+                    "status": "error",
+                    "error": "batch_failed",
+                    "failed_index": None,
+                    "action": None,
+                }
+            else:
+                payload = {"status": "error", "message": str(e)}
+            content = [TextContent(type="text", text=json.dumps(payload, indent=2))]
             return CallToolResult(content=content, is_error=True)
 
     return Server(

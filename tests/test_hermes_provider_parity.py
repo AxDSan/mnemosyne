@@ -124,6 +124,32 @@ def _provider_for_config(module, hermes_home: Path):
     return provider
 
 
+class _FailingBatchBeam:
+    conn = None
+
+    def remember(self, **_kwargs):
+        raise RuntimeError("/private/provider/path\ncanary")
+
+
+def test_batch_execution_failure_payload_matches_across_providers(provider_modules):
+    payloads = []
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        provider._beam = _FailingBatchBeam()
+        payloads.append(json.loads(provider._handle_batch({
+            "operations": [{"action": "remember", "content": "x"}],
+        })))
+
+    expected = {
+        "status": "error",
+        "error": "batch_failed",
+        "failed_index": 0,
+        "action": "remember",
+    }
+    assert payloads == [expected, expected]
+    assert "/private/provider/path" not in json.dumps(payloads)
+
+
 def _json_stable(value):
     return json.loads(json.dumps(value, sort_keys=True))
 
