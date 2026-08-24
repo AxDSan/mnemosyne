@@ -150,19 +150,45 @@ def test_batch_execution_failure_payload_matches_across_providers(provider_modul
     assert "/private/provider/path" not in json.dumps(payloads)
 
 
-def test_batch_unknown_action_payload_matches_across_providers(provider_modules):
+def test_batch_unknown_action_payload_matches_across_providers(
+    tmp_path, provider_modules
+):
     canary = "<script>private-action</script>"
+    arguments = {
+        "operations": [
+            {"action": "remember", "content": "must not write"},
+            {
+                "action": canary,
+                "content": "complete unsupported operation",
+                "memory_id": "private-id",
+                "importance": 0.5,
+            },
+        ],
+    }
     payloads = []
-    for module in provider_modules.values():
+    for name, module in provider_modules.items():
         provider = module.MnemosyneMemoryProvider()
-        payloads.append(json.loads(provider._handle_batch({
-            "operations": [{"action": canary}],
-        })))
+        provider.initialize(
+            f"batch-unknown-{name}",
+            hermes_home=str(tmp_path / name),
+            profile_isolation=False,
+            agent_context="primary",
+        )
+        assert provider._beam is not None
+        payloads.append(json.loads(provider.handle_tool_call(
+            "mnemosyne_batch", arguments
+        )))
+        row_count = provider._beam.conn.execute(
+            "SELECT COUNT(*) FROM working_memory WHERE content = ?",
+            ("must not write",),
+        ).fetchone()[0]
+        assert row_count == 0
+        provider._beam.conn.close()
 
     expected = {
         "status": "error",
         "error": "batch_validation_failed",
-        "failed_index": 0,
+        "failed_index": 1,
         "action": None,
     }
     assert payloads == [expected, expected]
