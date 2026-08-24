@@ -27,9 +27,8 @@ def journal_mode() -> str:
     silently reverting to WAL on a typo would restore exactly the
     failure the deployment set the variable to escape).
 
-    Connections that do not set a journal mode inherit the mode
-    persisted in the database file, so one honoring connection flips
-    the whole store.
+    Only WAL persists in the database file; other modes are
+    per-connection, so every store connection re-applies this value.
     """
     raw = os.environ.get("MNEMOSYNE_JOURNAL_MODE")
     if raw is None or not raw.strip():
