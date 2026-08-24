@@ -150,6 +150,25 @@ def test_batch_execution_failure_payload_matches_across_providers(provider_modul
     assert "/private/provider/path" not in json.dumps(payloads)
 
 
+def test_batch_unknown_action_payload_matches_across_providers(provider_modules):
+    canary = "<script>private-action</script>"
+    payloads = []
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        payloads.append(json.loads(provider._handle_batch({
+            "operations": [{"action": canary}],
+        })))
+
+    expected = {
+        "status": "error",
+        "error": "batch_validation_failed",
+        "failed_index": 0,
+        "action": None,
+    }
+    assert payloads == [expected, expected]
+    assert canary not in json.dumps(payloads)
+
+
 def _json_stable(value):
     return json.loads(json.dumps(value, sort_keys=True))
 
