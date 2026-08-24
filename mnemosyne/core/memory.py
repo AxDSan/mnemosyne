@@ -156,7 +156,7 @@ def _export_completeness(conn: sqlite3.Connection, *, include_sync_events: bool)
         for field in sorted(set(actual_fields) - exported_fields):
             restore_default = _sqlite_restore_default(actual_fields[field])
             if restore_default is _UNKNOWN_RESTORE_DEFAULT:
-                predicate = f"{_quoted_identifier(field)} IS NOT NULL"
+                predicate = "1 = 1"
                 params = ()
             else:
                 predicate = f"{_quoted_identifier(field)} IS NOT ?"
@@ -931,23 +931,10 @@ class Mnemosyne:
         """Get consolidation history."""
         return self.beam.get_consolidation_log(limit=limit)
 
-    def export_to_file(
-        self, output_path: str, include_sync_events: bool = False
-    ) -> Dict:
-        """
-        Export supported Mnemosyne data to a portable JSON file. The additive
-        completeness manifest discloses omitted persisted surfaces and fields,
-        so a successful file write never implies a lossless database backup.
-
-        Schema version 1.3 adds the always-present ``canonical_facts`` section.
-        1.2 (post-sync) adds an optional ``sync_events`` section. Previous
-        versions (1.0, 1.1, 1.2) are still importable; ``sync_events`` presence
-        is keyed off the section itself on import, not the version number.
-        """
-        from mnemosyne.core.triples import TripleStore
-        from mnemosyne.core.annotations import AnnotationStore
-        from mnemosyne.core.canonical import CanonicalStore
-        import json as _json
+    def _build_portable_export(
+        self, include_sync_events: bool = False
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """Build the portable payload and completeness manifest."""
 
         # Build export metadata with device_id when available
         meta: Dict[str, Any] = {
@@ -998,23 +985,17 @@ class Mnemosyne:
         """)
         export["legacy_embeddings"] = [dict(row) for row in cursor.fetchall()]
 
-        # Triples (current-truth temporal facts; post-E6 scope)
-        triples = TripleStore(db_path=self.db_path)
-        export["triples"] = triples.export_all()
-
-        # Annotations (post-E6: multi-valued mentions, facts, occurred_on,
-        # has_source). Pre-E6 backups won't have this key — the import path
-        # handles that gracefully.
-        annotations = AnnotationStore(db_path=self.db_path)
-        export["annotations"] = annotations.export_all()
-
-        # Canonical facts: owner-scoped single-source-of-truth identity, with
-        # history. These are AUTHORED (not derived), so omitting them made a
-        # JSON restore silently lossy. CanonicalStore already exposes
-        # export_all/import_all (same contract as triples/annotations); they
-        # were simply never wired into the file export.
-        canonical = CanonicalStore(db_path=self.db_path)
-        export["canonical_facts"] = canonical.export_all()
+        # Read every surface through the shared connection so one SQLite read
+        # transaction can hold the complete export at a single snapshot.
+        cursor.execute("""
+            SELECT id, subject, predicate, object, valid_from, valid_until,
+                   source, confidence, created_at
+            FROM triples
+            ORDER BY id
+        """)
+        export["triples"] = [dict(row) for row in cursor.fetchall()]
+        export["annotations"] = self.beam.annotations.export_all()
+        export["canonical_facts"] = self.beam.canonical.export_all()
 
         # Sync events (optional, schema 1.2)
         if include_sync_events:
@@ -1035,6 +1016,22 @@ class Mnemosyne:
             self.conn, include_sync_events=include_sync_events
         )
         meta["completeness"] = completeness
+        return export, completeness
+
+    def export_to_file(
+        self, output_path: str, include_sync_events: bool = False
+    ) -> Dict:
+        """Export supported data and its completeness from one DB snapshot."""
+        import json as _json
+
+        owns_transaction = not self.conn.in_transaction
+        if owns_transaction:
+            self.conn.execute("BEGIN")
+        try:
+            export, completeness = self._build_portable_export(include_sync_events)
+        finally:
+            if owns_transaction:
+                self.conn.rollback()
 
         with open(output_path, "w", encoding="utf-8") as f:
             _json.dump(export, f, indent=2, ensure_ascii=False, default=str)
