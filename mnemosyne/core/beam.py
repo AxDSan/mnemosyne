@@ -5429,37 +5429,47 @@ class BeamMemory:
                                   source_memory_id=source_memory_id)
                 counts["version"] += 1
 
-        # Negations (critical for CR) — language-aware
-        for m in _re.finditer(pat['negation'], content, _re.IGNORECASE):
-            neg_text = m.group(1).strip()
-            # Language-aware split for "never"/"nie" vs "not"/"nicht"
-            neg_lower = neg_text.lower()
-            if lang == 'de':
-                split_words = ['nie', 'niemals', 'nicht']
-            else:
-                split_words = ['never', 'not']
-            obj = neg_text
-            for sw in split_words:
-                if sw in neg_lower:
-                    parts = neg_text.split(sw, 1)
-                    if len(parts) > 1:
-                        obj = parts[-1].strip()
-                        break
-            self._insert_kg(session, 'user', 'negation', obj[:80], message_idx, 0.75, source_memory_id=source_memory_id)
-            counts["negation"] += 1
+        # KG regex prototype (BEAM benchmark-oracle writer): these three
+        # branches hardcode (subject='user', predicate∈{negation,decision,
+        # requires}, confidence∈{0.75,0.65}) rows whose objects end at raw
+        # Python slices — the sole source of the junk previously found in
+        # memoria_kg. Opt-in only via MNEMOSYNE_REGEX_KG; default OFF.
+        # The real KG path is the LLM extraction wired through
+        # _extract_and_store_facts -> _store_kg_triples.
+        _regex_kg_enabled = os.environ.get(
+            "MNEMOSYNE_REGEX_KG", "").strip().lower() in ("1", "true", "yes", "on")
+        if _regex_kg_enabled:
+            # Negations (critical for CR) — language-aware
+            for m in _re.finditer(pat['negation'], content, _re.IGNORECASE):
+                neg_text = m.group(1).strip()
+                # Language-aware split for "never"/"nie" vs "not"/"nicht"
+                neg_lower = neg_text.lower()
+                if lang == 'de':
+                    split_words = ['nie', 'niemals', 'nicht']
+                else:
+                    split_words = ['never', 'not']
+                obj = neg_text
+                for sw in split_words:
+                    if sw in neg_lower:
+                        parts = neg_text.split(sw, 1)
+                        if len(parts) > 1:
+                            obj = parts[-1].strip()
+                            break
+                self._insert_kg(session, 'user', 'negation', obj[:80], message_idx, 0.75, source_memory_id=source_memory_id)
+                counts["negation"] += 1
 
-        # Decisions — language-aware
-        for m in _re.finditer(pat['decision'], content, _re.IGNORECASE):
-            decision = m.group(1).strip()
-            self._insert_kg(session, 'user', 'decision', decision, message_idx, 0.65, source_memory_id=source_memory_id)
-            counts["decision"] += 1
+            # Decisions — language-aware
+            for m in _re.finditer(pat['decision'], content, _re.IGNORECASE):
+                decision = m.group(1).strip()
+                self._insert_kg(session, 'user', 'decision', decision, message_idx, 0.65, source_memory_id=source_memory_id)
+                counts["decision"] += 1
 
-        # Entity-action pairs (MR support) — language-aware
-        for m in _re.finditer(pat['entity'], content, _re.IGNORECASE):
-            entity = m.group(1).strip()
-            action = m.group(2).strip()
-            self._insert_kg(session, entity, 'requires', action, message_idx, 0.65, source_memory_id=source_memory_id)
-            counts["decision"] += 1
+            # Entity-action pairs (MR support) — language-aware
+            for m in _re.finditer(pat['entity'], content, _re.IGNORECASE):
+                entity = m.group(1).strip()
+                action = m.group(2).strip()
+                self._insert_kg(session, entity, 'requires', action, message_idx, 0.65, source_memory_id=source_memory_id)
+                counts["decision"] += 1
 
         # Sequence markers (EO support) — language-aware
         for m in _re.finditer(pat['sequence'], content, _re.IGNORECASE):
