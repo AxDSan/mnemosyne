@@ -57,8 +57,6 @@ For automation, do not treat a non-zero exit from a non-dry-run `mnemosyne reind
 
 Import is idempotent: annotation collisions are skipped rather than aborting the run, so re-running is safe.
 
-`export` is a portable JSON transfer, not automatically a lossless database snapshot. Its completeness manifest names populated persisted surfaces omitted entirely and exported sections that omit populated fields. `import` restores supported data and reports that partial-state evidence for the source artifact; retain a database backup until a dedicated portability contract covers the missing data. Older exports remain importable but have unknown completeness.
-
 ## Banks
 
 | Command | Usage |
@@ -96,63 +94,37 @@ The built-in help lists only `hygiene audit|clean`; `status` and `restore` exist
 
 | Command | Usage |
 |---|---|
-| `mcp` | `mcp [--transport stdio\|sse\|streamable-http\|http] [--host 127.0.0.1] [--port 8080] [--path /mcp] [--json-response] [--env-file FILE] [--bank NAME]`. Starts the MCP server |
+| `mcp` | `mcp [--transport sse] [--port 8080] [--bank NAME]`. Starts the MCP server |
 
-stdio is the default transport. `sse` and `streamable-http` are HTTP transports; a non-loopback bind requires `MNEMOSYNE_MCP_TOKEN`. `streamable-http` (alias `http`) is the native MCP Streamable HTTP transport: clients POST JSON-RPC straight to `--path` (default `/mcp`) with no separate `/messages` route to proxy. Add `--json-response` to force JSON-only responses instead of the default SSE-upgrade streaming. A non-loopback `streamable-http` bind also requires `MNEMOSYNE_MCP_ALLOWED_HOSTS` (see below); `sse` requires only the token.
+stdio is the default transport. A non-loopback SSE bind requires `MNEMOSYNE_MCP_TOKEN`.
 
-### Streamable HTTP Host/Origin policy
+### Multi-agent tokens (per-agent identity)
 
-The Streamable HTTP transport applies a Host/Origin policy on **non-loopback**
-binds (DNS-rebinding protection). Loopback binds (`127.0.0.1`, `localhost`,
-`::1`) keep the SDK's built-in defaults and ignore these variables.
-
-Streamable HTTP serves the existing local Mnemosyne/SQLite store — no external
-database is involved. Binding non-loopback exposes the selected local memory
-bank to network clients, so treat the token and the Host/Origin gates below as
-the boundary between the local store and the network.
-
-- `MNEMOSYNE_MCP_ALLOWED_HOSTS` — **required** to start a non-loopback server.
-  Comma-separated `Host` header values clients will present. Each value is an
-  exact name or a `name:*` pattern covering any port. Any request whose `Host`
-  is not listed is rejected with HTTP 421.
-- `MNEMOSYNE_MCP_ALLOWED_ORIGINS` — **optional**. Comma-separated browser
-  `Origin` values to allow. Requests with **no** `Origin` header always pass;
-  any `Origin` not listed is rejected with HTTP 403.
-
-**Single value vs. list.** Both variables accept one value or several,
-comma-separated (whitespace is trimmed, empty entries ignored):
+`MNEMOSYNE_MCP_TOKENS` accepts a JSON object of named bearer tokens and takes
+precedence over the single `MNEMOSYNE_MCP_TOKEN`:
 
 ```bash
-# single
-export MNEMOSYNE_MCP_ALLOWED_HOSTS="mnemosyne.k.example.com:*"
-# list
-export MNEMOSYNE_MCP_ALLOWED_HOSTS="mnemosyne.k.example.com:*, mnemosyne.example.org"
-export MNEMOSYNE_MCP_ALLOWED_ORIGINS="https://inspector.example.com, https://app.example.com"
+MNEMOSYNE_MCP_TOKENS='{"hermes-family": "tok1", "hermes-admin": "tok2", "ci": "tok3"}' \
+  mnemosyne mcp --transport sse --host 0.0.0.0 --port 8080
 ```
 
-**SDK / CLI clients** (curl, MCP SDKs, Claude Code, etc.) send no `Origin`
-header, so they are unaffected by `MNEMOSYNE_MCP_ALLOWED_ORIGINS`. They only
-need their `Host` listed. Include the port wildcard (`name:*`) because clients
-and load balancers frequently send `host:port`.
+Every client sends its own token as usual (`Authorization: Bearer tok1`). In
+this opt-in multi-agent mode the *name* of the matched token is the
+**authoritative** author identity on memories that client creates: a
+conflicting client-supplied `author_id` is rejected before any write (an
+`author_id` matching the token name, or omitted, is fine), giving per-agent
+audit attribution from a single instance. Malformed JSON, non-string
+names/secrets (they are never coerced -- `1` or `null` fail instead of
+minting predictable credentials), empty mappings, empty names/secrets,
+duplicate names, and duplicate secrets (two names sharing one token would
+make attribution ambiguous) all refuse startup with an actionable error. The
+identity is bound to the session at connect time: a later request for the
+same session presenting a different valid token is rejected.
 
-**Browser clients** (e.g. MCP Inspector) send an `Origin` header, so in
-addition to a matching `Host` you must add the browser's origin to
-`MNEMOSYNE_MCP_ALLOWED_ORIGINS`, otherwise they get HTTP 403. Note the SDK does
-**not** support a bare `*` wildcard — list each origin explicitly.
-
-**Reverse proxies.** The `Host` header the server sees is whatever the proxy
-forwards (nginx `proxy_set_header Host $host` passes the original hostname).
-If multiple public hostnames or ports route to the same server, list each one;
-the same applies to `Origin` when browser clients arrive via different hosts.
-Bare `*` is never a valid entry.
-
-Example for a deployment behind an nginx ingress on one hostname:
-
-```bash
-MNEMOSYNE_MCP_TOKEN=<token> \
-MNEMOSYNE_MCP_ALLOWED_HOSTS="mnemosyne.k.example.com:*" \
-mnemosyne mcp --transport streamable-http --host 0.0.0.0 --port 8080
-```
+Single-token deployments (`MNEMOSYNE_MCP_TOKEN`) are unchanged: the token
+still authenticates and owns sessions, but introduces **no** author identity
+-- explicit `author_id` arguments and `MNEMOSYNE_AUTHOR_ID` keep their prior
+precedence, exactly as before multi-token support existed.
 
 ## Aliases
 
