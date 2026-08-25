@@ -61,6 +61,59 @@ def test_parse_facts_with_numbering():
     print("PASS: test_parse_facts_with_numbering")
 
 
+def test_parse_facts_json_dedupes_across_categories():
+    """A statement filed under several categories is returned once."""
+    import json as _json
+    raw = _json.dumps({
+        "facts": [
+            "Servers must clock out through the tablet",
+            "The POS system goes live October 1st",
+        ],
+        # Correct categorisation: the first is also an instruction, the second
+        # is also a timeline. Both belong in more than one bucket.
+        "instructions": ["Servers must clock out through the tablet"],
+        "preferences": [],
+        "timelines": ["The POS system goes live October 1st"],
+    })
+    facts = _parse_facts(raw)
+    assert len(facts) == 2, facts
+    assert len({f.casefold() for f in facts}) == 2, facts
+    # First-seen order is preserved, so 'facts' entries keep their position.
+    assert facts[0] == "Servers must clock out through the tablet"
+    assert facts[1] == "The POS system goes live October 1st"
+    print("PASS: test_parse_facts_json_dedupes_across_categories")
+
+
+def test_parse_facts_json_dedupe_ignores_case_and_padding():
+    """Dedupe compares trimmed, case-folded text."""
+    import json as _json
+    raw = _json.dumps({
+        "facts": ["The user prefers dark mode"],
+        "instructions": ["  the user prefers DARK MODE  "],
+        "preferences": [],
+        "timelines": [],
+    })
+    facts = _parse_facts(raw)
+    assert len(facts) == 1, facts
+    # The surviving copy keeps its original text, untrimmed variants dropped.
+    assert facts[0] == "The user prefers dark mode"
+    print("PASS: test_parse_facts_json_dedupe_ignores_case_and_padding")
+
+
+def test_parse_facts_json_keeps_distinct_items():
+    """Dedupe must not collapse genuinely different statements."""
+    import json as _json
+    raw = _json.dumps({
+        "facts": ["The user works evenings"],
+        "instructions": ["Always use tabs"],
+        "preferences": ["The user likes dark mode"],
+        "timelines": ["Release on 2026-12-01"],
+    })
+    facts = _parse_facts(raw)
+    assert len(facts) == 4, facts
+    print("PASS: test_parse_facts_json_keeps_distinct_items")
+
+
 def test_parse_facts_no_facts():
     """Test parsing 'NO_FACTS' response."""
     facts = _parse_facts("NO_FACTS")

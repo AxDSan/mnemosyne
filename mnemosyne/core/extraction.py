@@ -85,12 +85,27 @@ def _parse_facts(raw_output: str) -> List[str]:
         try:
             parsed = _json.loads(raw_clean)
             if isinstance(parsed, dict):
-                # Collect all extracted items across categories
+                # Collect all extracted items across categories.
+                # The categories overlap by design — "always use tabs" is both a
+                # fact and an instruction, and a dated statement is both a fact
+                # and a timeline — so a model that files one statement under
+                # every category it belongs to is behaving correctly. Without a
+                # dedupe here that correctness is punished: the same string is
+                # returned once per category and stored once per copy.
                 all_items = []
+                seen = set()
                 for category in ('facts', 'instructions', 'preferences', 'timelines'):
                     items = parsed.get(category, [])
                     if isinstance(items, list):
-                        all_items.extend(str(item) for item in items if item)
+                        for item in items:
+                            if not item:
+                                continue
+                            text = str(item)
+                            key = text.strip().casefold()
+                            if not key or key in seen:
+                                continue
+                            seen.add(key)
+                            all_items.append(text)
                 if all_items:
                     return all_items
         except (_json.JSONDecodeError, Exception):
