@@ -4,13 +4,12 @@ HOOK_FILE=".githooks/pre-commit"
 
 PII_PATTERNS="1641797+AxDSan@users.noreply.github.com"
 
-staged=$(git diff --cached --name-only | grep -v "^$HOOK_FILE$" || true)
-if [ -n "$staged" ]; then
-  if echo "$staged" | xargs grep -l "$PII_PATTERNS" 2>/dev/null; then
-    echo "ERROR: PII detected in staged files. Remove before committing."
-    echo "Found pattern: $PII_PATTERNS"
-    exit 1
-  fi
+if git diff --cached --no-color --text -U0 --output-indicator-new='!' -- . ":(exclude)$HOOK_FILE" \
+  | grep -a '^!' \
+  | grep -a -F -q "$PII_PATTERNS"; then
+  echo "ERROR: PII detected in staged files. Remove before committing."
+  echo "Found pattern: $PII_PATTERNS"
+  exit 1
 fi
 
 # Also check git config
