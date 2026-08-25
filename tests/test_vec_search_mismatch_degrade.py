@@ -217,19 +217,52 @@ def test_vec_search_degrades_on_confirmed_mismatch_for_every_vec_type(
 
 
 def test_vec_search_raises_when_table_dim_unreadable(tmp_path, monkeypatch, caplog):
-    """When the table's declared dimension cannot be read, the mismatch
-    cannot be confirmed, so the error propagates rather than being silently
-    swallowed."""
+    """When a successful dimension read yields no declared dimension, the
+    mismatch cannot be confirmed, so the KNN error propagates rather than
+    being silently swallowed."""
     if not beam._SQLITE_VEC_AVAILABLE:
         pytest.skip("sqlite-vec unavailable")
 
     db = _store_at(monkeypatch, tmp_path, "unreadable.db", 768)
     monkeypatch.setattr(beam, "EMBEDDING_DIM", 768)
-    monkeypatch.setattr(beam, "_existing_vec_dim", lambda conn, tables=None: None)
+    monkeypatch.setattr(beam, "_vec_table_dim_strict", lambda conn, table=None: None)
 
     with caplog.at_level("ERROR", logger="mnemosyne.core.beam"):
         with pytest.raises(sqlite3.Error):
             beam._vec_search(beam._get_connection(db), [0.01] * 384, k=5)
+
+
+def test_vec_search_dim_probe_failure_replaces_knn_exception():
+    """When the KNN raises a dimension mismatch but the follow-up dimension
+    probe fails with its own SQLite error, the probe error is the one that
+    propagates: it names the real storage problem, and silently re-raising
+    the KNN exception instead would discard it."""
+    knn_exc = sqlite3.OperationalError(
+        'Dimension mismatch for query vector for the "embedding" column. '
+        "Expected 768 dimensions but received 384."
+    )
+    probe_exc = sqlite3.DatabaseError("database disk image is malformed")
+
+    class _DimProbeBoomConn:
+        """Serves the type probe (first sqlite_master read), raises the KNN
+        dimension mismatch, then fails the dimension probe (second
+        sqlite_master read) with a distinct error."""
+
+        def __init__(self):
+            self._schema_reads = 0
+
+        def execute(self, sql, *a, **k):
+            if "sqlite_master" in sql:
+                self._schema_reads += 1
+                if self._schema_reads == 1:
+                    return _ProbeResult()
+                raise probe_exc
+            raise knn_exc
+
+    conn = _DimProbeBoomConn()
+    with pytest.raises(sqlite3.DatabaseError) as caught:
+        beam._vec_search(conn, [0.01] * 384, k=5)
+    assert caught.value is probe_exc
 
 
 def test_vec_search_returns_stored_row_when_dimension_matches(tmp_path, monkeypatch, caplog):

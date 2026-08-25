@@ -582,9 +582,9 @@ def _existing_vec_dims(conn: sqlite3.Connection) -> Tuple[Tuple[str, int], ...]:
     for name, sql in rows:
         if not sql:
             continue
-        match = re.search(r"\[(\d+)\]", sql)
-        if match:
-            declared_dims[name] = int(match.group(1))
+        dim = _dim_from_ddl(sql)
+        if dim is not None:
+            declared_dims[name] = dim
     return tuple((name, declared_dims[name]) for name in _VEC_TABLE_NAMES if name in declared_dims)
 
 
@@ -2522,6 +2522,30 @@ def _vec_table_type_strict(conn: sqlite3.Connection, table: str = "vec_episodes"
     return _vec_type_from_ddl(row)
 
 
+def _dim_from_ddl(sql: str) -> Optional[int]:
+    """Parse a vec0 table's declared embedding dimension from its DDL."""
+    match = re.search(r"\[(\d+)\]", sql)
+    return int(match.group(1)) if match else None
+
+
+def _vec_table_dim_strict(conn: sqlite3.Connection, table: str = "vec_episodes") -> Optional[int]:
+    """Read a vec0 table's declared embedding dimension, propagating errors.
+
+    Unlike ``_existing_vec_dim`` (which swallows sqlite3.Error and returns
+    None), a failed schema read here surfaces: the episodic KNN's mismatch
+    classification must not silently discard a real storage failure behind
+    the KNN exception. Returns None when a successful read finds no table
+    or no declared dimension; only the read failure itself propagates.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    if not row or not row[0]:
+        return None
+    return _dim_from_ddl(row[0])
+
+
 def _vec_insert(
     conn: sqlite3.Connection, rowid: int, embedding: List[float], *, commit: bool = True
 ):
@@ -3060,7 +3084,10 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
         # submitted, and against vec_episodes' own DDL: mixed or partially
         # migrated stores can carry vec tables at different dimensions.
         query_dim = len(embedding)
-        existing_dim = _existing_vec_dim(conn, tables=("vec_episodes",))
+        # Strict: a failed dimension probe propagates (it names the real
+        # storage problem); a successful read with no declared dimension
+        # leaves the mismatch unconfirmed, so the KNN error re-raises below.
+        existing_dim = _vec_table_dim_strict(conn)
         if not _is_query_dim_mismatch(exc, query_dim, existing_dim):
             raise
         logger.error(
