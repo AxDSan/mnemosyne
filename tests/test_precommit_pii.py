@@ -111,6 +111,29 @@ def test_precommit_ignores_removed_historical_pii(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_precommit_fails_closed_when_temp_file_creation_fails(tmp_path):
+    repo = _hook_repo(tmp_path)
+    missing_tmpdir = tmp_path / "missing-tmpdir"
+    assert not missing_tmpdir.exists()
+
+    result = _run_hook(repo, os.environ | {"TMPDIR": str(missing_tmpdir)})
+
+    assert result.returncode != 0
+    assert "ERROR: Unable to create temporary file for staged-diff PII check. Aborting commit." in result.stderr
+    assert not missing_tmpdir.exists()
+
+
+def test_precommit_excludes_hook_file_from_pii_check(tmp_path):
+    repo = _hook_repo(tmp_path)
+    hook = repo / ".githooks" / "pre-commit"
+    hook.write_text(hook.read_text(encoding="utf-8") + f"# contact: {PII}\n", encoding="utf-8")
+    assert _run(repo, "add", ".githooks/pre-commit").returncode == 0
+
+    result = _run_hook(repo)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_precommit_fails_closed_when_git_diff_fails(tmp_path):
     repo = _hook_repo(tmp_path)
     fake_bin = tmp_path / "fake-bin"
