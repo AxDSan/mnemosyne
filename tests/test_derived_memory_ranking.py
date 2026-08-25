@@ -568,6 +568,14 @@ class TestRecallRankingEffect:
         """
         monkeypatch.setenv("MNEMOSYNE_CROSS_TIER_DEDUP", "0")
         monkeypatch.delenv("MNEMOSYNE_CONSOLIDATION_TIER", raising=False)
+        original_recency_decay = beam_module._recency_decay
+        monkeypatch.setattr(
+            beam_module,
+            "_recency_decay",
+            lambda timestamp: original_recency_decay(timestamp, halflife_hours=168.0),
+        )
+        monkeypatch.setattr(beam_module, "TIER3_WEIGHT", 0.25)
+        monkeypatch.setattr(beam_module._embeddings, "available", lambda: False)
 
         def best_source_vs_summary(age_hours, path):
             beam, sid = _seed_sources_and_summary(path, age_hours=age_hours)
