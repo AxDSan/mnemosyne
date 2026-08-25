@@ -21,6 +21,25 @@ Mnemosyne is designed as a native memory backend for the [Hermes Agent Framework
 
 ### Step 1: Install
 
+**Choose an install mode first.** The default writes a symbolic link into the
+Hermes home and expects that link to survive. Persistent wrapper mode instead
+keeps Mnemosyne's Python dependencies in a side venv outside the Hermes runtime
+and installs a real plugin directory. Pick wrapper mode whenever Hermes rebuilds
+its own Python environment, or where symbolic links are privileged operations:
+
+| Your Hermes | Mode | Why |
+|---|---|---|
+| Linux or macOS, pip or source install | default (symlink) | The Hermes venv is yours and persists. |
+| Docker image | **wrapper** | The venv is rebuilt on every image update. |
+| Desktop binary installer | **wrapper** | The bundled Python environment is wiped and rebuilt on update. |
+| Native Windows | **wrapper** | Creating a symbolic link needs Developer Mode or an elevated shell, so the default fails with `WinError 1314`. |
+| WSL | default (symlink) | Behaves like Linux. |
+
+The three wrapper rows are the same mechanism for the same underlying reason:
+something outside your control replaces or restricts the Hermes runtime, and
+Mnemosyne has to survive it. Only the paths differ. See
+[Persistent side-venv wrapper mode](#persistent-side-venv-wrapper-mode) below.
+
 **pip (recommended):**
 
 ```bash
@@ -43,7 +62,20 @@ cd mnemosyne
 pip install -e "integrations/hermes[dev]"
 ```
 
-> **Docker users: use persistent side-venv wrapper mode.** This is the canonical Docker installation. Inside the official Hermes container, the mounted Hermes home is `/opt/data/`, not `~/.hermes/`. Keep the side venv on that mounted volume so both it and the wrapper survive image rebuilds. The side venv must use the same Python **major/minor** as the running Hermes gateway; do not create it with an unrelated `python3` from `PATH`.
+<a id="persistent-side-venv-wrapper-mode"></a>
+> **Persistent side-venv wrapper mode.** Use this wherever the Hermes Python
+> environment is rebuilt outside your control (Docker images, Desktop binary
+> installers) or where symbolic links require privileges (native Windows). The
+> side venv and the plugin directory live outside the replaceable runtime, so a
+> rebuilt Hermes venv does not take Mnemosyne with it, and no symbolic link is
+> created at all.
+>
+> The instructions below are written for Docker because its paths are the least
+> familiar; the same commands apply elsewhere with the Hermes home and
+> interpreter for your installation. For native Windows, use the PowerShell form
+> in [Native Windows local install and recovery](#native-windows-local-install-and-recovery).
+>
+> **Docker.** Inside the official Hermes container, the mounted Hermes home is `/opt/data/`, not `~/.hermes/`. Keep the side venv on that mounted volume so both it and the wrapper survive image rebuilds. The side venv must use the same Python **major/minor** as the running Hermes gateway; do not create it with an unrelated `python3` from `PATH`.
 >
 > For a launcher-based Hermes installation, first derive its runtime interpreter from the resolved `hermes` launcher. This bounded launcher-sibling probe covers only that installation shape: it checks the launcher's sibling `python`, then `python3`. It is not a reproduction of the installer's broader internal discovery. If it cannot find a sibling, **stop** and determine the real gateway interpreter from the deployment; do not substitute the current-shell Python or guess another environment.
 >
@@ -203,6 +235,20 @@ pip install -e "integrations/hermes[dev]"
 > **Never symlink a profile directly to `site-packages/mnemosyne_hermes`.** That bypasses the wrapper's `sys.path` bootstrap and can leave fresh Hermes profiles unable to import the provider.
 
 ### Native Windows local install and recovery
+
+> **Prefer persistent wrapper mode on native Windows.** The default install mode
+> creates a symbolic link, which Windows permits only with Developer Mode enabled
+> or an elevated shell. Without one of those it fails with `WinError 1314`, which
+> is why native Windows installs are reported as working for some people and not
+> others. Wrapper mode creates a real plugin directory and never needs the
+> privilege. Tracked in
+> [#857](https://github.com/mnemosyne-oss/mnemosyne/issues/857).
+>
+> Advice circulating in the community suggests linking a Mnemosyne **source
+> checkout** into the Hermes home. That target is wrong even when the link
+> succeeds: the only correct target is the installed package directory inside the
+> Hermes venv's `Lib\site-packages\mnemosyne_hermes`. Wrapper mode avoids the
+> question entirely.
 
 This section is for a **native Windows** Hermes installation, not Docker, WSL, or
 another user's Hermes home. Run it as the Windows user and in the Hermes profile
@@ -470,7 +516,7 @@ Mnemosyne does not currently expose a standalone REST API server.
 
 ## Uninstall
 
-### Persistent wrapper / Docker-image install
+### Persistent wrapper install (Docker, Desktop, native Windows)
 
 ```bash
 export HERMES_HOME=/opt/data  # Replace with the non-default Hermes home used at install time
