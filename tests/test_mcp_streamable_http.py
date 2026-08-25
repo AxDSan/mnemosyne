@@ -524,6 +524,7 @@ class TestStreamableHttpBearerRejection:
             # response start before terminating the session with DELETE.
             portal = client.portal
             get_started = threading.Event()
+            get_disconnect = threading.Event()
             get_result = {}
 
             def _drive_get():
@@ -548,8 +549,8 @@ class TestStreamableHttpBearerRejection:
                 }
 
                 async def receive():
-                    while True:
-                        await asyncio.sleep(3600)
+                    await asyncio.to_thread(get_disconnect.wait)
+                    return {"type": "http.disconnect"}
 
                 async def send(message):
                     if message["type"] == "http.response.start":
@@ -568,32 +569,40 @@ class TestStreamableHttpBearerRejection:
 
             get_thread = threading.Thread(target=_drive_get, daemon=True)
             get_thread.start()
-            assert get_started.wait(10), "authenticated GET stream never started"
-            assert get_result["status"] == 200
-            assert (get_result.get("content_type") or "").startswith(
-                "text/event-stream"
-            )
+            try:
+                assert get_started.wait(10), "authenticated GET stream never started"
+                assert get_result["status"] == 200
+                assert (get_result.get("content_type") or "").startswith(
+                    "text/event-stream"
+                )
 
-            # DELETE terminates the session (SDK 2.0.0 answers 200 with a JSON
-            # body)...
-            deleted = client.delete(
-                "/mcp", headers={**headers, "Mcp-Session-Id": session_id}
-            )
-            assert deleted.status_code == 200
-            assert deleted.headers["content-type"].startswith("application/json")
+                # DELETE terminates the session (SDK 2.0.0 answers 200 with a JSON
+                # body)...
+                deleted = client.delete(
+                    "/mcp", headers={**headers, "Mcp-Session-Id": session_id}
+                )
+                assert deleted.status_code == 200
+                assert deleted.headers["content-type"].startswith("application/json")
 
-            get_thread.join(10)
-            assert not get_thread.is_alive(), (
-                "GET stream did not close after DELETE"
-            )
+                get_thread.join(10)
+                assert not get_thread.is_alive(), (
+                    "GET stream did not close after DELETE"
+                )
 
-            # ...and any later request on the terminated session is rejected.
-            stale = client.post(
-                "/mcp",
-                json={"jsonrpc": "2.0", "method": "ping", "id": 3},
-                headers={**headers, "Mcp-Session-Id": session_id},
-            )
-            assert stale.status_code == 404
+                # ...and any later request on the terminated session is rejected.
+                stale = client.post(
+                    "/mcp",
+                    json={"jsonrpc": "2.0", "method": "ping", "id": 3},
+                    headers={**headers, "Mcp-Session-Id": session_id},
+                )
+                assert stale.status_code == 404
+            finally:
+                # Do not leave the long-lived GET for TestClient's portal teardown:
+                # complete the ASGI request explicitly, even if DELETE has not yet
+                # drained the stream or an assertion above fails.
+                get_disconnect.set()
+                get_thread.join(10)
+                assert not get_thread.is_alive(), "GET stream did not shut down"
 
     def _drive_middleware(self, header_value: bytes):
         """Run the bearer middleware directly against a stub downstream app.
