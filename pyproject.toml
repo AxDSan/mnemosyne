@@ -57,9 +57,9 @@ embeddings = ["fastembed>=0.3.0", "sqlite-vec>=0.1.0"]
 mcp = ["mcp>=2.0.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'"]
 openclaw = ["openclaw>=0.1.0; python_version >= '3.10'"]
 sync = ["cryptography>=41.0"]
-test = ["pytest>=7.0", "build"]
+test = ["pytest>=7.0", "pytest-timeout>=2.1", "build"]
 all = ["ctransformers>=0.2.27", "llama-cpp-python>=0.2.0", "huggingface-hub>=0.20", "fastembed>=0.3.0", "sqlite-vec>=0.1.0", "mcp>=2.0.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'", "cryptography>=41.0"]
-dev = ["pytest>=7.0", "build", "twine", "ruff==0.15.22"]
+dev = ["pytest>=7.0", "pytest-timeout>=2.1", "build", "twine", "ruff==0.15.22"]
 
 [project.urls]
 Homepage = "https://github.com/AxDSan/mnemosyne"
@@ -110,3 +110,12 @@ select = [
   "F",        # pyflakes (F401 unused imports, F841 dead locals, F541 unparsed f-strings, etc.)
   "RUF022",   # checks ordering of existing `__all__` definitions (does NOT require them)
 ]  # NOTE: F covers F63, F7, F82 but NOT E9 — the E9 fatal gate lives in ci.yml only
+
+[tool.pytest.ini_options]
+# No single test should take five minutes. The cap exists so a deadlock is
+# reported as one named failing test within minutes instead of stalling the
+# job until the workflow timeout, which tells us nothing about where it hung.
+# The signal method fails only the offending test and lets the rest of the
+# suite finish, so a hang still produces a full picture of the run.
+timeout = 300
+timeout_method = "signal"
