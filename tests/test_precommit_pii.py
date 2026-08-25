@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -42,13 +43,16 @@ def _hook_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _run_hook(repo: Path) -> subprocess.CompletedProcess[str]:
+def _run_hook(
+    repo: Path, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["/bin/sh", ".githooks/pre-commit"],
         cwd=repo,
         capture_output=True,
         text=True,
         check=False,
+        env=env,
     )
 
 
@@ -105,3 +109,31 @@ def test_precommit_ignores_removed_historical_pii(tmp_path):
     result = _run_hook(repo)
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_precommit_fails_closed_when_git_diff_fails(tmp_path):
+    repo = _hook_repo(tmp_path)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "diff" ]; then\n'
+        '  echo "simulated git diff failure" >&2\n'
+        "  exit 128\n"
+        "fi\n"
+        'exec "$REAL_GIT" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    real_git = shutil.which("git")
+    assert real_git is not None
+    env = os.environ | {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "REAL_GIT": real_git,
+    }
+
+    result = _run_hook(repo, env)
+
+    assert result.returncode != 0
+    assert "ERROR: Unable to inspect staged changes; git diff failed. Aborting commit." in result.stderr
