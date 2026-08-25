@@ -110,8 +110,41 @@ def test_parse_facts_json_keeps_distinct_items():
         "timelines": ["Release on 2026-12-01"],
     })
     facts = _parse_facts(raw)
-    assert len(facts) == 4, facts
+    assert facts == [
+        "The user works evenings",
+        "Always use tabs",
+        "The user likes dark mode",
+        "Release on 2026-12-01",
+    ], facts
     print("PASS: test_parse_facts_json_keeps_distinct_items")
+
+
+def test_parse_facts_json_empty_categories_yield_no_facts():
+    """A supported payload with nothing to extract returns no facts.
+
+    Falling through to the partial-JSON fallback would hand the raw text to a
+    regex matching any quoted run of ten or more characters, which the schema's
+    own key names satisfy — 'instructions' and 'preferences' would be stored.
+    """
+    import json as _json
+    for payload in (
+        {"facts": [], "instructions": [], "preferences": [], "timelines": []},
+        {"facts": ["   "], "instructions": [], "preferences": [], "timelines": []},
+        {"facts": [], "instructions": [], "preferences": [], "timelines": [], "kg": []},
+    ):
+        facts = _parse_facts(_json.dumps(payload))
+        assert facts == [], facts
+    print("PASS: test_parse_facts_json_empty_categories_yield_no_facts")
+
+
+def test_parse_facts_json_without_supported_categories_falls_back():
+    """No supported category present still falls through to the fallback."""
+    import json as _json
+    raw = _json.dumps({"kg": ["user prefers vim", "project uses fastapi"]})
+    facts = _parse_facts(raw)
+    assert "user prefers vim" in facts, facts
+    assert "project uses fastapi" in facts, facts
+    print("PASS: test_parse_facts_json_without_supported_categories_falls_back")
 
 
 def test_parse_facts_no_facts():

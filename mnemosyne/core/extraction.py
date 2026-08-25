@@ -94,9 +94,11 @@ def _parse_facts(raw_output: str) -> List[str]:
                 # returned once per category and stored once per copy.
                 all_items = []
                 seen = set()
+                saw_supported_category = False
                 for category in ('facts', 'instructions', 'preferences', 'timelines'):
-                    items = parsed.get(category, [])
+                    items = parsed.get(category)
                     if isinstance(items, list):
+                        saw_supported_category = True
                         for item in items:
                             if not item:
                                 continue
@@ -106,7 +108,15 @@ def _parse_facts(raw_output: str) -> List[str]:
                                 continue
                             seen.add(key)
                             all_items.append(text)
-                if all_items:
+                # Answered by presence, not by yield: a payload that supplies a
+                # supported category and no usable entries means "nothing to
+                # extract", so return that. Falling through would hand the raw
+                # text to the partial-JSON regex, which matches any quoted run
+                # of ten or more characters — including the schema's own key
+                # names, making "instructions" and "preferences" stored facts.
+                # No supported category still falls through, which keeps the
+                # malformed/unsupported and kg-only paths intact.
+                if saw_supported_category:
                     return all_items
         except (_json.JSONDecodeError, Exception):
             pass
