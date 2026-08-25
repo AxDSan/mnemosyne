@@ -91,6 +91,76 @@ SECRET_PATTERNS: List[str] = [
     r"(?i)^\s*(?:DB_PASS|SECRET_KEY|AUTH_TOKEN|API_SECRET)\s*=",
 ]
 
+# CJK character ranges treated as natural prose, not credential values.
+# A value containing CJK characters is almost always ordinary text
+# ("密码：建议每90天更换一次" is a policy note, not a secret), so the
+# credential-value predicate below excludes these ranges.
+_CJK_PROSE_RANGES = (
+    "\u4e00-\u9fff"  # Han ideographs (Chinese, Japanese, Korean hanja)
+    "\u3040-\u30ff"  # Hiragana + Katakana (Japanese)
+    "\uac00-\ud7af"  # Hangul syllables (Korean)
+    "\u3000-\u303f"  # CJK symbols / punctuation
+    "\uff00-\uffef"  # Fullwidth forms
+    "\u3400-\u4dbf"  # CJK Extension A
+    "\uf900-\ufaff"  # CJK Compatibility Ideographs
+    "\U00020000-\U0003347f"  # CJK Extensions B-J (non-BMP Han)
+    "\u1100-\u11ff"  # Hangul Jamo
+    "\u3130-\u318f"  # Hangul Compatibility Jamo
+    "\u31f0-\u31ff"  # Katakana Phonetic Extensions
+    "\u2e80-\u2eff"  # CJK Radicals Supplement
+    "\u2f00-\u2fdf"  # Kangxi Radicals
+)
+
+# CJK prose characters that must not directly follow a credential token:
+# ideographs, kana, hangul, radicals, and word-like fullwidth forms. Excludes
+# CJK/fullwidth punctuation so "，请勿外传" after a token is still detected.
+_CJK_IDEOGRAPHIC = (
+    "\u4e00-\u9fff"  # Han ideographs
+    "\u3040-\u30ff"  # Hiragana + Katakana
+    "\uff66-\uff9f"  # Halfwidth Katakana
+    "\uff10-\uff19"  # Fullwidth digits
+    "\uff21-\uff3a"  # Fullwidth Latin uppercase
+    "\uff41-\uff5a"  # Fullwidth Latin lowercase
+    "\uffa0-\uffbe"  # Halfwidth Hangul filler + letters
+    "\uffbf-\uffc1"  # Reserved allocation gap
+    "\uffc2-\uffc7"  # Halfwidth Hangul letters
+    "\uffc8-\uffc9"  # Reserved allocation gap
+    "\uffca-\uffcf"  # Halfwidth Hangul letters
+    "\uffd0-\uffd1"  # Reserved allocation gap
+    "\uffd2-\uffd7"  # Halfwidth Hangul letters
+    "\uffd8-\uffd9"  # Reserved allocation gap
+    "\uffda-\uffdc"  # Halfwidth Hangul letters
+    "\uac00-\ud7af"  # Hangul syllables
+    "\u1100-\u11ff"  # Hangul Jamo
+    "\u3130-\u318f"  # Hangul Compatibility Jamo
+    "\u31f0-\u31ff"  # Katakana Phonetic Extensions
+    "\u3005-\u3007"  # Ideographic iteration/closing marks and number zero
+    "\u3400-\u4dbf"  # CJK Extension A
+    "\uf900-\ufaff"  # CJK Compatibility Ideographs
+    "\U00020000-\U0003347f"  # CJK Extensions B-J (non-BMP Han)
+    "\u2e80-\u2eff"  # CJK Radicals Supplement
+    "\u2f00-\u2fdf"  # Kangxi Radicals
+)
+
+# Credential-value predicate: 8+ characters, no whitespace / quotes / brackets,
+# no CJK characters, and at least one ASCII letter or digit. The token is the
+# contiguous non-CJK run after the separator, and it must not be directly
+# followed by CJK prose, so mixed prose like "abc12345我的密码" is never treated
+# as a secret while "s3cr3t_pa55word_x1y2z3w4" (even with trailing "，请勿外传")
+# still is.
+_CREDENTIAL_VALUE = (
+    r"(?=(?:(?![" + _CJK_PROSE_RANGES + r"])[^\s'\"<>{}])*(?-i:[A-Za-z0-9]))"
+    r"(?:(?![" + _CJK_PROSE_RANGES + r"])[^\s'\"<>{}]){8,}"
+    r"(?![" + _CJK_IDEOGRAPHIC + r"])"
+)
+
+# Curated CJK secret labels (exact labels only, never generic substrings).
+_CJK_SECRET_LABELS = (
+    "密码|密钥|令牌|口令|私钥|"        # Chinese
+    "パスワード|秘密鍵|トークン|"     # Japanese
+    "비밀번호|키"                     # Korean
+)
+
 # Paired (label, regex) structure — the single source of truth.
 SECRET_LABELED_PATTERNS: List[tuple] = [
     ("api_key_prefix", r"(?:sk|pk|rk)-[a-zA-Z0-9]{20,}"),
@@ -100,7 +170,12 @@ SECRET_LABELED_PATTERNS: List[tuple] = [
     ("google_api_key", r"AIza[0-9A-Za-z_\-]{35}"),
     ("jwt_token", r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
     ("secret_assignment", r"(?i)(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)"
-                          r"\s*[=:]\s*['\"]?[^\s'\"<>{}]{8,}"),
+                          r"\s*(?:"
+                          r"[=:]\s*['\"]?[^\s'\"<>{}]{8,}|"
+                          r"[：＝]\s*['\"]?" + _CREDENTIAL_VALUE + r"['\"]?)"),
+    ("cjk_secret_assignment",
+     r"(?:" + _CJK_SECRET_LABELS + r")"
+     r"\s*[:=：＝]\s*['\"]?" + _CREDENTIAL_VALUE + r"['\"]?"),
     ("private_key_block", r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"),
     ("connection_string_with_credentials", r"(?:postgres|mysql|mongodb|redis)://[^:]+:[^@]+@"),
     ("env_secret_assignment", r"(?i)^\s*(?:DB_PASS|SECRET_KEY|AUTH_TOKEN|API_SECRET)\s*="),

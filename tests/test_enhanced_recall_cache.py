@@ -701,6 +701,158 @@ def test_dedup_remember_write_survives_post_commit_cache_invalidation_failure(
         _close_memory(memory)
 
 
+@pytest.mark.parametrize("operation", ["invalidate", "forget_working"])
+def test_post_commit_mutations_survive_query_cache_invalidation_failure(
+    monkeypatch, tmp_path: Path, caplog, operation: str
+):
+    """#594: a committed public mutation is never reported as a cache failure."""
+    memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+
+    def fail_invalidation():
+        raise RuntimeError("cache unavailable")
+
+    try:
+        memory_id = memory.remember(
+            f"issue 594 {operation} cache invalidation failure sentinel", source="test"
+        )
+        monkeypatch.setattr(memory, "_invalidate_query_cache", fail_invalidation)
+
+        with caplog.at_level(logging.WARNING, logger=beam_module.__name__):
+            if operation == "invalidate":
+                assert memory.invalidate(memory_id) is True
+                row = memory.conn.execute(
+                    "SELECT valid_until FROM working_memory WHERE id = ?", (memory_id,)
+                ).fetchone()
+                assert row is not None
+                assert row["valid_until"] is not None
+            else:
+                assert memory.forget_working(memory_id) is True
+                row = memory.conn.execute(
+                    "SELECT 1 FROM working_memory WHERE id = ?", (memory_id,)
+                ).fetchone()
+                assert row is None
+
+        assert (
+            f"{operation}: query-cache invalidation failed after commit "
+            "(RuntimeError): cache unavailable"
+        ) in caplog.text
+    finally:
+        _close_memory(memory)
+
+
+@pytest.mark.parametrize("operation", ["invalidate", "forget_working"])
+def test_mutations_keep_cache_invalidation_errors_before_caller_commit(
+    monkeypatch, tmp_path: Path, operation: str
+):
+    """#594's warning-only contract starts only after this instance commits."""
+    memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+
+    def fail_invalidation():
+        raise RuntimeError("cache unavailable")
+
+    try:
+        memory_id = memory.remember(
+            f"issue 594 {operation} caller transaction sentinel", source="test"
+        )
+        replacement_id = memory.remember(
+            "issue 594 caller transaction replacement sentinel", source="test"
+        )
+        monkeypatch.setattr(memory, "_invalidate_query_cache", fail_invalidation)
+        memory.conn.execute("BEGIN")
+
+        with pytest.raises(RuntimeError, match="cache unavailable"):
+            if operation == "invalidate":
+                memory.invalidate(memory_id, replacement_id=replacement_id)
+            else:
+                memory.forget_working(memory_id)
+
+        assert memory.conn.in_transaction
+        memory.conn.rollback()
+        if operation == "invalidate":
+            row = memory.conn.execute(
+                "SELECT valid_until FROM working_memory WHERE id = ?", (memory_id,)
+            ).fetchone()
+            assert row is not None
+            assert row["valid_until"] is None
+        else:
+            assert memory.get(memory_id) is not None
+    finally:
+        if memory.conn.in_transaction:
+            memory.conn.rollback()
+        _close_memory(memory)
+
+
+@pytest.mark.parametrize("memory_store", ["working", "episodic"])
+def test_invalidate_without_replacement_keeps_cache_failure_in_caller_transaction(
+    monkeypatch, tmp_path: Path, memory_store: str
+):
+    """#594: caller-owned invalidations must remain rollbackable on cache failure."""
+    memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+
+    def fail_invalidation():
+        raise RuntimeError("cache unavailable")
+
+    try:
+        if memory_store == "working":
+            memory_id = memory.remember(
+                "issue 594 caller transaction working invalidation sentinel", source="test"
+            )
+            table = "working_memory"
+        else:
+            memory_id = memory.consolidate_to_episodic(
+                "issue 594 caller transaction episodic invalidation sentinel",
+                source_wm_ids=[],
+                source="test",
+            )
+            table = "episodic_memory"
+
+        monkeypatch.setattr(memory, "_invalidate_query_cache", fail_invalidation)
+        memory.conn.execute("BEGIN")
+
+        with pytest.raises(RuntimeError, match="cache unavailable"):
+            memory.invalidate(memory_id)
+
+        assert memory.conn.in_transaction
+        memory.conn.rollback()
+        row = memory.conn.execute(
+            f"SELECT valid_until FROM {table} WHERE id = ?", (memory_id,)
+        ).fetchone()
+        assert row is not None
+        assert row["valid_until"] is None
+    finally:
+        if memory.conn.in_transaction:
+            memory.conn.rollback()
+        _close_memory(memory)
+
+
+def test_invalidate_keeps_cache_invalidation_error_during_deferred_commit(
+    monkeypatch, tmp_path: Path
+):
+    """A deferred batch has not committed when invalidate() returns."""
+    memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+
+    def fail_invalidation():
+        raise RuntimeError("cache unavailable")
+
+    try:
+        memory_id = memory.remember("issue 594 deferred invalidate sentinel", source="test")
+        monkeypatch.setattr(memory, "_invalidate_query_cache", fail_invalidation)
+
+        with pytest.raises(RuntimeError, match="cache unavailable"):
+            with beam_module._deferred_commits(memory.conn):
+                assert memory.invalidate(memory_id) is True
+
+        row = memory.conn.execute(
+            "SELECT valid_until FROM working_memory WHERE id = ?", (memory_id,)
+        ).fetchone()
+        assert row is not None
+        assert row["valid_until"] is None
+    finally:
+        if memory.conn.in_transaction:
+            memory.conn.rollback()
+        _close_memory(memory)
+
+
 def test_successful_invalidate_episodic_memory_invalidates_enhanced_recall_cache(
     monkeypatch, tmp_path: Path
 ):

@@ -317,6 +317,7 @@ def _post_chat(
     Same return contract as ``local_llm._call_remote_llm_with_model`` so the
     retry decision above can be made on status alone.
     """
+    status: Optional[int] = None
     try:
         import httpx
         has_httpx = True
@@ -350,7 +351,7 @@ def _post_chat(
             except urllib.error.HTTPError as exc:
                 return (None, exc.code, exc)
             except Exception as exc:
-                return (None, None, exc)
+                return (None, status, exc)
 
         choices = data.get("choices", []) if isinstance(data, dict) else []
         if choices:
@@ -359,7 +360,7 @@ def _post_chat(
                 return (str(content), status, None)
         return (None, status, None)
     except Exception as exc:
-        return (None, None, exc)
+        return (None, status, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -477,11 +478,15 @@ class OpenAICompatModalityBackend:
             text, status, exc = _post_chat(url, headers, payload, timeout)
             if text is not None:
                 break
-            transient = (
-                (status is not None and (status == 429 or 500 <= status < 600))
-                or (exc is not None and _is_rate_limit_error(exc))
-                or (status is None and exc is not None)
-            )
+            if status is None:
+                # No HTTP response was received, so this was a transport
+                # failure. Retry it regardless of how an exception is worded.
+                transient = exc is not None
+            else:
+                # A received HTTP status is authoritative. In particular, do
+                # not let an incidental "429" in the exception text turn a
+                # terminal client error into a retry.
+                transient = status == 429 or 500 <= status < 600
             if transient and attempt < _MAX_ATTEMPTS - 1:
                 time.sleep(_retry_delay(attempt))
                 continue
