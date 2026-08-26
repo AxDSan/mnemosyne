@@ -112,6 +112,7 @@ select = [
 ]  # NOTE: F covers F63, F7, F82 but NOT E9 — the E9 fatal gate lives in ci.yml only
 
 [tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
 # No single test should take five minutes. The cap exists so a deadlock is
 # reported as one named failing test within minutes instead of stalling the
 # job until the workflow timeout, which tells us nothing about where it hung.
