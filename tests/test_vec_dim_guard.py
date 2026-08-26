@@ -298,8 +298,30 @@ def test_legacy_vec_episodes_rejects_configured_dimension_query(tmp_path):
         ).fetchall()
 
 
+
+class _BinaryBits(list):
+    """List-compatible boolean result for the binary-vector path."""
+
+    def astype(self, _dtype):
+        return self
+
+
 class _QueryVector(list):
-    """Minimal embedding stand-in for public linear recall tests."""
+    """Dependency-free 1D numeric-array stand-in for public recall."""
+
+    @property
+    def shape(self):
+        return (len(self),)
+
+    def __getitem__(self, index):
+        item = super().__getitem__(index)
+        return type(self)(item) if isinstance(index, slice) else item
+
+    def __gt__(self, value):
+        return _BinaryBits(item > value for item in self)
+
+    def flatten(self):
+        return self
 
     def tolist(self):
         return list(self)
