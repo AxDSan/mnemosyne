@@ -309,6 +309,11 @@ def test_linear_recall_serves_lexical_candidates_under_mismatch(tmp_path, monkey
         pytest.skip("sqlite-vec unavailable")
 
     monkeypatch.delenv("MNEMOSYNE_POLYPHONIC_RECALL", raising=False)
+    # The two candidates are a (working-memory source, episodic summary) pair
+    # linked by source_wm_ids; the cross-tier summary dedup would collapse
+    # exactly that pair before results are returned. This test proves each
+    # lexical voice serves its own row, so the dedup is disabled for it.
+    monkeypatch.setenv("MNEMOSYNE_CROSS_TIER_DEDUP", "0")
     db = _store_at(monkeypatch, tmp_path, "e2e.db", 768)
 
     mem = beam.BeamMemory(session_id="s", db_path=db)
@@ -334,10 +339,13 @@ def test_linear_recall_serves_lexical_candidates_under_mismatch(tmp_path, monkey
     with caplog.at_level("ERROR", logger="mnemosyne.core.beam"):
         results = mem.recall("quantum harmonic oscillator", top_k=5)
     assert results, "lexical voices must still serve recall under a dimension mismatch"
-    # The recalled rows must actually be the seeded memories, not just
-    # "something came back".
+    # The recalled rows must be both seeded lexical candidates, each asserted
+    # on its own: the working-memory record and the episodic summary. A
+    # single "any" match here would pass if either voice silently stopped
+    # serving its candidate.
     contents = [(r.get("content") or "") if isinstance(r, dict) else getattr(r, "content", "") for r in results]
-    assert any("quantum harmonic oscillator" in c for c in contents), contents
+    assert any("lecture notes" in c for c in contents), contents
+    assert any("summary" in c for c in contents), contents
     # Proof the KNN degradation path ran (not that the vector voice was merely
     # absent): the guard's own diagnostic names the table and the query dim.
     logged = " ".join(r.message for r in caplog.records)
