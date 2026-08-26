@@ -18,7 +18,7 @@ import logging
 import threading
 import tempfile
 from datetime import datetime, timezone
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Union
 from pathlib import Path
 
 import os
@@ -156,7 +156,7 @@ def _export_completeness(conn: sqlite3.Connection, *, include_sync_events: bool)
         for field in sorted(set(actual_fields) - exported_fields):
             restore_default = _sqlite_restore_default(actual_fields[field])
             if restore_default is _UNKNOWN_RESTORE_DEFAULT:
-                predicate = f"{_quoted_identifier(field)} IS NOT NULL"
+                predicate = "1 = 1"
                 params = ()
             else:
                 predicate = f"{_quoted_identifier(field)} IS NOT ?"
@@ -662,7 +662,8 @@ class Mnemosyne:
                vec_weight: float = None,
                fts_weight: float = None,
                importance_weight: float = None,
-               explain: bool = False) -> List[Dict]:
+               explain: bool = False,
+               metadata_keys: Optional[List[str]] = None) -> Union[List[Dict], Dict[str, Any]]:
         """
         Search memories with hybrid relevance scoring.
         Uses BEAM episodic + working memory retrieval (sqlite-vec + FTS5).
@@ -670,33 +671,50 @@ class Mnemosyne:
         Supports multi-agent identity filtering: author_id, author_type, channel_id.
         Supports temporal scoring: temporal_weight, query_time, temporal_halflife.
         Supports scoring weight overrides: vec_weight, fts_weight, importance_weight.
+        metadata_keys: Optional allowlist of stored top-level metadata keys to
+            project onto the results produced by this recall call.
         """
         import os as _os
+        payload: Any
         if _os.environ.get("MNEMOSYNE_ENHANCED_RECALL", "0") == "1":
-            return self.beam.recall_enhanced(query, top_k=top_k,
-                                             from_date=from_date, to_date=to_date,
-                                             source=source, topic=topic,
-                                             author_id=author_id, author_type=author_type,
-                                             channel_id=channel_id,
-                                             temporal_weight=temporal_weight,
-                                             query_time=query_time,
-                                             temporal_halflife=temporal_halflife,
-                                             vec_weight=vec_weight,
-                                             fts_weight=fts_weight,
-                                             importance_weight=importance_weight,
-                                             explain=explain)
-        return self.beam.recall(query, top_k=top_k,
-                                from_date=from_date, to_date=to_date,
-                                source=source, topic=topic,
-                                author_id=author_id, author_type=author_type,
-                                channel_id=channel_id,
-                                temporal_weight=temporal_weight,
-                                query_time=query_time,
-                                temporal_halflife=temporal_halflife,
-                                vec_weight=vec_weight,
-                                fts_weight=fts_weight,
-                                importance_weight=importance_weight,
-                                explain=explain)
+            payload = self.beam.recall_enhanced(
+                query, top_k=top_k,
+                from_date=from_date, to_date=to_date,
+                source=source, topic=topic,
+                author_id=author_id, author_type=author_type,
+                channel_id=channel_id,
+                temporal_weight=temporal_weight,
+                query_time=query_time,
+                temporal_halflife=temporal_halflife,
+                vec_weight=vec_weight,
+                fts_weight=fts_weight,
+                importance_weight=importance_weight,
+                explain=explain,
+            )
+        else:
+            payload = self.beam.recall(
+                query, top_k=top_k,
+                from_date=from_date, to_date=to_date,
+                source=source, topic=topic,
+                author_id=author_id, author_type=author_type,
+                channel_id=channel_id,
+                temporal_weight=temporal_weight,
+                query_time=query_time,
+                temporal_halflife=temporal_halflife,
+                vec_weight=vec_weight,
+                fts_weight=fts_weight,
+                importance_weight=importance_weight,
+                explain=explain,
+            )
+        if metadata_keys is None:
+            return payload
+        if explain:
+            projected = dict(payload)
+            projected["results"] = self.beam._hydrate_recall_metadata(
+                payload["results"], metadata_keys
+            )
+            return projected
+        return self.beam._hydrate_recall_metadata(payload, metadata_keys)
 
     def _emit_wrapper(self, event_type: str, memory_id: str, **kwargs) -> None:
         """Emit a streaming event through the Mnemosyne wrapper layer."""
@@ -913,23 +931,10 @@ class Mnemosyne:
         """Get consolidation history."""
         return self.beam.get_consolidation_log(limit=limit)
 
-    def export_to_file(
-        self, output_path: str, include_sync_events: bool = False
-    ) -> Dict:
-        """
-        Export supported Mnemosyne data to a portable JSON file. The additive
-        completeness manifest discloses omitted persisted surfaces and fields,
-        so a successful file write never implies a lossless database backup.
-
-        Schema version 1.3 adds the always-present ``canonical_facts`` section.
-        1.2 (post-sync) adds an optional ``sync_events`` section. Previous
-        versions (1.0, 1.1, 1.2) are still importable; ``sync_events`` presence
-        is keyed off the section itself on import, not the version number.
-        """
-        from mnemosyne.core.triples import TripleStore
-        from mnemosyne.core.annotations import AnnotationStore
-        from mnemosyne.core.canonical import CanonicalStore
-        import json as _json
+    def _build_portable_export(
+        self, include_sync_events: bool = False
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """Build the portable payload and completeness manifest."""
 
         # Build export metadata with device_id when available
         meta: Dict[str, Any] = {
@@ -980,23 +985,17 @@ class Mnemosyne:
         """)
         export["legacy_embeddings"] = [dict(row) for row in cursor.fetchall()]
 
-        # Triples (current-truth temporal facts; post-E6 scope)
-        triples = TripleStore(db_path=self.db_path)
-        export["triples"] = triples.export_all()
-
-        # Annotations (post-E6: multi-valued mentions, facts, occurred_on,
-        # has_source). Pre-E6 backups won't have this key — the import path
-        # handles that gracefully.
-        annotations = AnnotationStore(db_path=self.db_path)
-        export["annotations"] = annotations.export_all()
-
-        # Canonical facts: owner-scoped single-source-of-truth identity, with
-        # history. These are AUTHORED (not derived), so omitting them made a
-        # JSON restore silently lossy. CanonicalStore already exposes
-        # export_all/import_all (same contract as triples/annotations); they
-        # were simply never wired into the file export.
-        canonical = CanonicalStore(db_path=self.db_path)
-        export["canonical_facts"] = canonical.export_all()
+        # Read every surface through the shared connection so one SQLite read
+        # transaction can hold the complete export at a single snapshot.
+        cursor.execute("""
+            SELECT id, subject, predicate, object, valid_from, valid_until,
+                   source, confidence, created_at
+            FROM triples
+            ORDER BY id
+        """)
+        export["triples"] = [dict(row) for row in cursor.fetchall()]
+        export["annotations"] = self.beam.annotations.export_all()
+        export["canonical_facts"] = self.beam.canonical.export_all()
 
         # Sync events (optional, schema 1.2)
         if include_sync_events:
@@ -1017,6 +1016,22 @@ class Mnemosyne:
             self.conn, include_sync_events=include_sync_events
         )
         meta["completeness"] = completeness
+        return export, completeness
+
+    def export_to_file(
+        self, output_path: str, include_sync_events: bool = False
+    ) -> Dict:
+        """Export supported data and its completeness from one DB snapshot."""
+        import json as _json
+
+        owns_transaction = not self.conn.in_transaction
+        if owns_transaction:
+            self.conn.execute("BEGIN")
+        try:
+            export, completeness = self._build_portable_export(include_sync_events)
+        finally:
+            if owns_transaction:
+                self.conn.rollback()
 
         with open(output_path, "w", encoding="utf-8") as f:
             _json.dump(export, f, indent=2, ensure_ascii=False, default=str)
@@ -1302,7 +1317,7 @@ _default_instance = None
 _default_bank = "default"
 
 
-def _get_default(bank: str = None):
+def _get_default(bank: Optional[str] = None):
     """Get or create the default Mnemosyne instance. Supports bank switching."""
     global _default_instance, _default_bank
     target_bank = bank or _default_bank or "default"
@@ -1353,7 +1368,8 @@ def recall(query: str, top_k: int = 5, *,
            fts_weight: float = None,
            importance_weight: float = None,
            explain: bool = False,
-           bank: str = None) -> List[Dict]:
+           metadata_keys: Optional[List[str]] = None,
+           bank: Optional[str] = None) -> Union[List[Dict], Dict[str, Any]]:
     """Search memories using the global instance with temporal filtering and scoring"""
     return _get_default(bank).recall(query, top_k,
                                      from_date=from_date, to_date=to_date,
@@ -1364,7 +1380,8 @@ def recall(query: str, top_k: int = 5, *,
                                      vec_weight=vec_weight,
                                      fts_weight=fts_weight,
                                      importance_weight=importance_weight,
-                                     explain=explain)
+                                     explain=explain,
+                                     metadata_keys=metadata_keys)
 
 
 def get_context(limit: int = 10, bank: str = None) -> List[Dict]:
