@@ -120,8 +120,11 @@ def test_article_is_matched_as_a_whole_word(graph):
     assert _triples(graph, "Alice is already ready") == []
     assert _triples(graph, "Alice is there") == []
     assert _triples(graph, "Carol is another person") == []
-    # "the" must not be consumed from inside the object word
+    # "the" must not be consumed from inside the object word, on every
+    # pattern that takes an optional article
     assert _triples(graph, "Alice is theory") == [("Alice", "is", "theory")]
+    assert _triples(graph, "Bob has theory") == [("Bob", "has", "theory")]
+    assert _triples(graph, "Bob uses theory") == [("Bob", "uses", "theory")]
 
 
 def test_article_is_still_consumed_when_present(graph):
