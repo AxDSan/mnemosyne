@@ -278,4 +278,10 @@ class TestOverlappingCategoriesReachStorageOnce:
 
         recalled = mem.beam.fact_recall("tablet")
         contents = [str(r.get("content", "")) for r in recalled]
-        assert len(contents) == len(set(contents)), contents
+        # Count the fact rather than only checking for repeats: an empty
+        # result set is duplicate-free too, so a recall that returned nothing
+        # would satisfy the weaker assertion without proving anything. Matched
+        # by containment because fact_recall prefixes the stored subject
+        # ("user stated ...") rather than echoing the fact verbatim.
+        matched = [c for c in contents if "clock out through the tablet" in c]
+        assert len(matched) == 1, contents
