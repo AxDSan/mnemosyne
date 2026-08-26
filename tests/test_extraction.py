@@ -154,14 +154,15 @@ def test_parse_facts_json_unusable_supported_values_yield_no_key_names():
         facts = _parse_facts(_json.dumps(payload))
         assert facts == [], facts
 
-    # A scalar where a list belongs is unusable too, and must not smuggle the
-    # key names in alongside whatever it did contain.
+    # A scalar where a list belongs is unusable too. It yields nothing rather
+    # than smuggling the key names in beside its content: the schema promises a
+    # list, and coercing a bare string into a fact would invent a contract the
+    # prompt never stated.
     scalar = _parse_facts(_json.dumps({
         "facts": "the user works evenings",
         "instructions": None, "preferences": None, "timelines": None,
     }))
-    assert "instructions" not in scalar, scalar
-    assert "preferences" not in scalar, scalar
+    assert scalar == [], scalar
     print("PASS: test_parse_facts_json_unusable_supported_values_yield_no_key_names")
 
 

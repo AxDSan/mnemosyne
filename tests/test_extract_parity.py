@@ -18,6 +18,8 @@ effects of extract=True:
 Plus a parity check for extract_entities=True.
 """
 
+import json
+
 import pytest
 
 from mnemosyne.core.memory import Mnemosyne
@@ -211,3 +213,69 @@ class TestWrapperExtractEntitiesParity:
         assert len(rows) >= 1, (
             "extract_entities=True did not produce 'mentions' annotations"
         )
+
+
+class TestOverlappingCategoriesReachStorageOnce:
+    """The cross-category dedupe must survive into both stores.
+
+    The fixtures above patch `extract_facts_safe` with an already-distinct
+    list, so they exercise the write path but never the parser that feeds it.
+    This drives real `_parse_facts` output — from a payload that files two
+    statements under more than one category, as the extraction prompt's own
+    examples invite — through `remember(extract=True)`, which writes to the
+    append-only AnnotationStore and the `facts` table alike. Without the
+    dedupe each repeat becomes its own row in both.
+    """
+
+    RAW = json.dumps({
+        "facts": [
+            "Servers must clock out through the tablet",
+            "The POS system goes live October 1st",
+        ],
+        "instructions": ["Servers must clock out through the tablet"],
+        "preferences": [],
+        "timelines": ["The POS system goes live October 1st"],
+    })
+
+    @pytest.fixture
+    def parsed_extraction(self, monkeypatch):
+        """Feed the real parser's output into the storage path."""
+        from mnemosyne.core.extraction import _parse_facts
+        parsed = _parse_facts(self.RAW)
+        monkeypatch.setattr(
+            "mnemosyne.core.extraction.extract_facts_safe",
+            lambda content, **kwargs: list(parsed),
+        )
+        return parsed
+
+    def test_parser_output_is_distinct_and_ordered(self, parsed_extraction):
+        assert parsed_extraction == [
+            "Servers must clock out through the tablet",
+            "The POS system goes live October 1st",
+        ], parsed_extraction
+
+    def test_no_duplicate_rows_reach_either_store(self, tmp_path, parsed_extraction):
+        from mnemosyne.core.annotations import AnnotationStore
+
+        db_path = tmp_path / "overlap.db"
+        mem = Mnemosyne(session_id="overlap", db_path=db_path)
+        mem.remember(
+            "The POS system goes live October 1st and servers must clock out "
+            "through the tablet.",
+            source="user",
+            extract=True,
+        )
+
+        values = [
+            str(r.get("value") or r.get("content") or "")
+            for r in AnnotationStore(db_path=db_path).query_by_kind("fact")
+        ]
+        assert len(values) == len(set(values)), values
+
+        assert _facts_table_count(db_path) == len(parsed_extraction), (
+            "facts table row count must match the distinct parsed facts"
+        )
+
+        recalled = mem.beam.fact_recall("tablet")
+        contents = [str(r.get("content", "")) for r in recalled]
+        assert len(contents) == len(set(contents)), contents
