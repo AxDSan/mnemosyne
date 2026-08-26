@@ -296,3 +296,88 @@ def test_legacy_vec_episodes_rejects_configured_dimension_query(tmp_path):
             "WHERE embedding MATCH vec_quantize_int8(?, 'unit') AND k=1",
             (json.dumps([0.0] * 384),),
         ).fetchall()
+
+
+class _QueryVector(list):
+    """Minimal embedding stand-in for public linear recall tests."""
+
+    def tolist(self):
+        return list(self)
+
+
+def _seed_legacy_episodic_vec_store(tmp_path, monkeypatch):
+    """Create a populated 768-dim vec index before reopening it at 384 dims."""
+    if not beam._SQLITE_VEC_AVAILABLE:
+        pytest.skip("sqlite-vec unavailable")
+
+    db = Path(tmp_path) / "legacy-recall.db"
+    monkeypatch.setattr(beam, "EMBEDDING_DIM", 768)
+    writer = beam.BeamMemory(session_id="legacy", db_path=db)
+    assert beam._vec_available(writer.conn)
+    writer.conn.execute(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, importance) "
+        "VALUES ('legacy-episode', 'legacy vector fallback marker', 'test', "
+        "datetime('now'), 0.5)"
+    )
+    rowid = writer.conn.execute(
+        "SELECT rowid FROM episodic_memory WHERE id = 'legacy-episode'"
+    ).fetchone()[0]
+    writer.conn.execute(
+        "INSERT INTO vec_episodes(rowid, embedding) "
+        "VALUES (?, vec_quantize_int8(?, 'unit'))",
+        (rowid, json.dumps([0.0] * 768)),
+    )
+    writer.conn.commit()
+    monkeypatch.setattr(beam, "EMBEDDING_DIM", 384)
+    return db
+
+
+@pytest.mark.parametrize("memory_class", [beam.BeamMemory, Mnemosyne])
+def test_public_linear_recall_skips_legacy_vec_search_and_returns_fts_match(
+    tmp_path, monkeypatch, memory_class
+):
+    """Both public linear APIs avoid a 768→384 sqlite-vec query but retain FTS."""
+    db = _seed_legacy_episodic_vec_store(tmp_path, monkeypatch)
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    calls = []
+    monkeypatch.setattr(beam._embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        beam._embeddings, "embed_query", lambda _query: _QueryVector([0.0] * 384)
+    )
+    def unexpected_vec_search(*_args, **_kwargs):
+        calls.append(True)
+        raise AssertionError("unexpected sqlite-vec episodic search")
+
+    monkeypatch.setattr(beam, "_vec_search", unexpected_vec_search)
+
+    memory = memory_class(session_id="legacy", db_path=db)
+    results = memory.recall("legacy vector fallback marker", top_k=5)
+
+    beam_memory = memory if memory_class is beam.BeamMemory else memory.beam
+    assert beam_memory.init_result.vec_dim_mismatch
+    assert any(result["id"] == "legacy-episode" for result in results)
+    assert calls == []
+
+
+def test_public_linear_recall_uses_vec_search_when_dimensions_match(tmp_path, monkeypatch):
+    """The mismatch guard does not disable the normal sqlite-vec episodic path."""
+    if not beam._SQLITE_VEC_AVAILABLE:
+        pytest.skip("sqlite-vec unavailable")
+
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setattr(beam, "EMBEDDING_DIM", 384)
+    memory = beam.BeamMemory(session_id="matched", db_path=Path(tmp_path) / "matched.db")
+    calls = []
+    monkeypatch.setattr(beam._embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        beam._embeddings, "embed_query", lambda _query: _QueryVector([0.0] * 384)
+    )
+    monkeypatch.setattr(
+        beam, "_vec_search", lambda *_args, **_kwargs: calls.append(True) or []
+    )
+
+    memory.recall("normal vector path", top_k=5)
+
+    assert not memory.init_result.vec_dim_mismatch
+    assert calls == [True]

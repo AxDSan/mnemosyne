@@ -6863,7 +6863,7 @@ class BeamMemory:
         if embeddings_available:
             emb_result = _get_query_embedding()
             if emb_result is not None:
-                if _vec_available(self.conn):
+                if _vec_available(self.conn) and not self.init_result.vec_dim_mismatch:
                     vec_rows = _vec_search(self.conn, emb_result.tolist(), k=max(top_k * 3, 20))
                 else:
                     # Fallback: in-memory cosine similarity search
