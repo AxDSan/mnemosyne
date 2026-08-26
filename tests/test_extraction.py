@@ -137,6 +137,34 @@ def test_parse_facts_json_empty_categories_yield_no_facts():
     print("PASS: test_parse_facts_json_empty_categories_yield_no_facts")
 
 
+def test_parse_facts_json_unusable_supported_values_yield_no_key_names():
+    """A supported key present but unusable still suppresses the fallback.
+
+    A model that answers `"facts": null` rather than `[]` reaches the same
+    trap as an empty payload: the partial-JSON regex matches the schema's own
+    key names. Presence of the category is what marks the document complete,
+    not whether its value happened to be a list.
+    """
+    import json as _json
+    for payload in (
+        {"facts": None, "instructions": None, "preferences": None, "timelines": None},
+        {"facts": {}, "instructions": None, "preferences": None, "timelines": None},
+        {"facts": 0, "instructions": None, "preferences": None, "timelines": None},
+    ):
+        facts = _parse_facts(_json.dumps(payload))
+        assert facts == [], facts
+
+    # A scalar where a list belongs is unusable too, and must not smuggle the
+    # key names in alongside whatever it did contain.
+    scalar = _parse_facts(_json.dumps({
+        "facts": "the user works evenings",
+        "instructions": None, "preferences": None, "timelines": None,
+    }))
+    assert "instructions" not in scalar, scalar
+    assert "preferences" not in scalar, scalar
+    print("PASS: test_parse_facts_json_unusable_supported_values_yield_no_key_names")
+
+
 def test_parse_facts_json_without_supported_categories_falls_back():
     """No supported category present still falls through to the fallback."""
     import json as _json

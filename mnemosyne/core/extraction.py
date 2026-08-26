@@ -96,9 +96,15 @@ def _parse_facts(raw_output: str) -> List[str]:
                 seen = set()
                 saw_supported_category = False
                 for category in ('facts', 'instructions', 'preferences', 'timelines'):
+                    if category not in parsed:
+                        continue
+                    # Presence decides, not usability. A document that parsed as
+                    # a dict and names a supported category is complete, not
+                    # partial, so `"facts": null` or a bare string means "no
+                    # facts" rather than "try the streaming recovery regex".
+                    saw_supported_category = True
                     items = parsed.get(category)
                     if isinstance(items, list):
-                        saw_supported_category = True
                         for item in items:
                             if not item:
                                 continue
