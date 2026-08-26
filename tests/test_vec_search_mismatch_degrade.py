@@ -228,8 +228,9 @@ def test_vec_search_raises_when_table_dim_unreadable(tmp_path, monkeypatch, capl
     monkeypatch.setattr(beam, "_vec_table_dim_strict", lambda conn, table=None: None)
 
     with caplog.at_level("ERROR", logger="mnemosyne.core.beam"):
-        with pytest.raises(sqlite3.Error):
+        with pytest.raises(sqlite3.OperationalError, match="(?i)dimension mismatch"):
             beam._vec_search(beam._get_connection(db), [0.01] * 384, k=5)
+    assert "Dimension mismatch querying vec_episodes" not in caplog.text
 
 
 def test_vec_search_dim_probe_failure_replaces_knn_exception():
