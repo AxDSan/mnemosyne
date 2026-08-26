@@ -34,6 +34,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **Optional `embeddings` and `all` installs cap `onnxruntime` below 1.29.** This avoids `blkid` stderr on minimal Linux/aarch64 systems.
 - **CI stopped being able to verify anything, because an unpinned dependency changed ASGI behaviour (#860).** `tests/test_mcp_streamable_http.py` drives the authenticated SSE GET by hand through the TestClient portal, and its `receive()` never delivered the initial `http.request` message. That violates the ASGI contract, but mcp 2.0.0 answered without waiting for it, so the driver passed. mcp 2.1.0 reads the request body to enforce `max_request_body_size` (SDK #3336), so the handler now blocks before `http.response.start`, the test's wait fails, and `TestClient.__exit__` then blocks forever draining a task group that still holds the wedged ASGI task. The job ran to its six-hour ceiling and reported nothing.
 
   The dependency is declared `mcp>=2.0.0` with no upper bound, so every run resolves the newest release at install time. mcp 2.1.0 was published on 2026-08-24 at 19:04 UTC; every green run predates it and every hung run follows it. This was not intermittent and not a race: 0 hangs in 22 consecutive runs on 2.0.0, then 4 hangs in 4 runs on 2.1.x, and the same boundary reproduces locally on the unmodified test.
