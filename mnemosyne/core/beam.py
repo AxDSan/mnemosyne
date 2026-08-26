@@ -611,8 +611,23 @@ def _dim_mismatch_message(existing_dim: int, configured_dim: int) -> str:
     )
 
 
-def init_beam(db_path: Path = None):
-    """Initialize BEAM schema."""
+@dataclass(frozen=True)
+class BeamInitResult:
+    """Outcome of BEAM schema initialization.
+
+    This is additive status only: callers that ignore ``init_beam()``'s return
+    value retain the historical initialization behavior. A dimension mismatch
+    remains recoverable and does not prevent the non-vector schema from being
+    initialized.
+    """
+
+    vec_dim_mismatch: bool
+    existing_dim: Optional[int]
+    configured_dim: int
+
+
+def init_beam(db_path: Path = None) -> BeamInitResult:
+    """Initialize BEAM schema and return its vector-index status."""
     conn = _get_connection(db_path)
     cursor = conn.cursor()
 
@@ -817,6 +832,7 @@ def init_beam(db_path: Path = None):
     # existing ones untouched, and surface one actionable error instead of
     # per-row insert noise; recall falls back to the float-JSON voice meanwhile.
     vec_dim_mismatch = False
+    existing_dim = None
     if _SQLITE_VEC_AVAILABLE:
         existing_dim = _existing_vec_dim(conn)
         if existing_dim is not None and existing_dim != EMBEDDING_DIM:
@@ -1258,6 +1274,12 @@ def init_beam(db_path: Path = None):
     _add_column_if_missing(conn, "episodic_memory", "corrected_by", "INTEGER DEFAULT NULL")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_wm_event_date ON working_memory(event_date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_em_event_date ON episodic_memory(event_date)")
+
+    return BeamInitResult(
+        vec_dim_mismatch=vec_dim_mismatch,
+        existing_dim=existing_dim,
+        configured_dim=EMBEDDING_DIM,
+    )
 
 
 class _BeamConnection(sqlite3.Connection):
@@ -3453,7 +3475,7 @@ class BeamMemory:
         self._extraction_buffer = []  # Buffer for batch extraction
         self._event_emitter = event_emitter  # Streaming event callback
         self.conn = _get_connection(self.db_path)
-        init_beam(self.db_path)
+        self.init_result = init_beam(self.db_path)
 
         # E6: ensure schema split + auto-migrate legacy TripleStore rows
         # to AnnotationStore. Honors MNEMOSYNE_AUTO_MIGRATE=0 for operators
