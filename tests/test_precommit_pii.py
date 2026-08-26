@@ -161,15 +161,19 @@ def test_precommit_fails_closed_when_git_diff_fails(tmp_path):
     fake_git.chmod(0o755)
     real_git = shutil.which("git")
     assert real_git is not None
+    hook_tmpdir = tmp_path / "hook-tmpdir"
+    hook_tmpdir.mkdir()
     env = os.environ | {
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "REAL_GIT": real_git,
+        "TMPDIR": str(hook_tmpdir),
     }
 
     result = _run_hook(repo, env)
 
     assert result.returncode != 0
     assert "ERROR: Unable to inspect staged changes; git diff failed. Aborting commit." in result.stderr
+    assert not list(hook_tmpdir.glob("pre-commit.*"))
 
 
 @pytest.mark.parametrize(
