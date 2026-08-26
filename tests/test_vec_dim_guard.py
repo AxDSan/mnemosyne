@@ -97,6 +97,40 @@ def test_init_beam_skips_vec_creation_on_dim_mismatch(tmp_path, monkeypatch):
     assert ep is not None and "[768]" in ep[0]
 
 
+def test_init_beam_reports_mismatch_when_sqlite_vec_is_unavailable(tmp_path, monkeypatch):
+    """Status reads an existing vec0 dimension even without sqlite-vec available."""
+    if not beam._SQLITE_VEC_AVAILABLE:
+        pytest.skip("sqlite-vec unavailable")
+
+    db = Path(tmp_path) / "unavailable-status.db"
+    monkeypatch.setattr(beam, "EMBEDDING_DIM", 768)
+    beam.init_beam(db)
+    conn = beam._get_connection(db)
+    conn.execute("DROP TABLE IF EXISTS vec_working")
+    conn.execute("DROP TABLE IF EXISTS vec_facts")
+    conn.commit()
+
+    monkeypatch.setattr(beam, "EMBEDDING_DIM", 384)
+    monkeypatch.setattr(beam, "_SQLITE_VEC_AVAILABLE", False)
+    backfill_calls = []
+    monkeypatch.setattr(
+        beam,
+        "_backfill_vec_working_from_memory_embeddings",
+        lambda backfill_conn: backfill_calls.append(backfill_conn),
+    )
+
+    result = beam.init_beam(db)
+
+    assert result == beam.BeamInitResult(True, 768, 384)
+    assert backfill_calls == []
+    assert conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'vec_working'"
+    ).fetchone() is None
+    assert conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'vec_facts'"
+    ).fetchone() is None
+
+
 def test_init_beam_creates_vec_tables_when_dim_matches(tmp_path, monkeypatch):
     """A fresh configured database creates vec tables normally."""
     if not beam._SQLITE_VEC_AVAILABLE:

@@ -831,14 +831,14 @@ def init_beam(db_path: Path = None) -> BeamInitResult:
     # environment as the writer. Refuse to create mismatched tables, leave any
     # existing ones untouched, and surface one actionable error instead of
     # per-row insert noise; recall falls back to the float-JSON voice meanwhile.
-    vec_dim_mismatch = False
-    existing_dim = None
+    existing_dim = _existing_vec_dim(conn)
+    vec_dim_mismatch = (
+        existing_dim is not None and existing_dim != EMBEDDING_DIM
+    )
+    if existing_dim is not None and vec_dim_mismatch:
+        logger.error(_dim_mismatch_message(existing_dim, EMBEDDING_DIM))
     if _SQLITE_VEC_AVAILABLE:
-        existing_dim = _existing_vec_dim(conn)
-        if existing_dim is not None and existing_dim != EMBEDDING_DIM:
-            vec_dim_mismatch = True
-            logger.error(_dim_mismatch_message(existing_dim, EMBEDDING_DIM))
-        else:
+        if not vec_dim_mismatch:
             try:
                 cursor.execute(f"""
                     CREATE VIRTUAL TABLE IF NOT EXISTS vec_episodes USING vec0(
@@ -1144,7 +1144,7 @@ def init_beam(db_path: Path = None) -> BeamInitResult:
         WHERE superseded_by IS NULL""")
     cursor.execute("""CREATE INDEX IF NOT EXISTS idx_mem_emb_type
         ON memory_embeddings(memory_id, model)""")
-    if not vec_dim_mismatch:
+    if _SQLITE_VEC_AVAILABLE and not vec_dim_mismatch:
         try:
             _backfill_vec_working_from_memory_embeddings(conn)
         except NameError:
@@ -1253,7 +1253,7 @@ def init_beam(db_path: Path = None) -> BeamInitResult:
     # Vector table for facts (sqlite-vec). Skipped on a dimension mismatch for the
     # same reason as vec_episodes / vec_working above (see the guard in the
     # sqlite-vec VIRTUAL TABLES block).
-    if not vec_dim_mismatch:
+    if _SQLITE_VEC_AVAILABLE and not vec_dim_mismatch:
         try:
             cursor.execute(f"""
                 CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts USING vec0(
