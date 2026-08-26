@@ -5,7 +5,10 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,7 +18,14 @@ PII = "1641797+AxDSan" + "@users.noreply.github.com"
 
 def _run(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["git", *args],
+        [
+            "git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            *args,
+        ],
         cwd=repo,
         capture_output=True,
         text=True,
@@ -160,3 +170,44 @@ def test_precommit_fails_closed_when_git_diff_fails(tmp_path):
 
     assert result.returncode != 0
     assert "ERROR: Unable to inspect staged changes; git diff failed. Aborting commit." in result.stderr
+
+
+@pytest.mark.parametrize(
+    "global_config",
+    [
+        "[core]\n\thooksPath = .githooks\n",
+        "[commit]\n\tgpgsign = true\n",
+    ],
+    ids=["hooks-path", "gpg-signing"],
+)
+def test_precommit_hook_tests_ignore_hostile_global_git_config(tmp_path, global_config):
+    config_path = tmp_path / "global.gitconfig"
+    config_path.write_text(global_config, encoding="utf-8")
+    hook_tests = (
+        "test_precommit_allows_harmless_pyproject_change_with_historical_pii",
+        "test_precommit_rejects_newly_added_pii",
+        "test_precommit_rejects_added_pii_with_diff_header_prefix",
+        "test_precommit_rejects_pii_in_staged_binary_content",
+        "test_precommit_ignores_removed_historical_pii",
+        "test_precommit_fails_closed_when_temp_file_creation_fails",
+        "test_precommit_excludes_hook_file_from_pii_check",
+        "test_precommit_fails_closed_when_git_diff_fails",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            *(f"{__file__}::{test}" for test in hook_tests),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=os.environ | {"GIT_CONFIG_GLOBAL": str(config_path)},
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "8 passed" in result.stdout
