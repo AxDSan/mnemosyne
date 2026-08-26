@@ -270,6 +270,10 @@ class TestOverlappingCategoriesReachStorageOnce:
             str(r.get("value") or r.get("content") or "")
             for r in AnnotationStore(db_path=db_path).query_by_kind("fact")
         ]
+        # Compare the whole persisted set, not just its uniqueness: an empty
+        # store is duplicate-free too, so a write path that silently persisted
+        # nothing would satisfy a uniqueness-only assertion.
+        assert sorted(values) == sorted(parsed_extraction), values
         assert len(values) == len(set(values)), values
 
         assert _facts_table_count(db_path) == len(parsed_extraction), (
@@ -285,3 +289,11 @@ class TestOverlappingCategoriesReachStorageOnce:
         # ("user stated ...") rather than echoing the fact verbatim.
         matched = [c for c in contents if "clock out through the tablet" in c]
         assert len(matched) == 1, contents
+
+        # The second overlapping statement is checked too — it is the one filed
+        # under both facts and timelines, so it exercises a different pair of
+        # categories than the tablet fact and could regress independently.
+        pos_recalled = mem.beam.fact_recall("POS")
+        pos_contents = [str(r.get("content", "")) for r in pos_recalled]
+        pos_matched = [c for c in pos_contents if "POS system goes live" in c]
+        assert len(pos_matched) == 1, pos_contents
