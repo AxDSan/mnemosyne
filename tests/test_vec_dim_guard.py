@@ -141,7 +141,8 @@ def test_mnemosyne_constructor_exposes_beam_init_status(tmp_path, monkeypatch):
     memory = Mnemosyne(session_id="status", db_path=tmp_path / "mnemosyne.db")
 
     assert memory.init_result == memory.beam.init_result
-    assert memory.init_result == beam.BeamInitResult(False, 384, 384)
+    expected_existing_dim = 384 if beam._SQLITE_VEC_AVAILABLE else None
+    assert memory.init_result == beam.BeamInitResult(False, expected_existing_dim, 384)
 
 
 def test_ignored_mismatch_result_recovers_after_matching_reinit(tmp_path, monkeypatch):
