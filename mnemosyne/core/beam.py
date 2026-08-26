@@ -557,53 +557,73 @@ def _detect_vec_type(conn: sqlite3.Connection) -> str:
     return "float32"
 
 
-def _existing_vec_dim(conn: sqlite3.Connection) -> Optional[int]:
-    """Return the embedding dimension already declared by a sqlite-vec table in
-    this database, or ``None`` if no ``vec0`` table exists yet.
+_VEC_TABLE_NAMES = ("vec_episodes", "vec_working", "vec_facts")
+
+
+def _existing_vec_dims(conn: sqlite3.Connection) -> Tuple[Tuple[str, int], ...]:
+    """Return immutable stored dimensions for each recognized vector table.
 
     A ``vec0`` virtual table fixes its dimension at creation time, encoded in its
-    DDL as ``embedding <type>[<dim>]``. When a store already holds vectors, that
-    declared dimension -- not the process's configured ``EMBEDDING_DIM`` -- is the
-    source of truth for what the stored data actually is. Reads only
-    ``sqlite_master`` (no extension required) so it is safe to call before the
+    DDL as ``embedding <type>[<dim>]``. Read every known table in a fixed order:
+    legacy databases can contain a mixed index, and returning the first
+    ``sqlite_master`` row would make its status depend on catalog row order.
+    Reads only ``sqlite_master`` (no extension required), so it is safe before
     sqlite-vec tables are (re)created.
     """
     try:
         rows = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
             "AND name IN ('vec_episodes', 'vec_working', 'vec_facts')"
         ).fetchall()
     except sqlite3.Error:
-        return None
-    for row in rows:
-        sql = row[0] if row else None
+        return ()
+
+    declared_dims = {}
+    for name, sql in rows:
         if not sql:
             continue
         match = re.search(r"\[(\d+)\]", sql)
         if match:
-            return int(match.group(1))
-    return None
+            declared_dims[name] = int(match.group(1))
+    return tuple((name, declared_dims[name]) for name in _VEC_TABLE_NAMES if name in declared_dims)
 
 
-def _dim_mismatch_message(existing_dim: int, configured_dim: int) -> str:
-    """Build the embedding-dimension-mismatch message.
+def _existing_vec_dim(conn: sqlite3.Connection) -> Optional[int]:
+    """Return a dimension only when all stored vector tables agree.
 
-    Extracted as a pure function so the wording -- explicitly NOT corruption plus
-    the exact self-heal commands -- is unit-testable without a sqlite-vec
-    database. The phrasing matters: 'dimension mismatch' is otherwise misread as
-    'database corrupt', and users (and agent frameworks) abandon the store
-    instead of reindexing.
+    Kept as a narrow compatibility helper for callers that only need a uniform
+    stored dimension. Mixed indexes have no honest scalar representation.
     """
+    stored_dims = _existing_vec_dims(conn)
+    dimensions = {dim for _, dim in stored_dims}
+    return dimensions.pop() if len(dimensions) == 1 else None
+
+
+def _dim_mismatch_message(
+    stored_dims: Tuple[Tuple[str, int], ...], configured_dim: int
+) -> str:
+    """Build an actionable message for uniform or mixed vector-index dimensions."""
+    stored_description = ", ".join(f"{table}={dim}" for table, dim in stored_dims)
+    dimensions = {dim for _, dim in stored_dims}
+    if len(dimensions) == 1:
+        existing_dim = next(iter(dimensions))
+        recovery_hint = (
+            f"  * Keep the existing {existing_dim}-dim vectors: relaunch with "
+            f"MNEMOSYNE_EMBEDDING_DIM={existing_dim} (and the matching model).\n"
+        )
+        index_description = f"This database stores {existing_dim}-dim vectors"
+    else:
+        recovery_hint = ""
+        index_description = f"This database has mixed vector-index dimensions ({stored_description})"
+
     return (
         f"Embedding dimension mismatch — NOT database corruption: your memories "
         f"are intact, only the vector index is affected (recall falls back to "
-        f"keyword search until this is fixed). This database stores "
-        f"{existing_dim}-dim vectors but this process is configured for "
-        f"{configured_dim}-dim (MNEMOSYNE_EMBEDDING_DIM / "
+        f"keyword search until this is fixed). {index_description} but this "
+        f"process is configured for {configured_dim}-dim (MNEMOSYNE_EMBEDDING_DIM / "
         f"MNEMOSYNE_EMBEDDING_MODEL); sqlite-vec tables were left untouched. To "
         f"self-heal, choose ONE:\n"
-        f"  * Keep the existing {existing_dim}-dim vectors: relaunch with "
-        f"MNEMOSYNE_EMBEDDING_DIM={existing_dim} (and the matching model).\n"
+        f"{recovery_hint}"
         f"  * Re-embed all memories at {configured_dim}-dim: run "
         f"`MNEMOSYNE_EMBEDDING_DIM={configured_dim} mnemosyne reindex` (it backs "
         f"up first).\n"
@@ -616,14 +636,16 @@ class BeamInitResult:
     """Outcome of BEAM schema initialization.
 
     This is additive status only: callers that ignore ``init_beam()``'s return
-    value retain the historical initialization behavior. A dimension mismatch
-    remains recoverable and does not prevent the non-vector schema from being
-    initialized.
+    value retain the historical initialization behavior. ``stored_dims`` is a
+    fixed-order immutable ``(table, dimension)`` tuple; ``existing_dim`` is set
+    only when those stored tables have one uniform dimension. A mismatch remains
+    recoverable and does not prevent the non-vector schema from being initialized.
     """
 
     vec_dim_mismatch: bool
     existing_dim: Optional[int]
     configured_dim: int
+    stored_dims: Tuple[Tuple[str, int], ...] = ()
 
 
 def init_beam(db_path: Path = None) -> BeamInitResult:
@@ -831,12 +853,12 @@ def init_beam(db_path: Path = None) -> BeamInitResult:
     # environment as the writer. Refuse to create mismatched tables, leave any
     # existing ones untouched, and surface one actionable error instead of
     # per-row insert noise; recall falls back to the float-JSON voice meanwhile.
-    existing_dim = _existing_vec_dim(conn)
-    vec_dim_mismatch = (
-        existing_dim is not None and existing_dim != EMBEDDING_DIM
-    )
-    if existing_dim is not None and vec_dim_mismatch:
-        logger.error(_dim_mismatch_message(existing_dim, EMBEDDING_DIM))
+    stored_dims = _existing_vec_dims(conn)
+    dimensions = {dim for _, dim in stored_dims}
+    existing_dim = dimensions.pop() if len(dimensions) == 1 else None
+    vec_dim_mismatch = any(dim != EMBEDDING_DIM for _, dim in stored_dims)
+    if vec_dim_mismatch:
+        logger.error(_dim_mismatch_message(stored_dims, EMBEDDING_DIM))
     if _SQLITE_VEC_AVAILABLE:
         if not vec_dim_mismatch:
             try:
@@ -1279,6 +1301,7 @@ def init_beam(db_path: Path = None) -> BeamInitResult:
         vec_dim_mismatch=vec_dim_mismatch,
         existing_dim=existing_dim,
         configured_dim=EMBEDDING_DIM,
+        stored_dims=stored_dims,
     )
 
 
