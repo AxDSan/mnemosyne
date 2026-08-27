@@ -2977,6 +2977,62 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     return plan
 
 
+def _episodic_vec_search_scoped(
+    conn: sqlite3.Connection,
+    embedding: List[float],
+    k: int = 20,
+    *,
+    where_sql: str,
+    where_params: Tuple[Any, ...] = (),
+) -> List[Dict]:
+    """Search episodic sqlite-vec candidates after applying recall scope.
+
+    sqlite-vec applies KNN ``k`` before relational predicates. Widen the
+    neighborhood just as working-memory recall does so a session's candidates
+    are not crowded out by closer rows from other sessions.
+    """
+    if not _vec_available(conn):
+        return []
+    import numpy as _np
+
+    emb_arr = _np.array(embedding, dtype=_np.float32)
+    norm = _np.linalg.norm(emb_arr)
+    if norm > 0:
+        emb_arr = emb_arr / norm
+    emb_json = json.dumps(emb_arr.tolist())
+    k = int(k)
+    try:
+        total_vectors = int(conn.execute("SELECT COUNT(*) FROM vec_episodes").fetchone()[0])
+    except Exception:
+        return []
+    if total_vectors == 0:
+        return []
+
+    scan_k = min(total_vectors, max(k * 25, 500))
+    match_expr = {
+        "bit": "vec_quantize_binary(?)",
+        "int8": "vec_quantize_int8(?, 'unit')",
+    }.get(_effective_vec_type(conn), "?")
+    rows = []
+    while True:
+        try:
+            rows = conn.execute(f"""
+                SELECT em.rowid, ve.distance
+                FROM vec_episodes ve
+                JOIN episodic_memory em ON em.rowid = ve.rowid
+                WHERE ve.embedding MATCH {match_expr}
+                  AND k = ?
+                  AND {where_sql}
+                ORDER BY ve.distance
+            """, (emb_json, scan_k, *where_params)).fetchall()
+        except Exception:
+            return []
+        if len(rows) >= k or scan_k >= total_vectors:
+            break
+        scan_k = min(total_vectors, scan_k * 2)
+    return [{"rowid": row["rowid"], "distance": row["distance"]} for row in rows[:k]]
+
+
 def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -> List[Dict]:
     """Search sqlite-vec and return rowids with distances.
 
@@ -3064,7 +3120,11 @@ def _has_cjk(text: str) -> bool:
     )
 
 
-def _cjk_like_search(conn: sqlite3.Connection, query: str, k: int = 20, working: bool = False) -> List[Dict]:
+def _cjk_like_search(
+    conn: sqlite3.Connection, query: str, k: int = 20, working: bool = False,
+    *, episodic_where_sql: Optional[str] = None,
+    episodic_where_params: Tuple[Any, ...] = (),
+) -> List[Dict]:
     """Fallback LIKE search for CJK text.
 
     The default unicode61 FTS5 tokenizer does not index CJK characters
@@ -3088,18 +3148,34 @@ def _cjk_like_search(conn: sqlite3.Connection, query: str, k: int = 20, working:
     if working:
         table = "working_memory"
         id_col = "id"
+        content_col = "content"
+        scoped_from = table
+        scoped_where = ""
+        scoped_params: Tuple[Any, ...] = ()
+    elif episodic_where_sql is not None:
+        table = "episodic_memory"
+        id_col = "rowid"
+        content_col = "em.content"
+        scoped_from = "episodic_memory em"
+        scoped_where = f" AND {episodic_where_sql}"
+        scoped_params = episodic_where_params
     else:
         table = "episodic_memory"
         id_col = "rowid"
+        content_col = "content"
+        scoped_from = table
+        scoped_where = ""
+        scoped_params = ()
 
     # Build parameterized LIKE clauses for each CJK character
-    conditions = " OR ".join("content LIKE ? ESCAPE '\\'" for _ in cjk_chars)
+    conditions = " OR ".join(f"{content_col} LIKE ? ESCAPE '\\'" for _ in cjk_chars)
     params = [f"%{ch}%" for ch in cjk_chars]
     # Also search for mixed CJK+ASCII: any of the CJK chars must be present
     try:
         all_rows = conn.execute(
-            f"SELECT {id_col}, content FROM {table} WHERE {conditions} LIMIT ?",
-            params + [k * 5]
+            f"SELECT {id_col}, {content_col} AS content FROM {scoped_from} "
+            f"WHERE ({conditions}){scoped_where} LIMIT ?",
+            (*params, *scoped_params, k * 5)
         ).fetchall()
     except Exception:
         return []
@@ -3216,6 +3292,8 @@ def _cyrillic_score(query: str, content: str, n: int = 3) -> float:
 
 def _cyrillic_like_search(
     conn: sqlite3.Connection, query: str, k: int = 20, working: bool = False,
+    *, episodic_where_sql: Optional[str] = None,
+    episodic_where_params: Tuple[Any, ...] = (),
 ) -> List[Dict]:
     """LIKE-based FTS5 fallback for Russian/Cyrillic text.
 
@@ -3233,8 +3311,22 @@ def _cyrillic_like_search(
         return []
     if working:
         table, id_col = "working_memory", "id"
+        content_col = "content"
+        scoped_from = table
+        scoped_where = ""
+        scoped_params: Tuple[Any, ...] = ()
+    elif episodic_where_sql is not None:
+        table, id_col = "episodic_memory", "rowid"
+        content_col = "em.content"
+        scoped_from = "episodic_memory em"
+        scoped_where = f" AND {episodic_where_sql}"
+        scoped_params = episodic_where_params
     else:
         table, id_col = "episodic_memory", "rowid"
+        content_col = "content"
+        scoped_from = table
+        scoped_where = ""
+        scoped_params = ()
 
     # SQLite's default LOWER() and LIKE are ASCII-only, so they cannot
     # case-fold Cyrillic letters (Т ≠ т, Ё ≠ ё). Register a Python
@@ -3255,13 +3347,14 @@ def _cyrillic_like_search(
         return []
 
     conditions = " OR ".join(
-        ["_py_lower(content) LIKE ? ESCAPE '\\'"] * len(q_words)
+        [f"_py_lower({content_col}) LIKE ? ESCAPE '\\'"] * len(q_words)
     )
     params = [f"%{w[:4].lower()}%" for w in q_words]
     try:
         all_rows = conn.execute(
-            f"SELECT {id_col}, content FROM {table} WHERE {conditions} LIMIT ?",
-            params + [k * 5],
+            f"SELECT {id_col}, {content_col} AS content FROM {scoped_from} "
+            f"WHERE ({conditions}){scoped_where} LIMIT ?",
+            (*params, *scoped_params, k * 5),
         ).fetchall()
     except Exception:
         return []
@@ -3280,6 +3373,51 @@ def _cyrillic_like_search(
     scored.sort(key=lambda x: x[1], reverse=True)
     result_key = "id" if working else "rowid"
     return [{result_key: rid, "rank": -score} for rid, score in scored[:k]]
+
+
+def _episodic_fts_search_scoped(
+    conn: sqlite3.Connection,
+    query: str,
+    k: int = 20,
+    *,
+    where_sql: str,
+    where_params: Tuple[Any, ...] = (),
+) -> List[Dict]:
+    """Search FTS5 episodic candidates after applying recall scope."""
+    terms = _fts_query_terms(query)
+    if not terms:
+        if _has_cjk(query):
+            return _cjk_like_search(
+                conn, query, k=k, working=False,
+                episodic_where_sql=where_sql, episodic_where_params=where_params,
+            )
+        if _has_cyrillic(query):
+            return _cyrillic_like_search(
+                conn, query, k=k, working=False,
+                episodic_where_sql=where_sql, episodic_where_params=where_params,
+            )
+        return []
+    fts_query = " OR ".join(terms)
+    rows = conn.execute(f"""
+        SELECT fts_episodes.rowid, fts_episodes.rank
+        FROM fts_episodes
+        JOIN episodic_memory em ON em.rowid = fts_episodes.rowid
+        WHERE fts_episodes MATCH ?
+          AND {where_sql}
+        ORDER BY fts_episodes.rank, fts_episodes.rowid
+        LIMIT ?
+    """, (fts_query, *where_params, k)).fetchall()
+    if not rows and _has_cjk(query):
+        return _cjk_like_search(
+            conn, query, k=k, working=False,
+            episodic_where_sql=where_sql, episodic_where_params=where_params,
+        )
+    if not rows and _has_cyrillic(query):
+        return _cyrillic_like_search(
+            conn, query, k=k, working=False,
+            episodic_where_sql=where_sql, episodic_where_params=where_params,
+        )
+    return [{"rowid": row["rowid"], "rank": row["rank"]} for row in rows]
 
 
 def _fts_search(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]:
@@ -6878,51 +7016,60 @@ class BeamMemory:
             if emb_result is not None:
                 query_bv = _mib(emb_result)
 
-        # Build episodic filters before candidate selection so the bounded
-        # in-memory vector fallback cannot be exhausted by out-of-scope rows.
+        # Build qualified episodic filters before candidate selection so bounded
+        # sqlite-vec, FTS, and JSON-vector paths cannot be exhausted by
+        # out-of-scope rows. These predicates are fixed SQL fragments; only
+        # values are caller-provided bind parameters.
         em_where_clauses = [
-            "(valid_until IS NULL OR julianday(valid_until) > julianday(?))",
-            "superseded_by IS NULL"
+            "(em.valid_until IS NULL OR julianday(em.valid_until) > julianday(?))",
+            "em.superseded_by IS NULL"
         ]
         em_params = [datetime.now(timezone.utc).isoformat()]
 
         # Session scope: channel filter only when explicitly specified.
         # Author-only searches have no session/channel restriction.
         if channel_id:
-            em_where_clauses.append(_session_scope_filter("channel_id", cross_session=cross_session))
-            em_params.extend(_session_scope_params(self.session_id, channel_id, cross_session=cross_session))
+            if cross_session:
+                em_where_clauses.append("(1=1)")
+            else:
+                em_where_clauses.append(
+                    "(em.session_id = ? OR em.scope = 'global' OR em.channel_id = ?)"
+                )
+                em_params.extend([self.session_id, channel_id])
         elif author_id or author_type:
             em_where_clauses.append("(1=1)")
+        elif cross_session:
+            em_where_clauses.append("(1=1)")
         else:
-            em_where_clauses.append(_session_scope_filter(cross_session=cross_session))
-            em_params.extend(_session_scope_params(self.session_id, cross_session=cross_session))
+            em_where_clauses.append("(em.session_id = ? OR em.scope = 'global')")
+            em_params.append(self.session_id)
 
         if from_date:
-            em_where_clauses.append("timestamp >= ?")
+            em_where_clauses.append("em.timestamp >= ?")
             em_params.append(f"{from_date}T00:00:00")
         if to_date:
-            em_where_clauses.append("timestamp <= ?")
+            em_where_clauses.append("em.timestamp <= ?")
             em_params.append(f"{to_date}T23:59:59")
         if source:
-            em_where_clauses.append("source = ?")
+            em_where_clauses.append("em.source = ?")
             em_params.append(source)
         if topic:
-            em_where_clauses.append("source = ?")
+            em_where_clauses.append("em.source = ?")
             em_params.append(topic)
         if veracity:
-            em_where_clauses.append("veracity = ?")
+            em_where_clauses.append("em.veracity = ?")
             em_params.append(veracity)
         if memory_type:
-            em_where_clauses.append("memory_type = ?")
+            em_where_clauses.append("em.memory_type = ?")
             em_params.append(memory_type)
         if author_id:
-            em_where_clauses.append("author_id = ?")
+            em_where_clauses.append("em.author_id = ?")
             em_params.append(author_id)
         if author_type:
-            em_where_clauses.append("author_type = ?")
+            em_where_clauses.append("em.author_type = ?")
             em_params.append(author_type)
         if channel_id:
-            em_where_clauses.append("channel_id = ?")
+            em_where_clauses.append("em.channel_id = ?")
             em_params.append(channel_id)
 
         em_where = " AND ".join(em_where_clauses)
@@ -6958,7 +7105,13 @@ class BeamMemory:
                     and _vec_available(self.conn)
                     and episodic_vec_dim == query_dim
                 ):
-                    vec_rows = _vec_search(self.conn, query_vector.tolist(), k=max(top_k * 3, 20))
+                    vec_rows = _episodic_vec_search_scoped(
+                        self.conn,
+                        query_vector.tolist(),
+                        k=max(top_k * 3, 20),
+                        where_sql=em_where,
+                        where_params=tuple(em_params),
+                    )
                 elif query_vector is not None:
                     # Fallback: in-memory cosine similarity search
                     vec_rows = _in_memory_vec_search_scoped(
@@ -6977,7 +7130,10 @@ class BeamMemory:
                         vec_results[vr["rowid"]] = sim
 
         fts_results = {}
-        fts_rows = _fts_search(self.conn, query, k=max(top_k * 3, 20))
+        fts_rows = _episodic_fts_search_scoped(
+            self.conn, query, k=max(top_k * 3, 20),
+            where_sql=em_where, where_params=tuple(em_params),
+        )
         _em_fts_raw_count = len(fts_rows)
         if fts_rows:
             min_rank = min(r["rank"] for r in fts_rows)
@@ -7002,7 +7158,7 @@ class BeamMemory:
             cursor = self.conn.cursor()
             cursor.execute(f"""
                 SELECT rowid, id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope, author_id, author_type, channel_id, memory_type, binary_vector
-                FROM episodic_memory
+                FROM episodic_memory em
                 WHERE rowid IN ({placeholders})
                   AND {em_where}
             """, (*tuple(episodic_rowids), *em_params))
@@ -7143,9 +7299,9 @@ class BeamMemory:
             cursor = self.conn.cursor()
             cursor.execute(f"""
                 SELECT rowid, id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope, author_id, author_type, channel_id, memory_type, binary_vector
-                FROM episodic_memory
+                FROM episodic_memory em
                 WHERE {em_where}
-                ORDER BY timestamp DESC
+                ORDER BY em.timestamp DESC
                 LIMIT {min(EPISODIC_RECALL_LIMIT, 500)}
             """, em_params)
             _em_fallback_rows = cursor.fetchall()

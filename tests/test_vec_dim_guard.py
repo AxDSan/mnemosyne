@@ -375,7 +375,7 @@ def test_public_linear_recall_skips_legacy_vec_search_and_returns_fts_match(
         calls.append(True)
         raise AssertionError("unexpected sqlite-vec episodic search")
 
-    monkeypatch.setattr(beam, "_vec_search", unexpected_vec_search)
+    monkeypatch.setattr(beam, "_episodic_vec_search_scoped", unexpected_vec_search)
 
     memory = memory_class(session_id="legacy", db_path=db)
     results = memory.recall("legacy vector fallback marker", top_k=5)
@@ -420,7 +420,7 @@ def test_public_linear_recall_uses_compatible_episodic_vec_despite_mixed_indexes
     writer.conn.commit()
 
     calls = []
-    original_vec_search = beam._vec_search
+    original_vec_search = beam._episodic_vec_search_scoped
     monkeypatch.setattr(beam._embeddings, "available", lambda: True)
     monkeypatch.setattr(
         beam._embeddings, "embed_query", lambda _query: _QueryVector([0.0] * 384)
@@ -430,7 +430,7 @@ def test_public_linear_recall_uses_compatible_episodic_vec_despite_mixed_indexes
         calls.append(True)
         return original_vec_search(*args, **kwargs)
 
-    monkeypatch.setattr(beam, "_vec_search", traced_vec_search)
+    monkeypatch.setattr(beam, "_episodic_vec_search_scoped", traced_vec_search)
     memory = beam.BeamMemory(session_id="mixed", db_path=db)
 
     results = memory.recall("unrelated aurora question", top_k=5)
@@ -470,7 +470,7 @@ def test_public_linear_recall_uses_query_dim_when_module_constant_differs(tmp_pa
     monkeypatch.setattr(beam, "EMBEDDING_DIM", 768)
 
     calls = []
-    original_vec_search = beam._vec_search
+    original_vec_search = beam._episodic_vec_search_scoped
     monkeypatch.setattr(beam._embeddings, "available", lambda: True)
     monkeypatch.setattr(
         beam._embeddings, "embed_query", lambda _query: _QueryVector([0.0] * 384)
@@ -480,7 +480,7 @@ def test_public_linear_recall_uses_query_dim_when_module_constant_differs(tmp_pa
         calls.append(True)
         return original_vec_search(*args, **kwargs)
 
-    monkeypatch.setattr(beam, "_vec_search", traced_vec_search)
+    monkeypatch.setattr(beam, "_episodic_vec_search_scoped", traced_vec_search)
     memory = beam.BeamMemory(session_id="query-dim", db_path=db)
 
     results = memory.recall("unrelated aurora question", top_k=5)
@@ -512,14 +512,14 @@ def test_public_linear_recall_normalizes_single_row_query_and_rejects_batches(tm
     )
     memory.conn.commit()
     monkeypatch.setattr(beam._embeddings, "available", lambda: True)
-    original_vec_search = beam._vec_search
+    original_vec_search = beam._episodic_vec_search_scoped
     calls = []
 
     def traced_vec_search(*args, **kwargs):
         calls.append(args[1])
         return original_vec_search(*args, **kwargs)
 
-    monkeypatch.setattr(beam, "_vec_search", traced_vec_search)
+    monkeypatch.setattr(beam, "_episodic_vec_search_scoped", traced_vec_search)
     monkeypatch.setattr(
         beam._embeddings, "embed_query", lambda _query: np.zeros((1, 384), dtype=np.float32)
     )
@@ -556,7 +556,7 @@ def test_public_linear_recall_uses_vec_search_when_dimensions_match(tmp_path, mo
         beam._embeddings, "embed_query", lambda _query: _QueryVector([0.0] * 384)
     )
     monkeypatch.setattr(
-        beam, "_vec_search", lambda *_args, **_kwargs: calls.append(True) or []
+        beam, "_episodic_vec_search_scoped", lambda *_args, **_kwargs: calls.append(True) or []
     )
 
     memory.recall("normal vector path", top_k=5)
@@ -632,3 +632,88 @@ def test_public_recall_scopes_in_memory_fallback_before_bounded_candidates(tmp_p
 
     assert memory.init_result.vec_dim_mismatch
     assert [result["id"] for result in results] == ["target"]
+
+
+def test_public_recall_scopes_sqlite_vec_candidates_before_knn_limit(tmp_path, monkeypatch):
+    """An in-scope episodic vector survives 20 closer foreign KNN rows."""
+    if not beam._SQLITE_VEC_AVAILABLE:
+        pytest.skip("sqlite-vec unavailable")
+
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setattr(beam, "EMBEDDING_DIM", 384)
+    memory = beam.BeamMemory(session_id="target-session", db_path=Path(tmp_path) / "vec-scope.db")
+    monkeypatch.setattr(beam._embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        beam._embeddings, "embed_query", lambda _query: _QueryVector([1.0] + [0.0] * 383)
+    )
+    monkeypatch.setattr(beam, "_episodic_fts_search_scoped", lambda *_args, **_kwargs: [])
+
+    foreign = [
+        (f"foreign-{index}", "foreign vector distractor", "foreign-session")
+        for index in range(20)
+    ]
+    memory.conn.executemany(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, scope) "
+        "VALUES (?, ?, 'test', datetime('now'), ?, 'session')",
+        foreign,
+    )
+    memory.conn.execute(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, scope) "
+        "VALUES ('target', 'target vector marker', 'test', datetime('now'), "
+        "'target-session', 'session')"
+    )
+    foreign_rowids = memory.conn.execute(
+        "SELECT rowid FROM episodic_memory WHERE session_id = 'foreign-session' ORDER BY rowid"
+    ).fetchall()
+    target_rowid = memory.conn.execute(
+        "SELECT rowid FROM episodic_memory WHERE id = 'target'"
+    ).fetchone()[0]
+    memory.conn.executemany(
+        "INSERT INTO vec_episodes(rowid, embedding) VALUES (?, vec_quantize_int8(?, 'unit'))",
+        [(row[0], json.dumps([1.0] + [0.0] * 383)) for row in foreign_rowids],
+    )
+    memory.conn.execute(
+        "INSERT INTO vec_episodes(rowid, embedding) VALUES (?, vec_quantize_int8(?, 'unit'))",
+        (target_rowid, json.dumps([0.0, 1.0] + [0.0] * 382)),
+    )
+    memory.conn.commit()
+
+    results = memory.recall("target vector marker", top_k=1)
+
+    assert [result["id"] for result in results] == ["target"]
+    assert all(result["id"] not in {row[0] for row in foreign} for result in results)
+
+
+def test_public_recall_scopes_fts_candidates_before_limit_on_vec_dim_mismatch(tmp_path, monkeypatch):
+    """An in-scope FTS match survives 20 foreign matches without JSON fallback."""
+    db = _seed_legacy_episodic_vec_store(tmp_path, monkeypatch)
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    memory = beam.BeamMemory(session_id="target-session", db_path=db)
+    memory.conn.execute("DELETE FROM episodic_memory WHERE id = 'legacy-episode'")
+    foreign = [
+        (f"foreign-{index}", "scoped fts marker", "foreign-session")
+        for index in range(20)
+    ]
+    memory.conn.executemany(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, scope) "
+        "VALUES (?, ?, 'test', datetime('now'), ?, 'session')",
+        foreign,
+    )
+    memory.conn.execute(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, scope) "
+        "VALUES ('target', 'scoped fts marker', 'test', datetime('now'), "
+        "'target-session', 'session')"
+    )
+    memory.conn.commit()
+    monkeypatch.setattr(beam._embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        beam._embeddings, "embed_query", lambda _query: _QueryVector([0.0] * 384)
+    )
+
+    results = memory.recall("scoped fts marker", top_k=1)
+
+    assert memory.init_result.vec_dim_mismatch
+    assert [result["id"] for result in results] == ["target"]
+    assert all(result["id"] not in {row[0] for row in foreign} for result in results)
