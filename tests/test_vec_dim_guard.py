@@ -717,3 +717,82 @@ def test_public_recall_scopes_fts_candidates_before_limit_on_vec_dim_mismatch(tm
     assert memory.init_result.vec_dim_mismatch
     assert [result["id"] for result in results] == ["target"]
     assert all(result["id"] not in {row[0] for row in foreign} for result in results)
+
+
+def test_public_recall_scopes_cjk_like_candidates_before_bounded_scan(tmp_path, monkeypatch):
+    """An in-scope CJK LIKE match survives foreign rows beyond its candidate scan."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setattr(beam._embeddings, "available", lambda: False)
+    memory = beam.BeamMemory(session_id="target-session", db_path=Path(tmp_path) / "cjk-scope.db")
+    query = "東京"
+    assert beam._fts_query_terms(query) == []
+    calls = []
+    cjk_like_search = beam._cjk_like_search
+
+    def traced_cjk_like_search(*args, **kwargs):
+        calls.append(kwargs)
+        return cjk_like_search(*args, **kwargs)
+
+    monkeypatch.setattr(beam, "_cjk_like_search", traced_cjk_like_search)
+    # Public recall passes max(top_k * 3, 20), so the fallback scans at most 100.
+    foreign = [
+        (f"foreign-{index}", "東京 foreign distractor", "foreign-session")
+        for index in range(101)
+    ]
+    memory.conn.executemany(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, scope) "
+        "VALUES (?, ?, 'test', datetime('now'), ?, 'session')",
+        foreign,
+    )
+    memory.conn.execute(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, scope) "
+        "VALUES ('target', '東京 target', 'test', datetime('now'), "
+        "'target-session', 'session')"
+    )
+    memory.conn.commit()
+
+    results = memory.recall(query, top_k=1)
+
+    assert [result["id"] for result in results] == ["target"]
+    assert all(result["id"] not in {row[0] for row in foreign} for result in results)
+    assert calls and calls[-1]["episodic_where_sql"]
+
+
+def test_public_recall_scopes_cyrillic_like_candidates_before_bounded_scan(tmp_path, monkeypatch):
+    """An in-scope Russian LIKE match survives foreign rows beyond its scan."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setattr(beam._embeddings, "available", lambda: False)
+    memory = beam.BeamMemory(session_id="target-session", db_path=Path(tmp_path) / "cyrillic-scope.db")
+    query = "тёмная"
+    calls = []
+    cyrillic_like_search = beam._cyrillic_like_search
+
+    def traced_cyrillic_like_search(*args, **kwargs):
+        calls.append(kwargs)
+        return cyrillic_like_search(*args, **kwargs)
+
+    monkeypatch.setattr(beam, "_cyrillic_like_search", traced_cyrillic_like_search)
+    # Public recall passes max(top_k * 3, 20), so the fallback scans at most 100.
+    foreign = [
+        (f"foreign-{index}", "тёмную foreign distractor", "foreign-session")
+        for index in range(101)
+    ]
+    memory.conn.executemany(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, scope) "
+        "VALUES (?, ?, 'test', datetime('now'), ?, 'session')",
+        foreign,
+    )
+    memory.conn.execute(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, scope) "
+        "VALUES ('target', 'тёмную target', 'test', datetime('now'), "
+        "'target-session', 'session')"
+    )
+    memory.conn.commit()
+
+    results = memory.recall(query, top_k=1)
+
+    assert [result["id"] for result in results] == ["target"]
+    assert all(result["id"] not in {row[0] for row in foreign} for result in results)
+    assert calls and calls[-1]["episodic_where_sql"]
