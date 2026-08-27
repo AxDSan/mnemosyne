@@ -13,6 +13,7 @@ Run with: pytest tests/test_mcp_streamable_http.py -v
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import threading
 from unittest.mock import AsyncMock, patch
@@ -519,81 +520,109 @@ class TestStreamableHttpBearerRejection:
                 "tools/list must return a non-empty tools list"
             )
 
-            # The authenticated GET opens the session's SSE stream. The stream
-            # is long-lived, so drive it in a portal thread and wait for the
+            # The authenticated GET opens the session's SSE stream. The
+            # stream is long-lived, so run it as a portal task and wait for the
             # response start before terminating the session with DELETE.
             portal = client.portal
             get_started = threading.Event()
             get_result = {}
 
-            def _drive_get():
-                scope = {
-                    "type": "http",
-                    "asgi": {"version": "3.0"},
-                    "http_version": "1.1",
-                    "method": "GET",
-                    "scheme": "http",
-                    "path": "/mcp",
-                    "raw_path": b"/mcp",
-                    "query_string": b"",
-                    "root_path": "",
-                    "headers": [
-                        (b"host", b"localhost:8080"),
-                        (b"authorization", b"Bearer supersecret"),
-                        (b"accept", b"text/event-stream"),
-                        (b"mcp-session-id", session_id.encode()),
-                    ],
-                    "client": ("testclient", 50000),
-                    "server": ("localhost", 8080),
-                }
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/mcp",
+                "raw_path": b"/mcp",
+                "query_string": b"",
+                "root_path": "",
+                "headers": [
+                    (b"host", b"localhost:8080"),
+                    (b"authorization", b"Bearer supersecret"),
+                    (b"accept", b"text/event-stream"),
+                    (b"mcp-session-id", session_id.encode()),
+                ],
+                "client": ("testclient", 50000),
+                "server": ("localhost", 8080),
+            }
 
-                async def receive():
-                    while True:
-                        await asyncio.sleep(3600)
+            # ASGI requires the server to deliver http.request before the
+            # app can respond, even for a bodyless GET. mcp 2.0.0 answered
+            # without waiting, so an earlier version of this driver skipped
+            # the message and still passed. mcp 2.1.0 reads the body to
+            # enforce max_request_body_size (SDK #3336), so skipping it wedges
+            # the handler before http.response.start and hangs the run. Real
+            # servers always send it; only a hand-driven scope can omit it.
+            request_delivered = threading.Event()
 
-                async def send(message):
-                    if message["type"] == "http.response.start":
-                        get_result["status"] = message["status"]
-                        get_result["content_type"] = dict(
-                            (k.decode(), v.decode())
-                            for k, v in message.get("headers", [])
-                        ).get("content-type")
-                        get_started.set()
+            async def receive():
+                if not request_delivered.is_set():
+                    request_delivered.set()
+                    return {
+                        "type": "http.request",
+                        "body": b"",
+                        "more_body": False,
+                    }
+                # The stream is long-lived: after the request is delivered
+                # there is nothing more to feed it, so block until cancelled.
+                while True:
+                    await asyncio.sleep(3600)
 
-                try:
-                    portal.call(authed_app, scope, receive, send)
-                except BaseException as exc:  # pragma: no cover - defensive
-                    get_result["exc"] = repr(exc)
+            async def send(message):
+                if message["type"] == "http.response.start":
+                    get_result["status"] = message["status"]
+                    get_result["content_type"] = dict(
+                        (k.decode(), v.decode())
+                        for k, v in message.get("headers", [])
+                    ).get("content-type")
                     get_started.set()
 
-            get_thread = threading.Thread(target=_drive_get, daemon=True)
-            get_thread.start()
-            assert get_started.wait(10), "authenticated GET stream never started"
-            assert get_result["status"] == 200
-            assert (get_result.get("content_type") or "").startswith(
-                "text/event-stream"
-            )
+            # start_task_soon runs the ASGI call inside a cancel scope owned
+            # by the portal, so the future can cancel it deterministically.
+            get_future = portal.start_task_soon(authed_app, scope, receive, send)
+            # A task that ends without ever sending http.response.start (an
+            # error, say) must still release the wait below.
+            get_future.add_done_callback(lambda _f: get_started.set())
 
-            # DELETE terminates the session (SDK 2.0.0 answers 200 with a JSON
-            # body)...
-            deleted = client.delete(
-                "/mcp", headers={**headers, "Mcp-Session-Id": session_id}
-            )
-            assert deleted.status_code == 200
-            assert deleted.headers["content-type"].startswith("application/json")
+            try:
+                assert get_started.wait(10), (
+                    "authenticated GET stream never started"
+                )
+                assert get_result["status"] == 200
+                assert (get_result.get("content_type") or "").startswith(
+                    "text/event-stream"
+                )
 
-            get_thread.join(10)
-            assert not get_thread.is_alive(), (
-                "GET stream did not close after DELETE"
-            )
+                # DELETE terminates the session (SDK 2.0.0 answers 200 with a
+                # JSON body)...
+                deleted = client.delete(
+                    "/mcp", headers={**headers, "Mcp-Session-Id": session_id}
+                )
+                assert deleted.status_code == 200
+                assert deleted.headers["content-type"].startswith(
+                    "application/json"
+                )
 
-            # ...and any later request on the terminated session is rejected.
-            stale = client.post(
-                "/mcp",
-                json={"jsonrpc": "2.0", "method": "ping", "id": 3},
-                headers={**headers, "Mcp-Session-Id": session_id},
-            )
-            assert stale.status_code == 404
+                concurrent.futures.wait([get_future], timeout=10)
+                assert get_future.done(), "GET stream did not close after DELETE"
+
+                # ...and any later request on the terminated session is
+                # rejected.
+                stale = client.post(
+                    "/mcp",
+                    json={"jsonrpc": "2.0", "method": "ping", "id": 3},
+                    headers={**headers, "Mcp-Session-Id": session_id},
+                )
+                assert stale.status_code == 404
+            finally:
+                # The ASGI task holds a slot in the portal's task group, and
+                # TestClient.__exit__ waits for that group to drain. If the
+                # stream is still open here (DELETE raced, or any assertion
+                # above failed) the exit blocks forever and the whole run
+                # hangs instead of reporting. Cancelling is a no-op once the
+                # task has finished, so this is safe on the happy path too.
+                get_future.cancel()
 
     def _drive_middleware(self, header_value: bytes):
         """Run the bearer middleware directly against a stub downstream app.
