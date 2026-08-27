@@ -448,6 +448,7 @@ def test_public_linear_recall_uses_vec_search_when_dimensions_match(tmp_path, mo
     if not beam._SQLITE_VEC_AVAILABLE:
         pytest.skip("sqlite-vec unavailable")
 
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "0")
     monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
     monkeypatch.setattr(beam, "EMBEDDING_DIM", 384)
     memory = beam.BeamMemory(session_id="matched", db_path=Path(tmp_path) / "matched.db")
