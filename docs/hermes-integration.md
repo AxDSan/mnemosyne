@@ -516,7 +516,7 @@ Mnemosyne does not currently expose a standalone REST API server.
 
 ## Uninstall
 
-### Persistent wrapper install (Docker, Desktop, native Windows)
+### Persistent wrapper install (Docker, Desktop, POSIX shells)
 
 ```bash
 export HERMES_HOME=/opt/data  # Replace with the non-default Hermes home used at install time
@@ -530,6 +530,26 @@ HERMES_HOME=/opt/data/profiles/work "$VENV/bin/mnemosyne-hermes" uninstall
 ```
 
 `mnemosyne-hermes uninstall` removes the plugin registration at `$HERMES_HOME/plugins/mnemosyne`. Remove every profile-local wrapper before uninstalling the side-venv package.
+
+### Persistent wrapper install (native Windows)
+
+Same sequence, different shell and layout: a native Windows virtual environment
+keeps its executables in `Scripts\` rather than `bin/`, so the POSIX block above
+does not run in PowerShell.
+
+```powershell
+$env:HERMES_HOME = "C:\ProgramData\hermes"   # Replace with the non-default Hermes home used at install time
+$Venv = "C:\path\to\venv"                   # The same side venv passed to the wrapper install
+hermes memory off        # Disable the external provider; built-in memory remains active
+hermes gateway restart   # Run from a shell outside the gateway process
+& "$Venv\Scripts\mnemosyne-hermes.exe" uninstall
+# For every profile-local wrapper, repeat the uninstall first, with that profile's Hermes home.
+$env:HERMES_HOME = "C:\ProgramData\hermes\profiles\work"
+& "$Venv\Scripts\mnemosyne-hermes.exe" uninstall
+& "$Venv\Scripts\python.exe" -m pip uninstall mnemosyne-hermes
+```
+
+WSL is a POSIX layout, so use the block above rather than this one.
 
 ### Activated local environment
 
