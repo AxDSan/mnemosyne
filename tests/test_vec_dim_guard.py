@@ -489,6 +489,58 @@ def test_public_linear_recall_uses_query_dim_when_module_constant_differs(tmp_pa
     assert [result["id"] for result in results] == ["semantic-episode"]
 
 
+def test_public_linear_recall_normalizes_single_row_query_and_rejects_batches(tmp_path, monkeypatch):
+    """sqlite-vec receives exactly one flat query vector, never a batch."""
+    if not beam._SQLITE_VEC_AVAILABLE:
+        pytest.skip("sqlite-vec unavailable")
+    import numpy as np
+
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setattr(beam, "EMBEDDING_DIM", 384)
+    memory = beam.BeamMemory(session_id="shape", db_path=Path(tmp_path) / "shape.db")
+    memory.conn.execute(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, importance) "
+        "VALUES ('shape-target', 'shape fallback marker', 'test', datetime('now'), 0.5)"
+    )
+    rowid = memory.conn.execute(
+        "SELECT rowid FROM episodic_memory WHERE id = 'shape-target'"
+    ).fetchone()[0]
+    memory.conn.execute(
+        "INSERT INTO vec_episodes(rowid, embedding) VALUES (?, vec_quantize_int8(?, 'unit'))",
+        (rowid, json.dumps([0.0] * 384)),
+    )
+    memory.conn.commit()
+    monkeypatch.setattr(beam._embeddings, "available", lambda: True)
+    original_vec_search = beam._vec_search
+    calls = []
+
+    def traced_vec_search(*args, **kwargs):
+        calls.append(args[1])
+        return original_vec_search(*args, **kwargs)
+
+    monkeypatch.setattr(beam, "_vec_search", traced_vec_search)
+    monkeypatch.setattr(
+        beam._embeddings, "embed_query", lambda _query: np.zeros((1, 384), dtype=np.float32)
+    )
+    assert [result["id"] for result in memory.recall("no lexical match", top_k=1)] == ["shape-target"]
+    assert len(calls) == 1 and len(calls[0]) == 384
+
+    calls.clear()
+    monkeypatch.setattr(
+        beam._embeddings, "embed_query", lambda _query: np.zeros((2, 384), dtype=np.float32)
+    )
+    assert memory.recall("shape fallback marker", top_k=1)[0]["id"] == "shape-target"
+    assert calls == []
+
+    calls.clear()
+    monkeypatch.setattr(
+        beam._embeddings, "embed_query", lambda _query: np.zeros(768, dtype=np.float32)
+    )
+    assert memory.recall("shape fallback marker", top_k=1)[0]["id"] == "shape-target"
+    assert calls == []
+
+
 def test_public_linear_recall_uses_vec_search_when_dimensions_match(tmp_path, monkeypatch):
     """The mismatch guard does not disable the normal sqlite-vec episodic path."""
     if not beam._SQLITE_VEC_AVAILABLE:

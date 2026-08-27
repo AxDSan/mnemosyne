@@ -2454,7 +2454,11 @@ def _in_memory_vec_search_scoped(
     where_clause: str = "(1=1)",
     where_params: Tuple[Any, ...] = (),
 ) -> List[Dict]:
-    """Fallback vector search using scoped memory_embeddings + numpy cosine similarity."""
+    """Fallback vector search using scoped memory_embeddings + numpy cosine similarity.
+
+    ``where_clause`` is internal SQL assembled from fixed recall filters, never
+    user-derived text.
+    """
     if np is None:
         return []
     cursor = conn.cursor()
@@ -6930,25 +6934,42 @@ class BeamMemory:
             emb_result = _get_query_embedding()
             if emb_result is not None:
                 episodic_vec_dim = dict(_existing_vec_dims(self.conn)).get("vec_episodes")
+                query_vector = emb_result
                 query_shape = getattr(emb_result, "shape", None)
                 if query_shape:
-                    query_dim = int(query_shape[-1] if len(query_shape) > 1 else query_shape[0])
+                    if len(query_shape) == 1:
+                        query_dim = int(query_shape[0])
+                    elif len(query_shape) == 2 and query_shape[0] == 1:
+                        query_vector = emb_result.flatten()
+                        query_dim = int(query_shape[1])
+                    else:
+                        # sqlite-vec accepts one vector, never a batch. Do not
+                        # reinterpret a multi-row embedding as one long vector.
+                        query_vector = None
+                        query_dim = None
                 else:
                     try:
                         query_dim = len(emb_result)
                     except TypeError:
+                        query_vector = None
                         query_dim = None
-                if _vec_available(self.conn) and episodic_vec_dim == query_dim:
-                    vec_rows = _vec_search(self.conn, emb_result.tolist(), k=max(top_k * 3, 20))
-                else:
+                if (
+                    query_vector is not None
+                    and _vec_available(self.conn)
+                    and episodic_vec_dim == query_dim
+                ):
+                    vec_rows = _vec_search(self.conn, query_vector.tolist(), k=max(top_k * 3, 20))
+                elif query_vector is not None:
                     # Fallback: in-memory cosine similarity search
                     vec_rows = _in_memory_vec_search_scoped(
                         self.conn,
-                        emb_result,
+                        query_vector,
                         k=max(top_k * 3, 20),
                         where_clause=em_where,
                         where_params=tuple(em_params),
                     )
+                else:
+                    vec_rows = []
                 if vec_rows:
                     max_distance = max(vr["distance"] for vr in vec_rows)
                     for vr in vec_rows:
