@@ -202,6 +202,105 @@ pip install -e "integrations/hermes[dev]"
 >
 > **Never symlink a profile directly to `site-packages/mnemosyne_hermes`.** That bypasses the wrapper's `sys.path` bootstrap and can leave fresh Hermes profiles unable to import the provider.
 
+### Native Windows local install and recovery
+
+This section is for a **native Windows** Hermes installation, not Docker, WSL, or
+another user's Hermes home. Run it as the Windows user and in the Hermes profile
+that will use Mnemosyne. Do not copy a path from another account: select that
+Hermes installation's Python as `<hermes-python>`. If discovery cannot identify
+it, the explicit `--python` form below is authoritative.
+
+`mnemosyne-hermes` requires the standard local semantic-search dependency set,
+`mnemosyne-memory[embeddings]`. A Hermes-managed virtual environment can lack
+`pip`; check it first. In a fresh PowerShell, set the selected Hermes home and
+interpreter. `$HermesHome` must be the active user's intended Hermes home or
+profile home; it prevents this install from using another profile. Use its
+adjacent Scripts directory for the installer:
+
+```powershell
+$HermesHome = '<selected-hermes-home-or-profile-home>'
+$env:HERMES_HOME = $HermesHome
+$HermesPython = '<hermes-python>'
+$MnemosyneHermes = Join-Path (Split-Path -Parent $HermesPython) 'mnemosyne-hermes.exe'
+
+& $HermesPython -m pip --version
+if ($LASTEXITCODE -ne 0) {
+    uv pip install --python $HermesPython "mnemosyne-memory[embeddings]" mnemosyne-hermes
+} else {
+    & $HermesPython -m pip install "mnemosyne-memory[embeddings]" mnemosyne-hermes
+}
+
+# Symlink is the normal local install mode. --python is the safe fallback when
+# discovery is not applicable to this Hermes layout.
+& $MnemosyneHermes install --python $HermesPython --no-profile-links
+```
+
+`[embeddings]` is the standard local semantic-search profile. `mnemosyne-memory[all]`
+also adds local-LLM consolidation dependencies. On Windows, its local LLM
+dependencies can require compatible wheels (including `llama-cpp-python`) or a
+native build toolchain such as MSVC, NMake, and Visual Studio Build Tools; do
+not assume they will build universally. Start with `[embeddings]` unless local
+LLM consolidation is required.
+
+The installer discovers native Windows `Scripts/python.exe` layouts when using
+implicit discovery. An explicit `--python` remains the authoritative, safer
+choice for an unusual layout.
+
+#### Windows WinError 1314 recovery
+
+If the normal symlink install fails specifically with **WinError 1314**, the
+current process lacks effective symbolic-link privilege. Enable Windows Developer
+Mode or use an account that has that effective privilege; administrator-group
+membership alone does not guarantee it. The installer intentionally does not
+switch modes automatically, and this guide does not use junctions as a workaround.
+
+A wrapper retry avoids the plugin symlink and records the selected interpreter.
+Use the same selected Hermes Python:
+
+```powershell
+& $MnemosyneHermes install --mode wrapper --python $HermesPython --import-timeout 60 --no-profile-links
+```
+
+`--import-timeout` is the wrapper validation timeout and currently defaults to
+60 seconds; the explicit value above makes that retry policy visible. Wrapper
+mode is appropriate for a persistent side virtual environment in deployments
+where that side environment is retained across Hermes updates. It does **not**
+make a direct install into a Hermes-managed virtual environment survive a Hermes
+venv rebuild or replacement. After changing a wrapper, restart or refresh the
+actual local Hermes process before checking provider state.
+
+#### Enable and verify
+
+If Hermes reports the Mnemosyne plugin as disabled, enable it without requesting
+any built-in-tool override, then select it as the memory provider:
+
+```powershell
+hermes plugins enable mnemosyne --no-allow-tool-override
+hermes config set memory.provider mnemosyne
+```
+
+Restart or start a new local Hermes session, then verify the installer and active
+provider in the same user/profile scope:
+
+```powershell
+& $MnemosyneHermes status
+hermes memory status
+```
+
+The current documented Hermes CLI contract does not provide a `hermes plugins
+doctor mnemosyne` command, so do not substitute an unverified plugin-doctor
+command. Likewise, this guide does not prescribe a direct store/recall/delete
+smoke command: use the provider's runtime tools only after the two status checks
+succeed.
+
+| Symptom | Bounded recovery |
+|---|---|
+| `No module named pip` from `<hermes-python>` | Use `uv pip install --python "<hermes-python>" "mnemosyne-memory[embeddings]" mnemosyne-hermes`, then repeat the normal installer command. |
+| `[all]` fails while installing local-LLM dependencies | Keep `[embeddings]` for local semantic search, or resolve compatible wheels/build-toolchain requirements before retrying `[all]`. |
+| WinError 1314 during symlink install | Enable Developer Mode/effective symlink privilege, or retry wrapper mode with the selected Hermes Python. Do not use a junction or expect an automatic mode switch. |
+| Wrapper validation times out | `--import-timeout` defaults to 60 and affects installer validation only. A larger positive finite value can retry that install probe, but `mnemosyne-hermes status` always validates with its fixed 60-second policy; investigate the selected interpreter if status still fails. |
+| Hermes update or venv replacement leaves a missing/stale provider | Reinstall into the replacement Hermes interpreter for a symlink install. For a persistent-side-venv wrapper, refresh the wrapper against its retained selected interpreter, then restart Hermes and rerun both status commands. |
+
 ### Step 2: Link the plugin in a local mutable environment
 
 For a non-Docker local installation, the supported installer default is symlink mode:
@@ -358,7 +457,14 @@ For integration with MCP-compatible clients:
 ```bash
 mnemosyne mcp                          # stdio transport
 mnemosyne mcp --transport sse --port 8080  # SSE transport
+mnemosyne mcp --transport streamable-http --port 8080  # native MCP http transport
 ```
+
+The HTTP transports bind to loopback (`127.0.0.1`) by default and need no
+token there. A non-loopback bind exposes the selected local SQLite-backed
+memory bank to network clients, so it requires `MNEMOSYNE_MCP_TOKEN`; the
+`streamable-http` transport also requires `MNEMOSYNE_MCP_ALLOWED_HOSTS`, with
+`MNEMOSYNE_MCP_ALLOWED_ORIGINS` optionally restricting browser origins.
 
 Mnemosyne does not currently expose a standalone REST API server.
 

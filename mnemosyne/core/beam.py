@@ -557,53 +557,73 @@ def _detect_vec_type(conn: sqlite3.Connection) -> str:
     return "float32"
 
 
-def _existing_vec_dim(conn: sqlite3.Connection) -> Optional[int]:
-    """Return the embedding dimension already declared by a sqlite-vec table in
-    this database, or ``None`` if no ``vec0`` table exists yet.
+_VEC_TABLE_NAMES = ("vec_episodes", "vec_working", "vec_facts")
+
+
+def _existing_vec_dims(conn: sqlite3.Connection) -> Tuple[Tuple[str, int], ...]:
+    """Return immutable stored dimensions for each recognized vector table.
 
     A ``vec0`` virtual table fixes its dimension at creation time, encoded in its
-    DDL as ``embedding <type>[<dim>]``. When a store already holds vectors, that
-    declared dimension -- not the process's configured ``EMBEDDING_DIM`` -- is the
-    source of truth for what the stored data actually is. Reads only
-    ``sqlite_master`` (no extension required) so it is safe to call before the
+    DDL as ``embedding <type>[<dim>]``. Read every known table in a fixed order:
+    legacy databases can contain a mixed index, and returning the first
+    ``sqlite_master`` row would make its status depend on catalog row order.
+    Reads only ``sqlite_master`` (no extension required), so it is safe before
     sqlite-vec tables are (re)created.
     """
     try:
         rows = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
             "AND name IN ('vec_episodes', 'vec_working', 'vec_facts')"
         ).fetchall()
     except sqlite3.Error:
-        return None
-    for row in rows:
-        sql = row[0] if row else None
+        return ()
+
+    declared_dims = {}
+    for name, sql in rows:
         if not sql:
             continue
         match = re.search(r"\[(\d+)\]", sql)
         if match:
-            return int(match.group(1))
-    return None
+            declared_dims[name] = int(match.group(1))
+    return tuple((name, declared_dims[name]) for name in _VEC_TABLE_NAMES if name in declared_dims)
 
 
-def _dim_mismatch_message(existing_dim: int, configured_dim: int) -> str:
-    """Build the embedding-dimension-mismatch message.
+def _existing_vec_dim(conn: sqlite3.Connection) -> Optional[int]:
+    """Return a dimension only when all stored vector tables agree.
 
-    Extracted as a pure function so the wording -- explicitly NOT corruption plus
-    the exact self-heal commands -- is unit-testable without a sqlite-vec
-    database. The phrasing matters: 'dimension mismatch' is otherwise misread as
-    'database corrupt', and users (and agent frameworks) abandon the store
-    instead of reindexing.
+    Kept as a narrow compatibility helper for callers that only need a uniform
+    stored dimension. Mixed indexes have no honest scalar representation.
     """
+    stored_dims = _existing_vec_dims(conn)
+    dimensions = {dim for _, dim in stored_dims}
+    return dimensions.pop() if len(dimensions) == 1 else None
+
+
+def _dim_mismatch_message(
+    stored_dims: Tuple[Tuple[str, int], ...], configured_dim: int
+) -> str:
+    """Build an actionable message for uniform or mixed vector-index dimensions."""
+    stored_description = ", ".join(f"{table}={dim}" for table, dim in stored_dims)
+    dimensions = {dim for _, dim in stored_dims}
+    if len(dimensions) == 1:
+        existing_dim = next(iter(dimensions))
+        recovery_hint = (
+            f"  * Keep the existing {existing_dim}-dim vectors: relaunch with "
+            f"MNEMOSYNE_EMBEDDING_DIM={existing_dim} (and the matching model).\n"
+        )
+        index_description = f"This database stores {existing_dim}-dim vectors"
+    else:
+        recovery_hint = ""
+        index_description = f"This database has mixed vector-index dimensions ({stored_description})"
+
     return (
         f"Embedding dimension mismatch — NOT database corruption: your memories "
         f"are intact, only the vector index is affected (recall falls back to "
-        f"keyword search until this is fixed). This database stores "
-        f"{existing_dim}-dim vectors but this process is configured for "
-        f"{configured_dim}-dim (MNEMOSYNE_EMBEDDING_DIM / "
+        f"keyword search until this is fixed). {index_description} but this "
+        f"process is configured for {configured_dim}-dim (MNEMOSYNE_EMBEDDING_DIM / "
         f"MNEMOSYNE_EMBEDDING_MODEL); sqlite-vec tables were left untouched. To "
         f"self-heal, choose ONE:\n"
-        f"  * Keep the existing {existing_dim}-dim vectors: relaunch with "
-        f"MNEMOSYNE_EMBEDDING_DIM={existing_dim} (and the matching model).\n"
+        f"{recovery_hint}"
         f"  * Re-embed all memories at {configured_dim}-dim: run "
         f"`MNEMOSYNE_EMBEDDING_DIM={configured_dim} mnemosyne reindex` (it backs "
         f"up first).\n"
@@ -611,8 +631,25 @@ def _dim_mismatch_message(existing_dim: int, configured_dim: int) -> str:
     )
 
 
-def init_beam(db_path: Path = None):
-    """Initialize BEAM schema."""
+@dataclass(frozen=True)
+class BeamInitResult:
+    """Outcome of BEAM schema initialization.
+
+    This is additive status only: callers that ignore ``init_beam()``'s return
+    value retain the historical initialization behavior. ``stored_dims`` is a
+    fixed-order immutable ``(table, dimension)`` tuple; ``existing_dim`` is set
+    only when those stored tables have one uniform dimension. A mismatch remains
+    recoverable and does not prevent the non-vector schema from being initialized.
+    """
+
+    vec_dim_mismatch: bool
+    existing_dim: Optional[int]
+    configured_dim: int
+    stored_dims: Tuple[Tuple[str, int], ...] = ()
+
+
+def init_beam(db_path: Path = None) -> BeamInitResult:
+    """Initialize BEAM schema and return its vector-index status."""
     conn = _get_connection(db_path)
     cursor = conn.cursor()
 
@@ -816,13 +853,14 @@ def init_beam(db_path: Path = None):
     # environment as the writer. Refuse to create mismatched tables, leave any
     # existing ones untouched, and surface one actionable error instead of
     # per-row insert noise; recall falls back to the float-JSON voice meanwhile.
-    vec_dim_mismatch = False
+    stored_dims = _existing_vec_dims(conn)
+    dimensions = {dim for _, dim in stored_dims}
+    existing_dim = dimensions.pop() if len(dimensions) == 1 else None
+    vec_dim_mismatch = any(dim != EMBEDDING_DIM for _, dim in stored_dims)
+    if vec_dim_mismatch:
+        logger.error(_dim_mismatch_message(stored_dims, EMBEDDING_DIM))
     if _SQLITE_VEC_AVAILABLE:
-        existing_dim = _existing_vec_dim(conn)
-        if existing_dim is not None and existing_dim != EMBEDDING_DIM:
-            vec_dim_mismatch = True
-            logger.error(_dim_mismatch_message(existing_dim, EMBEDDING_DIM))
-        else:
+        if not vec_dim_mismatch:
             try:
                 cursor.execute(f"""
                     CREATE VIRTUAL TABLE IF NOT EXISTS vec_episodes USING vec0(
@@ -1128,7 +1166,7 @@ def init_beam(db_path: Path = None):
         WHERE superseded_by IS NULL""")
     cursor.execute("""CREATE INDEX IF NOT EXISTS idx_mem_emb_type
         ON memory_embeddings(memory_id, model)""")
-    if not vec_dim_mismatch:
+    if _SQLITE_VEC_AVAILABLE and not vec_dim_mismatch:
         try:
             _backfill_vec_working_from_memory_embeddings(conn)
         except NameError:
@@ -1237,7 +1275,7 @@ def init_beam(db_path: Path = None):
     # Vector table for facts (sqlite-vec). Skipped on a dimension mismatch for the
     # same reason as vec_episodes / vec_working above (see the guard in the
     # sqlite-vec VIRTUAL TABLES block).
-    if not vec_dim_mismatch:
+    if _SQLITE_VEC_AVAILABLE and not vec_dim_mismatch:
         try:
             cursor.execute(f"""
                 CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts USING vec0(
@@ -1258,6 +1296,13 @@ def init_beam(db_path: Path = None):
     _add_column_if_missing(conn, "episodic_memory", "corrected_by", "INTEGER DEFAULT NULL")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_wm_event_date ON working_memory(event_date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_em_event_date ON episodic_memory(event_date)")
+
+    return BeamInitResult(
+        vec_dim_mismatch=vec_dim_mismatch,
+        existing_dim=existing_dim,
+        configured_dim=EMBEDDING_DIM,
+        stored_dims=stored_dims,
+    )
 
 
 class _BeamConnection(sqlite3.Connection):
@@ -3453,7 +3498,7 @@ class BeamMemory:
         self._extraction_buffer = []  # Buffer for batch extraction
         self._event_emitter = event_emitter  # Streaming event callback
         self.conn = _get_connection(self.db_path)
-        init_beam(self.db_path)
+        self.init_result = init_beam(self.db_path)
 
         # E6: ensure schema split + auto-migrate legacy TripleStore rows
         # to AnnotationStore. Honors MNEMOSYNE_AUTO_MIGRATE=0 for operators
@@ -4603,9 +4648,16 @@ class BeamMemory:
             else:
                 invalidated = validate_and_invalidate()
             if invalidated:
-                self._invalidate_query_cache()
+                if owns_transaction:
+                    self._invalidate_query_cache_after_commit("invalidate")
+                else:
+                    self._invalidate_query_cache()
             return invalidated
 
+        # The no-replacement path mutates a single row directly.  Snapshot
+        # ownership before its first UPDATE: a caller-owned transaction must
+        # retain both its commit boundary and cache-failure rollback behavior.
+        owns_transaction = not self.conn.in_transaction
         now = datetime.now(timezone.utc).isoformat()
         # Try working_memory first
         cursor.execute("""
@@ -4614,8 +4666,11 @@ class BeamMemory:
             WHERE id = ? AND (session_id = ? OR scope = 'global')
         """, (now, replacement_id, memory_id, self.session_id))
         if cursor.rowcount > 0:
-            self.conn.commit()
-            self._invalidate_query_cache()
+            if owns_transaction:
+                self.conn.commit()
+                self._invalidate_query_cache_after_commit("invalidate")
+            else:
+                self._invalidate_query_cache()
             return True
         # Try episodic_memory
         cursor.execute("""
@@ -4624,9 +4679,13 @@ class BeamMemory:
             WHERE id = ? AND (session_id = ? OR scope = 'global')
         """, (now, replacement_id, memory_id, self.session_id))
         invalidated = cursor.rowcount > 0
-        self.conn.commit()
+        if owns_transaction:
+            self.conn.commit()
         if invalidated:
-            self._invalidate_query_cache()
+            if owns_transaction:
+                self._invalidate_query_cache_after_commit("invalidate")
+            else:
+                self._invalidate_query_cache()
         return invalidated
 
     def _detect_conflicts(self, rows: List[Dict], similarity_threshold: float = 0.88) -> List[tuple]:
@@ -4927,6 +4986,7 @@ class BeamMemory:
         # uncommitted on the connection for a later unrelated commit to
         # silently include.
         cursor = self.conn.cursor()
+        owns_transaction = not self.conn.in_transaction
         with _guarded_transaction(self.conn):
             authorized_row = cursor.execute(
                 "SELECT rowid FROM working_memory WHERE id = ? AND (session_id = ? OR scope = 'global')",
@@ -4951,7 +5011,10 @@ class BeamMemory:
                     cursor.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
         forgotten = wm_rows > 0
         if forgotten:
-            self._invalidate_query_cache()
+            if owns_transaction:
+                self._invalidate_query_cache_after_commit("forget_working")
+            else:
+                self._invalidate_query_cache()
         return forgotten
 
     # ------------------------------------------------------------------

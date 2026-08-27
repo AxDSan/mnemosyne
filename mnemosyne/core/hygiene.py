@@ -852,6 +852,7 @@ def restore_archived(
     except Exception as e:
         conn.rollback()
         logger.error("Restore failed: %s", e)
+        raise
     finally:
         conn.close()
 

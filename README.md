@@ -6,6 +6,8 @@
 
 *Zero-cloud AI memory that works everywhere. SQLite-backed. One pure-Python dependency.*
 
+<a href="https://trendshift.io/repositories/27293?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-27293" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/27293/daily?language=Python" alt="mnemosyne-oss/mnemosyne | Trendshift" width="250" height="55"/></a>
+
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
 [![PyPI](https://img.shields.io/pypi/v/mnemosyne-memory.svg)](https://pypi.org/project/mnemosyne-memory/)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -178,6 +180,9 @@ If Mnemosyne is installed in an isolated venv, activate that venv or invoke its 
 # MCP server (works with any MCP client)
 mnemosyne mcp                          # stdio (default)
 mnemosyne mcp --transport sse --port 8080  # SSE (web clients)
+mnemosyne mcp --transport streamable-http --port 8080  # Streamable HTTP (native MCP http)
+# A non-loopback streamable-http bind also requires MNEMOSYNE_MCP_ALLOWED_HOSTS
+# (and, for browser clients, MNEMOSYNE_MCP_ALLOWED_ORIGINS) -- see docs/cli-reference.md.
 
 # Direct memory ops
 mnemosyne store "User likes dark mode"

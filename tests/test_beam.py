@@ -12,6 +12,30 @@ from datetime import datetime, timedelta, timezone
 
 from mnemosyne.core import beam as beam_module
 from mnemosyne.core.beam import BeamMemory, init_beam, _find_memories_by_fact, _wm_vec_search
+
+
+def _same_utc_day_future(
+    now,
+    ahead=timedelta(hours=2),
+    margin=timedelta(seconds=30),
+):
+    """Pick a naive future ``valid_until`` that stays on ``now``'s UTC date.
+
+    A space separator only sorts before a "T" separator while the date
+    components match, so a naive value that rolls into tomorrow sorts *after*
+    an aware-UTC ``now`` and stops misleading a lexical filter. Clamping to the
+    end of today keeps that trap intact.
+
+    Returns ``None`` when no such value can outlive the caller. Clamping close
+    to midnight can leave milliseconds of validity, which expires mid-test and
+    would trade one flake for a narrower one.
+    """
+    candidate = now + ahead
+    if candidate.date() != now.date():
+        candidate = now.replace(hour=23, minute=59, second=59, microsecond=0)
+    if candidate <= now + margin:
+        return None
+    return candidate
 from mnemosyne.core.memory import Mnemosyne
 
 
@@ -946,12 +970,17 @@ class TestWorkingMemory:
                 past_mid,
             ),
         )
+        _space_future = _same_utc_day_future(datetime.now(timezone.utc))
+        if _space_future is None:
+            pytest.skip(
+                "too close to the end of the UTC day: no naive value can be "
+                "both chronologically future and lexically earlier than now "
+                "for long enough to outlive this test"
+            )
         beam.conn.execute(
             "UPDATE working_memory SET valid_until = ? WHERE id = ?",
             (
-                (datetime.now(timezone.utc) + timedelta(hours=2)).replace(
-                    tzinfo=None
-                ).strftime("%Y-%m-%d %H:%M:%S"),
+                _space_future.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S"),
                 space_mid,
             ),
         )
@@ -2905,3 +2934,54 @@ class TestEmbeddingDimConfig:
         # Verify the value is sensible
         assert beam_module.EMBEDDING_DIM > 0
         assert beam_module.EMBEDDING_DIM <= 4096  # reasonable upper bound
+
+
+class TestSameUtcDayFuture:
+    """Deterministic coverage for the valid_until fixture's clock decision.
+
+    The integration test that uses this helper reads the real clock, so it
+    cannot prove either branch on demand. These pin both against fixed
+    instants instead.
+    """
+
+    @staticmethod
+    def _at(hh, mm, ss=0, us=0):
+        return datetime(2026, 8, 21, hh, mm, ss, us, tzinfo=timezone.utc)
+
+    def test_plain_offset_used_when_it_stays_on_the_same_day(self):
+        now = self._at(12, 0)
+        assert _same_utc_day_future(now) == now + timedelta(hours=2)
+
+    def test_clamped_once_the_offset_would_roll_into_tomorrow(self):
+        now = self._at(22, 0)
+        assert _same_utc_day_future(now) == self._at(23, 59, 59)
+
+    def test_clamp_boundary_is_exactly_two_hours_before_midnight(self):
+        assert _same_utc_day_future(self._at(21, 59, 59)) == self._at(23, 59, 59)
+        assert _same_utc_day_future(self._at(22, 0)) == self._at(23, 59, 59)
+
+    def test_skips_when_the_clamped_value_would_expire_mid_test(self):
+        # 23:59:58.999 clamps to 23:59:59.000, one millisecond of validity.
+        assert _same_utc_day_future(self._at(23, 59, 58, 999000)) is None
+        assert _same_utc_day_future(self._at(23, 59, 59)) is None
+
+    def test_margin_boundary_is_exact(self):
+        """The 30s margin is the contract, so pin both sides of it."""
+        # Exactly 30s of validity is not enough: the margin is inclusive.
+        assert _same_utc_day_future(self._at(23, 59, 29)) is None
+        # One microsecond more than the margin is enough.
+        assert _same_utc_day_future(self._at(23, 59, 28, 999999)) == self._at(
+            23, 59, 59
+        )
+
+    def test_returned_value_always_sorts_before_aware_utc_now(self):
+        """The property the fixture actually depends on, swept minute by minute."""
+        for hh in range(24):
+            for mm in range(60):
+                now = self._at(hh, mm)
+                future = _same_utc_day_future(now)
+                if future is None:
+                    continue
+                assert future > now, (hh, mm)
+                stored = future.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+                assert stored < now.isoformat(), (hh, mm, stored)
