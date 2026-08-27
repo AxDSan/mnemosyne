@@ -7538,7 +7538,7 @@ class BeamMemory:
     # cached under an older digest are not reused. Part of the hashed payload;
     # the opaque key keeps the "v2:" prefix because QueryCache's opaque-path
     # recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
-    _ENHANCED_RECALL_CACHE_VERSION = 5
+    _ENHANCED_RECALL_CACHE_VERSION = 6
 
     def _enhanced_recall_cache_key(
         self,

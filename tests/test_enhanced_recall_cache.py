@@ -79,25 +79,23 @@ def _close_memory(memory: BeamMemory | None) -> None:
 def test_dense_predicate_version_bump_invalidates_old_entries(
     enhanced, monkeypatch, tmp_path: Path
 ):
-    """#696/#427 regression: the default dense candidate predicate changed
-    (dialog / honcho / consolidated exclusion), so an opaque cache entry
-    created under the pre-change algorithm version (4, upstream literal-flag
-    schema without our dense predicate) must never be reused — it could
-    still contain dialog, honcho or consolidated dense candidates. The
-    version bump (4 -> 5) lives inside the hashed payload; the ``v2:`` key
-    prefix stays fixed."""
-    memory, calls = enhanced
-    assert memory._ENHANCED_RECALL_CACHE_VERSION >= 5
+    """Candidate-selection changes must bypass opaque enhanced-recall cache entries.
 
-    # Warm the cache under the OLD algorithm version so it holds a
-    # pre-predicate ranked result, keyed through the real request path.
+    Version 6 covers the episodic sqlite-vec mismatch fallback, which can add
+    scoped vector candidates that version-5 entries never considered.
+    """
+    memory, calls = enhanced
+    assert memory._ENHANCED_RECALL_CACHE_VERSION >= 6
+
+    # Warm the cache under the immediately previous algorithm version so it
+    # holds a result from before the new fallback candidate selection.
     with monkeypatch.context() as ctx:
-        ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 4)
+        ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 5)
         stale = _call(memory, "alpha query")
     assert len(calls) == 1
     stale_id = stale[0]["id"]
 
-    # The current-version digest differs from the stale v4 key: cache miss.
+    # The current-version digest differs from the stale v5 key: cache miss.
     fresh = _call(memory, "alpha query")
     assert len(calls) == 2  # base recall ran; the stale entry was not reused
     assert not any(r.get("id") == stale_id for r in fresh)
