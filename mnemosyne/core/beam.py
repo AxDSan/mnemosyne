@@ -2437,18 +2437,26 @@ def _find_memories_by_fact(beam: "BeamMemory", query: str) -> List[str]:
         return []
 
 
-def _in_memory_vec_search(conn: sqlite3.Connection, query_embedding: np.ndarray, k: int = 20) -> List[Dict]:
-    """Fallback vector search using memory_embeddings table + numpy cosine similarity."""
+def _in_memory_vec_search(
+    conn: sqlite3.Connection,
+    query_embedding: np.ndarray,
+    k: int = 20,
+    *,
+    where_clause: str = "(1=1)",
+    where_params: Tuple[Any, ...] = (),
+) -> List[Dict]:
+    """Fallback vector search using scoped memory_embeddings + numpy cosine similarity."""
     if np is None:
         return []
     cursor = conn.cursor()
     # Join with episodic_memory (not memories) since that's where BEAM stores consolidated data
-    cursor.execute("""
+    cursor.execute(f"""
         SELECT em.rowid, me.memory_id, me.embedding_json
         FROM memory_embeddings me
         JOIN episodic_memory em ON me.memory_id = em.id
+        WHERE {where_clause}
         LIMIT 10000
-    """)
+    """, where_params)
     rows = cursor.fetchall()
     if not rows:
         return []
@@ -6857,51 +6865,14 @@ class BeamMemory:
             if emb_result is not None:
                 query_bv = _mib(emb_result)
 
-        # ---- Episodic memory (vec + FTS5 hybrid) ----
-        vec_results = {}
-        max_distance = 0.0
-        if embeddings_available:
-            emb_result = _get_query_embedding()
-            if emb_result is not None:
-                if _vec_available(self.conn) and not self.init_result.vec_dim_mismatch:
-                    vec_rows = _vec_search(self.conn, emb_result.tolist(), k=max(top_k * 3, 20))
-                else:
-                    # Fallback: in-memory cosine similarity search
-                    vec_rows = _in_memory_vec_search(self.conn, emb_result, k=max(top_k * 3, 20))
-                if vec_rows:
-                    max_distance = max(vr["distance"] for vr in vec_rows)
-                    for vr in vec_rows:
-                        sim = max(0.0, 1.0 - (vr["distance"] / max_distance)) if max_distance > 0 else 1.0
-                        vec_results[vr["rowid"]] = sim
-
-        fts_results = {}
-        fts_rows = _fts_search(self.conn, query, k=max(top_k * 3, 20))
-        _em_fts_raw_count = len(fts_rows)
-        if fts_rows:
-            min_rank = min(r["rank"] for r in fts_rows)
-            max_rank = max(r["rank"] for r in fts_rows)
-            rng = max_rank - min_rank if max_rank != min_rank else 1.0
-            for fr in fts_rows:
-                normalized = 1.0 - ((fr["rank"] - min_rank) / rng)
-                fts_results[fr["rowid"]] = normalized
-
-        episodic_rowids = set(vec_results.keys()) | set(fts_results.keys())
-        if episodic_rowids:
-            _em_had_candidates = True
-        # [C4] em_fts/em_vec kept counts are accumulated per-row
-        # inside the scoring loop below so the counters reflect
-        # post-filter results, not pre-filter candidate sets.
-        # /review caught the pre-filter recording as misleading --
-        # rows that pass FTS but get dropped by wm_where/em_where
-        # (session/channel/date) inflated the counter.
-        
-        # Build temporal filter for episodic memory
+        # Build episodic filters before candidate selection so the bounded
+        # in-memory vector fallback cannot be exhausted by out-of-scope rows.
         em_where_clauses = [
             "(valid_until IS NULL OR julianday(valid_until) > julianday(?))",
             "superseded_by IS NULL"
         ]
         em_params = [datetime.now(timezone.utc).isoformat()]
-        
+
         # Session scope: channel filter only when explicitly specified.
         # Author-only searches have no session/channel restriction.
         if channel_id:
@@ -6912,7 +6883,7 @@ class BeamMemory:
         else:
             em_where_clauses.append(_session_scope_filter(cross_session=cross_session))
             em_params.extend(_session_scope_params(self.session_id, cross_session=cross_session))
-        
+
         if from_date:
             em_where_clauses.append("timestamp >= ?")
             em_params.append(f"{from_date}T00:00:00")
@@ -6940,8 +6911,52 @@ class BeamMemory:
         if channel_id:
             em_where_clauses.append("channel_id = ?")
             em_params.append(channel_id)
-        
+
         em_where = " AND ".join(em_where_clauses)
+
+        # ---- Episodic memory (vec + FTS5 hybrid) ----
+        vec_results = {}
+        max_distance = 0.0
+        if embeddings_available:
+            emb_result = _get_query_embedding()
+            if emb_result is not None:
+                if _vec_available(self.conn) and not self.init_result.vec_dim_mismatch:
+                    vec_rows = _vec_search(self.conn, emb_result.tolist(), k=max(top_k * 3, 20))
+                else:
+                    # Fallback: in-memory cosine similarity search
+                    vec_rows = _in_memory_vec_search(
+                        self.conn,
+                        emb_result,
+                        k=max(top_k * 3, 20),
+                        where_clause=em_where,
+                        where_params=tuple(em_params),
+                    )
+                if vec_rows:
+                    max_distance = max(vr["distance"] for vr in vec_rows)
+                    for vr in vec_rows:
+                        sim = max(0.0, 1.0 - (vr["distance"] / max_distance)) if max_distance > 0 else 1.0
+                        vec_results[vr["rowid"]] = sim
+
+        fts_results = {}
+        fts_rows = _fts_search(self.conn, query, k=max(top_k * 3, 20))
+        _em_fts_raw_count = len(fts_rows)
+        if fts_rows:
+            min_rank = min(r["rank"] for r in fts_rows)
+            max_rank = max(r["rank"] for r in fts_rows)
+            rng = max_rank - min_rank if max_rank != min_rank else 1.0
+            for fr in fts_rows:
+                normalized = 1.0 - ((fr["rank"] - min_rank) / rng)
+                fts_results[fr["rowid"]] = normalized
+
+        episodic_rowids = set(vec_results.keys()) | set(fts_results.keys())
+        if episodic_rowids:
+            _em_had_candidates = True
+        # [C4] em_fts/em_vec kept counts are accumulated per-row
+        # inside the scoring loop below so the counters reflect
+        # post-filter results, not pre-filter candidate sets.
+        # /review caught the pre-filter recording as misleading --
+        # rows that pass FTS but get dropped by wm_where/em_where
+        # (session/channel/date) inflated the counter.
         
         if episodic_rowids:
             placeholders = ",".join("?" * len(episodic_rowids))

@@ -403,3 +403,66 @@ def test_public_linear_recall_uses_vec_search_when_dimensions_match(tmp_path, mo
 
     assert not memory.init_result.vec_dim_mismatch
     assert calls == [True]
+
+
+def test_in_memory_vec_search_filters_before_bounded_candidates(tmp_path, monkeypatch):
+    """Scoped rows remain searchable after 10,000 earlier out-of-scope rows."""
+    class Vector(list):
+        def __truediv__(self, _norm):
+            return self
+
+    class Numpy:
+        float32 = object()
+
+        class linalg:
+            @staticmethod
+            def norm(vector):
+                return 1.0 if any(vector) else 0.0
+
+        @staticmethod
+        def array(vector, dtype):
+            assert dtype is Numpy.float32
+            return Vector(vector)
+
+        @staticmethod
+        def dot(left, right):
+            return sum(a * b for a, b in zip(left, right))
+
+    monkeypatch.setattr(beam, "np", Numpy)
+    memory = beam.BeamMemory(session_id="target-session", db_path=Path(tmp_path) / "scope.db")
+    conn = memory.conn
+
+    out_of_scope = [
+        (f"other-{index}", "out of scope", "test", "other-session")
+        for index in range(10_000)
+    ]
+    conn.executemany(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id) "
+        "VALUES (?, ?, ?, datetime('now'), ?)",
+        out_of_scope,
+    )
+    conn.executemany(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json) VALUES (?, ?)",
+        [(memory_id, "[0.0]") for memory_id, *_ in out_of_scope],
+    )
+    conn.execute(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id) "
+        "VALUES ('target', 'scoped semantic match', 'test', datetime('now'), 'target-session')"
+    )
+    target_rowid = conn.execute(
+        "SELECT rowid FROM episodic_memory WHERE id = 'target'"
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json) VALUES ('target', '[1.0]')"
+    )
+    conn.commit()
+
+    results = beam._in_memory_vec_search(
+        conn,
+        Numpy.array([1.0], dtype=Numpy.float32),
+        k=1,
+        where_clause="em.session_id = ?",
+        where_params=("target-session",),
+    )
+
+    assert results == [{"rowid": target_rowid, "distance": 0.0}]
