@@ -443,6 +443,52 @@ def test_public_linear_recall_uses_compatible_episodic_vec_despite_mixed_indexes
     assert [result["id"] for result in results] == ["semantic-episode"]
 
 
+def test_public_linear_recall_uses_query_dim_when_module_constant_differs(tmp_path, monkeypatch):
+    """Compatible episodic sqlite-vec stays on when only beam.EMBEDDING_DIM drifted."""
+    if not beam._SQLITE_VEC_AVAILABLE:
+        pytest.skip("sqlite-vec unavailable")
+
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setattr(beam, "EMBEDDING_DIM", 384)
+    db = Path(tmp_path) / "query-dim.db"
+    writer = beam.BeamMemory(session_id="query-dim", db_path=db)
+    writer.conn.execute(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, importance) "
+        "VALUES ('semantic-episode', 'calibrated nebula archive', 'test', "
+        "datetime('now'), 0.5)"
+    )
+    rowid = writer.conn.execute(
+        "SELECT rowid FROM episodic_memory WHERE id = 'semantic-episode'"
+    ).fetchone()[0]
+    writer.conn.execute(
+        "INSERT INTO vec_episodes(rowid, embedding) "
+        "VALUES (?, vec_quantize_int8(?, 'unit'))",
+        (rowid, json.dumps([0.0] * 384)),
+    )
+    writer.conn.commit()
+    monkeypatch.setattr(beam, "EMBEDDING_DIM", 768)
+
+    calls = []
+    original_vec_search = beam._vec_search
+    monkeypatch.setattr(beam._embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        beam._embeddings, "embed_query", lambda _query: _QueryVector([0.0] * 384)
+    )
+
+    def traced_vec_search(*args, **kwargs):
+        calls.append(True)
+        return original_vec_search(*args, **kwargs)
+
+    monkeypatch.setattr(beam, "_vec_search", traced_vec_search)
+    memory = beam.BeamMemory(session_id="query-dim", db_path=db)
+
+    results = memory.recall("unrelated aurora question", top_k=5)
+
+    assert calls == [True]
+    assert [result["id"] for result in results] == ["semantic-episode"]
+
+
 def test_public_linear_recall_uses_vec_search_when_dimensions_match(tmp_path, monkeypatch):
     """The mismatch guard does not disable the normal sqlite-vec episodic path."""
     if not beam._SQLITE_VEC_AVAILABLE:
