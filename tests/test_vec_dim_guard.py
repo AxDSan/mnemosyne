@@ -362,6 +362,10 @@ def test_public_linear_recall_skips_legacy_vec_search_and_returns_fts_match(
     db = _seed_legacy_episodic_vec_store(tmp_path, monkeypatch)
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "0")
     monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    before_dims = beam._existing_vec_dims(beam._get_connection(db))
+    before_vec_rows = beam._get_connection(db).execute(
+        "SELECT rowid FROM vec_episodes ORDER BY rowid"
+    ).fetchall()
     calls = []
     monkeypatch.setattr(beam._embeddings, "available", lambda: True)
     monkeypatch.setattr(
@@ -380,6 +384,63 @@ def test_public_linear_recall_skips_legacy_vec_search_and_returns_fts_match(
     assert beam_memory.init_result.vec_dim_mismatch
     assert any(result["id"] == "legacy-episode" for result in results)
     assert calls == []
+    assert beam._existing_vec_dims(beam_memory.conn) == before_dims
+    assert beam_memory.conn.execute(
+        "SELECT rowid FROM vec_episodes ORDER BY rowid"
+    ).fetchall() == before_vec_rows
+
+
+def test_public_linear_recall_uses_compatible_episodic_vec_despite_mixed_indexes(
+    tmp_path, monkeypatch
+):
+    """A non-episodic mismatch does not disable compatible episodic sqlite-vec."""
+    if not beam._SQLITE_VEC_AVAILABLE:
+        pytest.skip("sqlite-vec unavailable")
+
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setattr(beam, "EMBEDDING_DIM", 384)
+    db = Path(tmp_path) / "mixed-episodic-compatible.db"
+    writer = beam.BeamMemory(session_id="mixed", db_path=db)
+    writer.conn.execute(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, importance) "
+        "VALUES ('semantic-episode', 'calibrated nebula archive', 'test', "
+        "datetime('now'), 0.5)"
+    )
+    rowid = writer.conn.execute(
+        "SELECT rowid FROM episodic_memory WHERE id = 'semantic-episode'"
+    ).fetchone()[0]
+    writer.conn.execute(
+        "INSERT INTO vec_episodes(rowid, embedding) "
+        "VALUES (?, vec_quantize_int8(?, 'unit'))",
+        (rowid, json.dumps([0.0] * 384)),
+    )
+    writer.conn.execute("DROP TABLE vec_working")
+    writer.conn.execute("CREATE VIRTUAL TABLE vec_working USING vec0(embedding int8[768])")
+    writer.conn.commit()
+
+    calls = []
+    original_vec_search = beam._vec_search
+    monkeypatch.setattr(beam._embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        beam._embeddings, "embed_query", lambda _query: _QueryVector([0.0] * 384)
+    )
+
+    def traced_vec_search(*args, **kwargs):
+        calls.append(True)
+        return original_vec_search(*args, **kwargs)
+
+    monkeypatch.setattr(beam, "_vec_search", traced_vec_search)
+    memory = beam.BeamMemory(session_id="mixed", db_path=db)
+
+    results = memory.recall("unrelated aurora question", top_k=5)
+
+    assert memory.init_result.vec_dim_mismatch
+    assert memory.init_result.stored_dims == (
+        ("vec_episodes", 384), ("vec_working", 768), ("vec_facts", 384)
+    )
+    assert calls == [True]
+    assert [result["id"] for result in results] == ["semantic-episode"]
 
 
 def test_public_linear_recall_uses_vec_search_when_dimensions_match(tmp_path, monkeypatch):
@@ -433,6 +494,7 @@ def test_public_recall_scopes_in_memory_fallback_before_bounded_candidates(tmp_p
     monkeypatch.setattr(beam, "np", Numpy)
     memory = beam.BeamMemory(session_id="target-session", db_path=Path(tmp_path) / "scope.db")
     memory.init_result = beam.BeamInitResult(True, 768, 384, (("vec_episodes", 768),))
+    monkeypatch.setattr(beam, "_existing_vec_dims", lambda _conn: (("vec_episodes", 768),))
     monkeypatch.setattr(beam._embeddings, "available", lambda: True)
     monkeypatch.setattr(
         beam._embeddings,
