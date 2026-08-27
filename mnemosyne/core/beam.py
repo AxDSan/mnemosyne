@@ -2441,6 +2441,15 @@ def _in_memory_vec_search(
     conn: sqlite3.Connection,
     query_embedding: np.ndarray,
     k: int = 20,
+) -> List[Dict]:
+    """Fallback vector search retaining the established three-argument contract."""
+    return _in_memory_vec_search_scoped(conn, query_embedding, k=k)
+
+
+def _in_memory_vec_search_scoped(
+    conn: sqlite3.Connection,
+    query_embedding: np.ndarray,
+    k: int = 20,
     *,
     where_clause: str = "(1=1)",
     where_params: Tuple[Any, ...] = (),
@@ -6924,7 +6933,7 @@ class BeamMemory:
                     vec_rows = _vec_search(self.conn, emb_result.tolist(), k=max(top_k * 3, 20))
                 else:
                     # Fallback: in-memory cosine similarity search
-                    vec_rows = _in_memory_vec_search(
+                    vec_rows = _in_memory_vec_search_scoped(
                         self.conn,
                         emb_result,
                         k=max(top_k * 3, 20),

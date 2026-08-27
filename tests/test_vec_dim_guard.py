@@ -405,8 +405,8 @@ def test_public_linear_recall_uses_vec_search_when_dimensions_match(tmp_path, mo
     assert calls == [True]
 
 
-def test_in_memory_vec_search_filters_before_bounded_candidates(tmp_path, monkeypatch):
-    """Scoped rows remain searchable after 10,000 earlier out-of-scope rows."""
+def test_public_recall_scopes_in_memory_fallback_before_bounded_candidates(tmp_path, monkeypatch):
+    """Public recall preserves an in-scope semantic match after 10,000 foreign rows."""
     class Vector(list):
         def __truediv__(self, _norm):
             return self
@@ -428,17 +428,30 @@ def test_in_memory_vec_search_filters_before_bounded_candidates(tmp_path, monkey
         def dot(left, right):
             return sum(a * b for a, b in zip(left, right))
 
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "0")
     monkeypatch.setattr(beam, "np", Numpy)
     memory = beam.BeamMemory(session_id="target-session", db_path=Path(tmp_path) / "scope.db")
+    memory.init_result = beam.BeamInitResult(True, 768, 384, (("vec_episodes", 768),))
+    monkeypatch.setattr(beam._embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        beam._embeddings,
+        "embed_query",
+        lambda _query: Numpy.array([1.0], dtype=Numpy.float32),
+    )
+    monkeypatch.setattr(beam, "_wm_vec_search", lambda conn, emb, k=20, **_kwargs: [])
+    monkeypatch.setattr(beam, "_fts_search_working", lambda conn, query, k=20: [])
+    monkeypatch.setattr(beam, "_fts_search", lambda conn, query, k=20: [])
+    monkeypatch.setattr(beam, "_mib", None)
     conn = memory.conn
 
     out_of_scope = [
-        (f"other-{index}", "out of scope", "test", "other-session")
+        (f"other-{index}", "unrelated text", "test", "other-session")
         for index in range(10_000)
     ]
     conn.executemany(
-        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id) "
-        "VALUES (?, ?, ?, datetime('now'), ?)",
+        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, scope) "
+        "VALUES (?, ?, ?, datetime('now'), ?, 'session')",
         out_of_scope,
     )
     conn.executemany(
@@ -447,22 +460,14 @@ def test_in_memory_vec_search_filters_before_bounded_candidates(tmp_path, monkey
     )
     conn.execute(
         "INSERT INTO episodic_memory (id, content, source, timestamp, session_id) "
-        "VALUES ('target', 'scoped semantic match', 'test', datetime('now'), 'target-session')"
+        "VALUES ('target', 'different wording', 'test', datetime('now'), 'target-session')"
     )
-    target_rowid = conn.execute(
-        "SELECT rowid FROM episodic_memory WHERE id = 'target'"
-    ).fetchone()[0]
     conn.execute(
         "INSERT INTO memory_embeddings (memory_id, embedding_json) VALUES ('target', '[1.0]')"
     )
     conn.commit()
 
-    results = beam._in_memory_vec_search(
-        conn,
-        Numpy.array([1.0], dtype=Numpy.float32),
-        k=1,
-        where_clause="em.session_id = ?",
-        where_params=("target-session",),
-    )
+    results = memory.recall("quasar signal", top_k=1)
 
-    assert results == [{"rowid": target_rowid, "distance": 0.0}]
+    assert memory.init_result.vec_dim_mismatch
+    assert [result["id"] for result in results] == ["target"]
