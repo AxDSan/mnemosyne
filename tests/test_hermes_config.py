@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 import yaml
@@ -92,6 +93,62 @@ def test_cached_config_fails_closed_after_malformed_or_deleted_file(tmp_path):
     _write_config(tmp_path, "first")
     assert hermes_config.read_hermes_config_key(str(tmp_path), "default_scope") == "first"
     config_path.unlink()
+    assert hermes_config.read_hermes_config_key(str(tmp_path), "default_scope") is None
+
+
+def test_stat_open_aba_does_not_cache_replaced_file_content(tmp_path, monkeypatch):
+    _write_config(tmp_path, "first")
+    config_path = (tmp_path / "config.yaml").resolve()
+    replacement = tmp_path / "replacement.yaml"
+    _write_config(tmp_path, "first")
+    replacement.write_text(
+        "memory:\n"
+        "  mnemosyne:\n"
+        "    default_scope: other\n"
+    )
+    saved_original = tmp_path / "saved-original.yaml"
+    original_open = Path.open
+    original_load = yaml.load
+    replaced = False
+
+    def replace_before_open(path, *args, **kwargs):
+        nonlocal replaced
+        if path == config_path and not replaced:
+            replaced = True
+            os.replace(config_path, saved_original)
+            os.replace(replacement, config_path)
+        return original_open(path, *args, **kwargs)
+
+    def restore_after_load(*args, **kwargs):
+        loaded = original_load(*args, **kwargs)
+        if saved_original.exists():
+            os.replace(saved_original, config_path)
+        return loaded
+
+    monkeypatch.setattr(Path, "open", replace_before_open)
+    monkeypatch.setattr(yaml, "load", restore_after_load)
+    monkeypatch.setattr(hermes_config, "_config_fingerprint", lambda path: (1, 2, 3, 4, 5))
+
+    assert hermes_config.read_hermes_config_key(str(tmp_path), "default_scope") == "other"
+    assert hermes_config.read_hermes_config_key(str(tmp_path), "default_scope") == "first"
+
+
+def test_non_mapping_config_evicts_prior_cached_entry(tmp_path):
+    _write_config(tmp_path, "first")
+    config_path = (tmp_path / "config.yaml").resolve()
+    assert hermes_config.read_hermes_config_key(str(tmp_path), "default_scope") == "first"
+    assert config_path in hermes_config._CONFIG_CACHE
+
+    config_path.write_text("- not\n- a mapping\n")
+    assert hermes_config.read_hermes_config_key(str(tmp_path), "default_scope") is None
+    assert config_path not in hermes_config._CONFIG_CACHE
+
+
+def test_resolve_error_fails_closed(tmp_path, monkeypatch):
+    def fail_resolve(self, *args, **kwargs):
+        raise OSError("symlink resolution failed")
+
+    monkeypatch.setattr(Path, "resolve", fail_resolve)
     assert hermes_config.read_hermes_config_key(str(tmp_path), "default_scope") is None
 
 

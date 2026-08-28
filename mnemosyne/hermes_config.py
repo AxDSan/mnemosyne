@@ -11,10 +11,14 @@ _ConfigFingerprint = tuple[int, int, int, int, int]
 _CONFIG_CACHE: dict[Path, tuple[_ConfigFingerprint, dict[str, Any]]] = {}
 
 
+def _fingerprint_from_stat(stat: os.stat_result) -> _ConfigFingerprint:
+    """Return a replacement-sensitive fingerprint from a stat result."""
+    return (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+
+
 def _config_fingerprint(config_path: Path) -> _ConfigFingerprint:
     """Return a replacement-sensitive fingerprint for a config file."""
-    stat = config_path.stat()
-    return (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+    return _fingerprint_from_stat(config_path.stat())
 
 
 def _load_hermes_config(config_path: Path, yaml: Any) -> dict[str, Any] | None:
@@ -32,6 +36,7 @@ def _load_hermes_config(config_path: Path, yaml: Any) -> dict[str, Any] | None:
     try:
         loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
         with config_path.open() as config_file:
+            read_fingerprint = _fingerprint_from_stat(os.fstat(config_file.fileno()))
             config = yaml.load(config_file, Loader=loader)
     except Exception:
         _CONFIG_CACHE.pop(config_path, None)
@@ -40,6 +45,7 @@ def _load_hermes_config(config_path: Path, yaml: Any) -> dict[str, Any] | None:
     if config is None:
         config = {}
     if not isinstance(config, dict):
+        _CONFIG_CACHE.pop(config_path, None)
         return {}
 
     try:
@@ -47,9 +53,10 @@ def _load_hermes_config(config_path: Path, yaml: Any) -> dict[str, Any] | None:
     except OSError:
         _CONFIG_CACHE.pop(config_path, None)
         return None
-    if parsed_fingerprint != fingerprint:
+    if parsed_fingerprint != read_fingerprint:
+        _CONFIG_CACHE.pop(config_path, None)
         return config
-    _CONFIG_CACHE[config_path] = (parsed_fingerprint, config)
+    _CONFIG_CACHE[config_path] = (read_fingerprint, config)
     return config
 
 
@@ -64,8 +71,11 @@ def read_hermes_config_key(hermes_home: str | None, key: str) -> Any:
     # hermes_home=...). HERMES_HOME is the explicit active-profile authority in
     # that phase; do not fall back to ~/.hermes, which could cross profiles.
     resolved_home = hermes_home or os.environ.get("HERMES_HOME")
-    config_path = Path(resolved_home, "config.yaml").resolve() if resolved_home else None
-    if config_path is None:
+    if not resolved_home:
+        return None
+    try:
+        config_path = Path(resolved_home, "config.yaml").resolve()
+    except (OSError, RuntimeError):
         return None
     try:
         import yaml
