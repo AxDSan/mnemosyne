@@ -862,6 +862,28 @@ def _is_windows_platform() -> bool:
     return os.name == "nt"
 
 
+DEFAULT_INSTALL_MODE_POSIX = "symlink"
+DEFAULT_INSTALL_MODE_WINDOWS = "wrapper"
+
+
+def default_install_mode() -> str:
+    """Return the install mode to use when the caller did not choose one.
+
+    Symlink mode is the historical default and stays the default everywhere it
+    can actually succeed. It cannot succeed on native Windows: creating a
+    symbolic link there requires ``SeCreateSymbolicLinkPrivilege``, which in
+    practice means Developer Mode is enabled or the shell is elevated. Without
+    one of those, ``os.symlink`` raises ``WinError 1314`` and the install fails.
+
+    That is why native Windows installs have been reported as working for some
+    people and not others: the outcome depends on a privilege nobody thinks to
+    check. Wrapper mode writes a real plugin directory and needs no privilege,
+    so it is the default there. An explicit ``--mode symlink`` still works for
+    anyone who does hold the privilege. See issue #857.
+    """
+    return DEFAULT_INSTALL_MODE_WINDOWS if _is_windows_platform() else DEFAULT_INSTALL_MODE_POSIX
+
+
 def _venv_python_candidates(venv_root: Path) -> tuple[Path, ...]:
     """Return supported interpreter paths in platform-appropriate order.
 
@@ -1760,7 +1782,7 @@ def install_plugin(
     *,
     hermes_home_path: str | Path | None = None,
     force: bool = False,
-    mode: str = "symlink",
+    mode: str | None = None,
     python: str | Path | None = None,
     import_timeout: float = DEFAULT_WRAPPER_IMPORT_TIMEOUT,
     migrate_wrapper_to_symlink: bool = False,
@@ -1776,6 +1798,8 @@ def install_plugin(
     opted-in profile fan-out by default; set it False to install only at the
     selected Hermes home.
     """
+    if mode is None:
+        mode = default_install_mode()
     if mode not in {"symlink", "wrapper"}:
         raise ValueError("mode must be 'symlink' or 'wrapper'")
     if migrate_wrapper_to_symlink and (mode != "symlink" or not force):
@@ -2081,8 +2105,12 @@ def _parser() -> argparse.ArgumentParser:
     install.add_argument(
         "--mode",
         choices=("symlink", "wrapper"),
-        default="symlink",
-        help="Install mode: symlink (default) or persistent wrapper shim.",
+        default=None,
+        help=(
+            "Install mode. Defaults to symlink, except on native Windows where "
+            "it defaults to the persistent wrapper shim because symbolic links "
+            "there require Developer Mode or an elevated shell."
+        ),
     )
     install.add_argument(
         "--python",
@@ -2153,7 +2181,7 @@ def run_install(
     force: bool = False,
     hermes_home_path: str | Path | None = None,
     no_bootstrap: bool = False,
-    mode: str = "symlink",
+    mode: str | None = None,
     python: str | Path | None = None,
     import_timeout: float = DEFAULT_WRAPPER_IMPORT_TIMEOUT,
     migrate_wrapper_to_symlink: bool = False,
@@ -2165,6 +2193,9 @@ def run_install(
     Can be called from the CLI ``install`` subcommand or programmatically
     (e.g., from ``upgrade.py`` after upgrading the pip package).
     """
+    if mode is None:
+        mode = default_install_mode()
+
     # Check core library first (installer's own Python)
     core_ok = check_mnemosyne_core()
     if not core_ok:
@@ -2240,9 +2271,11 @@ def run_install(
     except _WindowsSymlinkPrivilegeError:
         print(
             "\n  ⚠ Windows symbolic-link privilege is unavailable (WinError 1314).\n"
-            "     Enable Developer Mode or run with an account granted the "
-            "symbolic-link privilege.\n"
-            "     The installer did not switch install modes automatically.\n",
+            "     Symlink mode was requested explicitly, so the installer did not\n"
+            "     switch modes on your behalf. Either enable Developer Mode or run\n"
+            "     with an account granted the symbolic-link privilege, or install in\n"
+            "     persistent wrapper mode, which needs no privilege and is the\n"
+            "     default on Windows when no mode is given.\n",
             file=sys.stderr,
         )
         if hermes_python is not None:
@@ -2293,6 +2326,18 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if command == "install":
+            # argparse leaves --mode as None when the user did not choose one, so
+            # resolve it here, before anything reads it. Every downstream path
+            # (dry-run reporting included) then sees a concrete mode.
+            if getattr(args, "mode", None) is None:
+                args.mode = default_install_mode()
+                if args.mode == DEFAULT_INSTALL_MODE_WINDOWS and _is_windows_platform():
+                    print(
+                        "  Native Windows detected: installing in persistent wrapper mode.\n"
+                        "  Symbolic links need Developer Mode or an elevated shell here, so\n"
+                        "  wrapper mode is the default. Pass --mode symlink to override."
+                    )
+
             # Dry-run: just show what would happen
             hermes_python = _find_hermes_python(
                 explicit_python=getattr(args, "python", None)
