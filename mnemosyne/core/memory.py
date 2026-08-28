@@ -41,6 +41,149 @@ _DEFAULT_ROOT = Path(
 DEFAULT_DATA_DIR = _DEFAULT_ROOT / "mnemosyne" / "data"
 DEFAULT_DB_PATH = DEFAULT_DATA_DIR / "mnemosyne.db"
 
+# The portable JSON format carries these physical tables through the named
+# sections below. Do not assume a represented table is lossless: this mapping
+# makes populated fields omitted by a section visible in the export manifest.
+_EXPORTED_SURFACES = {
+    "working_memory": ("working_memory", {
+        "id", "content", "source", "timestamp", "session_id", "importance",
+        "metadata_json", "valid_until", "superseded_by", "scope", "recall_count",
+        "last_recalled", "created_at", "veracity", "consolidated_at",
+        "consolidation_claimed_at",
+    }),
+    "episodic_memory": ("episodic_memory", {
+        "rowid", "id", "content", "source", "timestamp", "session_id",
+        "importance", "metadata_json", "summary_of", "valid_until",
+        "superseded_by", "scope", "recall_count", "last_recalled", "created_at",
+    }),
+    "scratchpad": ("scratchpad", {"id", "content", "session_id", "created_at", "updated_at"}),
+    "consolidation_log": ("consolidation_log", {"id", "session_id", "items_consolidated", "summary_preview", "created_at"}),
+    "legacy_memories": ("memories", {"id", "content", "source", "timestamp", "session_id", "importance", "metadata_json", "created_at"}),
+    "legacy_embeddings": ("memory_embeddings", {"memory_id", "embedding_json", "model", "created_at"}),
+    "triples": ("triples", {"id", "subject", "predicate", "object", "valid_from", "valid_until", "source", "confidence", "created_at"}),
+    "annotations": ("annotations", {"id", "memory_id", "kind", "value", "source", "confidence", "created_at"}),
+    "canonical_facts": ("canonical_facts", {"id", "owner_id", "category", "name", "body", "source", "confidence", "version", "valid_from", "valid_until", "created_at"}),
+    "sync_events": ("memory_events", {"event_id", "memory_id", "operation", "timestamp", "device_id", "payload", "parent_event_ids", "importance", "expiry", "event_hash", "synced_at"}),
+}
+_REBUILDABLE_EXPORT_PREFIXES = ("fts_", "vec_")
+_OMITTED_EXPORT_GUIDANCE = {
+    "facts": "Derived recall facts are not included; rerun extraction after restore.",
+    "gists": "Episodic graph summaries are not included; rerun graph extraction after restore.",
+    "graph_edges": "Episodic graph edges are not included; rerun graph extraction after restore.",
+    "consolidated_facts": "Veracity consolidation output is not included; rerun consolidation after restore.",
+    "conflicts": "Veracity conflict history is not included; rerun consolidation after restore.",
+    "memory_events": "Sync events are omitted unless export uses --include-sync-events.",
+}
+
+
+def _quoted_identifier(identifier: str) -> str:
+    """Quote a SQLite identifier from sqlite_master safely."""
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+_UNKNOWN_RESTORE_DEFAULT = object()
+
+
+def _sqlite_restore_default(default_sql: Optional[str]) -> Any:
+    """Decode SQLite literal defaults without evaluating schema-supplied SQL."""
+    if default_sql is None:
+        return None
+    default_sql = default_sql.strip()
+    while default_sql.startswith("(") and default_sql.endswith(")"):
+        default_sql = default_sql[1:-1].strip()
+    upper = default_sql.upper()
+    if upper == "NULL":
+        return None
+    if upper == "TRUE":
+        return 1
+    if upper == "FALSE":
+        return 0
+    if len(default_sql) >= 2 and default_sql[0] in "\"'" and default_sql[-1] == default_sql[0]:
+        quote = default_sql[0]
+        return default_sql[1:-1].replace(quote * 2, quote)
+    if len(default_sql) >= 3 and upper.startswith("X'") and default_sql.endswith("'"):
+        try:
+            return bytes.fromhex(default_sql[2:-1])
+        except ValueError:
+            return _UNKNOWN_RESTORE_DEFAULT
+    try:
+        return int(default_sql)
+    except ValueError:
+        try:
+            return float(default_sql)
+        except ValueError:
+            return _UNKNOWN_RESTORE_DEFAULT
+
+
+def _export_completeness(conn: sqlite3.Connection, *, include_sync_events: bool) -> Dict[str, Any]:
+    """Describe persisted values the portable JSON export does not carry."""
+    exported_tables = {
+        table for section, (table, _) in _EXPORTED_SURFACES.items()
+        if include_sync_events or section != "sync_events"
+    }
+    omitted_surfaces = []
+    partial_surfaces = []
+    catalog = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+    ).fetchall()
+    for (table,) in catalog:
+        if table.startswith(_REBUILDABLE_EXPORT_PREFIXES):
+            continue
+        row_count = int(conn.execute(
+            f"SELECT COUNT(*) FROM {_quoted_identifier(table)}"
+        ).fetchone()[0])
+        if not row_count:
+            continue
+        if table not in exported_tables:
+            omitted_surfaces.append({
+                "table": table,
+                "row_count": row_count,
+                "rebuild_guidance": _OMITTED_EXPORT_GUIDANCE.get(
+                    table,
+                    "This persisted surface is not included in the portable JSON export; preserve the source database until dedicated portability support exists.",
+                ),
+            })
+            continue
+        section, (_, exported_fields) = next(
+            (name, surface) for name, surface in _EXPORTED_SURFACES.items()
+            if surface[0] == table
+        )
+        actual_fields = {
+            row[1]: row[4]
+            for row in conn.execute(f"PRAGMA table_info({_quoted_identifier(table)})")
+        }
+        omitted_fields = []
+        for field in sorted(set(actual_fields) - exported_fields):
+            restore_default = _sqlite_restore_default(actual_fields[field])
+            if restore_default is _UNKNOWN_RESTORE_DEFAULT:
+                predicate = f"{_quoted_identifier(field)} IS NOT NULL"
+                params = ()
+            else:
+                predicate = f"{_quoted_identifier(field)} IS NOT ?"
+                params = (restore_default,)
+            affected_rows = int(conn.execute(
+                f"SELECT COUNT(*) FROM {_quoted_identifier(table)} WHERE {predicate}", params
+            ).fetchone()[0])
+            if affected_rows:
+                omitted_fields.append({
+                    "field": field,
+                    "affected_rows": affected_rows,
+                })
+        if omitted_fields:
+            partial_surfaces.append({
+                "section": section,
+                "table": table,
+                "row_count": row_count,
+                "omitted_fields": omitted_fields,
+            })
+    omitted_surfaces.sort(key=lambda surface: surface["table"])
+    partial_surfaces.sort(key=lambda surface: surface["section"])
+    return {
+        "complete": not omitted_surfaces and not partial_surfaces,
+        "omitted_surfaces": omitted_surfaces,
+        "partial_surfaces": partial_surfaces,
+    }
+
 # Allow override via environment
 if os.environ.get("MNEMOSYNE_DATA_DIR"):
     DEFAULT_DATA_DIR = Path(os.environ.get("MNEMOSYNE_DATA_DIR"))
@@ -242,6 +385,7 @@ class Mnemosyne:
                                author_id=author_id, author_type=author_type,
                                channel_id=channel_id,
                                event_emitter=self._stream_emit)
+        self.init_result = self.beam.init_result
         # ``self.conn`` remains the core module cache. _get_connection
         # coordinates it with BEAM, preserving core connection identity while
         # direct wrappers dual-write through one transaction-capable handle.
@@ -387,7 +531,9 @@ class Mnemosyne:
                  extract_entities: bool = False,
                  extract: bool = False,
                  veracity: str = "unknown",
-                 trust_tier: str = None) -> str:
+                 trust_tier: str = None,
+                 memory_type: str = None,
+                 dedupe: bool = True) -> str:
         """
         Store a memory directly to SQLite.
         Writes to both BEAM working_memory and legacy memories table.
@@ -402,10 +548,20 @@ class Mnemosyne:
             trust_tier: Trust classification for prompt-injection defense.
                 None = use beam default ('STATED'). 'EXTERNAL_WRITE' for MCP
                 tool calls, 'IMPORTED' for bulk imports.
+            memory_type: Optional explicit MemoryType value; overrides the
+                content classifier. See BeamMemory.remember.
+            dedupe: When False, always write a new row instead of folding into
+                an exact content match. See BeamMemory.remember.
 
         Returns:
             memory_id on success, or None if the content was filtered by
             the write classifier (noise pattern or secret detection).
+
+        Note for programmatic writers: this facade can return None, because
+        the write filter below may veto the content outright. It also does not
+        accept a caller-supplied memory_id. Callers that must observe every
+        write and control its id -- media ingest, importers -- should call
+        BeamMemory.remember directly rather than going through here.
         """
         # --- Core-level write filter (issues #406, #428) ---
         # Placed here so ALL entry points (Hermes provider, MCP server, SDK,
@@ -458,6 +614,8 @@ class Mnemosyne:
                 extract_entities=extract_entities, extract=extract,
                 veracity=veracity,
                 trust_tier=trust_tier,
+                memory_type=memory_type,
+                dedupe=dedupe,
             )
             timestamp = datetime.now().isoformat()
 
@@ -760,9 +918,9 @@ class Mnemosyne:
         self, output_path: str, include_sync_events: bool = False
     ) -> Dict:
         """
-        Export all Mnemosyne data (legacy + BEAM + triples + annotations +
-        canonical facts + optional sync events) to a JSON file. Returns export
-        metadata.
+        Export supported Mnemosyne data to a portable JSON file. The additive
+        completeness manifest discloses omitted persisted surfaces and fields,
+        so a successful file write never implies a lossless database backup.
 
         Schema version 1.3 adds the always-present ``canonical_facts`` section.
         1.2 (post-sync) adds an optional ``sync_events`` section. Previous
@@ -775,7 +933,7 @@ class Mnemosyne:
         import json as _json
 
         # Build export metadata with device_id when available
-        meta = {
+        meta: Dict[str, Any] = {
             "version": "1.3",
             "export_date": datetime.now().isoformat(),
             "source_db": str(self.db_path),
@@ -793,7 +951,7 @@ class Mnemosyne:
         except Exception:
             pass
 
-        export = {
+        export: Dict[str, Any] = {
             "mnemosyne_export": meta,
         }
 
@@ -856,12 +1014,20 @@ class Mnemosyne:
                 # memory_events table may not exist if sync was never used
                 export["sync_events"] = []
 
+        completeness = _export_completeness(
+            self.conn, include_sync_events=include_sync_events
+        )
+        meta["completeness"] = completeness
+
         with open(output_path, "w", encoding="utf-8") as f:
             _json.dump(export, f, indent=2, ensure_ascii=False, default=str)
 
         return {
             "status": "exported",
             "path": output_path,
+            "complete": completeness["complete"],
+            "omitted_surfaces": completeness["omitted_surfaces"],
+            "partial_surfaces": completeness["partial_surfaces"],
             "working_memory_count": len(export["working_memory"]),
             "episodic_memory_count": len(export["episodic_memory"]),
             "scratchpad_count": len(export["scratchpad"]),
@@ -973,7 +1139,24 @@ class Mnemosyne:
         if version not in ("1.0", "1.1", "1.2", "1.3"):
             raise ValueError(f"Unsupported export version: {version}")
 
+        completeness = meta.get("completeness")
+        if isinstance(completeness, dict) and isinstance(completeness.get("complete"), bool):
+            restore_complete = completeness["complete"]
+            omitted_surfaces = completeness.get("omitted_surfaces", [])
+            partial_surfaces = completeness.get("partial_surfaces", [])
+            if not isinstance(omitted_surfaces, list):
+                omitted_surfaces = []
+            if not isinstance(partial_surfaces, list):
+                partial_surfaces = []
+        else:
+            restore_complete = None
+            omitted_surfaces = []
+            partial_surfaces = []
+
         stats = {
+            "restore_complete": restore_complete,
+            "omitted_surfaces": omitted_surfaces,
+            "partial_surfaces": partial_surfaces,
             "beam": {},
             "legacy": {},
             "triples": {},

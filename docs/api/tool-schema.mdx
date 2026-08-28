@@ -1,19 +1,19 @@
 ---
 title: "MCP Tool Schema"
-version: 3.16.0
+version: 4.0.0b1
 tool_count: 37
 mcp_tool_count: 29
 plugin_only_tool_count: 8
 generated_at: "auto"
 ---
 
-# MCP Tool Schema (v3.16.0)
+# MCP Tool Schema (v4.0.0b1)
 
 > **Generated file. Do not edit by hand.**
 > Source: `mnemosyne/tool_schemas.py` and `mnemosyne/mcp_tools.py`.
 > Regenerate with `python3 scripts/generate-docs.py`.
 
-Mnemosyne declares **37 tools**. Of those, **29 are callable over MCP** (stdio and SSE), and **8 are implemented only in the Hermes provider** and are not reachable through the MCP server.
+Mnemosyne declares **37 tools**. Of those, **29 are callable over MCP** (stdio, SSE and Streamable HTTP), and **8 are implemented only in the Hermes provider** and are not reachable through the MCP server.
 
 The split is real and worth respecting: calling a plugin-only tool over MCP raises `Unknown tool`. The counts above are derived from `mnemosyne/mcp_tools.py::_TOOL_HANDLERS`, so they cannot drift from the code.
 

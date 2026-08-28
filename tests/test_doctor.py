@@ -119,7 +119,7 @@ def test_open_readonly_doctor_db_rejects_schema_and_data_writes(tmp_path):
 
 
 def test_optional_sqlite_vec_load_keeps_doctor_connection_write_protected(tmp_path):
-    sqlite_vec = pytest.importorskip("sqlite_vec")
+    pytest.importorskip("sqlite_vec")
     db_path = tmp_path / "doctor.db"
     sqlite3.connect(db_path).close()
 
@@ -437,6 +437,107 @@ def test_runtime_metadata_is_retained_in_safe_doctor_artifacts(
         assert detail in markdown_artifact
 
 
+def test_safe_preview_redacts_cjk_labeled_secret():
+    """CJK-labelled secrets must be redacted in doctor previews (issue #806)."""
+    # nosec - test fixture
+    raw_secret = "s3cr3t_pa55word_x1y2z3w4"
+    preview = doctor.safe_preview(f"数据库密码：{raw_secret}", max_length=120)
+    assert raw_secret not in preview
+    assert "<redact" in preview
+
+
+def test_safe_preview_redacts_cjk_secret_with_trailing_prose():
+    """Trailing CJK prose must not let a CJK-labelled secret survive."""
+    # nosec - test fixture
+    raw_secret = "s3cr3t_pa55word_x1y2z3w4"
+    preview = doctor.safe_preview(f"数据库密码：{raw_secret}，请勿外传", max_length=120)
+    assert raw_secret not in preview
+    assert "<redact" in preview
+
+
+def test_safe_preview_keeps_cjk_policy_prose():
+    """Ordinary Chinese policy prose after a label must not be redacted."""
+    prose = "密码：建议每90天更换一次"
+    preview = doctor.safe_preview(prose, max_length=120)
+    assert prose in preview
+    assert "<redact" not in preview
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "password：建议每90天更换一次",
+        "password＝建议每90天更换一次",
+    ],
+)
+def test_safe_preview_keeps_english_label_fullwidth_separator_policy_prose(prose):
+    """English labels with fullwidth separators must not redact CJK prose."""
+    assert doctor.safe_preview(prose, max_length=120) == prose
+
+
+def test_safe_preview_keeps_cjk_ascii_prefix_then_prose():
+    """ASCII prefix followed by CJK prose must not be redacted."""
+    prose = "密码：abc12345我的密码"
+    preview = doctor.safe_preview(prose, max_length=120)
+    assert prose in preview
+    assert "<redact" not in preview
+
+
+def test_safe_preview_keeps_cjk_non_bmp_prefix_then_prose():
+    """Non-BMP CJK after an ASCII prefix must not be redacted."""
+    prose = "密码：abc12345\U00020000"
+    preview = doctor.safe_preview(prose, max_length=120)
+    assert prose in preview
+    assert "<redact" not in preview
+
+
+@pytest.mark.parametrize(
+    "character",
+    [
+        "\u3005",
+        "\u3006",
+        "\u3007",
+        "\u31f0",
+        "\U000323b0",
+        "\U0003347f",
+        "\uff21",
+        "\uffa0",
+        "\uffbf",
+        "\uffc1",
+        "\uffc8",
+        "\uffc9",
+        "\uffd0",
+        "\uffd1",
+        "\uffd8",
+        "\uffd9",
+    ],
+)
+def test_safe_preview_keeps_cjk_boundary_prefix_then_prose(character):
+    """CJK or fullwidth prose after an ASCII prefix must not be redacted."""
+    prose = f"密码：abc12345{character}"
+    preview = doctor.safe_preview(prose, max_length=120)
+    assert preview == prose
+    assert "<redacted>" not in preview
+
+
+@pytest.mark.parametrize("character", ["ſ", "ı", "İ", "K"])
+def test_safe_preview_keeps_unicode_casefold_equivalent_values(character):
+    """Unicode case-fold equivalents are not ASCII credential characters."""
+    prose = f"密码：!!!!!!!!{character}"
+    assert doctor.safe_preview(prose, max_length=120) == prose
+
+
+def test_safe_preview_redacts_cjk_secret_before_truncating():
+    """Truncation must not let a CJK-labelled secret value survive."""
+    # nosec - test fixture
+    raw_secret = "s3cr3t_pa55word_x1y2z3w4"
+    preview = doctor.safe_preview("x" * 90 + f" 数据库密码：{raw_secret}" + " trailing", max_length=120)
+    assert len(preview) <= 120
+    assert "<redacted>" in preview
+    assert raw_secret[:8] not in preview
+    assert raw_secret not in preview
+
+
 def test_safe_preview_caps_raw_text_before_regex_redaction(monkeypatch):
     """Unbounded input must not be handed to Doctor's regex redactors."""
 
@@ -716,6 +817,7 @@ def test_adapter_catalog_errors_are_unknown_and_redacted():
         "episodic_memory",
         "canonical_facts",
         "triples",
+        "media_moments",
     }
     assert all(metric == {"status": STATUS_UNKNOWN, "error_class": "database_error"} for metric in result.metrics.values())
     assert "private body" not in json.dumps(result.metrics)

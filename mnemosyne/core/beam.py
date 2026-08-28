@@ -188,6 +188,31 @@ def _source_to_trust_tier(source: str) -> str:
     # Conservative default: treat as direct user input
     return "STATED"
 
+
+def _clamp_memory_type(value: Optional[str]) -> Optional[str]:
+    """Validate an explicit memory_type label, or return None.
+
+    None passes through, which is the signal to fall back to the content
+    classifier. An unrecognized label also returns None, with a WARNING: a
+    typo should degrade to classification, not strip the type off the row.
+
+    Mirrors the posture of clamp_veracity -- validate at the lowest public
+    ingest path rather than trusting callers, since the value reaches a
+    column that recall filters on.
+    """
+    if value is None:
+        return None
+    if MemoryType is None:  # typed_memory unavailable; nothing to validate against
+        return None
+    candidate = str(value).strip().lower()
+    if candidate in {m.value for m in MemoryType}:
+        return candidate
+    logger.warning(
+        "remember: unknown memory_type %r; falling back to the classifier", value
+    )
+    return None
+
+
 try:
     import numpy as np
 except ImportError:
@@ -532,53 +557,73 @@ def _detect_vec_type(conn: sqlite3.Connection) -> str:
     return "float32"
 
 
-def _existing_vec_dim(conn: sqlite3.Connection) -> Optional[int]:
-    """Return the embedding dimension already declared by a sqlite-vec table in
-    this database, or ``None`` if no ``vec0`` table exists yet.
+_VEC_TABLE_NAMES = ("vec_episodes", "vec_working", "vec_facts")
+
+
+def _existing_vec_dims(conn: sqlite3.Connection) -> Tuple[Tuple[str, int], ...]:
+    """Return immutable stored dimensions for each recognized vector table.
 
     A ``vec0`` virtual table fixes its dimension at creation time, encoded in its
-    DDL as ``embedding <type>[<dim>]``. When a store already holds vectors, that
-    declared dimension -- not the process's configured ``EMBEDDING_DIM`` -- is the
-    source of truth for what the stored data actually is. Reads only
-    ``sqlite_master`` (no extension required) so it is safe to call before the
+    DDL as ``embedding <type>[<dim>]``. Read every known table in a fixed order:
+    legacy databases can contain a mixed index, and returning the first
+    ``sqlite_master`` row would make its status depend on catalog row order.
+    Reads only ``sqlite_master`` (no extension required), so it is safe before
     sqlite-vec tables are (re)created.
     """
     try:
         rows = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
             "AND name IN ('vec_episodes', 'vec_working', 'vec_facts')"
         ).fetchall()
     except sqlite3.Error:
-        return None
-    for row in rows:
-        sql = row[0] if row else None
+        return ()
+
+    declared_dims = {}
+    for name, sql in rows:
         if not sql:
             continue
         match = re.search(r"\[(\d+)\]", sql)
         if match:
-            return int(match.group(1))
-    return None
+            declared_dims[name] = int(match.group(1))
+    return tuple((name, declared_dims[name]) for name in _VEC_TABLE_NAMES if name in declared_dims)
 
 
-def _dim_mismatch_message(existing_dim: int, configured_dim: int) -> str:
-    """Build the embedding-dimension-mismatch message.
+def _existing_vec_dim(conn: sqlite3.Connection) -> Optional[int]:
+    """Return a dimension only when all stored vector tables agree.
 
-    Extracted as a pure function so the wording -- explicitly NOT corruption plus
-    the exact self-heal commands -- is unit-testable without a sqlite-vec
-    database. The phrasing matters: 'dimension mismatch' is otherwise misread as
-    'database corrupt', and users (and agent frameworks) abandon the store
-    instead of reindexing.
+    Kept as a narrow compatibility helper for callers that only need a uniform
+    stored dimension. Mixed indexes have no honest scalar representation.
     """
+    stored_dims = _existing_vec_dims(conn)
+    dimensions = {dim for _, dim in stored_dims}
+    return dimensions.pop() if len(dimensions) == 1 else None
+
+
+def _dim_mismatch_message(
+    stored_dims: Tuple[Tuple[str, int], ...], configured_dim: int
+) -> str:
+    """Build an actionable message for uniform or mixed vector-index dimensions."""
+    stored_description = ", ".join(f"{table}={dim}" for table, dim in stored_dims)
+    dimensions = {dim for _, dim in stored_dims}
+    if len(dimensions) == 1:
+        existing_dim = next(iter(dimensions))
+        recovery_hint = (
+            f"  * Keep the existing {existing_dim}-dim vectors: relaunch with "
+            f"MNEMOSYNE_EMBEDDING_DIM={existing_dim} (and the matching model).\n"
+        )
+        index_description = f"This database stores {existing_dim}-dim vectors"
+    else:
+        recovery_hint = ""
+        index_description = f"This database has mixed vector-index dimensions ({stored_description})"
+
     return (
         f"Embedding dimension mismatch — NOT database corruption: your memories "
         f"are intact, only the vector index is affected (recall falls back to "
-        f"keyword search until this is fixed). This database stores "
-        f"{existing_dim}-dim vectors but this process is configured for "
-        f"{configured_dim}-dim (MNEMOSYNE_EMBEDDING_DIM / "
+        f"keyword search until this is fixed). {index_description} but this "
+        f"process is configured for {configured_dim}-dim (MNEMOSYNE_EMBEDDING_DIM / "
         f"MNEMOSYNE_EMBEDDING_MODEL); sqlite-vec tables were left untouched. To "
         f"self-heal, choose ONE:\n"
-        f"  * Keep the existing {existing_dim}-dim vectors: relaunch with "
-        f"MNEMOSYNE_EMBEDDING_DIM={existing_dim} (and the matching model).\n"
+        f"{recovery_hint}"
         f"  * Re-embed all memories at {configured_dim}-dim: run "
         f"`MNEMOSYNE_EMBEDDING_DIM={configured_dim} mnemosyne reindex` (it backs "
         f"up first).\n"
@@ -586,8 +631,25 @@ def _dim_mismatch_message(existing_dim: int, configured_dim: int) -> str:
     )
 
 
-def init_beam(db_path: Path = None):
-    """Initialize BEAM schema."""
+@dataclass(frozen=True)
+class BeamInitResult:
+    """Outcome of BEAM schema initialization.
+
+    This is additive status only: callers that ignore ``init_beam()``'s return
+    value retain the historical initialization behavior. ``stored_dims`` is a
+    fixed-order immutable ``(table, dimension)`` tuple; ``existing_dim`` is set
+    only when those stored tables have one uniform dimension. A mismatch remains
+    recoverable and does not prevent the non-vector schema from being initialized.
+    """
+
+    vec_dim_mismatch: bool
+    existing_dim: Optional[int]
+    configured_dim: int
+    stored_dims: Tuple[Tuple[str, int], ...] = ()
+
+
+def init_beam(db_path: Path = None) -> BeamInitResult:
+    """Initialize BEAM schema and return its vector-index status."""
     conn = _get_connection(db_path)
     cursor = conn.cursor()
 
@@ -791,13 +853,14 @@ def init_beam(db_path: Path = None):
     # environment as the writer. Refuse to create mismatched tables, leave any
     # existing ones untouched, and surface one actionable error instead of
     # per-row insert noise; recall falls back to the float-JSON voice meanwhile.
-    vec_dim_mismatch = False
+    stored_dims = _existing_vec_dims(conn)
+    dimensions = {dim for _, dim in stored_dims}
+    existing_dim = dimensions.pop() if len(dimensions) == 1 else None
+    vec_dim_mismatch = any(dim != EMBEDDING_DIM for _, dim in stored_dims)
+    if vec_dim_mismatch:
+        logger.error(_dim_mismatch_message(stored_dims, EMBEDDING_DIM))
     if _SQLITE_VEC_AVAILABLE:
-        existing_dim = _existing_vec_dim(conn)
-        if existing_dim is not None and existing_dim != EMBEDDING_DIM:
-            vec_dim_mismatch = True
-            logger.error(_dim_mismatch_message(existing_dim, EMBEDDING_DIM))
-        else:
+        if not vec_dim_mismatch:
             try:
                 cursor.execute(f"""
                     CREATE VIRTUAL TABLE IF NOT EXISTS vec_episodes USING vec0(
@@ -1103,7 +1166,7 @@ def init_beam(db_path: Path = None):
         WHERE superseded_by IS NULL""")
     cursor.execute("""CREATE INDEX IF NOT EXISTS idx_mem_emb_type
         ON memory_embeddings(memory_id, model)""")
-    if not vec_dim_mismatch:
+    if _SQLITE_VEC_AVAILABLE and not vec_dim_mismatch:
         try:
             _backfill_vec_working_from_memory_embeddings(conn)
         except NameError:
@@ -1212,7 +1275,7 @@ def init_beam(db_path: Path = None):
     # Vector table for facts (sqlite-vec). Skipped on a dimension mismatch for the
     # same reason as vec_episodes / vec_working above (see the guard in the
     # sqlite-vec VIRTUAL TABLES block).
-    if not vec_dim_mismatch:
+    if _SQLITE_VEC_AVAILABLE and not vec_dim_mismatch:
         try:
             cursor.execute(f"""
                 CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts USING vec0(
@@ -1233,6 +1296,13 @@ def init_beam(db_path: Path = None):
     _add_column_if_missing(conn, "episodic_memory", "corrected_by", "INTEGER DEFAULT NULL")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_wm_event_date ON working_memory(event_date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_em_event_date ON episodic_memory(event_date)")
+
+    return BeamInitResult(
+        vec_dim_mismatch=vec_dim_mismatch,
+        existing_dim=existing_dim,
+        configured_dim=EMBEDDING_DIM,
+        stored_dims=stored_dims,
+    )
 
 
 class _BeamConnection(sqlite3.Connection):
@@ -3428,7 +3498,7 @@ class BeamMemory:
         self._extraction_buffer = []  # Buffer for batch extraction
         self._event_emitter = event_emitter  # Streaming event callback
         self.conn = _get_connection(self.db_path)
-        init_beam(self.db_path)
+        self.init_result = init_beam(self.db_path)
 
         # E6: ensure schema split + auto-migrate legacy TripleStore rows
         # to AnnotationStore. Honors MNEMOSYNE_AUTO_MIGRATE=0 for operators
@@ -3460,6 +3530,13 @@ class BeamMemory:
         # canonical_facts table on first init; nothing else changes.
         from mnemosyne.core.canonical import CanonicalStore
         self.canonical = CanonicalStore(db_path=self.db_path, conn=self.conn)
+
+        # Media assets + moment index (RFC 0003 phase 0). Wired exactly like
+        # CanonicalStore above: the store owns its own idempotent DDL, so
+        # existing banks acquire the tables on next open with no migration
+        # module. Zero lines in init_beam, which holds only first-party DDL.
+        from mnemosyne.core.media import MediaStore
+        self.media = MediaStore(db_path=self.db_path, conn=self.conn)
 
         # Phase 3: Episodic graph (shared connection)
         self.episodic_graph = None
@@ -3635,7 +3712,9 @@ class BeamMemory:
                  extract_entities: bool = False,
                  extract: bool = False,
                  veracity: str = "unknown",
-                 trust_tier: str = None) -> str:
+                 trust_tier: str = None,
+                 memory_type: str = None,
+                 dedupe: bool = True) -> str:
         """Store into working_memory. Deduplicates exact content matches.
 
         When called from the legacy-compatible Mnemosyne.remember() path,
@@ -3657,6 +3736,29 @@ class BeamMemory:
             veracity: Confidence level -- 'stated', 'inferred', 'tool', 'imported', 'unknown'.
                 Non-canonical labels are clamped to 'unknown' with a WARNING
                 (mirrors the C12.b clamp at the hermes_memory_provider boundary).
+            memory_type: Optional explicit MemoryType value (e.g. 'artifact').
+                Overrides the content classifier entirely -- the classifier is
+                not consulted when this is supplied. Unrecognized labels log a
+                WARNING and fall back to classification, so a typo degrades to
+                default behaviour rather than stripping the type. Callers that
+                *know* what they are writing (a media caption is an artifact,
+                whatever its words look like) should set this.
+            dedupe: When False, skip the exact-content duplicate check and
+                always write a new row.
+
+                Callers writing programmatically-generated text need this. The
+                dedup key is (session_id, content), and generated text collides
+                far more readily than prose -- "a black frame", "a screenshot
+                of a terminal window", a repeated slide. Two such rows
+                describing *different* sources would otherwise collapse into
+                one, and any sidecar table binding to the returned id would
+                bind the second source's row to the first source's memory.
+                Nothing raises and the counts all look right, which is what
+                makes it worth an explicit opt-out.
+
+                Leaving dedupe on has a second effect worth knowing: the
+                dedup-update path applies memory_type via COALESCE, so an
+                explicit type on a colliding write retypes the existing row.
         """
         # Clamp veracity at the BeamMemory.remember entry too -- the
         # method is the lowest-level public ingest path under BeamMemory,
@@ -3683,8 +3785,12 @@ class BeamMemory:
             trust_tier = "STATED"
 
         # --- Typed memory classification (Phase 1 -- zero overhead) ---
-        memory_type = None
-        if classify_memory is not None:
+        # An explicit memory_type wins outright and short-circuits the
+        # classifier: a caller that declares the type knows something the
+        # content does not say. An unrecognized label degrades to
+        # classification rather than to NULL.
+        memory_type = _clamp_memory_type(memory_type)
+        if memory_type is None and classify_memory is not None:
             try:
                 result = classify_memory(content)
                 memory_type = result.memory_type.value
@@ -3692,7 +3798,7 @@ class BeamMemory:
                 pass  # Classifier failures are non-blocking
 
         # --- Deduplication: exact match ---
-        existing_id = self._find_duplicate(content)
+        existing_id = self._find_duplicate(content) if dedupe else None
         if existing_id:
             cursor = self.conn.cursor()
             # Dedup-update clears consolidated_at so a re-remembered row
@@ -3846,6 +3952,21 @@ class BeamMemory:
             # Enrichment can refill enhanced recall after the early post-commit eviction.
             self._invalidate_query_cache_after_remember_commit()
 
+    def remember_media(self, ref: str, **kwargs):
+        """Register a piece of media and, if configured, describe it.
+
+        Delegates to :func:`mnemosyne.core.media.remember_media`, which owns the
+        flow. Keeping the body here to one line is deliberate: `beam.py` is
+        already ~8,000 lines, and the ingest path is far easier to test as a
+        free function against a stub than as a method on this class.
+
+        Returns a ``MediaIngestResult``, not a bare id -- the degradation ladder
+        produces a status (``ok``/``partial``/``unavailable``/``refused``) that a
+        string return would discard, and ``unavailable`` is a success.
+        """
+        from mnemosyne.core.media import remember_media as _remember_media
+        return _remember_media(self, ref=ref, **kwargs)
+
     def remember_batch(self, items: List[Dict],
                        *,
                        veracity: Optional[str] = None,
@@ -3957,8 +4078,11 @@ class BeamMemory:
             memory_id = _generate_id(item["content"])
             ids.append(memory_id)
             # Typed memory classification
-            item_type = None
-            if classify_memory is not None:
+            # Per-item explicit type wins and short-circuits the classifier,
+            # matching remember(). There is no method-level default: a batch
+            # is heterogeneous by nature.
+            item_type = _clamp_memory_type(item.get("memory_type"))
+            if item_type is None and classify_memory is not None:
                 try:
                     result = classify_memory(item["content"])
                     item_type = result.memory_type.value
@@ -4450,6 +4574,22 @@ class BeamMemory:
                 exc,
             )
 
+    def _invalidate_query_cache_after_commit(self, operation: str) -> None:
+        """Best-effort query-cache invalidation after a mutating commit.
+
+        Consolidation / reclaim / sleep change dense-pool eligibility
+        (``consolidated_at`` transitions, new episodic summaries, episodic
+        degradation), so warmed enhanced-recall v3 entries must not be served
+        stale after those mutations.
+        """
+        try:
+            self._invalidate_query_cache()
+        except Exception as exc:
+            logger.warning(
+                "%s: query-cache invalidation failed after commit (%s): %s",
+                operation, type(exc).__name__, exc,
+            )
+
     def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
         """
         Mark a memory as invalid/superseded.
@@ -4508,9 +4648,16 @@ class BeamMemory:
             else:
                 invalidated = validate_and_invalidate()
             if invalidated:
-                self._invalidate_query_cache()
+                if owns_transaction:
+                    self._invalidate_query_cache_after_commit("invalidate")
+                else:
+                    self._invalidate_query_cache()
             return invalidated
 
+        # The no-replacement path mutates a single row directly.  Snapshot
+        # ownership before its first UPDATE: a caller-owned transaction must
+        # retain both its commit boundary and cache-failure rollback behavior.
+        owns_transaction = not self.conn.in_transaction
         now = datetime.now(timezone.utc).isoformat()
         # Try working_memory first
         cursor.execute("""
@@ -4519,8 +4666,11 @@ class BeamMemory:
             WHERE id = ? AND (session_id = ? OR scope = 'global')
         """, (now, replacement_id, memory_id, self.session_id))
         if cursor.rowcount > 0:
-            self.conn.commit()
-            self._invalidate_query_cache()
+            if owns_transaction:
+                self.conn.commit()
+                self._invalidate_query_cache_after_commit("invalidate")
+            else:
+                self._invalidate_query_cache()
             return True
         # Try episodic_memory
         cursor.execute("""
@@ -4529,9 +4679,13 @@ class BeamMemory:
             WHERE id = ? AND (session_id = ? OR scope = 'global')
         """, (now, replacement_id, memory_id, self.session_id))
         invalidated = cursor.rowcount > 0
-        self.conn.commit()
+        if owns_transaction:
+            self.conn.commit()
         if invalidated:
-            self._invalidate_query_cache()
+            if owns_transaction:
+                self._invalidate_query_cache_after_commit("invalidate")
+            else:
+                self._invalidate_query_cache()
         return invalidated
 
     def _detect_conflicts(self, rows: List[Dict], similarity_threshold: float = 0.88) -> List[tuple]:
@@ -4815,7 +4969,7 @@ class BeamMemory:
 
     def forget_working(self, memory_id: str) -> bool:
         """Delete a session-authorized working memory row and its cascade
-        (vector, annotations, embeddings) atomically."""
+        (vector, annotations, embeddings, gists) atomically."""
         # E6.a: the cascade-delete of annotations must be authorized by the
         # session-scoped working_memory DELETE. The annotations table has no
         # session_id column, so an unconditional `DELETE FROM annotations
@@ -4832,6 +4986,7 @@ class BeamMemory:
         # uncommitted on the connection for a later unrelated commit to
         # silently include.
         cursor = self.conn.cursor()
+        owns_transaction = not self.conn.in_transaction
         with _guarded_transaction(self.conn):
             authorized_row = cursor.execute(
                 "SELECT rowid FROM working_memory WHERE id = ? AND (session_id = ? OR scope = 'global')",
@@ -4849,9 +5004,17 @@ class BeamMemory:
                     "DELETE FROM annotations WHERE memory_id = ?", (memory_id,)
                 )
                 cursor.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
+                gists_table = cursor.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gists'"
+                ).fetchone()
+                if gists_table is not None:
+                    cursor.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
         forgotten = wm_rows > 0
         if forgotten:
-            self._invalidate_query_cache()
+            if owns_transaction:
+                self._invalidate_query_cache_after_commit("forget_working")
+            else:
+                self._invalidate_query_cache()
         return forgotten
 
     # ------------------------------------------------------------------
@@ -4950,21 +5113,29 @@ class BeamMemory:
                 except Exception:
                     pass  # Non-blocking
 
-        self.conn.commit()
+        try:
+            self.conn.commit()
 
-        # Phase 3-4: Graph + veracity for consolidated episodic memory
-        # E4.a.1 review fix (H2): thread the aggregated row_veracity into
-        # graph + fact extraction so Bayesian compounding on consolidated
-        # facts uses the source-aggregated signal, not a hardcoded
-        # 'inferred'. Pre-fix this line passed 'inferred' regardless, which
-        # the consolidator's `consolidate_fact` then used as the veracity
-        # weight in its confidence update -- undermining the very signal
-        # we just preserved in the episodic INSERT.
-        self._ingest_graph_and_veracity(memory_id, summary, source, veracity=row_veracity)
+            # Phase 3-4: Graph + veracity for consolidated episodic memory
+            # E4.a.1 review fix (H2): thread the aggregated row_veracity into
+            # graph + fact extraction so Bayesian compounding on consolidated
+            # facts uses the source-aggregated signal, not a hardcoded
+            # 'inferred'. Pre-fix this line passed 'inferred' regardless, which
+            # the consolidator's `consolidate_fact` then used as the veracity
+            # weight in its confidence update -- undermining the very signal
+            # we just preserved in the episodic INSERT.
+            self._ingest_graph_and_veracity(memory_id, summary, source, veracity=row_veracity)
 
-        self._emit_event("MEMORY_CONSOLIDATED", memory_id, content=summary,
-                         source=source, importance=importance,
-                         metadata={"summary_of": source_wm_ids, **(metadata or {})})
+            self._emit_event("MEMORY_CONSOLIDATED", memory_id, content=summary,
+                             source=source, importance=importance,
+                             metadata={"summary_of": source_wm_ids, **(metadata or {})})
+        finally:
+            # The new episodic row, its embeddings, and the graph/fact
+            # mutations all change dense-pool eligibility for enhanced recall;
+            # drop warmed cache entries after every write path, even if the
+            # enrichment step fails (another worker could otherwise refill the
+            # cache between the commit and the graph writes).
+            self._invalidate_query_cache_after_commit("consolidate_to_episodic")
         return memory_id
 
     # ------------------------------------------------------------------
@@ -6244,6 +6415,29 @@ class BeamMemory:
         
         wm_where = " AND ".join(wm_where_clauses)
 
+        # Vector pool isolation (#696): raw dialog capture (source='conversation',
+        # source='honcho_message') stays fully FTS-reachable but is excluded from
+        # the working-memory DENSE candidate pool. Conversational queries are
+        # topically identical to their own dialog rows, so the nearest-N pool
+        # saturates with them and starves distilled facts out of the dense
+        # voice (facts semantically matching a query can rank beyond the pool
+        # and surface with dense_score=0.0 or not at all). Durable honcho rows
+        # are NOT raw dialog and stay eligible for a dense score:
+        # honcho_summary is a deliberate session summary with higher
+        # importance, honcho_import is a generic import default. Consolidated
+        # rows (consolidated_at IS NOT NULL) are likewise kept out of the
+        # default dense candidates: per #427 they must not compete with hot
+        # unconsolidated memories (mirrors get_context). An explicit
+        # source=/topic= filter keeps the caller in control — asking for
+        # conversation rows directly still works.
+        wm_vec_where = wm_where
+        if not (source or topic):
+            wm_vec_where = (
+                f"{wm_where} AND (source IS NULL OR "
+                f"(source <> 'conversation' AND source <> 'honcho_message'))"
+                f" AND consolidated_at IS NULL"
+            )
+
         # ---- Working memory (vector search) ----
         wm_vec_sims = {}
         if embeddings_available:
@@ -6252,7 +6446,7 @@ class BeamMemory:
                 if emb_result is not None:
                     wm_vec = _wm_vec_search(self.conn, emb_result,
                                               k=max(top_k, 20) if _BEAM_MODE else max(top_k * 3, 50),
-                                              where_sql=wm_where,
+                                              where_sql=wm_vec_where,
                                               where_params=tuple(wm_params))
                     for vr in wm_vec:
                         wm_vec_sims[vr["id"]] = vr["sim"]
@@ -7290,7 +7484,7 @@ class BeamMemory:
     # cached under an older digest are not reused. Part of the hashed payload;
     # the opaque key keeps the "v2:" prefix because QueryCache's opaque-path
     # recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
-    _ENHANCED_RECALL_CACHE_VERSION = 4
+    _ENHANCED_RECALL_CACHE_VERSION = 5
 
     def _enhanced_recall_cache_key(
         self,
@@ -7420,6 +7614,13 @@ class BeamMemory:
             },
         }
         material = json.dumps(canonicalize(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        # The default dense candidate predicate changed (dialog / honcho /
+        # consolidated exclusion, #696 / #427), so pre-change opaque cache
+        # entries could still contain dialog, honcho or consolidated dense
+        # candidates. _ENHANCED_RECALL_CACHE_VERSION is part of the hashed
+        # payload; bumping it (4 -> 5) guarantees those entries are never
+        # reused. The "v2:" prefix stays fixed — QueryCache's opaque-path
+        # recognition keys off that exact prefix.
         return "v2:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     def recall_enhanced(self, query: str, top_k: int = 40, *,
@@ -7507,7 +7708,7 @@ class BeamMemory:
         kwargs["fts_weight"] = weight_snapshot.fts
         kwargs["importance_weight"] = weight_snapshot.importance
 
-        # 3. Query cache check.  Opaque v2 keys use QueryCache's exact-only
+        # 3. Query cache check.  Opaque v3 keys use QueryCache's exact-only
         # path, so no semantic tier can reuse a different effective request.
         runtime = resolve_beam_runtime()
         explain = bool(kwargs.get("explain", False))
@@ -7911,6 +8112,15 @@ class BeamMemory:
                 query=query,
                 query_embedding=query_embedding,
                 top_k=top_k * 2,  # over-fetch for filter dropouts
+                # Explicit source=/topic= filters must not be pre-empted by
+                # the default dense-source exclusion (dialog / honcho /
+                # consolidated rows) inside the vector voice — the caller
+                # asked for those rows directly (#696). The explicit values
+                # are propagated as real predicates so they apply BEFORE
+                # top-K selection, mirroring the linear wm_where semantics.
+                default_dense_source_filter=not (source or topic),
+                source=source,
+                topic=topic,
             )
         except Exception as exc:
             logger.exception("polyphonic recall engine failed: %s", exc)
@@ -8109,7 +8319,11 @@ class BeamMemory:
             return False
         if source and row_dict.get("source") != source:
             return False
-        if topic and topic not in (row_dict.get("source") or ""):
+        # topic is stored in the source field (pending a dedicated topic
+        # column) — match EXACTLY like the linear path's `source = ?`, so a
+        # non-vector voice returning source='conversation_archive' cannot
+        # pass topic='conversation'.
+        if topic and row_dict.get("source") != topic:
             return False
         if author_id and row_dict.get("author_id") != author_id:
             return False
@@ -8682,6 +8896,11 @@ class BeamMemory:
                     logger.info("degrade_episodic: rollback failed", exc_info=True)
 
         self.conn.commit()
+        # Tier demotion changes episodic content + embeddings; drop warmed
+        # enhanced-recall entries. Also covers direct degrade_episodic()
+        # calls and the sleep_all_sessions() degradation pass, which do not
+        # go through sleep()'s own invalidation.
+        self._invalidate_query_cache_after_commit("degrade_episodic")
         return results
 
     def get_contaminated(self, limit: int = 50, min_importance: float = 0.0) -> List[Dict]:
@@ -8882,6 +9101,9 @@ class BeamMemory:
         )
         reclaimed = cursor.rowcount
         self.conn.commit()
+        # Clearing consolidated_at re-admits rows to the default dense
+        # pool; warmed enhanced-recall entries are no longer accurate.
+        self._invalidate_query_cache_after_commit("reclaim_orphans")
         logger.info("reclaim_orphans: reclaimed=%d candidates=%d", reclaimed, len(candidate_ids))
         return {
             "status": "reclaimed" if reclaimed else "no_op",
@@ -8989,6 +9211,11 @@ class BeamMemory:
             # Filter rows to only those we successfully claimed.
             rows = [r for r in rows if r["id"] in claimed_ids]
             self.conn.commit()
+            # The claim flips consolidated_at on live working rows, which
+            # changes default dense-pool eligibility (#427 predicate);
+            # drop warmed enhanced-recall entries immediately so a stale
+            # result set is never served while summaries are being written.
+            self._invalidate_query_cache_after_commit("sleep.claim")
 
         grouped: Dict[str, List[Dict]] = {}
         for row in rows:
@@ -9219,6 +9446,9 @@ class BeamMemory:
 
         # Run tiered degradation after consolidation
         degrade_result = self.degrade_episodic(dry_run=dry_run)
+        if not dry_run:
+            # Summaries + degradation both changed recallable content.
+            self._invalidate_query_cache_after_commit("sleep")
 
         logger.info(
             "sleep: consolidated=%d summaries=%d conflicts=%d llm=%s method=%s",

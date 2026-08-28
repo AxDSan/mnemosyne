@@ -8,6 +8,7 @@ import hashlib
 import importlib
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 PLUGIN_NAME = "mnemosyne"
+DEFAULT_WRAPPER_IMPORT_TIMEOUT = 60.0
 SKILL_NAME = "mnemosyne-memory-override"
 SKILL_CATEGORY = "memory"
 BUNDLED_SKILL_RESOURCE = ("skills", SKILL_NAME, "SKILL.md")
@@ -83,6 +85,22 @@ class SkillInstallResult:
     changed: bool
     target: Path
     message: str
+
+
+class _WindowsSymlinkPrivilegeError(RuntimeError):
+    """A Windows symlink failure for which the CLI has a safe retry."""
+
+
+def _is_windows_symlink_privilege_error(error: OSError) -> bool:
+    """Return whether ``error`` is Windows ERROR_PRIVILEGE_NOT_HELD (1314)."""
+    return getattr(error, "winerror", None) == 1314
+
+
+def _windows_wrapper_retry_command(hermes_python: Path) -> str:
+    """Format a Windows-command-line-safe wrapper retry for a selected Python."""
+    return subprocess.list2cmdline(
+        ["mnemosyne-hermes", "install", "--mode", "wrapper", "--python", str(hermes_python)]
+    )
 
 
 def hermes_home() -> Path:
@@ -358,14 +376,67 @@ def _wrapper_metadata(target: Path, init_file: Path) -> _WrapperMetadata:
     return _WrapperMetadata(python=python, site_packages=site_packages)
 
 
-def _site_packages_for_python(python: Path) -> Path:
-    """Ask an interpreter for its purelib/site-packages path."""
-    result = subprocess.run(
-        [str(python), "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
-        capture_output=True,
-        text=True,
-        timeout=10,
+def _validated_import_timeout(value: float | str) -> float:
+    """Return a safe wrapper-validation timeout in seconds."""
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("import timeout must be a positive finite number of seconds") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("import timeout must be a positive finite number of seconds")
+    return timeout
+
+
+def _parse_import_timeout(value: str) -> float:
+    """Argparse adapter that keeps invalid timeout diagnostics actionable."""
+    try:
+        return _validated_import_timeout(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _timeout_diagnostic(python: Path, timeout: float, *, retry_hint: bool = True) -> str:
+    """Return an actionable timeout diagnostic for selected wrapper Python."""
+    seconds = f"{timeout:g}"
+    message = f"wrapper validation timed out after {seconds} seconds for interpreter {python}."
+    if not retry_hint:
+        return message + (
+            " Status validates wrapper imports with its fixed default "
+            f"{DEFAULT_WRAPPER_IMPORT_TIMEOUT:g}-second policy. Inspect the selected "
+            "interpreter and its import performance; --import-timeout only affects "
+            "installer validation."
+        )
+    retry_seconds = f"{max(timeout * 2, timeout + 1):g}"
+    retry_args = [
+        "mnemosyne-hermes",
+        "install",
+        "--mode",
+        "wrapper",
+        "--python",
+        str(python),
+        "--import-timeout",
+        retry_seconds,
+    ]
+    retry_command = (
+        subprocess.list2cmdline(retry_args) if os.name == "nt" else shlex.join(retry_args)
     )
+    return message + f" Retry with: {retry_command}"
+
+
+def _site_packages_for_python(
+    python: Path, *, import_timeout: float = DEFAULT_WRAPPER_IMPORT_TIMEOUT
+) -> Path:
+    """Ask an interpreter for its purelib/site-packages path."""
+    import_timeout = _validated_import_timeout(import_timeout)
+    try:
+        result = subprocess.run(
+            [str(python), "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+            capture_output=True,
+            text=True,
+            timeout=import_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(_timeout_diagnostic(python, import_timeout)) from exc
     if result.returncode != 0:
         stderr = result.stderr.strip() or result.stdout.strip()
         raise RuntimeError(f"Could not resolve site-packages for {python}: {stderr}")
@@ -376,7 +447,11 @@ def _site_packages_for_python(python: Path) -> Path:
 
 
 def _check_wrapper_import(
-    site_packages: Path, python: Path | None = None
+    site_packages: Path,
+    python: Path | None = None,
+    *,
+    import_timeout: float = DEFAULT_WRAPPER_IMPORT_TIMEOUT,
+    retry_hint: bool = True,
 ) -> tuple[bool, str | None, bool]:
     """Return import success, error text, and whether the runtime is invalid."""
     if not site_packages.is_dir():
@@ -386,6 +461,7 @@ def _check_wrapper_import(
         return False, f"wrapper Python missing: {runner}", True
     if not os.access(runner, os.X_OK):
         return False, f"wrapper Python is not executable: {runner}", True
+    import_timeout = _validated_import_timeout(import_timeout)
     code = (
         "import site\n"
         "import sys\n"
@@ -406,7 +482,7 @@ def _check_wrapper_import(
             [str(runner), "-S", "-c", code],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=import_timeout,
             # -S and a selected site directory isolate imports from the runner's
             # ambient site/user directories. Filtering PYTHONPATH prevents a
             # caller-controlled package shadowing that contract; filtering
@@ -421,7 +497,7 @@ def _check_wrapper_import(
     except OSError as exc:
         return False, f"could not run wrapper Python {runner}: {exc}", True
     except subprocess.TimeoutExpired:
-        return False, f"wrapper Python import timed out: {runner}", False
+        return False, _timeout_diagnostic(runner, import_timeout, retry_hint=retry_hint), False
     if result.returncode == 0:
         return True, None, False
     return False, (result.stderr.strip() or result.stdout.strip() or "import failed")[:500], False
@@ -523,6 +599,8 @@ def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
             wrapper_import_ok, wrapper_import_error, invalid_runtime = _check_wrapper_import(
                 wrapper_site,
                 wrapper_python,
+                import_timeout=DEFAULT_WRAPPER_IMPORT_TIMEOUT,
+                retry_hint=False,
             )
             if not wrapper_import_ok:
                 status = "invalid_wrapper" if invalid_runtime else "stale_wrapper"
@@ -779,14 +857,55 @@ def _resolve_hermes_bin(hermes_bin: str) -> Path | None:
     return None
 
 
+def _is_windows_platform() -> bool:
+    """Return whether the installer is running on native Windows."""
+    return os.name == "nt"
+
+
+DEFAULT_INSTALL_MODE_POSIX = "symlink"
+DEFAULT_INSTALL_MODE_WINDOWS = "wrapper"
+
+
+def default_install_mode() -> str:
+    """Return the install mode to use when the caller did not choose one.
+
+    Symlink mode is the historical default and stays the default everywhere it
+    can actually succeed. It cannot succeed on native Windows: creating a
+    symbolic link there requires ``SeCreateSymbolicLinkPrivilege``, which in
+    practice means Developer Mode is enabled or the shell is elevated. Without
+    one of those, ``os.symlink`` raises ``WinError 1314`` and the install fails.
+
+    That is why native Windows installs have been reported as working for some
+    people and not others: the outcome depends on a privilege nobody thinks to
+    check. Wrapper mode writes a real plugin directory and needs no privilege,
+    so it is the default there. An explicit ``--mode symlink`` still works for
+    anyone who does hold the privilege. See issue #857.
+    """
+    return DEFAULT_INSTALL_MODE_WINDOWS if _is_windows_platform() else DEFAULT_INSTALL_MODE_POSIX
+
+
+def _venv_python_candidates(venv_root: Path) -> tuple[Path, ...]:
+    """Return supported interpreter paths in platform-appropriate order.
+
+    Native Windows virtual environments keep their interpreter in
+    ``Scripts/python.exe``. POSIX layouts remain ``bin/python`` followed by
+    ``bin/python3``. The predicate that consumes these candidates still requires
+    the adjacent ``pyvenv.cfg`` marker and executability.
+    """
+    posix = (venv_root / "bin" / "python", venv_root / "bin" / "python3")
+    if _is_windows_platform():
+        return (venv_root / "Scripts" / "python.exe", *posix)
+    return posix
+
+
 def _is_venv_bin_dir(bin_dir: Path) -> bool:
-    """Return whether ``bin_dir`` is the ``bin/`` of a real virtual environment.
+    """Return whether ``bin_dir`` is an interpreter directory of a real venv.
 
     ``pyvenv.cfg`` is what separates a venv from a directory that merely holds
     executables. It is the only cheap signal that discriminates the #618 case:
     ``~/.local/bin`` holds both a ``hermes`` launcher and an unrelated
     ``python``, so "the launcher sits next to a python" proves nothing on its
-    own.
+    own. The same marker applies to native Windows ``Scripts/`` layouts.
     """
     return (bin_dir.parent / "pyvenv.cfg").is_file()
 
@@ -873,9 +992,7 @@ def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[P
     if hermes_bin:
         resolved = _resolve_hermes_bin(hermes_bin)
         if resolved:
-            bin_dir = resolved.parent
-            for py_name in ("python", "python3"):
-                candidate = bin_dir / py_name
+            for candidate in _venv_python_candidates(resolved.parent.parent):
                 if _is_validated_venv_python(candidate):
                     return candidate
 
@@ -893,18 +1010,18 @@ def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[P
         Path("/usr/lib/hermes-agent"),
     ]:
         for venv_name in ("venv", ".venv"):
-            candidate = root / venv_name / "bin" / "python"
-            if _is_validated_venv_python(candidate):
-                return candidate
+            for candidate in _venv_python_candidates(root / venv_name):
+                if _is_validated_venv_python(candidate):
+                    return candidate
 
     # 3. Check if we're running inside Hermes' venv ourselves.
     #    `sys.prefix != sys.base_prefix` says the *running* interpreter is in a
     #    venv; it says nothing about the bin/python being asked for here, which
     #    can be absent or non-executable in a partially built environment.
     if sys.prefix != sys.base_prefix:
-        venv_python = Path(sys.prefix) / "bin" / "python"
-        if _is_validated_venv_python(venv_python):
-            return venv_python
+        for candidate in _venv_python_candidates(Path(sys.prefix)):
+            if _is_validated_venv_python(candidate):
+                return candidate
 
     # 4. Check VIRTUAL_ENV env var (uv-managed or explicit).
     #    This is an ordinary environment variable, not an assertion that a venv
@@ -913,9 +1030,9 @@ def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[P
     #    this function exists to prevent.
     ve = os.environ.get("VIRTUAL_ENV")
     if ve:
-        candidate = Path(ve) / "bin" / "python"
-        if _is_validated_venv_python(candidate):
-            return candidate
+        for candidate in _venv_python_candidates(Path(ve)):
+            if _is_validated_venv_python(candidate):
+                return candidate
 
     # Nothing validated. Better to stop and let the caller ask for --python
     # than to bootstrap into an interpreter that only looked plausible.
@@ -1421,13 +1538,18 @@ def _is_wrapper_plugin_target(target: Path) -> bool:
 
 def _validated_wrapper_environment(
     python: str | Path | None,
+    *,
+    import_timeout: float = DEFAULT_WRAPPER_IMPORT_TIMEOUT,
 ) -> tuple[Path, Path]:
     """Validate the selected wrapper runtime before touching an installed plugin."""
     wrapper_python = Path(python).expanduser() if python else Path(sys.executable)
     if not wrapper_python.is_file():
         raise FileNotFoundError(f"Python interpreter not found: {wrapper_python}")
-    site_packages = _site_packages_for_python(wrapper_python)
-    import_ok, import_error, _invalid_runtime = _check_wrapper_import(site_packages, wrapper_python)
+    import_timeout = _validated_import_timeout(import_timeout)
+    site_packages = _site_packages_for_python(wrapper_python, import_timeout=import_timeout)
+    import_ok, import_error, _invalid_runtime = _check_wrapper_import(
+        site_packages, wrapper_python, import_timeout=import_timeout
+    )
     if not import_ok:
         raise RuntimeError(
             f"Selected Python environment cannot import mnemosyne_hermes: {import_error}"
@@ -1660,8 +1782,9 @@ def install_plugin(
     *,
     hermes_home_path: str | Path | None = None,
     force: bool = False,
-    mode: str = "symlink",
+    mode: str | None = None,
     python: str | Path | None = None,
+    import_timeout: float = DEFAULT_WRAPPER_IMPORT_TIMEOUT,
     migrate_wrapper_to_symlink: bool = False,
     link_profiles: bool = True,
 ) -> Path:
@@ -1675,6 +1798,8 @@ def install_plugin(
     opted-in profile fan-out by default; set it False to install only at the
     selected Hermes home.
     """
+    if mode is None:
+        mode = default_install_mode()
     if mode not in {"symlink", "wrapper"}:
         raise ValueError("mode must be 'symlink' or 'wrapper'")
     if migrate_wrapper_to_symlink and (mode != "symlink" or not force):
@@ -1736,7 +1861,12 @@ def install_plugin(
         _write_profile_links_preference(link_profiles, hermes_home_path=hermes_home_path)
         try:
             _prepare_plugin_target(base, target, force=force)
-            os.symlink(str(source), str(target))
+            try:
+                os.symlink(str(source), str(target))
+            except OSError as error:
+                if _is_windows_symlink_privilege_error(error):
+                    raise _WindowsSymlinkPrivilegeError from error
+                raise
         except Exception:
             try:
                 _restore_profile_links_preference(preference_path, previous_preference)
@@ -1759,7 +1889,9 @@ def install_plugin(
     # Validate and fully write the replacement before removing a working wrapper.
     # In particular, a bad --python or a selected environment missing this package
     # must leave the existing wrapper and every profile link untouched.
-    wrapper_python, site_packages = _validated_wrapper_environment(python)
+    wrapper_python, site_packages = _validated_wrapper_environment(
+        python, import_timeout=import_timeout
+    )
     target.parent.mkdir(parents=True, exist_ok=True)
     staging_parent = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
     staged = staging_parent / target.name
@@ -1973,8 +2105,12 @@ def _parser() -> argparse.ArgumentParser:
     install.add_argument(
         "--mode",
         choices=("symlink", "wrapper"),
-        default="symlink",
-        help="Install mode: symlink (default) or persistent wrapper shim.",
+        default=None,
+        help=(
+            "Install mode. Defaults to symlink, except on native Windows where "
+            "it defaults to the persistent wrapper shim because symbolic links "
+            "there require Developer Mode or an elevated shell."
+        ),
     )
     install.add_argument(
         "--python",
@@ -1983,6 +2119,16 @@ def _parser() -> argparse.ArgumentParser:
             "Hermes' Python interpreter. Authoritative when given: skips launcher "
             "and install-root discovery. Also selects the site-packages a wrapper "
             "install imports from."
+        ),
+    )
+    install.add_argument(
+        "--import-timeout",
+        type=_parse_import_timeout,
+        default=DEFAULT_WRAPPER_IMPORT_TIMEOUT,
+        metavar="SECONDS",
+        help=(
+            "Wrapper validation timeout in seconds "
+            f"(default: {DEFAULT_WRAPPER_IMPORT_TIMEOUT:g})."
         ),
     )
     install.add_argument(
@@ -2035,8 +2181,9 @@ def run_install(
     force: bool = False,
     hermes_home_path: str | Path | None = None,
     no_bootstrap: bool = False,
-    mode: str = "symlink",
+    mode: str | None = None,
     python: str | Path | None = None,
+    import_timeout: float = DEFAULT_WRAPPER_IMPORT_TIMEOUT,
     migrate_wrapper_to_symlink: bool = False,
     link_profiles: bool = True,
 ) -> int:
@@ -2046,6 +2193,9 @@ def run_install(
     Can be called from the CLI ``install`` subcommand or programmatically
     (e.g., from ``upgrade.py`` after upgrading the pip package).
     """
+    if mode is None:
+        mode = default_install_mode()
+
     # Check core library first (installer's own Python)
     core_ok = check_mnemosyne_core()
     if not core_ok:
@@ -2108,14 +2258,41 @@ def run_install(
         else:
             print(f"  Hermes' Python: mnemosyne-memory {hermes_core} OK")
 
-    target = install_plugin(
-        hermes_home_path=hermes_home_path,
-        force=force,
-        mode=mode,
-        python=python,
-        migrate_wrapper_to_symlink=migrate_wrapper_to_symlink,
-        link_profiles=link_profiles,
-    )
+    try:
+        target = install_plugin(
+            hermes_home_path=hermes_home_path,
+            force=force,
+            mode=mode,
+            python=python,
+            import_timeout=import_timeout,
+            migrate_wrapper_to_symlink=migrate_wrapper_to_symlink,
+            link_profiles=link_profiles,
+        )
+    except _WindowsSymlinkPrivilegeError:
+        print(
+            "\n  ⚠ Windows symbolic-link privilege is unavailable (WinError 1314).\n"
+            "     Symlink mode was requested explicitly, so the installer did not\n"
+            "     switch modes on your behalf. Either enable Developer Mode or run\n"
+            "     with an account granted the symbolic-link privilege, or install in\n"
+            "     persistent wrapper mode, which needs no privilege and is the\n"
+            "     default on Windows when no mode is given.\n",
+            file=sys.stderr,
+        )
+        if hermes_python is not None:
+            print(
+                "  Persistent no-symlink-privilege alternative:\n"
+                f"    {_windows_wrapper_retry_command(hermes_python)}\n",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "  A safe wrapper retry cannot be generated because Hermes' Python was "
+                "not resolved.\n"
+                "  Locate the Hermes interpreter, then re-run with --python "
+                "<path-to-hermes-python>.\n",
+                file=sys.stderr,
+            )
+        return 1
     skill_result = install_bundled_skill(
         hermes_home_path=hermes_home_path,
         force=force,
@@ -2149,6 +2326,18 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if command == "install":
+            # argparse leaves --mode as None when the user did not choose one, so
+            # resolve it here, before anything reads it. Every downstream path
+            # (dry-run reporting included) then sees a concrete mode.
+            if getattr(args, "mode", None) is None:
+                args.mode = default_install_mode()
+                if args.mode == DEFAULT_INSTALL_MODE_WINDOWS and _is_windows_platform():
+                    print(
+                        "  Native Windows detected: installing in persistent wrapper mode.\n"
+                        "  Symbolic links need Developer Mode or an elevated shell here, so\n"
+                        "  wrapper mode is the default. Pass --mode symlink to override."
+                    )
+
             # Dry-run: just show what would happen
             hermes_python = _find_hermes_python(
                 explicit_python=getattr(args, "python", None)
@@ -2186,7 +2375,11 @@ def main(argv: list[str] | None = None) -> int:
                     wrapper_python = Path(getattr(args, "python", None) or sys.executable).expanduser()
                     print(f"  Wrapper Python: {wrapper_python}")
                     if wrapper_python.is_file():
-                        print(f"  Wrapper site-packages: {_site_packages_for_python(wrapper_python)}")
+                        print(
+                            "  Wrapper site-packages: "
+                            f"{_site_packages_for_python(wrapper_python, import_timeout=args.import_timeout)}"
+                        )
+                    print(f"  Wrapper import timeout: {args.import_timeout:g} seconds")
                 print(f"  Will force: {bool(getattr(args, 'force', False))}")
                 if getattr(args, "migrate_wrapper_to_symlink", False):
                     print("  Will allow wrapper-to-symlink migration: yes")
@@ -2215,6 +2408,7 @@ def main(argv: list[str] | None = None) -> int:
                 no_bootstrap=getattr(args, "no_bootstrap", False),
                 mode=getattr(args, "mode", "symlink"),
                 python=getattr(args, "python", None),
+                import_timeout=getattr(args, "import_timeout", DEFAULT_WRAPPER_IMPORT_TIMEOUT),
                 migrate_wrapper_to_symlink=getattr(args, "migrate_wrapper_to_symlink", False),
                 link_profiles=getattr(args, "link_profiles", True),
             )
