@@ -162,11 +162,14 @@ def test_prefers_c_safe_loader_and_falls_back_to_safe_loader(tmp_path, monkeypat
         return original_load(*args, **kwargs)
 
     monkeypatch.setattr(yaml, "load", recording_load)
-    assert hermes_config.read_hermes_config_key(str(tmp_path), "default_scope") == "first"
-    assert loaders == [yaml.CSafeLoader]
 
-    getattr(hermes_config, "_CONFIG_CACHE", {}).clear()
-    loaders.clear()
-    monkeypatch.delattr(yaml, "CSafeLoader")
+    if hasattr(yaml, "CSafeLoader"):
+        assert hermes_config.read_hermes_config_key(str(tmp_path), "default_scope") == "first"
+        assert loaders == [yaml.CSafeLoader]
+
+        getattr(hermes_config, "_CONFIG_CACHE", {}).clear()
+        loaders.clear()
+        monkeypatch.delattr(yaml, "CSafeLoader")
+
     assert hermes_config.read_hermes_config_key(str(tmp_path), "default_scope") == "first"
     assert loaders == [yaml.SafeLoader]
