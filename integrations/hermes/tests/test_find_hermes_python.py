@@ -599,6 +599,40 @@ def test_no_bootstrap_continues_without_a_validated_interpreter(tmp_path, monkey
     assert "Continuing without dependency validation" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("blank_python", ["", " \t\n "])
+def test_wrapper_explicit_blank_python_fails_without_target_or_fallback(
+    tmp_path, monkeypatch, capsys, blank_python
+):
+    """An explicit blank wrapper --python is invalid, not a request for this Python."""
+    fallback_python = tmp_path / "fallback-python"
+    _write_executable(fallback_python, "#!/bin/sh\nexit 0\n")
+    hermes_home = tmp_path / "hermes-home"
+    target = install.plugin_target_dir(hermes_home)
+
+    monkeypatch.setattr(sys, "executable", str(fallback_python))
+
+    def fail_if_fallback_is_validated(*args, **kwargs):
+        raise AssertionError("blank --python must not fall back to sys.executable")
+
+    monkeypatch.setattr(install, "_site_packages_for_python", fail_if_fallback_is_validated)
+
+    rc = install.main(
+        [
+            "--hermes-home",
+            str(hermes_home),
+            "install",
+            "--mode",
+            "wrapper",
+            "--python",
+            blank_python,
+        ]
+    )
+
+    assert rc == 1
+    assert "--python was given an empty value" in capsys.readouterr().err
+    assert not target.exists()
+
+
 def test_wrapper_mode_is_unaffected_by_failed_discovery(tmp_path, monkeypatch):
     """Wrapper installs validate their own interpreter and must not be blocked."""
     system_bin = tmp_path / "usr" / "bin"

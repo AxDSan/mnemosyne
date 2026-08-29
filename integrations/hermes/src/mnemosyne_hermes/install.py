@@ -1551,7 +1551,16 @@ def _validated_wrapper_environment(
     import_timeout: float = DEFAULT_WRAPPER_IMPORT_TIMEOUT,
 ) -> tuple[Path, Path]:
     """Validate the selected wrapper runtime before touching an installed plugin."""
-    wrapper_python = Path(python).expanduser() if python else Path(sys.executable)
+    if python is None:
+        wrapper_python = Path(sys.executable)
+    else:
+        selected = str(python)
+        if not selected.strip():
+            raise ValueError(
+                "--python was given an empty value. Pass the path to Hermes' "
+                "interpreter, or omit --python to let the installer find it."
+            )
+        wrapper_python = Path(selected).expanduser()
     if not wrapper_python.is_file():
         raise FileNotFoundError(f"Python interpreter not found: {wrapper_python}")
     import_timeout = _validated_import_timeout(import_timeout)
