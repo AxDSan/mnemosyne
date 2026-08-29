@@ -46,7 +46,9 @@ def test_vec_search_degrades_on_dimension_mismatch_with_guidance(tmp_path, monke
         rows = beam._vec_search(beam._get_connection(db), [0.01] * 384, k=5)
     assert rows == []
     logged = " ".join(r.message for r in caplog.records)
-    expected = beam._dim_mismatch_message(768, 384)
+    expected = beam._dim_mismatch_message(
+        (("vec_episodes", 768), ("vec_working", 768), ("vec_facts", 768)), 384
+    )
     assert "dimension mismatch" in logged.lower() and "vec_episodes" in logged.lower(), logged
     assert expected.strip() in logged, logged
 
@@ -96,9 +98,16 @@ def test_vec_search_uses_vec_episodes_dim_in_mixed_schema(tmp_path, monkeypatch,
     conn.execute("DROP TABLE vec_working")
     conn.commit()
     monkeypatch.setattr(beam, "EMBEDDING_DIM", 384)
-    beam.init_beam(db)  # creates vec_working at 384; guard leaves vec_episodes
-    assert beam._existing_vec_dim(conn) in (384, 768)  # generic lookup is ambiguous here
-    assert beam._existing_vec_dim(conn, tables=("vec_episodes",)) == 768
+    beam.init_beam(db)  # guard leaves vec_episodes at 768 untouched
+    # Main's guarded init no longer recreates vec_working under a mismatch, so
+    # build the mixed shape explicitly: vec_working at 384, vec_episodes at 768.
+    conn.execute(
+        "CREATE VIRTUAL TABLE vec_working USING vec0(embedding float32[384])"
+    )
+    conn.commit()
+    assert beam._existing_vec_dim(conn) is None  # mixed store has no honest scalar
+    assert dict(beam._existing_vec_dims(conn))["vec_episodes"] == 768
+    assert dict(beam._existing_vec_dims(conn))["vec_working"] == 384
 
     monkeypatch.setattr(beam, "EMBEDDING_DIM", 768)
     with caplog.at_level("ERROR", logger="mnemosyne.core.beam"):
@@ -106,6 +115,10 @@ def test_vec_search_uses_vec_episodes_dim_in_mixed_schema(tmp_path, monkeypatch,
     assert rows == []
     logged = " ".join(r.message for r in caplog.records)
     assert "table is 768-dim" in logged, logged
+    # A mixed store gets the every-table reindex guidance even though
+    # vec_episodes agrees with the configuration; the endpoint branch's
+    # "stored vectors are fine" claim is only true for a uniform store.
+    assert "vec_episodes=768" in logged and "vec_working=384" in logged, logged
     assert "384-dim, table is 384" not in logged, logged
 
 

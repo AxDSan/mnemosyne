@@ -3018,16 +3018,29 @@ def _is_query_dim_mismatch(exc: BaseException, query_dim: int, existing_dim: Opt
     )
 
 
-def _query_dim_guidance(query_dim: int, existing_dim: int) -> str:
+def _query_dim_guidance(
+    query_dim: int,
+    existing_dim: int,
+    stored_dims: Tuple[Tuple[str, int], ...],
+) -> str:
     """Self-heal guidance for a confirmed query-side dimension mismatch.
 
     The reindex steps from ``_dim_mismatch_message`` are only correct when
     the CONFIGURED dimension disagrees with the store. When config and store
     agree, the embedding endpoint served a wrong-dim query vector and the
     store needs nothing: reindex advice there would be false and destructive.
+    The full ``stored_dims`` tuple is passed through so a mixed store's
+    message names every table, not just the one under query; a mixed store
+    gets the reindex guidance even when vec_episodes happens to agree with
+    the configuration, because the stored vectors are not uniformly fine.
     """
-    if existing_dim != EMBEDDING_DIM:
-        return _dim_mismatch_message(existing_dim, EMBEDDING_DIM)
+    if not stored_dims:
+        # The message-side catalog read failed after the strict probe
+        # succeeded; describe the one dimension that was confirmed rather
+        # than rendering an empty mixed-store description.
+        stored_dims = (("vec_episodes", existing_dim),)
+    if existing_dim != EMBEDDING_DIM or len({dim for _, dim in stored_dims}) != 1:
+        return _dim_mismatch_message(stored_dims, EMBEDDING_DIM)
     return (
         f"The store and the process configuration agree at "
         f"{existing_dim}-dim; the embedding endpoint/model served "
@@ -3096,7 +3109,7 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
             "recall disabled for this call, falling back to other recall "
             "voices. %s",
             query_dim, existing_dim, EMBEDDING_DIM,
-            _query_dim_guidance(query_dim, existing_dim),
+            _query_dim_guidance(query_dim, existing_dim, _existing_vec_dims(conn)),
         )
         return []
     return [{"rowid": r["rowid"], "distance": r["distance"]} for r in rows]
