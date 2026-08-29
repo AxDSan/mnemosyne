@@ -752,6 +752,125 @@ def test_run_install_honours_explicit_python(hermes_world, tmp_path, monkeypatch
     assert bootstrapped == [chosen]
 
 
+@pytest.mark.parametrize(
+    ("mode", "cli_core_present", "selected_core_present", "expected_rc"),
+    [
+        pytest.param("wrapper", False, False, None, id="wrapper-cli-missing-selected-missing"),
+        pytest.param("wrapper", False, True, 0, id="wrapper-cli-missing-selected-present"),
+        pytest.param("wrapper", True, False, None, id="wrapper-cli-present-selected-missing"),
+        pytest.param("wrapper", True, True, 0, id="wrapper-cli-present-selected-present"),
+        pytest.param("symlink", False, False, 1, id="symlink-cli-missing-selected-missing"),
+        pytest.param("symlink", False, True, 1, id="symlink-cli-missing-selected-present"),
+        pytest.param("symlink", True, False, 1, id="symlink-cli-present-selected-missing"),
+        pytest.param("symlink", True, True, 0, id="symlink-cli-present-selected-present"),
+    ],
+)
+def test_explicit_python_core_preflight_matrix(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    mode,
+    cli_core_present,
+    selected_core_present,
+    expected_rc,
+):
+    """Wrapper mode validates only --python; symlink mode retains CLI preflight."""
+    selected_python = tmp_path / "selected-python"
+    selected_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    selected_python.chmod(0o755)
+    target = tmp_path / "plugin-target"
+    target.mkdir()
+    symlink_target = tmp_path / "plugin-link"
+    symlink_target.symlink_to(target, target_is_directory=True)
+    cli_checks: list[bool] = []
+    selected_checks: list[Path] = []
+    install_calls: list[dict[str, object]] = []
+
+    class _SkillResult:
+        message = "skipped"
+
+    def check_cli_core():
+        cli_checks.append(True)
+        return cli_core_present
+
+    def check_selected_core(python):
+        selected_checks.append(Path(python))
+        return "4.0" if selected_core_present else None
+
+    def install_selected(**kwargs):
+        install_calls.append(kwargs)
+        if mode == "wrapper" and not selected_core_present:
+            # This is the selected-runtime failure raised by
+            # _validated_wrapper_environment(), not the CLI-runtime preflight.
+            raise RuntimeError(
+                "Selected Python environment cannot import mnemosyne_hermes: "
+                "No module named 'mnemosyne_hermes'"
+            )
+        return target if mode == "wrapper" else symlink_target
+
+    monkeypatch.setattr(install, "check_mnemosyne_core", check_cli_core)
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kwargs: selected_python)
+    monkeypatch.setattr(install, "check_mnemosyne_core_for_hermes_python", check_selected_core)
+    monkeypatch.setattr(install, "install_plugin", install_selected)
+    monkeypatch.setattr(install, "install_bundled_skill", lambda **kwargs: _SkillResult())
+    monkeypatch.setattr(
+        install,
+        "plugin_state",
+        lambda **kwargs: install.PluginState(
+            status="installed",
+            installed=True,
+            target=target,
+            mode="wrapper",
+            message="ok",
+        ),
+    )
+
+    wrapper_failure = ""
+    if mode == "wrapper" and not selected_core_present:
+        with pytest.raises(RuntimeError, match="Selected Python environment cannot import") as exc_info:
+            install.run_install(
+                hermes_home_path=tmp_path / "home",
+                mode=mode,
+                python=selected_python,
+                no_bootstrap=True,
+            )
+        wrapper_failure = str(exc_info.value)
+        rc = None
+    else:
+        rc = install.run_install(
+            hermes_home_path=tmp_path / "home",
+            mode=mode,
+            python=selected_python,
+            no_bootstrap=True,
+        )
+
+    captured = capsys.readouterr()
+    stderr = captured.err
+    stdout = captured.out
+    assert rc == expected_rc
+    if mode == "wrapper":
+        assert cli_checks == []
+        assert selected_checks == []
+        assert install_calls and install_calls[0]["python"] == selected_python
+        if selected_core_present:
+            assert "mnemosyne-memory NOT found in this Python" not in stderr
+        else:
+            assert "Selected Python environment cannot import mnemosyne_hermes" in wrapper_failure
+    else:
+        assert cli_checks == [True]
+        if not cli_core_present:
+            assert selected_checks == []
+            assert install_calls == []
+            assert "mnemosyne-memory NOT found in this Python" in stderr
+        else:
+            assert selected_checks == [selected_python]
+            if selected_core_present:
+                assert install_calls and install_calls[0]["python"] == selected_python
+            else:
+                assert install_calls == []
+                assert "Hermes' Python at" in stdout
+
+
 def _make_windows_venv(root: Path) -> Path:
     """Create a native Windows venv layout without changing ``os.name``."""
     scripts = root / "Scripts"

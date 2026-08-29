@@ -2196,9 +2196,12 @@ def run_install(
     if mode is None:
         mode = default_install_mode()
 
-    # Check core library first (installer's own Python)
-    core_ok = check_mnemosyne_core()
-    if not core_ok:
+    # A wrapper activates the selected --python environment itself. Its
+    # validation belongs in _validated_wrapper_environment(), so an installer
+    # launched from an unrelated Python must not preempt that selected runtime.
+    # Symlink installs still expose this process directly to Hermes and retain
+    # the historical installer-Python core preflight.
+    if mode != "wrapper" and not check_mnemosyne_core():
         print(
             "  mnemosyne-memory NOT found in this Python. Install it first:\n"
             "    pip install mnemosyne-hermes[all]",
