@@ -1011,22 +1011,66 @@ def test_explicit_python_core_preflight_matrix(
                 assert "Hermes' Python at" in stdout
 
 
-def test_default_wrapper_without_explicit_python_retains_cli_core_preflight(
-    tmp_path, monkeypatch, capsys
+def test_default_wrapper_without_explicit_python_defers_core_validation_to_wrapper(
+    tmp_path, monkeypatch
 ):
-    """Windows' default wrapper mode must not bypass the CLI core check."""
+    """The discovered wrapper runtime reaches its own selected-env validation."""
+    cli_checks: list[bool] = []
+    discovered = _make_venv(tmp_path / "hermes-venv")
+    selected: list[Path | None] = []
+    target = tmp_path / "wrapper-target"
+    target.mkdir()
+
+    class _SkillResult:
+        message = "skipped"
+
+    def check_cli_core():
+        cli_checks.append(True)
+        return False
+
+    monkeypatch.setattr(install, "default_install_mode", lambda: "wrapper")
+    monkeypatch.setattr(install, "check_mnemosyne_core", check_cli_core)
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kwargs: discovered)
+    monkeypatch.setattr(
+        install,
+        "install_plugin",
+        lambda **kwargs: (selected.append(kwargs["python"]), target)[1],
+    )
+    monkeypatch.setattr(install, "install_bundled_skill", lambda **kwargs: _SkillResult())
+    monkeypatch.setattr(
+        install,
+        "plugin_state",
+        lambda **kwargs: install.PluginState(
+            status="installed",
+            installed=True,
+            target=target,
+            mode="wrapper",
+            message="ok",
+        ),
+    )
+
+    rc = install.run_install(hermes_home_path=tmp_path / "home")
+
+    assert rc == 0
+    assert cli_checks == []
+    assert selected == [discovered]
+
+
+def test_default_symlink_retains_cli_core_preflight(tmp_path, monkeypatch, capsys):
+    """The default symlink path still stops before discovery or installation."""
     cli_checks: list[bool] = []
 
     def check_cli_core():
         cli_checks.append(True)
         return False
 
-    def selected_environment_validation(**kwargs):
-        raise AssertionError("must not validate selected wrapper environment")
+    def fail(*args, **kwargs):
+        raise AssertionError("symlink preflight must stop before later install work")
 
-    monkeypatch.setattr(install, "default_install_mode", lambda: "wrapper")
+    monkeypatch.setattr(install, "default_install_mode", lambda: "symlink")
     monkeypatch.setattr(install, "check_mnemosyne_core", check_cli_core)
-    monkeypatch.setattr(install, "install_plugin", selected_environment_validation)
+    monkeypatch.setattr(install, "_find_hermes_python", fail)
+    monkeypatch.setattr(install, "install_plugin", fail)
 
     rc = install.run_install(hermes_home_path=tmp_path / "home")
 

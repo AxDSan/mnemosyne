@@ -2220,12 +2220,10 @@ def run_install(
     if mode is None:
         mode = default_install_mode()
 
-    # An explicit wrapper --python activates that selected environment itself.
-    # Its validation belongs in _validated_wrapper_environment(), so an installer
-    # launched from an unrelated Python must not preempt that selected runtime.
-    # Wrapper installs without --python still use this process and retain the
-    # historical installer-Python core preflight.
-    if not (mode == "wrapper" and python is not None) and not check_mnemosyne_core():
+    # Wrapper validation belongs to its selected environment, including the
+    # interpreter discovered when --python is omitted. Only symlink installs
+    # retain the installer-Python core preflight and bootstrap path.
+    if mode == "symlink" and not check_mnemosyne_core():
         print(
             "  mnemosyne-memory NOT found in this Python. Install it first:\n"
             "    pip install mnemosyne-hermes[all]",
