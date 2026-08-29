@@ -7,8 +7,9 @@ triples reach `facts`, `graph_edges` and `consolidated_facts`, from where
 `fact_recall` surfaced them:
 
 1. The optional article was not anchored as a whole word, so
-   "Alice is already ready" captured article "a" + object "lready", and
-   "Alice is there" captured "the" + "re".
+   "Alice is already ready" captured article "a" + object "lready". ("Alice
+   is there" captured "the" + "re" the same way, but never persisted: the
+   existing `len(obj) > 2` check already discarded a two-character object.)
 2. Nothing guarded the object side, so "Bob is different" persisted
    (Bob, is, different), and every such state/stance/filler token shared
    (subject, predicate) with the real facts about Bob, which the veracity
@@ -16,7 +17,12 @@ triples reach `facts`, `graph_edges` and `consolidated_facts`, from where
 
 The fix is a whole-word article group in the three affected patterns plus
 `_is_low_quality_object`, a closed word list (no suffix or shape heuristic,
-so a name can never be rejected). These tests pin the unit behaviour and
+so a name can never be rejected). The patterns capture a single object
+token and this fix does not change that, so the guard is a rule about one
+word: an adjective phrase reaches it as its leading modifier ("an extremely
+reliable editor" -> "extremely"), which is why the modifiers are listed.
+`test_the_object_is_a_single_token` pins the capture width as it stands.
+These tests pin the unit behaviour and
 then walk each ingest path that reaches `extract_facts`: `remember`, the
 dedup-update branch of `remember`, `remember_batch`,
 `consolidate_to_episodic`, and the `fact_recall` mix that reads the result.
@@ -87,7 +93,6 @@ def test_object_guard_rejects_value_free_tokens(obj):
 @pytest.mark.parametrize("obj", [
     "developer",            # lone common noun
     "Rust", "ComfyUI",      # lone proper noun / product
-    "senior developer",     # multi-word always passes
     "Sally", "Italy",       # names ending in -ly must never be rejected
     "family", "assembly",   # common nouns ending in -ly must never be rejected
     "fast",                 # an adjective the list does not name stays a fact
@@ -133,6 +138,23 @@ def test_article_is_still_consumed_when_present(graph):
     assert _triples(graph, "Bob is the lead") == [("Bob", "is", "lead")]
     assert _triples(graph, "Bob has a dog") == [("Bob", "has", "dog")]
     assert _triples(graph, "Bob uses the terminal") == [("Bob", "uses", "terminal")]
+
+
+def test_a_leading_modifier_is_not_a_fact(graph):
+    """An adjective phrase arrives as its modifier alone, which names no
+    value. Reported in review of #876 against the public entry point."""
+    assert _triples(graph, "Alice is really talented.") == []
+    assert _triples(graph, "Bob has a very useful tool.") == []
+    assert _triples(graph, "Carol uses an extremely reliable editor.") == []
+    assert _triples(graph, "Dave is originally from Texas") == []
+
+
+def test_the_object_is_a_single_token(graph):
+    """Pinned as it is, not endorsed: the patterns stop at the first word
+    boundary, so a multi-word value keeps only its first token. Widening the
+    capture would change every object row and is not part of this fix."""
+    assert _triples(graph, "Alice is a senior developer") == [("Alice", "is", "senior")]
+    assert _triples(graph, "Bob works at Acme Corp") == [("Bob", "works_at", "Acme")]
 
 
 def test_low_value_objects_are_rejected_on_every_pattern(graph):

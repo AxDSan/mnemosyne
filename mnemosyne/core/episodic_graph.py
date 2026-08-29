@@ -66,6 +66,14 @@ def _is_low_quality_subject(subject: str) -> bool:
 # facts about that subject, so the veracity consolidator reads each one as a
 # contradiction.
 #
+# Because the capture is one token, an adjective phrase arrives as its
+# leading modifier and nothing else: "an extremely reliable editor" reaches
+# the guard as "extremely". Those modifiers are in the list for the same
+# reason as the rest, they name no value, but note that this is the modifier
+# alone and not a shortened phrase. Widening the capture to keep
+# "extremely reliable editor" would change what every object row holds and
+# is deliberately not part of this fix.
+#
 # This is a closed word list on purpose. A suffix heuristic ("ends in -ly")
 # was tried before and rejected proper nouns and common nouns that happen to
 # end that way ("Sally", "Italy", "family", "assembly"), so the adverb class
@@ -99,23 +107,31 @@ _LOW_QUALITY_OBJECT_WORDS = frozenset({
     "often", "sometimes", "rarely", "seldom", "again", "quite", "rather",
     "pretty", "kind", "sort", "maybe", "perhaps", "however", "therefore",
     "otherwise", "anyway", "instead", "indeed", "even",
+    "extremely", "incredibly", "highly", "fairly", "somewhat", "slightly",
+    "truly", "deeply", "utterly", "especially", "particularly", "notably",
+    "remarkably", "hardly", "barely", "scarcely", "seriously", "genuinely",
+    "frankly", "arguably", "reportedly", "allegedly", "evidently",
+    "unusually", "increasingly", "occasionally", "frequently", "constantly",
+    "recently", "eventually", "immediately", "originally", "initially",
+    "previously", "formerly", "lately",
 })
 
 
 def _is_low_quality_object(obj: str) -> bool:
     """True if `obj` carries no nameable value and should not become a fact
-    triple: empty, or a lone lowercase token in _LOW_QUALITY_OBJECT_WORDS.
+    triple: empty, or a lowercase token in _LOW_QUALITY_OBJECT_WORDS.
 
-    A multi-word object, a capitalised token ("Rust", "ComfyUI") and a lone
-    common noun ("developer") all pass. The check is a closed list, never a
-    suffix or shape heuristic, so it cannot reject a name."""
+    The extraction patterns stop at the first word boundary, so the object
+    this sees is always a single token. It makes no claim about phrases: a
+    capitalised token ("Rust", "ComfyUI") and a lone common noun
+    ("developer") pass, and anything the list does not name passes. The
+    check is a closed list, never a suffix or shape heuristic, so it cannot
+    reject a name."""
     if not obj:
         return True
     o = obj.strip()
     if not o:
         return True
-    if len(o.split()) > 1:
-        return False
     if o[:1].isupper():
         return False
     return o.lower() in _LOW_QUALITY_OBJECT_WORDS
