@@ -5478,11 +5478,11 @@ class BeamMemory:
         # branches hardcode (subject='user', predicate∈{negation,decision,
         # requires}, confidence∈{0.75,0.65}) rows whose objects end at raw
         # Python slices — the sole source of the junk previously found in
-        # memoria_kg. Opt-in only via MNEMOSYNE_REGEX_KG; default OFF.
+        # memoria_kg. Opt-in only via MNEMOSYNE_REGEX_KG (env-only; not a
+        # config.yaml key); default OFF via _env_truthy.
         # The real KG path is the LLM extraction wired through
         # _extract_and_store_facts -> _store_kg_triples.
-        _regex_kg_enabled = os.environ.get(
-            "MNEMOSYNE_REGEX_KG", "").strip().lower() in ("1", "true", "yes", "on")
+        _regex_kg_enabled = _env_truthy("MNEMOSYNE_REGEX_KG")
         if _regex_kg_enabled:
             # Negations (critical for CR) — language-aware
             for m in _re.finditer(pat['negation'], content, _re.IGNORECASE):
