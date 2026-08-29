@@ -162,6 +162,15 @@ class TestValidateKgTriples:
         ])
         assert [t[1] for t in out] == ["works_at"]
 
+    def test_separator_only_predicate_rejected(self):
+        # Normalization of "-" / "___" yields "" — must not persist a
+        # triple with an empty predicate (CodeRabbit e1c067d follow-up).
+        assert validate_kg_triples([
+            ("user", "-", "x"),
+            ("user", "___", "x"),
+            ("user", "  - -  ", "x"),
+        ]) == []
+
     def test_object_truncated_at_word_boundary(self):
         long_obj = "deploy the service across every region " * 12
         out = validate_kg_triples([("platform", "requires", long_obj)])

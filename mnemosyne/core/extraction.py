@@ -268,6 +268,8 @@ def validate_kg_triples(triples) -> List[Tuple[str, str, str]]:
 
         predicate = re.sub(r"[\s\-]+", "_", predicate.lower())
         predicate = re.sub(r"_+", "_", predicate).strip("_")
+        if not predicate:
+            continue
 
         key = (subject.lower(), predicate, obj.lower())
         if key in seen:
