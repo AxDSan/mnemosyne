@@ -2,6 +2,7 @@
 
 import subprocess
 import sys
+import venv
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -83,6 +84,42 @@ def test_wrapper_validation_rejects_selected_python_without_mnemosyne_core(
         install._validated_wrapper_environment(selected_python)
 
     assert any("import mnemosyne.core.beam" in command[-1] for command in commands)
+
+
+def test_wrapper_validation_rejects_real_selected_venv_without_mnemosyne_core(tmp_path):
+    """A selected venv may import the graceful fallback without containing core."""
+    environment = tmp_path / "selected-environment"
+    venv.EnvBuilder(with_pip=True).create(environment)
+    python = environment / ("Scripts/python.exe" if sys.platform.startswith("win32") else "bin/python")
+    project = Path(__file__).resolve().parent.parent
+    install_result = subprocess.run(
+        [str(python), "-m", "pip", "install", "--no-deps", "-e", str(project)],
+        capture_output=True,
+        text=True,
+    )
+    assert install_result.returncode == 0, install_result.stderr
+
+    site_packages = install._site_packages_for_python(python)
+    fallback_probe = subprocess.run(
+        [
+            str(python),
+            "-S",
+            "-c",
+            "import site\n"
+            f"site.addsitedir({str(site_packages)!r})\n"
+            "import mnemosyne_hermes\n"
+            "print('fallback-imported')\n"
+            "import mnemosyne.core.beam\n",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert fallback_probe.returncode != 0
+    assert fallback_probe.stdout.strip() == "fallback-imported"
+    assert "No module named 'mnemosyne'" in fallback_probe.stderr
+
+    with pytest.raises(RuntimeError, match=r"mnemosyne\.core\.beam"):
+        install._validated_wrapper_environment(python)
 
 
 def test_plugin_state_accepts_11_second_healthy_wrapper_import(tmp_path, monkeypatch):
