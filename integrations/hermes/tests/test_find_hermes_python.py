@@ -871,6 +871,30 @@ def test_explicit_python_core_preflight_matrix(
                 assert "Hermes' Python at" in stdout
 
 
+def test_default_wrapper_without_explicit_python_retains_cli_core_preflight(
+    tmp_path, monkeypatch, capsys
+):
+    """Windows' default wrapper mode must not bypass the CLI core check."""
+    cli_checks: list[bool] = []
+
+    def check_cli_core():
+        cli_checks.append(True)
+        return False
+
+    def selected_environment_validation(**kwargs):
+        raise AssertionError("must not validate selected wrapper environment")
+
+    monkeypatch.setattr(install, "default_install_mode", lambda: "wrapper")
+    monkeypatch.setattr(install, "check_mnemosyne_core", check_cli_core)
+    monkeypatch.setattr(install, "install_plugin", selected_environment_validation)
+
+    rc = install.run_install(hermes_home_path=tmp_path / "home")
+
+    assert rc == 1
+    assert cli_checks == [True]
+    assert "mnemosyne-memory NOT found in this Python" in capsys.readouterr().err
+
+
 def _make_windows_venv(root: Path) -> Path:
     """Create a native Windows venv layout without changing ``os.name``."""
     scripts = root / "Scripts"
