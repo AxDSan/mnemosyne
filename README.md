@@ -6,6 +6,8 @@
 
 *Zero-cloud AI memory that works everywhere. SQLite-backed. One pure-Python dependency.*
 
+<a href="https://trendshift.io/repositories/27293?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-27293" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/27293/daily?language=Python" alt="mnemosyne-oss/mnemosyne | Trendshift" width="250" height="55"/></a>
+
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
 [![PyPI](https://img.shields.io/pypi/v/mnemosyne-memory.svg)](https://pypi.org/project/mnemosyne-memory/)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
