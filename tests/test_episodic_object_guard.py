@@ -187,12 +187,17 @@ def test_article_led_subjects_are_rejected(graph):
     assert _triples(graph, "The silence is different") == []
     assert _triples(graph, "The build is a success") == []
     assert _triples(graph, "A frame has legs") == []
+    assert _triples(graph, "An engineer uses Python") == []
+    assert _triples(graph, "The service works at Acme") == []
 
 
 def test_article_led_names_are_kept(graph):
-    """The article rule must not cost a fact about a named entity."""
+    """The article rule must not cost a fact about a named entity, on any of
+    the four patterns."""
     assert _triples(graph, "The Matrix is a film") == [("The Matrix", "is", "film")]
     assert _triples(graph, "A New Hope has a sequel") == [("A New Hope", "has", "sequel")]
+    assert _triples(graph, "The Matrix uses Python") == [("The Matrix", "uses", "Python")]
+    assert _triples(graph, "The Matrix works at Warner") == [("The Matrix", "works_at", "Warner")]
 
 
 def test_mixed_content_keeps_only_the_real_facts(graph):
