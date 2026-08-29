@@ -831,6 +831,62 @@ def test_wrapper_dry_run_does_not_report_a_bootstrap(tmp_path, monkeypatch, caps
     assert "Will bootstrap: True" in capsys.readouterr().out
 
 
+def test_wrapper_dry_run_uses_discovered_interpreter_for_display_and_probe(
+    tmp_path, monkeypatch, capsys
+):
+    """The public dry-run path matches wrapper install's discovered runtime."""
+    discovered = _make_venv(tmp_path / "hermes-venv")
+    installer_python = tmp_path / "installer-python"
+    _write_executable(installer_python, "#!/bin/sh\nexit 0\n")
+    site_packages = tmp_path / "site-packages"
+    probed: list[Path] = []
+
+    monkeypatch.setattr(sys, "executable", str(installer_python))
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kwargs: discovered)
+    monkeypatch.setattr(
+        install,
+        "_site_packages_for_python",
+        lambda python, **kwargs: (probed.append(Path(python)), site_packages)[1],
+    )
+
+    rc = install.main(["install", "--mode", "wrapper", "--dry-run"])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert f"Wrapper Python: {discovered}" in out
+    assert f"Wrapper site-packages: {site_packages}" in out
+    assert str(installer_python) not in out
+    assert probed == [discovered]
+
+
+def test_wrapper_dry_run_makes_explicit_relative_python_absolute_before_probe(
+    tmp_path, monkeypatch, capsys
+):
+    """The public dry-run path probes and reports relative --python lexically."""
+    selected = _make_venv(tmp_path / "hermes-venv")
+    site_packages = tmp_path / "site-packages"
+    relative_python = os.path.relpath(selected, start=tmp_path)
+    probed: list[Path] = []
+
+    monkeypatch.chdir(tmp_path)
+    expected = Path(relative_python).absolute()
+    monkeypatch.setattr(
+        install,
+        "_site_packages_for_python",
+        lambda python, **kwargs: (probed.append(Path(python)), site_packages)[1],
+    )
+
+    rc = install.main(
+        ["install", "--mode", "wrapper", "--dry-run", "--python", relative_python]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert f"Wrapper Python: {expected}" in out
+    assert f"Wrapper site-packages: {site_packages}" in out
+    assert probed == [expected]
+
+
 def test_run_install_honours_explicit_python(hermes_world, tmp_path, monkeypatch):
     """--python reaches discovery in symlink mode, not just wrapper mode."""
     bootstrapped: list[Path] = []

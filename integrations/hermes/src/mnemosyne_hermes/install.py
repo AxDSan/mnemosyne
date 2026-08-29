@@ -2400,7 +2400,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  Skill state: {skill.status}")
                 print(f"  Skill action: {skill_plan.message}")
                 if getattr(args, "mode", "symlink") == "wrapper":
-                    wrapper_python = Path(getattr(args, "python", None) or sys.executable).expanduser()
+                    # Match run_install(): wrapper metadata and validation use
+                    # the discovered Hermes runtime unless --python selected one.
+                    # Preserve a venv's python symlink; absolute() is lexical.
+                    wrapper_python = (hermes_python or Path(sys.executable)).absolute()
                     print(f"  Wrapper Python: {wrapper_python}")
                     if wrapper_python.is_file():
                         print(
