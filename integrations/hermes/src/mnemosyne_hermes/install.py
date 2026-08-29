@@ -1560,7 +1560,12 @@ def _validated_wrapper_environment(
                 "--python was given an empty value. Pass the path to Hermes' "
                 "interpreter, or omit --python to let the installer find it."
             )
-        wrapper_python = Path(selected).expanduser()
+        # The import probe runs from an isolated temporary working directory.
+        # Make an explicit relative path independent of that cwd before either
+        # validation or the probe uses it.  ``absolute()`` is lexical here:
+        # ``resolve()`` would follow a venv's bin/python symlink to its base
+        # interpreter and lose the selected virtual environment.
+        wrapper_python = Path(selected).expanduser().absolute()
     if not wrapper_python.is_file():
         raise FileNotFoundError(f"Python interpreter not found: {wrapper_python}")
     import_timeout = _validated_import_timeout(import_timeout)
@@ -2228,9 +2233,10 @@ def run_install(
         )
         return 1
 
-    # Symlink installs need Hermes' own Python to contain the package. Wrapper
-    # installs validate the explicitly selected interpreter in install_plugin().
-    hermes_python = _find_hermes_python(explicit_python=python) if mode == "symlink" else None
+    # Both install modes need a Hermes interpreter. Symlink installs bootstrap
+    # it when needed; wrapper installs validate it and record its metadata. An
+    # explicit --python remains authoritative through _find_hermes_python().
+    hermes_python = _find_hermes_python(explicit_python=python)
     if mode == "symlink" and hermes_python is None:
         # Discovery found no validated Hermes runtime, so there is nothing safe
         # to bootstrap into. Before #618 this path guessed at the launcher's
@@ -2256,7 +2262,7 @@ def run_install(
     # to its base interpreter, so resolving both sides reports a venv and the
     # base install as the same runtime and skips the check that bootstraps
     # Hermes' venv (#618).
-    if hermes_python and hermes_python != Path(sys.executable):
+    if mode == "symlink" and hermes_python and hermes_python != Path(sys.executable):
         hermes_core = check_mnemosyne_core_for_hermes_python(hermes_python)
         if hermes_core is None:
             print(f"\n  ⚠ Hermes' Python at {hermes_python} can't import mnemosyne core.")
@@ -2285,7 +2291,7 @@ def run_install(
             hermes_home_path=hermes_home_path,
             force=force,
             mode=mode,
-            python=python,
+            python=hermes_python if mode == "wrapper" else python,
             import_timeout=import_timeout,
             migrate_wrapper_to_symlink=migrate_wrapper_to_symlink,
             link_profiles=link_profiles,

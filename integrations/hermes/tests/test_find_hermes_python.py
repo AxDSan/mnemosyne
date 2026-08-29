@@ -669,6 +669,78 @@ def test_wrapper_mode_is_unaffected_by_failed_discovery(tmp_path, monkeypatch):
     assert rc == 0
 
 
+def test_wrapper_without_python_uses_discovered_hermes_interpreter(
+    tmp_path, monkeypatch
+):
+    """An omitted wrapper --python records and validates Hermes' runtime, not ours."""
+    discovered = _make_venv(tmp_path / "hermes-venv")
+    installer_python = tmp_path / "installer-python"
+    _write_executable(installer_python, "#!/bin/sh\nexit 0\n")
+    selected: list[Path | None] = []
+    target = tmp_path / "wrapper-target"
+    target.mkdir()
+
+    class _SkillResult:
+        message = "skipped"
+
+    monkeypatch.setattr(sys, "executable", str(installer_python))
+    monkeypatch.setattr(install, "check_mnemosyne_core", lambda: True)
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kwargs: discovered)
+    monkeypatch.setattr(
+        install,
+        "install_plugin",
+        lambda **kwargs: (selected.append(kwargs["python"]), target)[1],
+    )
+    monkeypatch.setattr(install, "install_bundled_skill", lambda **kwargs: _SkillResult())
+    monkeypatch.setattr(
+        install,
+        "plugin_state",
+        lambda **kwargs: install.PluginState(
+            status="installed",
+            installed=True,
+            target=target,
+            mode="wrapper",
+            message="ok",
+        ),
+    )
+
+    assert install.run_install(hermes_home_path=tmp_path / "home", mode="wrapper") == 0
+    assert selected == [discovered]
+    assert selected != [Path(sys.executable)]
+
+
+def test_relative_wrapper_python_is_lexically_absolute_before_isolated_probe(
+    tmp_path, monkeypatch
+):
+    """A relative --python survives the probe's different temporary cwd intact."""
+    selected = tmp_path / "venv" / "bin" / "python"
+    selected.parent.mkdir(parents=True)
+    selected.symlink_to(Path(sys.executable))
+    site_packages = tmp_path / "site-packages"
+    _write_executable(site_packages / "mnemosyne_hermes" / "__init__.py", "__version__ = 'test'\n")
+    (site_packages / "mnemosyne" / "core").mkdir(parents=True)
+    (site_packages / "mnemosyne" / "__init__.py").write_text("", encoding="utf-8")
+    (site_packages / "mnemosyne" / "core" / "__init__.py").write_text("", encoding="utf-8")
+    (site_packages / "mnemosyne" / "core" / "beam.py").write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    relative_python = os.path.relpath(selected, start=tmp_path)
+    expected = Path(relative_python).absolute()
+    seen: list[Path] = []
+
+    def site_for_python(python, **kwargs):
+        seen.append(Path(python))
+        return site_packages
+
+    monkeypatch.setattr(install, "_site_packages_for_python", site_for_python)
+
+    wrapper_python, returned_site = install._validated_wrapper_environment(relative_python)
+
+    assert wrapper_python == expected == selected
+    assert wrapper_python.resolve() == Path(sys.executable).resolve()
+    assert seen == [expected]
+    assert returned_site == site_packages
+
+
 def test_run_install_bootstraps_hermes_venv_not_path_sibling(
     hermes_world, tmp_path, monkeypatch
 ):
