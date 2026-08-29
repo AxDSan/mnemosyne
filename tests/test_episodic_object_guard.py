@@ -41,8 +41,10 @@ from mnemosyne.core.episodic_graph import (
     _is_low_quality_subject,
 )
 
-JUNK = "Bob is different. Bob is already ready. Bob is there. Bob has it."
-GOOD = "Alice is a developer. Alice uses Rust. Alice works at Anthropic."
+JUNK = ("Bob is different. Bob is already ready. Bob is there. Bob has it. "
+        "The frame has legs. An engineer uses Python.")
+GOOD = ("Alice is a developer. Alice uses Rust. Alice works at Anthropic. "
+        "The Matrix is a film. The Matrix works at Warner.")
 
 
 @pytest.fixture
@@ -71,10 +73,17 @@ def _consolidated_rows(conn: sqlite3.Connection):
 
 
 def _assert_clean(rows, label: str):
-    """No row's object is a truncated article victim or a state/filler word."""
+    """No row's object is a truncated article victim or a state/filler word,
+    and no row's subject is an article-led common-noun phrase."""
     objects = {obj for _, _, obj in rows}
     for junk in ("lready", "re", "different", "it", "nother", "ory"):
         assert junk not in objects, f"{label}: junk object {junk!r} in {rows}"
+    for subject, _, _ in rows:
+        tokens = subject.split()
+        assert not (len(tokens) > 1
+                    and tokens[0].lower() in ("the", "a", "an")
+                    and tokens[1][:1].islower()), (
+            f"{label}: article-led common-noun subject {subject!r} in {rows}")
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +229,8 @@ def test_remember_does_not_persist_junk(temp_db):
     facts = _fact_rows(beam.conn)
     _assert_clean(facts, "facts")
     assert ("Alice", "is", "developer") in facts
+    assert ("The Matrix", "is", "film") in facts, (
+        "an article-led name is a fact and must persist")
     consolidated = _consolidated_rows(beam.conn)
     _assert_clean(consolidated, "consolidated_facts")
     assert any(s == "Alice" for s, _, _ in consolidated)
@@ -252,6 +263,7 @@ def test_remember_batch_does_not_persist_junk(temp_db):
     facts = _fact_rows(beam.conn)
     _assert_clean(facts, "facts")
     assert ("Alice", "uses", "Rust") in facts
+    assert ("The Matrix", "works_at", "Warner") in facts
     assert not any(s == "Bob" for s, _, _ in facts)
     _assert_clean(_consolidated_rows(beam.conn), "consolidated_facts")
 
@@ -282,3 +294,5 @@ def test_fact_recall_mix_carries_no_junk(temp_db):
             assert not content.endswith(" has it"), (query, content)
     alice = {h["content"] for h in beam.fact_recall("Alice")}
     assert any("Alice is developer" in c or "Alice uses Rust" in c for c in alice), alice
+    matrix = {h["content"] for h in beam.fact_recall("Matrix")}
+    assert any("The Matrix" in c for c in matrix), matrix
