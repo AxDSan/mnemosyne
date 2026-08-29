@@ -56,6 +56,35 @@ def test_wrapper_validation_timeout_reaches_both_probes(tmp_path, monkeypatch, i
     assert observed_timeouts == [import_timeout, import_timeout]
 
 
+def test_wrapper_validation_rejects_selected_python_without_mnemosyne_core(
+    tmp_path, monkeypatch
+):
+    """Wrapper --python must prove core imports, not only the fallback package."""
+    selected_python = tmp_path / "selected-python"
+    selected_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    selected_python.chmod(0o755)
+    site_packages = tmp_path / "site-packages"
+    site_packages.mkdir()
+    commands = []
+
+    def probe(command, **kwargs):
+        commands.append(command)
+        if "-S" not in command:
+            return subprocess.CompletedProcess(command, 0, f"{site_packages}\n", "")
+        if "import mnemosyne.core.beam" in command[-1]:
+            return subprocess.CompletedProcess(
+                command, 1, "", "ModuleNotFoundError: No module named 'mnemosyne.core'"
+            )
+        return subprocess.CompletedProcess(command, 0, "0.0-test\n", "")
+
+    monkeypatch.setattr(install.subprocess, "run", probe)
+
+    with pytest.raises(RuntimeError, match="cannot import required mnemosyne core"):
+        install._validated_wrapper_environment(selected_python)
+
+    assert any("import mnemosyne.core.beam" in command[-1] for command in commands)
+
+
 def test_plugin_state_accepts_11_second_healthy_wrapper_import(tmp_path, monkeypatch):
     """Status must share the 60-second wrapper-validation policy with install."""
     target = tmp_path / "plugins" / "mnemosyne"

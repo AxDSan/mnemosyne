@@ -469,6 +469,11 @@ def _check_wrapper_import(
         f"selected_site = Path({str(site_packages)!r}).resolve()\n"
         "site.addsitedir(str(selected_site))\n"
         "import mnemosyne_hermes\n"
+        # mnemosyne_hermes deliberately degrades when its optional core imports
+        # are unavailable. A wrapper needs the actual runtime, not merely that
+        # importable fallback package, so prove the same core entry point as the
+        # installer's CLI preflight in the selected interpreter.
+        "import mnemosyne.core.beam\n"
         "origin = getattr(mnemosyne_hermes, '__file__', None)\n"
         "if not origin:\n"
         "    raise SystemExit('mnemosyne_hermes package has no file origin')\n"
@@ -1070,7 +1075,7 @@ def check_mnemosyne_core() -> bool:
 
 
 def check_mnemosyne_core_for_hermes_python(hermes_python: Path) -> Optional[str]:
-    """Check if Hermes' Python can import mnemosyne core.
+    """Check if Hermes' Python can import Mnemosyne's operational dependencies.
 
     Returns the version string if importable, None otherwise.
     """
@@ -1078,7 +1083,7 @@ def check_mnemosyne_core_for_hermes_python(hermes_python: Path) -> Optional[str]
         result = subprocess.run(
             [str(hermes_python), "-c",
              "import mnemosyne; print(mnemosyne.__version__); "
-             "import sqlite_vec"],
+             "import mnemosyne.core.beam; import sqlite_vec"],
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0:
@@ -1552,7 +1557,8 @@ def _validated_wrapper_environment(
     )
     if not import_ok:
         raise RuntimeError(
-            f"Selected Python environment cannot import mnemosyne_hermes: {import_error}"
+            "Selected Python environment cannot import required mnemosyne core "
+            f"(mnemosyne.core.beam): {import_error}"
         )
     return wrapper_python, site_packages
 

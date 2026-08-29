@@ -1176,6 +1176,12 @@ def test_wrapper_preflight_and_bootstrap_support_real_pep660_editable_install(tm
 
     site_packages = install_mod._site_packages_for_python(python)
     assert not (site_packages / "mnemosyne_hermes").exists()
+    # The wrapper's selected interpreter must contain both the editable Hermes
+    # package and the operational Mnemosyne core. Model the latter with a
+    # second editable-style .pth entry, without downloading dependencies.
+    (site_packages / "mnemosyne-memory.pth").write_text(
+        f"{project.parent.parent}\n", encoding="utf-8"
+    )
     assert install_mod._check_wrapper_import(site_packages, python) == (True, None, False)
 
     wrapper = tmp_path / "hermes-home" / "plugins" / "mnemosyne"
