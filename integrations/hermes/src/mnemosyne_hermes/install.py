@@ -483,22 +483,26 @@ def _check_wrapper_import(
         + "print(getattr(mnemosyne_hermes, '__version__', 'unknown'))\n"
     )
     try:
-        result = subprocess.run(
-            [str(runner), "-S", "-c", code],
-            capture_output=True,
-            text=True,
-            timeout=import_timeout,
-            # -S and a selected site directory isolate imports from the runner's
-            # ambient site/user directories. Filtering PYTHONPATH prevents a
-            # caller-controlled package shadowing that contract; filtering
-            # PYTHONOPTIMIZE keeps assertion elision from changing probe behavior.
-            env={
-                key: value
-                for key, value in os.environ.items()
-                if key not in {"PYTHONPATH", "PYTHONOPTIMIZE"}
-            },
-            cwd=site_packages,
-        )
+        # Python puts the subprocess working directory on sys.path.  Use a
+        # fresh empty directory so validation cannot borrow a checkout or the
+        # installer's current directory to satisfy the selected runtime.
+        with tempfile.TemporaryDirectory(prefix="mnemosyne-wrapper-import-") as probe_cwd:
+            result = subprocess.run(
+                [str(runner), "-S", "-c", code],
+                capture_output=True,
+                text=True,
+                timeout=import_timeout,
+                # -S and a selected site directory isolate imports from the runner's
+                # ambient site/user directories. Filtering PYTHONPATH prevents a
+                # caller-controlled package shadowing that contract; filtering
+                # PYTHONOPTIMIZE keeps assertion elision from changing probe behavior.
+                env={
+                    key: value
+                    for key, value in os.environ.items()
+                    if key not in {"PYTHONPATH", "PYTHONOPTIMIZE"}
+                },
+                cwd=probe_cwd,
+            )
     except OSError as exc:
         return False, f"could not run wrapper Python {runner}: {exc}", True
     except subprocess.TimeoutExpired:

@@ -1,5 +1,6 @@
 """Focused coverage for wrapper validation timeout configuration."""
 
+import os
 import subprocess
 import sys
 import venv
@@ -100,6 +101,8 @@ def test_wrapper_validation_rejects_real_selected_venv_without_mnemosyne_core(tm
     assert install_result.returncode == 0, install_result.stderr
 
     site_packages = install._site_packages_for_python(python)
+    probe_cwd = tmp_path / "fallback-probe-cwd"
+    probe_cwd.mkdir()
     fallback_probe = subprocess.run(
         [
             str(python),
@@ -113,6 +116,8 @@ def test_wrapper_validation_rejects_real_selected_venv_without_mnemosyne_core(tm
         ],
         capture_output=True,
         text=True,
+        cwd=probe_cwd,
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
     )
     assert fallback_probe.returncode != 0
     assert fallback_probe.stdout.strip() == "fallback-imported"
