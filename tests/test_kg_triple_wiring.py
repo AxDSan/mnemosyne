@@ -133,6 +133,12 @@ class TestParseKgTriples:
         fenced = "```json\n" + _kg_payload(["a b c"]) + "\n```"
         assert validate_kg_triples(_parse_kg_triples(fenced)) == [("a", "b", "c")]
 
+    def test_null_fields_rejected_before_str_conversion(self):
+        # JSON null must never become the literal string "None".
+        assert _parse_kg_triples(_kg_payload([[None, "uses", "sqlite"]])) == []
+        assert _parse_kg_triples(_kg_payload([["user", None, "sqlite"]])) == []
+        assert _parse_kg_triples(_kg_payload([["user", "uses", None]])) == []
+
 
 class TestValidateKgTriples:
 
@@ -143,6 +149,18 @@ class TestValidateKgTriples:
             ("user", "decision", "whether to abandon ship"),
             ("what to do next", "decision", "ship"),
         ]) == []
+
+    def test_predicate_normalized_to_snake_case(self):
+        # Hyphens/space runs/leading/trailing separators all collapse to
+        # a single snake_case predicate so "works-at" and "works at"
+        # cannot persist as separate current truths (supersede keys on
+        # subject+predicate).
+        out = validate_kg_triples([
+            ("user", "works-at", "acme"),
+            ("user", "works at", "acme"),
+            ("user", "--works--at--", "acme"),
+        ])
+        assert [t[1] for t in out] == ["works_at"]
 
     def test_object_truncated_at_word_boundary(self):
         long_obj = "deploy the service across every region " * 12

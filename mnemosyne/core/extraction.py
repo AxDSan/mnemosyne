@@ -169,6 +169,8 @@ def _parse_kg_triples(raw_output: str) -> List[Tuple[str, str, str]]:
     triples: List[Tuple[str, str, str]] = []
     for item in items:
         if isinstance(item, (list, tuple)) and len(item) == 3:
+            if any(f is None for f in item):
+                continue
             triples.append((str(item[0]), str(item[1]), str(item[2])))
         elif isinstance(item, dict):
             s, p, o = item.get("subject"), item.get("predicate"), item.get("object")
@@ -229,7 +231,8 @@ def validate_kg_triples(triples) -> List[Tuple[str, str, str]]:
     - length caps: subject <= 120, predicate <= 60, object <= 300 chars.
       Over-long objects are cut at a word boundary (never mid-word); a field
       with no clean cut is rejected outright;
-    - predicates are lowercased with whitespace folded to underscores;
+    - predicates are lowercased with whitespace/hyphens folded to underscores
+      (collapse runs, trim boundary underscores), enforcing snake_case;
     - within-batch duplicates (case-insensitive) are dropped.
     """
     validated: List[Tuple[str, str, str]] = []
@@ -263,7 +266,8 @@ def validate_kg_triples(triples) -> List[Tuple[str, str, str]]:
         if not subject or not predicate or not obj:
             continue
 
-        predicate = re.sub(r"\s+", "_", predicate.lower())
+        predicate = re.sub(r"[\s\-]+", "_", predicate.lower())
+        predicate = re.sub(r"_+", "_", predicate).strip("_")
 
         key = (subject.lower(), predicate, obj.lower())
         if key in seen:
@@ -475,7 +479,7 @@ def _extract_facts_impl(text: str) -> Tuple[List[str], List[Tuple[str, str, str]
             diagnostics_safe_for_log(e),
         )
         diag.record_call(succeeded=False)
-        return []
+        return [], []
     if llm is not None:
         try:
             raw_output = _call_local_extraction_llm(llm, prompt)
