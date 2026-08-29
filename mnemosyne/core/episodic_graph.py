@@ -38,22 +38,32 @@ _LOW_QUALITY_SUBJECT_LEADERS = frozenset({
     "i", "you", "he", "she", "they", "we",
     "him", "her", "them", "us",
     "my", "your", "his", "their", "our", "its",
-    # Article-led subjects ("The silence is different", "A frame has ...")
-    # are the same transient-state noise on narrative traffic: a named entity
-    # never opens with an article. Kept in this leader set rather than as a
-    # separate rule; the broader proper-noun-shape subject rule (#742)
-    # subsumes it and both can coexist.
-    "the", "a", "an",
 })
+
+# Article-led subjects are the same transient-state noise on narrative
+# traffic ("The silence is different", "A frame has ..."), but the article
+# alone cannot decide it: a proper name may open with one ("The Matrix",
+# "The Netherlands", "A New Hope"). The word after the article settles it,
+# lowercase for the common-noun phrase and capitalised for the name, which
+# is the same proper-noun shape the broader subject rule (#742) will apply
+# to the whole subject; both can coexist.
+_SUBJECT_ARTICLES = frozenset({"the", "a", "an"})
 
 
 def _is_low_quality_subject(subject: str) -> bool:
-    """True if `subject` is a pronoun/demonstrative/possessive/article-led
-    phrase that should not become a fact triple. See
-    _LOW_QUALITY_SUBJECT_LEADERS."""
+    """True if `subject` is a pronoun/demonstrative/possessive-led phrase, or
+    an article followed by a common noun, and so should not become a fact
+    triple. An article followed by a capitalised word is a name and passes.
+    See _LOW_QUALITY_SUBJECT_LEADERS and _SUBJECT_ARTICLES."""
     if not subject:
         return True
-    first = subject.strip().split(None, 1)[0].strip(".,!?;:'\"").lower()
+    tokens = [t.strip(".,!?;:'\"") for t in subject.strip().split()]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return True
+    first = tokens[0].lower()
+    if first in _SUBJECT_ARTICLES:
+        return not (len(tokens) > 1 and tokens[1][:1].isupper())
     return first in _LOW_QUALITY_SUBJECT_LEADERS
 
 

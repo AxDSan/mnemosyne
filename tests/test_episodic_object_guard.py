@@ -108,12 +108,22 @@ def test_object_guard_has_no_suffix_heuristic():
     assert _is_low_quality_object("definitely")
 
 
-def test_subject_guard_rejects_article_led_subjects():
+def test_subject_guard_rejects_article_led_common_nouns():
     assert _is_low_quality_subject("The silence")
     assert _is_low_quality_subject("A frame")
     assert _is_low_quality_subject("An engineer")
     assert not _is_low_quality_subject("Alice")
     assert not _is_low_quality_subject("Alice Smith")
+
+
+def test_subject_guard_keeps_article_led_names():
+    """An article can open a name, so the word after it decides.
+    Raised in review of #876."""
+    assert not _is_low_quality_subject("The Matrix")
+    assert not _is_low_quality_subject("The Netherlands")
+    assert not _is_low_quality_subject("A New Hope")
+    assert _is_low_quality_subject("The")
+    assert _is_low_quality_subject("A")
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +187,12 @@ def test_article_led_subjects_are_rejected(graph):
     assert _triples(graph, "The silence is different") == []
     assert _triples(graph, "The build is a success") == []
     assert _triples(graph, "A frame has legs") == []
+
+
+def test_article_led_names_are_kept(graph):
+    """The article rule must not cost a fact about a named entity."""
+    assert _triples(graph, "The Matrix is a film") == [("The Matrix", "is", "film")]
+    assert _triples(graph, "A New Hope has a sequel") == [("A New Hope", "has", "sequel")]
 
 
 def test_mixed_content_keeps_only_the_real_facts(graph):
