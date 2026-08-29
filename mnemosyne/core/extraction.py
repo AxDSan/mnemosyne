@@ -186,13 +186,15 @@ KG_MAX_SUBJECT_CHARS = 120
 KG_MAX_PREDICATE_CHARS = 60
 KG_MAX_OBJECT_CHARS = 300
 
-# Conversational-filler openings that mark a proposed triple as chat debris
-# rather than durable knowledge (the same hit class the regex prototype
-# stored as junk decisions).
+# Hedge / conversational-filler openings that mark a proposed triple as
+# chat debris rather than durable knowledge (same hit class the regex
+# prototype stored as junk decisions). Trailing space-or-end match keeps
+# "Wellington" etc. Includes the #848 review examples ("you said", "let me").
 _KG_FILLER_PREFIXES = (
     "what ", "whats ", "what's ", "whether ", "maybe ", "perhaps ",
     "probably ", "possibly ", "i think ", "i guess ", "i mean ",
     "it seems ", "not sure ", "kinda ", "sorta ", "well ",
+    "you said ", "let me ", "let me check ",
 )
 
 
@@ -244,9 +246,15 @@ def validate_kg_triples(triples) -> List[Tuple[str, str, str]]:
             continue
 
         low_subject, low_object = subject.lower(), obj.lower()
-        if any(low_subject.startswith(pfx) for pfx in _KG_FILLER_PREFIXES):
-            continue
-        if any(low_object.startswith(pfx) for pfx in _KG_FILLER_PREFIXES):
+
+        def _is_filler(text: str) -> bool:
+            for pfx in _KG_FILLER_PREFIXES:
+                stem = pfx.rstrip()
+                if text == stem or text.startswith(stem + " "):
+                    return True
+            return False
+
+        if _is_filler(low_subject) or _is_filler(low_object):
             continue
 
         subject = _kg_word_safe_truncate(subject, KG_MAX_SUBJECT_CHARS)

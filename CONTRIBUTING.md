@@ -83,6 +83,17 @@ Pull requests are reviewed by the maintainers and merged when they:
 - Follow the principles above
 - Include a clear description of what changed and why
 
+Either maintainer may review any pull request, and an approval means the code is
+correct rather than that the change ships.
+
+Some pull requests raise a question that review cannot settle, because the answer is
+a project decision rather than a matter of whether the code works. A pull request
+that changes a supported public API, the storage schema, or a configuration contract
+gets the `needs-decision` label. Review carries on as normal while the label is
+there; the label holds the merge, not the discussion. Applying it early is helpful
+rather than obstructive, because it surfaces the question while changing the answer
+is still cheap.
+
 See [MAINTAINERS.md](MAINTAINERS.md) for the canonical decision framework, including who has authority over which areas of the codebase.
 
 ## Areas of Interest
