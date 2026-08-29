@@ -599,6 +599,33 @@ def test_no_bootstrap_continues_without_a_validated_interpreter(tmp_path, monkey
     assert "Continuing without dependency validation" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("mode", ["symlink", "wrapper"])
+@pytest.mark.parametrize("blank_python", ["", " \t\n "])
+def test_run_install_rejects_blank_python_before_any_preflight(
+    tmp_path, monkeypatch, blank_python, mode
+):
+    """A supplied blank --python never reaches preflight, discovery, or install."""
+    calls: list[str] = []
+
+    def fail(name):
+        def _fail(*args, **kwargs):
+            calls.append(name)
+            raise AssertionError(f"blank --python reached {name}")
+
+        return _fail
+
+    monkeypatch.setattr(install, "check_mnemosyne_core", fail("core preflight"))
+    monkeypatch.setattr(install, "_find_hermes_python", fail("discovery"))
+    monkeypatch.setattr(install, "install_plugin", fail("plugin install"))
+
+    with pytest.raises(ValueError, match="--python was given an empty value"):
+        install.run_install(
+            hermes_home_path=tmp_path / "home", mode=mode, python=blank_python
+        )
+
+    assert calls == []
+
+
 @pytest.mark.parametrize("blank_python", ["", " \t\n "])
 def test_wrapper_explicit_blank_python_fails_without_target_or_fallback(
     tmp_path, monkeypatch, capsys, blank_python
@@ -631,42 +658,6 @@ def test_wrapper_explicit_blank_python_fails_without_target_or_fallback(
     assert rc == 1
     assert "--python was given an empty value" in capsys.readouterr().err
     assert not target.exists()
-
-
-def test_wrapper_mode_is_unaffected_by_failed_discovery(tmp_path, monkeypatch):
-    """Wrapper installs validate their own interpreter and must not be blocked."""
-    system_bin = tmp_path / "usr" / "bin"
-    _write_executable(system_bin / "hermes", "#!/bin/sh\nexit 0\n")
-
-    class _SkillResult:
-        message = "skipped"
-
-    target = tmp_path / "wrapper-target"
-    target.mkdir()
-
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-home"))
-    monkeypatch.setenv("PATH", str(system_bin))
-    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
-    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "user-home"))
-    monkeypatch.setattr(install, "check_mnemosyne_core", lambda: True)
-    monkeypatch.setattr(install, "install_plugin", lambda **kwargs: target)
-    monkeypatch.setattr(install, "install_bundled_skill", lambda **kwargs: _SkillResult())
-    monkeypatch.setattr(
-        install,
-        "plugin_state",
-        lambda **kwargs: install.PluginState(
-            status="installed",
-            installed=True,
-            target=target,
-            mode="wrapper",
-            message="ok",
-        ),
-    )
-
-    rc = install.run_install(hermes_home_path=tmp_path / "empty-home", mode="wrapper")
-
-    assert rc == 0
 
 
 def test_wrapper_without_python_uses_discovered_hermes_interpreter(
@@ -707,6 +698,33 @@ def test_wrapper_without_python_uses_discovered_hermes_interpreter(
     assert install.run_install(hermes_home_path=tmp_path / "home", mode="wrapper") == 0
     assert selected == [discovered]
     assert selected != [Path(sys.executable)]
+
+
+def test_wrapper_without_discovered_python_fails_closed(tmp_path, monkeypatch, capsys):
+    """An omitted wrapper --python must not fall back to this Python or mutate."""
+    fallback_python = tmp_path / "installer-python"
+    _write_executable(fallback_python, "#!/bin/sh\nexit 0\n")
+    target = install.plugin_target_dir(tmp_path / "home")
+    calls: list[str] = []
+
+    def fail(name):
+        def _fail(*args, **kwargs):
+            calls.append(name)
+            raise AssertionError(f"missing wrapper runtime reached {name}")
+
+        return _fail
+
+    monkeypatch.setattr(sys, "executable", str(fallback_python))
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kwargs: None)
+    monkeypatch.setattr(install, "check_mnemosyne_core", fail("core preflight"))
+    monkeypatch.setattr(install, "_site_packages_for_python", fail("fallback probe"))
+    monkeypatch.setattr(install, "install_plugin", fail("plugin install"))
+    monkeypatch.setattr(install, "install_bundled_skill", fail("skill install"))
+
+    assert install.run_install(hermes_home_path=tmp_path / "home", mode="wrapper") == 1
+    assert "Pass --python" in capsys.readouterr().err
+    assert calls == []
+    assert not target.exists()
 
 
 def test_relative_wrapper_python_is_lexically_absolute_before_isolated_probe(
@@ -857,6 +875,32 @@ def test_wrapper_dry_run_uses_discovered_interpreter_for_display_and_probe(
     assert f"Wrapper site-packages: {site_packages}" in out
     assert str(installer_python) not in out
     assert probed == [discovered]
+
+
+def test_wrapper_dry_run_without_discovered_python_fails_without_fallback_or_probe(
+    tmp_path, monkeypatch, capsys
+):
+    """Dry-run has the same fail-closed wrapper-runtime boundary as installation."""
+    fallback_python = tmp_path / "installer-python"
+    _write_executable(fallback_python, "#!/bin/sh\nexit 0\n")
+    calls: list[str] = []
+
+    def fail(name):
+        def _fail(*args, **kwargs):
+            calls.append(name)
+            raise AssertionError(f"missing wrapper runtime reached {name}")
+
+        return _fail
+
+    monkeypatch.setattr(sys, "executable", str(fallback_python))
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kwargs: None)
+    monkeypatch.setattr(install, "_site_packages_for_python", fail("fallback probe"))
+    monkeypatch.setattr(install, "install_bundled_skill", fail("skill planning"))
+    monkeypatch.setattr(install, "plugin_target_dir", fail("target planning"))
+
+    assert install.main(["install", "--mode", "wrapper", "--dry-run"]) == 1
+    assert "Pass --python" in capsys.readouterr().err
+    assert calls == []
 
 
 def test_wrapper_dry_run_makes_explicit_relative_python_absolute_before_probe(

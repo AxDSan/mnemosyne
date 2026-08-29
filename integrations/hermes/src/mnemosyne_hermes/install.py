@@ -939,6 +939,15 @@ def _is_validated_venv_python(candidate: Path) -> bool:
     )
 
 
+def _validate_explicit_python(explicit_python: str | Path | None) -> None:
+    """Reject a supplied --python value that names no interpreter."""
+    if explicit_python is not None and not str(explicit_python).strip():
+        raise ValueError(
+            "--python was given an empty value. Pass the path to Hermes' "
+            "interpreter, or omit --python to let the installer find it."
+        )
+
+
 def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[Path]:
     """Try to find Hermes' python executable for dep validation.
 
@@ -964,16 +973,12 @@ def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[P
     #    would answer with a different interpreter than the one the user asked
     #    for -- exactly the silent substitution this branch exists to prevent.
     if explicit_python is not None:
+        _validate_explicit_python(explicit_python)
         selected = str(explicit_python)
         # Strip only to decide whether anything was named. A POSIX path may
         # legitimately begin or end with whitespace, so stripping the value we
         # return would select a different interpreter than the one requested,
         # or fail to find it at all.
-        if not selected.strip():
-            raise ValueError(
-                "--python was given an empty value. Pass the path to Hermes' "
-                "interpreter, or omit --python to let the installer find it."
-            )
         return Path(selected).expanduser()
 
     hermes_home_path = hermes_home()
@@ -2220,6 +2225,11 @@ def run_install(
     if mode is None:
         mode = default_install_mode()
 
+    # Validate supplied input before the symlink-mode installer preflight. A
+    # blank value is explicit, not an omitted --python request, and must never
+    # be hidden by an earlier preflight return.
+    _validate_explicit_python(python)
+
     # Wrapper validation belongs to its selected environment, including the
     # interpreter discovered when --python is omitted. Only symlink installs
     # retain the installer-Python core preflight and bootstrap path.
@@ -2235,6 +2245,14 @@ def run_install(
     # it when needed; wrapper installs validate it and record its metadata. An
     # explicit --python remains authoritative through _find_hermes_python().
     hermes_python = _find_hermes_python(explicit_python=python)
+    if mode == "wrapper" and hermes_python is None:
+        print(
+            "\n  ⚠ Could not identify Hermes' Python for wrapper mode.\n"
+            "     Pass --python /path/to/hermes/venv/bin/python to select the "
+            "environment the wrapper must import from.",
+            file=sys.stderr,
+        )
+        return 1
     if mode == "symlink" and hermes_python is None:
         # Discovery found no validated Hermes runtime, so there is nothing safe
         # to bootstrap into. Before #618 this path guessed at the launcher's
@@ -2368,6 +2386,14 @@ def main(argv: list[str] | None = None) -> int:
             hermes_python = _find_hermes_python(
                 explicit_python=getattr(args, "python", None)
             )
+            if args.mode == "wrapper" and hermes_python is None:
+                print(
+                    "\n  ⚠ Could not identify Hermes' Python for wrapper mode.\n"
+                    "     Pass --python /path/to/hermes/venv/bin/python to select "
+                    "the environment the wrapper must import from.",
+                    file=sys.stderr,
+                )
+                return 1
             target = plugin_target_dir(args.hermes_home)
             if getattr(args, "dry_run", False):
                 invalid_wrapper_migration_args = (
@@ -2401,7 +2427,8 @@ def main(argv: list[str] | None = None) -> int:
                     # Match run_install(): wrapper metadata and validation use
                     # the discovered Hermes runtime unless --python selected one.
                     # Preserve a venv's python symlink; absolute() is lexical.
-                    wrapper_python = (hermes_python or Path(sys.executable)).absolute()
+                    assert hermes_python is not None
+                    wrapper_python = hermes_python.absolute()
                     print(f"  Wrapper Python: {wrapper_python}")
                     if wrapper_python.is_file():
                         print(
