@@ -279,6 +279,67 @@ def test_vec_search_dim_probe_failure_replaces_knn_exception():
     assert caught.value is probe_exc
 
 
+def test_vec_search_lock_error_survives_dim_probe_failure():
+    """Two-failure identity: when the KNN raises an unrelated lock error and
+    the follow-up dimension probe would fail too, the ORIGINAL lock error is
+    the one that propagates. The handler classifies the KNN error's own text
+    before any further schema probe, so a failing probe can never replace an
+    unrelated failure."""
+    lock_exc = sqlite3.OperationalError("database is locked")
+    probe_exc = sqlite3.DatabaseError("database disk image is malformed")
+
+    class _LockThenBoomConn:
+        """Serves the type probe (first sqlite_master read), raises the lock
+        error on the KNN, and fails every later sqlite_master read."""
+
+        def __init__(self):
+            self._schema_reads = 0
+
+        def execute(self, sql, *a, **k):
+            if "sqlite_master" in sql:
+                self._schema_reads += 1
+                if self._schema_reads == 1:
+                    return _ProbeResult()
+                raise probe_exc
+            raise lock_exc
+
+    with pytest.raises(sqlite3.OperationalError) as caught:
+        beam._vec_search(_LockThenBoomConn(), [0.01] * 384, k=5)
+    assert caught.value is lock_exc
+
+
+def test_vec_search_guidance_catalog_failure_propagates():
+    """After a CONFIRMED dimension mismatch, the guidance's all-tables
+    catalog read is strict: a diagnostic lock/I/O/corruption failure there
+    propagates instead of being swallowed into degraded guidance and a
+    silent [] return."""
+    knn_exc = sqlite3.OperationalError(
+        'Dimension mismatch for query vector for the "embedding" column. '
+        "Expected 768 dimensions but received 384."
+    )
+    diag_exc = sqlite3.DatabaseError("database disk image is malformed")
+
+    class _GuidanceBoomConn:
+        """Serves the type and dimension probes (first two sqlite_master
+        reads), raises a confirmed KNN dimension mismatch, then fails the
+        guidance's all-tables catalog read (third sqlite_master read)."""
+
+        def __init__(self):
+            self._schema_reads = 0
+
+        def execute(self, sql, *a, **k):
+            if "sqlite_master" in sql:
+                self._schema_reads += 1
+                if self._schema_reads <= 2:
+                    return _ProbeResult()
+                raise diag_exc
+            raise knn_exc
+
+    with pytest.raises(sqlite3.DatabaseError) as caught:
+        beam._vec_search(_GuidanceBoomConn(), [0.01] * 384, k=5)
+    assert caught.value is diag_exc
+
+
 def test_vec_search_returns_stored_row_when_dimension_matches(tmp_path, monkeypatch, caplog):
     """The guard must not weaken healthy retrieval: with the table populated
     at the configured dimension, the stored rowid comes back, warning-free."""

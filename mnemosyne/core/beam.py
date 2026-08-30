@@ -560,23 +560,16 @@ def _detect_vec_type(conn: sqlite3.Connection) -> str:
 _VEC_TABLE_NAMES = ("vec_episodes", "vec_working", "vec_facts")
 
 
-def _existing_vec_dims(conn: sqlite3.Connection) -> Tuple[Tuple[str, int], ...]:
-    """Return immutable stored dimensions for each recognized vector table.
+def _existing_vec_dims_strict(conn: sqlite3.Connection) -> Tuple[Tuple[str, int], ...]:
+    """Per-table stored dimensions, propagating SQLite errors.
 
-    A ``vec0`` virtual table fixes its dimension at creation time, encoded in its
-    DDL as ``embedding <type>[<dim>]``. Read every known table in a fixed order:
-    legacy databases can contain a mixed index, and returning the first
-    ``sqlite_master`` row would make its status depend on catalog row order.
-    Reads only ``sqlite_master`` (no extension required), so it is safe before
-    sqlite-vec tables are (re)created.
+    Same read as ``_existing_vec_dims``, for callers on an error path where a
+    failed catalog read must surface instead of degrading to empty guidance.
     """
-    try:
-        rows = conn.execute(
-            "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
-            "AND name IN ('vec_episodes', 'vec_working', 'vec_facts')"
-        ).fetchall()
-    except sqlite3.Error:
-        return ()
+    rows = conn.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
+        "AND name IN ('vec_episodes', 'vec_working', 'vec_facts')"
+    ).fetchall()
 
     declared_dims = {}
     for name, sql in rows:
@@ -586,6 +579,22 @@ def _existing_vec_dims(conn: sqlite3.Connection) -> Tuple[Tuple[str, int], ...]:
         if dim is not None:
             declared_dims[name] = dim
     return tuple((name, declared_dims[name]) for name in _VEC_TABLE_NAMES if name in declared_dims)
+
+
+def _existing_vec_dims(conn: sqlite3.Connection) -> Tuple[Tuple[str, int], ...]:
+    """Return immutable stored dimensions for each recognized vector table.
+
+    A ``vec0`` virtual table fixes its dimension at creation time, encoded in its
+    DDL as ``embedding <type>[<dim>]``. Read every known table in a fixed order:
+    legacy databases can contain a mixed index, and returning the first
+    ``sqlite_master`` row would make its status depend on catalog row order.
+    Reads only ``sqlite_master`` (no extension required), so it is safe before
+    sqlite-vec tables are (re)created. A failed read degrades to ``()``.
+    """
+    try:
+        return _existing_vec_dims_strict(conn)
+    except sqlite3.Error:
+        return ()
 
 
 def _existing_vec_dim(conn: sqlite3.Connection) -> Optional[int]:
@@ -3002,6 +3011,15 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     return plan
 
 
+def _has_dim_mismatch_signal(exc: BaseException) -> bool:
+    """True when the error's own text is sqlite-vec's dimension-mismatch
+    signal. Shared by the early gate in ``_vec_search`` and the classifier so
+    the two can never drift apart: a mismatch the classifier would confirm
+    must always clear the gate, or confirmed mismatches would re-raise out of
+    recall() instead of degrading."""
+    return "dimension mismatch" in str(exc).lower()
+
+
 def _is_query_dim_mismatch(exc: BaseException, query_dim: int, existing_dim: Optional[int]) -> bool:
     """True only when sqlite-vec actually rejected the query vector for its
     dimension.
@@ -3014,7 +3032,7 @@ def _is_query_dim_mismatch(exc: BaseException, query_dim: int, existing_dim: Opt
     return (
         existing_dim is not None
         and query_dim != existing_dim
-        and "dimension mismatch" in str(exc).lower()
+        and _has_dim_mismatch_signal(exc)
     )
 
 
@@ -3035,9 +3053,11 @@ def _query_dim_guidance(
     the configuration, because the stored vectors are not uniformly fine.
     """
     if not stored_dims:
-        # The message-side catalog read failed after the strict probe
-        # succeeded; describe the one dimension that was confirmed rather
-        # than rendering an empty mixed-store description.
+        # Defensive only: the strict catalog read raises on failure, so an
+        # empty tuple here means the read succeeded but yielded no declared
+        # dimension (a DDL rewrite racing the probes). Describe the one
+        # dimension that was confirmed rather than rendering an empty
+        # mixed-store description.
         stored_dims = (("vec_episodes", existing_dim),)
     if existing_dim != EMBEDDING_DIM or len({dim for _, dim in stored_dims}) != 1:
         return _dim_mismatch_message(stored_dims, EMBEDDING_DIM)
@@ -3093,9 +3113,16 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
         # (see _is_query_dim_mismatch); every other sqlite3.Error (locked
         # database, corruption, disk I/O) propagates unchanged, so a real
         # storage failure is never silently converted into a loss of the
-        # vector voice. Classify against the query vector actually
-        # submitted, and against vec_episodes' own DDL: mixed or partially
+        # vector voice. Classify the original KNN error first, by its own
+        # text, BEFORE any further schema probe: when an unrelated failure
+        # (a lock) is followed by a failing probe, the original must be
+        # the one that propagates, never the probe's error. Only an actual
+        # sqlite-vec dimension-mismatch signal earns the strict dimension
+        # probe, which classifies against the query vector actually
+        # submitted and against vec_episodes' own DDL: mixed or partially
         # migrated stores can carry vec tables at different dimensions.
+        if not _has_dim_mismatch_signal(exc):
+            raise
         query_dim = len(embedding)
         # Strict: a failed dimension probe propagates (it names the real
         # storage problem); a successful read with no declared dimension
@@ -3103,13 +3130,16 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
         existing_dim = _vec_table_dim_strict(conn)
         if not _is_query_dim_mismatch(exc, query_dim, existing_dim):
             raise
+        # The guidance's all-tables catalog read is strict too: after a
+        # confirmed mismatch, a diagnostic lock/I/O/corruption failure must
+        # surface, not be swallowed into degraded guidance plus [].
         logger.error(
             "Dimension mismatch querying vec_episodes (query vector is "
             "%s-dim, table is %s-dim, process configured %s-dim); vector "
             "recall disabled for this call, falling back to other recall "
             "voices. %s",
             query_dim, existing_dim, EMBEDDING_DIM,
-            _query_dim_guidance(query_dim, existing_dim, _existing_vec_dims(conn)),
+            _query_dim_guidance(query_dim, existing_dim, _existing_vec_dims_strict(conn)),
         )
         return []
     return [{"rowid": r["rowid"], "distance": r["distance"]} for r in rows]
