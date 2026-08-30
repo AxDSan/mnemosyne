@@ -1718,11 +1718,40 @@ class TestExportImport:
                     "SELECT COUNT(*) FROM consolidation_log"
                 ).fetchone()[0] == 1
 
+                target.conn.execute(
+                    """UPDATE consolidation_log
+                       SET session_id=?, items_consolidated=?, summary_preview=?, created_at=?
+                       WHERE id=?""",
+                    ("changed", 1, "changed", "2026-08-25T08:00:00", 1),
+                )
+                target.conn.commit()
                 forced = target.import_from_file(str(export_path), force=True)
                 assert forced["beam"]["consolidation_log"]["overwritten"] == 1
+                restored = target.conn.execute(
+                    """SELECT id, session_id, items_consolidated, summary_preview, created_at
+                       FROM consolidation_log WHERE id=?""",
+                    (1,),
+                ).fetchone()
+                assert tuple(restored) == (
+                    1, "s1", 209, "snapshot", "2026-08-24T08:00:00"
+                )
                 assert target.conn.execute(
                     "SELECT COUNT(*) FROM consolidation_log"
                 ).fetchone()[0] == 1
+
+                legacy = {
+                    "consolidation_log": [{
+                        "session_id": "legacy", "items_consolidated": 3,
+                        "summary_preview": "legacy", "created_at": "2026-08-26T08:00:00",
+                    }]
+                }
+                legacy_first = target.beam.import_from_dict(legacy)
+                legacy_second = target.beam.import_from_dict(legacy)
+                assert legacy_first["consolidation_log"]["inserted"] == 1
+                assert legacy_second["consolidation_log"]["inserted"] == 1
+                assert target.conn.execute(
+                    "SELECT COUNT(*) FROM consolidation_log WHERE session_id=?", ("legacy",)
+                ).fetchone()[0] == 2
             finally:
                 source.conn.close()
                 if target is not None:
