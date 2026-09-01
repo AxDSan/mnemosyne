@@ -6613,7 +6613,8 @@ class BeamMemory:
             """, (*tuple(entity_memory_ids), *wm_params))
             entity_rows = cursor.fetchall()
             
-            # Add entity-matched memories with boosted scores
+            # Entity matches can strengthen an existing query candidate, but
+            # must not introduce annotation-only rows with no query evidence.
             existing_ids = {r["id"] for r in results}
             for row in entity_rows:
                 if row["id"] in existing_ids:
@@ -6623,38 +6624,7 @@ class BeamMemory:
                             r["score"] = round(min(r["score"] * 1.3, 1.0), 4)
                             r["entity_match"] = True
                             break
-                else:
-                    decay = _recency_decay(row["timestamp"])
-                    score = (0.6 + row["importance"] * 0.2) * (0.7 + 0.3 * decay)
-                    score += _current_state_recency_bonus(query_words, row["content"])
-                    # Temporal boost (Phase 3)
-                    if temporal_weight > 0.0:
-                        t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
-                        score *= (1.0 + temporal_weight * t_boost)
-                    _track_literal_content("working", row["id"], row["content"])
-                    results.append({
-                        "id": row["id"],
-                        "content": row["content"][:500],
-                        "source": row["source"],
-                        "timestamp": row["timestamp"],
-                        "tier": "working",
-                        "score": round(score, 4),
-                        "keyword_score": 0.0,
-                        "dense_score": round(wm_vec_sims.get(row["id"], 0.0), 4),
-                        "fts_score": 0.0,
-                        "importance": row["importance"],
-                        "recall_count": row["recall_count"] or 0,
-                        "last_recalled": row["last_recalled"],
-                        "recency_decay": round(decay, 4),
-                        "scope": row["scope"] if "scope" in row.keys() else "session",
-                        "author_id": row["author_id"] if "author_id" in row.keys() else None,
-                        "author_type": row["author_type"] if "author_type" in row.keys() else None,
-                        "channel_id": row["channel_id"] if "channel_id" in row.keys() else None,
-                        "veracity": row["veracity"] if "veracity" in row.keys() else "unknown",
-                        "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
-                        "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None,
-                        "entity_match": True
-                    })
+
             
             # Also check episodic memory for entity matches
             em_placeholders = ",".join("?" * len(entity_memory_ids))
@@ -6686,45 +6656,7 @@ class BeamMemory:
                             r["score"] = round(min(r["score"] * 1.3, 1.0), 4)
                             r["entity_match"] = True
                             break
-                else:
-                    decay = _recency_decay(row["timestamp"])
-                    score = (0.6 + row["importance"] * 0.2) * (0.7 + 0.3 * decay)
-                    score += _current_state_recency_bonus(query_words, row["content"])
-                    # Temporal boost (Phase 3)
-                    if temporal_weight > 0.0:
-                        t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
-                        score *= (1.0 + temporal_weight * t_boost)
-                    _track_literal_content("episodic", row["id"], row["content"])
-                    results.append({
-                        "id": row["id"],
-                        "content": row["content"][:500],
-                        "source": row["source"],
-                        "timestamp": row["timestamp"],
-                        "tier": "episodic",
-                        "score": round(score, 4),
-                        "keyword_score": 0.0,
-                        # C30: episodic rows never key into wm_vec_sims
-                        # (that dict holds working_memory ids only). Set
-                        # 0.0 explicitly rather than lookup-that-always-
-                        # returns-default, so post-run analysis isn't
-                        # misled into thinking dense similarity was
-                        # computed. The entity/fact-matched episodic
-                        # paths don't compute ep dense sim themselves.
-                        "dense_score": 0.0,
-                        "fts_score": 0.0,
-                        "importance": row["importance"],
-                        "recall_count": row["recall_count"] or 0,
-                        "last_recalled": row["last_recalled"],
-                        "recency_decay": round(decay, 4),
-                        "scope": row["scope"] if "scope" in row.keys() else "session",
-                        "author_id": row["author_id"] if "author_id" in row.keys() else None,
-                        "author_type": row["author_type"] if "author_type" in row.keys() else None,
-                        "channel_id": row["channel_id"] if "channel_id" in row.keys() else None,
-                        "veracity": row["veracity"] if "veracity" in row.keys() else "unknown",
-                        "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
-                        "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None,
-                        "entity_match": True
-                    })
+
 
         # ---- Fact-aware recall ----
         fact_memory_ids = _find_memories_by_fact(self, query)

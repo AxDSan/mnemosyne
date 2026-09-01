@@ -738,6 +738,41 @@ class TestWorkingMemory:
         assert len(ctx) == 1
         assert ctx[0]["content"] == "Prefers Neovim"
 
+    def test_entity_annotations_only_boost_existing_recall_candidates(self, temp_db, monkeypatch):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        lexical_id = beam.remember("Atlas deployment notes", importance=0.1)
+        entity_only_id = beam.remember("unrelated status update", importance=1.0)
+
+        monkeypatch.setattr(
+            beam_module,
+            "_find_memories_by_entity",
+            lambda _beam, _query: [lexical_id, entity_only_id],
+        )
+
+        results = beam.recall("Atlas", top_k=1)
+
+        assert [row["id"] for row in results] == [lexical_id]
+        assert results[0]["entity_match"] is True
+
+    def test_entity_annotations_do_not_append_episodic_only_candidates(self, temp_db, monkeypatch):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        lexical_id = beam.consolidate_to_episodic(
+            summary="Atlas deployment notes", source_wm_ids=["wm-atlas"], importance=0.1,
+        )
+        entity_only_id = beam.consolidate_to_episodic(
+            summary="unrelated status update", source_wm_ids=["wm-other"], importance=1.0,
+        )
+
+        monkeypatch.setattr(
+            beam_module,
+            "_find_memories_by_entity",
+            lambda _beam, _query: [lexical_id, entity_only_id],
+        )
+
+        results = beam.recall("Atlas", top_k=1)
+
+        assert [row["id"] for row in results] == [lexical_id]
+
     def test_get_context_keeps_global_first_then_session_order(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         now = datetime.now()
