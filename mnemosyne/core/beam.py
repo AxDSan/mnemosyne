@@ -6615,12 +6615,12 @@ class BeamMemory:
             
             # Entity matches can strengthen an existing query candidate, but
             # must not introduce annotation-only rows with no query evidence.
-            existing_ids = {r["id"] for r in results}
+            existing_ids = {r["id"] for r in results if r.get("tier") == "working"}
             for row in entity_rows:
                 if row["id"] in existing_ids:
                     # Boost existing result
                     for r in results:
-                        if r["id"] == row["id"]:
+                        if r.get("tier") == "working" and r["id"] == row["id"]:
                             r["score"] = round(min(r["score"] * 1.3, 1.0), 4)
                             r["entity_match"] = True
                             break
@@ -6648,16 +6648,6 @@ class BeamMemory:
             """, (*em_entity_params,))
             em_entity_rows = cursor.fetchall()
             
-            em_existing_ids = {r["id"] for r in results}
-            for row in em_entity_rows:
-                if row["id"] in em_existing_ids:
-                    for r in results:
-                        if r["id"] == row["id"]:
-                            r["score"] = round(min(r["score"] * 1.3, 1.0), 4)
-                            r["entity_match"] = True
-                            break
-
-
         # ---- Fact-aware recall ----
         fact_memory_ids = _find_memories_by_fact(self, query)
         if fact_memory_ids:
@@ -7127,6 +7117,20 @@ class BeamMemory:
                     fallback_used=True,
                 )
 
+        # Entity lookup runs before episodic candidate assembly, so apply its
+        # annotation only after both primary and fallback episodic candidates
+        # are present. Match the tier as well as the id: ids are not a
+        # cross-tier identity contract.
+        if entity_memory_ids:
+            episodic_entity_ids = {row["id"] for row in em_entity_rows}
+            for result in results:
+                if (
+                    result.get("tier") == "episodic"
+                    and result["id"] in episodic_entity_ids
+                ):
+                    result["score"] = round(min(result["score"] * 1.3, 1.0), 4)
+                    result["entity_match"] = True
+
         # --- Tiered degradation weighting: apply tier multiplier to episodic scores ---
         weight_map = {1: TIER1_WEIGHT, 2: TIER2_WEIGHT, 3: TIER3_WEIGHT}
         veracity_map = {"stated": STATED_WEIGHT, "inferred": INFERRED_WEIGHT,
@@ -7416,7 +7420,7 @@ class BeamMemory:
     # cached under an older digest are not reused. Part of the hashed payload;
     # the opaque key keeps the "v2:" prefix because QueryCache's opaque-path
     # recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
-    _ENHANCED_RECALL_CACHE_VERSION = 5
+    _ENHANCED_RECALL_CACHE_VERSION = 6
 
     def _enhanced_recall_cache_key(
         self,
@@ -7550,7 +7554,7 @@ class BeamMemory:
         # consolidated exclusion, #696 / #427), so pre-change opaque cache
         # entries could still contain dialog, honcho or consolidated dense
         # candidates. _ENHANCED_RECALL_CACHE_VERSION is part of the hashed
-        # payload; bumping it (4 -> 5) guarantees those entries are never
+        # payload; bumping it guarantees those entries are never
         # reused. The "v2:" prefix stays fixed — QueryCache's opaque-path
         # recognition keys off that exact prefix.
         return "v2:" + hashlib.sha256(material.encode("utf-8")).hexdigest()

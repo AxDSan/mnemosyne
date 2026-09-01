@@ -743,16 +743,24 @@ class TestWorkingMemory:
         lexical_id = beam.remember("Atlas deployment notes", importance=0.1)
         entity_only_id = beam.remember("unrelated status update", importance=1.0)
 
+        baseline = beam.recall("Atlas", top_k=1)
+        assert [row["id"] for row in baseline] == [lexical_id]
+        baseline_score = baseline[0]["score"]
+
         monkeypatch.setattr(
             beam_module,
             "_find_memories_by_entity",
             lambda _beam, _query: [lexical_id, entity_only_id],
         )
 
-        results = beam.recall("Atlas", top_k=1)
+        results = beam.recall("Atlas", top_k=2)
+        result_ids = {row["id"] for row in results}
+        lexical_result = next(row for row in results if row["id"] == lexical_id)
 
-        assert [row["id"] for row in results] == [lexical_id]
-        assert results[0]["entity_match"] is True
+        assert entity_only_id not in result_ids
+        assert lexical_id in result_ids
+        assert lexical_result["entity_match"] is True
+        assert baseline_score < lexical_result["score"] <= min(baseline_score * 1.3, 1.0) + 0.0001
 
     def test_entity_annotations_do_not_append_episodic_only_candidates(self, temp_db, monkeypatch):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
@@ -763,15 +771,27 @@ class TestWorkingMemory:
             summary="unrelated status update", source_wm_ids=["wm-other"], importance=1.0,
         )
 
-        monkeypatch.setattr(
-            beam_module,
-            "_find_memories_by_entity",
-            lambda _beam, _query: [lexical_id, entity_only_id],
-        )
+        baseline = beam.recall("Atlas", top_k=1)
+        assert [row["id"] for row in baseline] == [lexical_id]
+        baseline_score = baseline[0]["score"]
 
-        results = beam.recall("Atlas", top_k=1)
+        entity_calls = []
 
-        assert [row["id"] for row in results] == [lexical_id]
+        def entity_matches(_beam, query):
+            entity_calls.append(query)
+            return [lexical_id, entity_only_id]
+
+        monkeypatch.setattr(beam_module, "_find_memories_by_entity", entity_matches)
+
+        results = beam.recall("Atlas", top_k=2)
+        result_ids = {row["id"] for row in results}
+        lexical_result = next(row for row in results if row["id"] == lexical_id)
+
+        assert entity_calls == ["Atlas"]
+        assert entity_only_id not in result_ids
+        assert lexical_id in result_ids
+        assert lexical_result["entity_match"] is True
+        assert baseline_score < lexical_result["score"] <= min(baseline_score * 1.3, 1.0) + 0.0001
 
     def test_get_context_keeps_global_first_then_session_order(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
