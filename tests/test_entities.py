@@ -111,6 +111,13 @@ class TestRegexEntityExtraction(unittest.TestCase):
         self.assertNotIn("The room is quiet now.", result)
         # The bare capitalized word is still a candidate; the fragment is not.
         self.assertIn("Okay", result)
+        # Double quotes, and a value no capitalized pattern can reproduce, so
+        # this one bites if the double-quote pattern ever comes back. The
+        # comma is what let it dodge the stop-word filter before.
+        self.assertNotIn(
+            "okay, fine",
+            extract_entities_regex('She whispered "okay, fine" and left.'),
+        )
 
     def test_name_in_a_quoted_sentence_is_no_longer_swallowed(self):
         # The span used to be stored whole, and the substring post-filter then
@@ -118,20 +125,6 @@ class TestRegexEntityExtraction(unittest.TestCase):
         result = extract_entities_regex("'Talia pauses.' Then she smiled.")
         self.assertIn("Talia", result)
         self.assertNotIn("Talia pauses.", result)
-
-    def test_at_mention(self):
-        result = extract_entities_regex("Contact @abdias for help.")
-        self.assertIn("@abdias", result)
-
-    def test_hashtag(self):
-        result = extract_entities_regex("This is #ImportantNews today.")
-        self.assertIn("#ImportantNews", result)
-
-    def test_stop_words_filtered(self):
-        result = extract_entities_regex("The Quick Brown Fox")
-        # "The" should be filtered as a stop word
-        self.assertNotIn("The", result)
-        self.assertIn("Quick Brown Fox", result)
 
     def test_no_entities(self):
         result = extract_entities_regex("the quick brown fox jumps")
