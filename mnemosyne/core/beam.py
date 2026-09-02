@@ -6624,48 +6624,18 @@ class BeamMemory:
             """, (*tuple(entity_memory_ids), *wm_params))
             entity_rows = cursor.fetchall()
             
-            # Add entity-matched memories with boosted scores
-            existing_ids = {r["id"] for r in results}
+            # Entity matches can strengthen an existing query candidate, but
+            # must not introduce annotation-only rows with no query evidence.
+            existing_ids = {r["id"] for r in results if r.get("tier") == "working"}
             for row in entity_rows:
                 if row["id"] in existing_ids:
                     # Boost existing result
                     for r in results:
-                        if r["id"] == row["id"]:
+                        if r.get("tier") == "working" and r["id"] == row["id"]:
                             r["score"] = round(min(r["score"] * 1.3, 1.0), 4)
                             r["entity_match"] = True
                             break
-                else:
-                    decay = _recency_decay(row["timestamp"])
-                    score = (0.6 + row["importance"] * 0.2) * (0.7 + 0.3 * decay)
-                    score += _current_state_recency_bonus(query_words, row["content"])
-                    # Temporal boost (Phase 3)
-                    if temporal_weight > 0.0:
-                        t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
-                        score *= (1.0 + temporal_weight * t_boost)
-                    _track_literal_content("working", row["id"], row["content"])
-                    results.append({
-                        "id": row["id"],
-                        "content": row["content"][:500],
-                        "source": row["source"],
-                        "timestamp": row["timestamp"],
-                        "tier": "working",
-                        "score": round(score, 4),
-                        "keyword_score": 0.0,
-                        "dense_score": round(wm_vec_sims.get(row["id"], 0.0), 4),
-                        "fts_score": 0.0,
-                        "importance": row["importance"],
-                        "recall_count": row["recall_count"] or 0,
-                        "last_recalled": row["last_recalled"],
-                        "recency_decay": round(decay, 4),
-                        "scope": row["scope"] if "scope" in row.keys() else "session",
-                        "author_id": row["author_id"] if "author_id" in row.keys() else None,
-                        "author_type": row["author_type"] if "author_type" in row.keys() else None,
-                        "channel_id": row["channel_id"] if "channel_id" in row.keys() else None,
-                        "veracity": row["veracity"] if "veracity" in row.keys() else "unknown",
-                        "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
-                        "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None,
-                        "entity_match": True
-                    })
+
             
             # Also check episodic memory for entity matches
             em_placeholders = ",".join("?" * len(entity_memory_ids))
@@ -6689,54 +6659,6 @@ class BeamMemory:
             """, (*em_entity_params,))
             em_entity_rows = cursor.fetchall()
             
-            em_existing_ids = {r["id"] for r in results}
-            for row in em_entity_rows:
-                if row["id"] in em_existing_ids:
-                    for r in results:
-                        if r["id"] == row["id"]:
-                            r["score"] = round(min(r["score"] * 1.3, 1.0), 4)
-                            r["entity_match"] = True
-                            break
-                else:
-                    decay = _recency_decay(row["timestamp"])
-                    score = (0.6 + row["importance"] * 0.2) * (0.7 + 0.3 * decay)
-                    score += _current_state_recency_bonus(query_words, row["content"])
-                    # Temporal boost (Phase 3)
-                    if temporal_weight > 0.0:
-                        t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
-                        score *= (1.0 + temporal_weight * t_boost)
-                    _track_literal_content("episodic", row["id"], row["content"])
-                    results.append({
-                        "id": row["id"],
-                        "content": row["content"][:500],
-                        "source": row["source"],
-                        "timestamp": row["timestamp"],
-                        "tier": "episodic",
-                        "score": round(score, 4),
-                        "keyword_score": 0.0,
-                        # C30: episodic rows never key into wm_vec_sims
-                        # (that dict holds working_memory ids only). Set
-                        # 0.0 explicitly rather than lookup-that-always-
-                        # returns-default, so post-run analysis isn't
-                        # misled into thinking dense similarity was
-                        # computed. The entity/fact-matched episodic
-                        # paths don't compute ep dense sim themselves.
-                        "dense_score": 0.0,
-                        "fts_score": 0.0,
-                        "importance": row["importance"],
-                        "recall_count": row["recall_count"] or 0,
-                        "last_recalled": row["last_recalled"],
-                        "recency_decay": round(decay, 4),
-                        "scope": row["scope"] if "scope" in row.keys() else "session",
-                        "author_id": row["author_id"] if "author_id" in row.keys() else None,
-                        "author_type": row["author_type"] if "author_type" in row.keys() else None,
-                        "channel_id": row["channel_id"] if "channel_id" in row.keys() else None,
-                        "veracity": row["veracity"] if "veracity" in row.keys() else "unknown",
-                        "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
-                        "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None,
-                        "entity_match": True
-                    })
-
         # ---- Fact-aware recall ----
         fact_memory_ids = _find_memories_by_fact(self, query)
         if fact_memory_ids:
@@ -7206,6 +7128,20 @@ class BeamMemory:
                     fallback_used=True,
                 )
 
+        # Entity lookup runs before episodic candidate assembly, so apply its
+        # annotation only after both primary and fallback episodic candidates
+        # are present. Match the tier as well as the id: ids are not a
+        # cross-tier identity contract.
+        if entity_memory_ids:
+            episodic_entity_ids = {row["id"] for row in em_entity_rows}
+            for result in results:
+                if (
+                    result.get("tier") == "episodic"
+                    and result["id"] in episodic_entity_ids
+                ):
+                    result["score"] = round(min(result["score"] * 1.3, 1.0), 4)
+                    result["entity_match"] = True
+
         # --- Tiered degradation weighting: apply tier multiplier to episodic scores ---
         weight_map = {1: TIER1_WEIGHT, 2: TIER2_WEIGHT, 3: TIER3_WEIGHT}
         veracity_map = {"stated": STATED_WEIGHT, "inferred": INFERRED_WEIGHT,
@@ -7495,7 +7431,7 @@ class BeamMemory:
     # cached under an older digest are not reused. Part of the hashed payload;
     # the opaque key keeps the "v2:" prefix because QueryCache's opaque-path
     # recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
-    _ENHANCED_RECALL_CACHE_VERSION = 5
+    _ENHANCED_RECALL_CACHE_VERSION = 6
 
     def _enhanced_recall_cache_key(
         self,
@@ -7629,7 +7565,7 @@ class BeamMemory:
         # consolidated exclusion, #696 / #427), so pre-change opaque cache
         # entries could still contain dialog, honcho or consolidated dense
         # candidates. _ENHANCED_RECALL_CACHE_VERSION is part of the hashed
-        # payload; bumping it (4 -> 5) guarantees those entries are never
+        # payload; bumping it guarantees those entries are never
         # reused. The "v2:" prefix stays fixed — QueryCache's opaque-path
         # recognition keys off that exact prefix.
         return "v2:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
