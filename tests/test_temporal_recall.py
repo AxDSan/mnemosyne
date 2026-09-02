@@ -14,6 +14,7 @@ Tests:
 
 import sys
 import os
+import statistics
 import unittest
 import tempfile
 import time
@@ -328,32 +329,48 @@ class TestTemporalRecallEndToEnd(unittest.TestCase):
         )
 
     def test_performance_overhead(self):
-        """Temporal scoring adds <1ms overhead per query."""
-        # Create some memories
+        """Temporal scoring stays bounded relative to the same-process control."""
         for i in range(10):
-            self.beam.remember(f"Memory item {i} for performance test",
-                               source="test", importance=0.5)
+            self.beam.remember(
+                f"Memory item {i} for performance test", source="test", importance=0.5
+            )
 
-        # Warm up
-        self.beam.recall("memory", top_k=5)
+        # Prime both paths before timing. Alternating AB/BA paired samples makes
+        # scheduler or CPU-frequency drift affect both paths equally; the gate
+        # intentionally measures temporal scoring relative to its control.
+        # Absolute end-to-end throughput is deliberately outside this test.
+        self.beam.recall("memory", top_k=5, temporal_weight=0.0)
+        self.beam.recall("memory", top_k=5, temporal_weight=0.3, query_time=datetime.now())
 
-        # Baseline without temporal
-        start = time.perf_counter()
-        for _ in range(50):
-            self.beam.recall("memory", top_k=5, temporal_weight=0.0)
-        baseline_time = (time.perf_counter() - start) / 50 * 1000  # ms
+        iterations = 50
+        paired_budget_excesses = []
+        for sample_index in range(4):
+            query_time = datetime.now()
 
-        # With temporal
-        start = time.perf_counter()
-        for _ in range(50):
-            self.beam.recall("memory", top_k=5,
-                              temporal_weight=0.3,
-                              query_time=datetime.now())
-        temporal_time = (time.perf_counter() - start) / 50 * 1000  # ms
+            def measure(temporal_weight):
+                start = time.perf_counter()
+                for _ in range(iterations):
+                    self.beam.recall(
+                        "memory",
+                        top_k=5,
+                        temporal_weight=temporal_weight,
+                        query_time=query_time,
+                    )
+                return (time.perf_counter() - start) / iterations * 1000
 
-        overhead = temporal_time - baseline_time
-        self.assertLess(overhead, 10.0,
-                        f"Temporal overhead {overhead:.3f}ms exceeds 10ms gate")
+            if sample_index % 2:
+                temporal_ms, control_ms = measure(0.3), measure(0.0)
+            else:
+                control_ms, temporal_ms = measure(0.0), measure(0.3)
+            paired_budget_excesses.append(temporal_ms - control_ms * 1.5)
+
+        median_budget_excess = statistics.median(paired_budget_excesses)
+        self.assertLess(
+            median_budget_excess,
+            2.0,
+            "Temporal recall median paired budget excess exceeded 2ms: "
+            f"samples={paired_budget_excesses!r}, median={median_budget_excess:.3f}ms",
+        )
 
     def test_backward_compatibility(self):
         """Default recall() call works exactly as before Phase 3."""
