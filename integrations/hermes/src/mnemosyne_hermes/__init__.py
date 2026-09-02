@@ -94,14 +94,24 @@ except Exception as _batch_tool_import_exc:  # pragma: no cover - broken install
     def validate_batch_operations(_operations):
         raise BatchValidationError("mnemosyne_batch is unavailable; upgrade mnemosyne-memory")
 
-    def batch_validation_error_payload(exc: Exception) -> Dict[str, Any]:
-        return {"status": "error", "error": str(exc)}
+    def batch_validation_error_payload(_exc: Exception) -> Dict[str, Any]:
+        return {
+            "status": "error",
+            "error": "batch_validation_failed",
+            "failed_index": None,
+            "action": None,
+        }
 
     def dry_run_batch(_operations):
         return {"status": "error", "error": "mnemosyne_batch is unavailable; upgrade mnemosyne-memory"}
 
     def apply_beam_batch(*_args, **_kwargs):
-        return {"status": "error", "error": "mnemosyne_batch is unavailable; upgrade mnemosyne-memory"}
+        return {
+            "status": "error",
+            "error": "batch_failed",
+            "failed_index": None,
+            "action": None,
+        }
 
 try:
     from mnemosyne.hermes_config import read_hermes_config_key
