@@ -198,10 +198,6 @@ class TestTemporalRecallEndToEnd(unittest.TestCase):
         """, (recent_time, "%beta%"))
         self.beam.conn.commit()
 
-        # Without temporal boost, both have similar scores
-        results_no_temporal = self.beam.recall("meeting", top_k=5, temporal_weight=0.0)
-        scores_no_temporal = {r["content"]: r["score"] for r in results_no_temporal}
-
         # With temporal boost, recent one should score higher
         results_temporal = self.beam.recall("meeting", top_k=5, temporal_weight=0.5)
         scores_temporal = {r["content"]: r["score"] for r in results_temporal}
