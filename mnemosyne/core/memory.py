@@ -878,9 +878,12 @@ class Mnemosyne:
             beam_updated = self.beam.update_working(
                 memory_id, content=content, importance=importance
             )
+            updated = legacy_updated or beam_updated
 
+        if not updated:
+            return False
         self._emit_wrapper("MEMORY_UPDATED", memory_id, content=content, importance=importance)
-        return legacy_updated or beam_updated
+        return True
 
     def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
         """Mark a memory as expired or superseded. Delegates to BEAM."""
