@@ -9774,7 +9774,7 @@ class BeamMemory:
             "working_memory": {"inserted": 0, "skipped": 0, "overwritten": 0},
             "episodic_memory": {"inserted": 0, "skipped": 0, "overwritten": 0, "embeddings_inserted": 0},
             "scratchpad": {"inserted": 0, "updated": 0},
-            "consolidation_log": {"inserted": 0},
+            "consolidation_log": {"inserted": 0, "skipped": 0, "overwritten": 0},
         }
         cursor = self.conn.cursor()
 
@@ -9953,12 +9953,52 @@ class BeamMemory:
 
         # -- Consolidation log --
         for item in data.get("consolidation_log", []):
-            cursor.execute("""
-                INSERT INTO consolidation_log (session_id, items_consolidated, summary_preview, created_at)
-                VALUES (?, ?, ?, ?)
-            """, (item.get("session_id", "default"), item.get("items_consolidated", 0),
-                  item.get("summary_preview", ""), item.get("created_at")))
-            stats["consolidation_log"]["inserted"] += 1
+            log_id = item.get("id")
+            if log_id is not None:
+                exists = cursor.execute(
+                    "SELECT 1 FROM consolidation_log WHERE id = ?", (log_id,)
+                ).fetchone() is not None
+                if not force:
+                    cursor.execute(
+                        """
+                        INSERT OR IGNORE INTO consolidation_log
+                            (id, session_id, items_consolidated, summary_preview, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (log_id, item.get("session_id", "default"),
+                         item.get("items_consolidated", 0), item.get("summary_preview", ""),
+                         item.get("created_at")),
+                    )
+                    stats["consolidation_log"][
+                        "skipped" if cursor.rowcount == 0 else "inserted"
+                    ] += 1
+                else:
+                    cursor.execute(
+                        """
+                        INSERT INTO consolidation_log
+                            (id, session_id, items_consolidated, summary_preview, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            session_id=excluded.session_id,
+                            items_consolidated=excluded.items_consolidated,
+                            summary_preview=excluded.summary_preview,
+                            created_at=excluded.created_at
+                        """,
+                        (log_id, item.get("session_id", "default"),
+                         item.get("items_consolidated", 0), item.get("summary_preview", ""),
+                         item.get("created_at")),
+                    )
+                    stats["consolidation_log"]["overwritten" if exists else "inserted"] += 1
+            else:
+                # Pre-ID exports cannot be matched to an existing log entry;
+                # preserve their historical append behavior.
+                cursor.execute("""
+                    INSERT INTO consolidation_log
+                        (session_id, items_consolidated, summary_preview, created_at)
+                    VALUES (?, ?, ?, ?)
+                """, (item.get("session_id", "default"), item.get("items_consolidated", 0),
+                      item.get("summary_preview", ""), item.get("created_at")))
+                stats["consolidation_log"]["inserted"] += 1
         self.conn.commit()
 
         return stats
