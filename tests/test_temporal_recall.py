@@ -177,8 +177,9 @@ class TestTemporalRecallEndToEnd(unittest.TestCase):
                 pass
         os.rmdir(self.tmpdir)
 
+    @patch.dict(os.environ, {"MNEMOSYNE_POLYPHONIC_RECALL": "0"})
     def test_temporal_boost_recent_vs_old(self):
-        """Recent memory gets higher score with temporal_weight > 0."""
+        """Temporal weighting widens the score gap on the linear path."""
         now = datetime.now()
         old_time = (now - timedelta(days=5)).isoformat()
         recent_time = (now - timedelta(hours=2)).isoformat()
@@ -201,11 +202,20 @@ class TestTemporalRecallEndToEnd(unittest.TestCase):
         # The fixed query time makes the zero-weight control and temporal
         # result directly comparable, without a moving clock between recalls.
         query_time = now
+        temporal_halflife = 24.0
         results_no_temporal = self.beam.recall(
-            "meeting", top_k=5, temporal_weight=0.0, query_time=query_time
+            "meeting",
+            top_k=5,
+            temporal_weight=0.0,
+            temporal_halflife=temporal_halflife,
+            query_time=query_time,
         )
         results_temporal = self.beam.recall(
-            "meeting", top_k=5, temporal_weight=0.5, query_time=query_time
+            "meeting",
+            top_k=5,
+            temporal_weight=0.5,
+            temporal_halflife=temporal_halflife,
+            query_time=query_time,
         )
         scores_no_temporal = {r["content"]: r["score"] for r in results_no_temporal}
         scores_temporal = {r["content"]: r["score"] for r in results_temporal}
