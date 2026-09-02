@@ -490,8 +490,10 @@ async def _run_streamable_http(
 ) -> None:
     """Run MCP server over the Streamable HTTP transport.
 
-    Default host is 127.0.0.1 (loopback only). Binding non-loopback
-    requires MNEMOSYNE_MCP_TOKEN -- see _resolve_http_auth.
+    Default host is 127.0.0.1 (loopback only). Binding non-loopback requires
+    MNEMOSYNE_MCP_TOKEN (see _resolve_http_auth) *and*
+    MNEMOSYNE_MCP_ALLOWED_HOSTS (see _resolve_transport_security). Both gates
+    fail closed independently, so satisfying only one still refuses startup.
     """
     try:
         import uvicorn
@@ -580,7 +582,9 @@ def run_mcp_server(
         port: Port for the HTTP transports (ignored for stdio)
         bank: Default bank for operations (optional)
         host: Bind address for the HTTP transports (default: 127.0.0.1 --
-            loopback only). Non-loopback hosts require MNEMOSYNE_MCP_TOKEN.
+            loopback only). Non-loopback hosts require MNEMOSYNE_MCP_TOKEN on
+            both HTTP transports, and streamable-http additionally requires
+            MNEMOSYNE_MCP_ALLOWED_HOSTS.
         env_file: Path to optional .env file to load before starting.
         path: Endpoint path for streamable-http (default: /mcp)
         json_response: Force JSON-only responses for streamable-http
@@ -625,8 +629,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         default="127.0.0.1",
         help=(
             "Bind address for SSE and streamable-http transports (default: "
-            "127.0.0.1 -- loopback only). Use 0.0.0.0 to expose on LAN; this "
-            "requires the MNEMOSYNE_MCP_TOKEN env var to be set."
+            "127.0.0.1 -- loopback only). A non-loopback bind requires "
+            "MNEMOSYNE_MCP_TOKEN on both transports, and streamable-http "
+            "additionally requires MNEMOSYNE_MCP_ALLOWED_HOSTS (comma-separated "
+            "Host header values, exact names or 'name:*'). Startup is refused "
+            "when either is missing. MNEMOSYNE_MCP_ALLOWED_ORIGINS is optional "
+            "and restricts browser origins."
         ),
     )
     parser.add_argument(

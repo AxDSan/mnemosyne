@@ -1041,16 +1041,21 @@ all = [
     { name = "huggingface-hub" },
     { name = "llama-cpp-python" },
     { name = "mcp" },
+    { name = "onnxruntime", version = "1.23.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "onnxruntime", version = "1.25.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "sqlite-vec" },
 ]
 dev = [
     { name = "build" },
     { name = "pytest" },
+    { name = "pytest-timeout" },
     { name = "ruff" },
     { name = "twine" },
 ]
 embeddings = [
     { name = "fastembed" },
+    { name = "onnxruntime", version = "1.23.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "onnxruntime", version = "1.25.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "sqlite-vec" },
 ]
 llm = [
@@ -1069,7 +1074,9 @@ sync = [
     { name = "cryptography" },
 ]
 test = [
+    { name = "build" },
     { name = "pytest" },
+    { name = "pytest-timeout" },
 ]
 
 [package.metadata]
@@ -1077,6 +1084,7 @@ requires-dist = [
     { name = "anyio", marker = "python_full_version >= '3.10' and extra == 'all'", specifier = ">=4.0" },
     { name = "anyio", marker = "python_full_version >= '3.10' and extra == 'mcp'", specifier = ">=4.0" },
     { name = "build", marker = "extra == 'dev'" },
+    { name = "build", marker = "extra == 'test'" },
     { name = "cryptography", marker = "extra == 'all'", specifier = ">=41.0" },
     { name = "cryptography", marker = "extra == 'sync'", specifier = ">=41.0" },
     { name = "ctransformers", marker = "extra == 'all'", specifier = ">=0.2.27" },
@@ -1089,13 +1097,17 @@ requires-dist = [
     { name = "llama-cpp-python", marker = "extra == 'llm'", specifier = ">=0.2.0" },
     { name = "mcp", marker = "python_full_version >= '3.10' and extra == 'all'", specifier = ">=2.0.0" },
     { name = "mcp", marker = "python_full_version >= '3.10' and extra == 'mcp'", specifier = ">=2.0.0" },
+    { name = "onnxruntime", marker = "extra == 'all'", specifier = ">=1.21.0,<1.29" },
+    { name = "onnxruntime", marker = "extra == 'embeddings'", specifier = ">=1.21.0,<1.29" },
     { name = "openclaw", marker = "python_full_version >= '3.10' and extra == 'openclaw'", specifier = ">=0.1.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=7.0" },
+    { name = "pytest-timeout", marker = "extra == 'dev'", specifier = ">=2.1" },
+    { name = "pytest-timeout", marker = "extra == 'test'", specifier = ">=2.1" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.22" },
-    { name = "sqlite-vec", marker = "extra == 'all'", specifier = ">=0.1.0" },
-    { name = "sqlite-vec", marker = "extra == 'embeddings'", specifier = ">=0.1.0" },
+    { name = "sqlite-vec", marker = "extra == 'all'", specifier = ">=0.1.9,<0.1.10" },
+    { name = "sqlite-vec", marker = "extra == 'embeddings'", specifier = ">=0.1.9,<0.1.10" },
     { name = "twine", marker = "extra == 'dev'" },
 ]
 provides-extras = ["llm", "embeddings", "mcp", "openclaw", "sync", "test", "all", "dev"]
@@ -1798,6 +1810,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/7d/0d/549bd94f1a0a402dc8cf64563a117c0f3765662e2e668477624baeec44d5/pytest-9.0.3.tar.gz", hash = "sha256:b86ada508af81d19edeb213c681b1d48246c1a91d304c6c81a427674c17eb91c", size = 1572165, upload-time = "2026-04-07T17:16:18.027Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d4/24/a372aaf5c9b7208e7112038812994107bc65a84cd00e0354a88c2c77a617/pytest-9.0.3-py3-none-any.whl", hash = "sha256:2c5efc453d45394fdd706ade797c0a81091eccd1d6e4bccfcd476e2b8e0ab5d9", size = 375249, upload-time = "2026-04-07T17:16:16.13Z" },
+]
+
+[[package]]
+name = "pytest-timeout"
+version = "2.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pytest" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ac/82/4c9ecabab13363e72d880f2fb504c5f750433b2b6f16e99f4ec21ada284c/pytest_timeout-2.4.0.tar.gz", hash = "sha256:7e68e90b01f9eff71332b25001f85c75495fc4e3a836701876183c4bcfd0540a", size = 17973, upload-time = "2025-05-05T19:44:34.99Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fa/b6/3127540ecdf1464a00e5a01ee60a1b09175f6913f0644ac748494d9c4b21/pytest_timeout-2.4.0-py3-none-any.whl", hash = "sha256:c42667e5cdadb151aeb5b26d114aff6bdf5a907f176a007a30b940d3d865b5c2", size = 14382, upload-time = "2025-05-05T19:44:33.502Z" },
 ]
 
 [[package]]

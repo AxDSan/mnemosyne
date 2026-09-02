@@ -469,6 +469,11 @@ def _check_wrapper_import(
         f"selected_site = Path({str(site_packages)!r}).resolve()\n"
         "site.addsitedir(str(selected_site))\n"
         "import mnemosyne_hermes\n"
+        # mnemosyne_hermes deliberately degrades when its optional core imports
+        # are unavailable. A wrapper needs the actual runtime, not merely that
+        # importable fallback package, so prove the same core entry point as the
+        # installer's CLI preflight in the selected interpreter.
+        "import mnemosyne.core.beam\n"
         "origin = getattr(mnemosyne_hermes, '__file__', None)\n"
         "if not origin:\n"
         "    raise SystemExit('mnemosyne_hermes package has no file origin')\n"
@@ -478,22 +483,26 @@ def _check_wrapper_import(
         + "print(getattr(mnemosyne_hermes, '__version__', 'unknown'))\n"
     )
     try:
-        result = subprocess.run(
-            [str(runner), "-S", "-c", code],
-            capture_output=True,
-            text=True,
-            timeout=import_timeout,
-            # -S and a selected site directory isolate imports from the runner's
-            # ambient site/user directories. Filtering PYTHONPATH prevents a
-            # caller-controlled package shadowing that contract; filtering
-            # PYTHONOPTIMIZE keeps assertion elision from changing probe behavior.
-            env={
-                key: value
-                for key, value in os.environ.items()
-                if key not in {"PYTHONPATH", "PYTHONOPTIMIZE"}
-            },
-            cwd=site_packages,
-        )
+        # Python puts the subprocess working directory on sys.path.  Use a
+        # fresh empty directory so validation cannot borrow a checkout or the
+        # installer's current directory to satisfy the selected runtime.
+        with tempfile.TemporaryDirectory(prefix="mnemosyne-wrapper-import-") as probe_cwd:
+            result = subprocess.run(
+                [str(runner), "-S", "-c", code],
+                capture_output=True,
+                text=True,
+                timeout=import_timeout,
+                # -S and a selected site directory isolate imports from the runner's
+                # ambient site/user directories. Filtering PYTHONPATH prevents a
+                # caller-controlled package shadowing that contract; filtering
+                # PYTHONOPTIMIZE keeps assertion elision from changing probe behavior.
+                env={
+                    key: value
+                    for key, value in os.environ.items()
+                    if key not in {"PYTHONPATH", "PYTHONOPTIMIZE"}
+                },
+                cwd=probe_cwd,
+            )
     except OSError as exc:
         return False, f"could not run wrapper Python {runner}: {exc}", True
     except subprocess.TimeoutExpired:
@@ -862,6 +871,28 @@ def _is_windows_platform() -> bool:
     return os.name == "nt"
 
 
+DEFAULT_INSTALL_MODE_POSIX = "symlink"
+DEFAULT_INSTALL_MODE_WINDOWS = "wrapper"
+
+
+def default_install_mode() -> str:
+    """Return the install mode to use when the caller did not choose one.
+
+    Symlink mode is the historical default and stays the default everywhere it
+    can actually succeed. It cannot succeed on native Windows: creating a
+    symbolic link there requires ``SeCreateSymbolicLinkPrivilege``, which in
+    practice means Developer Mode is enabled or the shell is elevated. Without
+    one of those, ``os.symlink`` raises ``WinError 1314`` and the install fails.
+
+    That is why native Windows installs have been reported as working for some
+    people and not others: the outcome depends on a privilege nobody thinks to
+    check. Wrapper mode writes a real plugin directory and needs no privilege,
+    so it is the default there. An explicit ``--mode symlink`` still works for
+    anyone who does hold the privilege. See issue #857.
+    """
+    return DEFAULT_INSTALL_MODE_WINDOWS if _is_windows_platform() else DEFAULT_INSTALL_MODE_POSIX
+
+
 def _venv_python_candidates(venv_root: Path) -> tuple[Path, ...]:
     """Return supported interpreter paths in platform-appropriate order.
 
@@ -908,6 +939,15 @@ def _is_validated_venv_python(candidate: Path) -> bool:
     )
 
 
+def _validate_explicit_python(explicit_python: str | Path | None) -> None:
+    """Reject a supplied --python value that names no interpreter."""
+    if explicit_python is not None and not str(explicit_python).strip():
+        raise ValueError(
+            "--python was given an empty value. Pass the path to Hermes' "
+            "interpreter, or omit --python to let the installer find it."
+        )
+
+
 def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[Path]:
     """Try to find Hermes' python executable for dep validation.
 
@@ -933,16 +973,12 @@ def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[P
     #    would answer with a different interpreter than the one the user asked
     #    for -- exactly the silent substitution this branch exists to prevent.
     if explicit_python is not None:
+        _validate_explicit_python(explicit_python)
         selected = str(explicit_python)
         # Strip only to decide whether anything was named. A POSIX path may
         # legitimately begin or end with whitespace, so stripping the value we
         # return would select a different interpreter than the one requested,
         # or fail to find it at all.
-        if not selected.strip():
-            raise ValueError(
-                "--python was given an empty value. Pass the path to Hermes' "
-                "interpreter, or omit --python to let the installer find it."
-            )
         return Path(selected).expanduser()
 
     hermes_home_path = hermes_home()
@@ -1048,7 +1084,7 @@ def check_mnemosyne_core() -> bool:
 
 
 def check_mnemosyne_core_for_hermes_python(hermes_python: Path) -> Optional[str]:
-    """Check if Hermes' Python can import mnemosyne core.
+    """Check if Hermes' Python can import Mnemosyne's operational dependencies.
 
     Returns the version string if importable, None otherwise.
     """
@@ -1056,7 +1092,7 @@ def check_mnemosyne_core_for_hermes_python(hermes_python: Path) -> Optional[str]
         result = subprocess.run(
             [str(hermes_python), "-c",
              "import mnemosyne; print(mnemosyne.__version__); "
-             "import sqlite_vec"],
+             "import mnemosyne.core.beam; import sqlite_vec"],
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0:
@@ -1520,7 +1556,21 @@ def _validated_wrapper_environment(
     import_timeout: float = DEFAULT_WRAPPER_IMPORT_TIMEOUT,
 ) -> tuple[Path, Path]:
     """Validate the selected wrapper runtime before touching an installed plugin."""
-    wrapper_python = Path(python).expanduser() if python else Path(sys.executable)
+    if python is None:
+        wrapper_python = Path(sys.executable)
+    else:
+        selected = str(python)
+        if not selected.strip():
+            raise ValueError(
+                "--python was given an empty value. Pass the path to Hermes' "
+                "interpreter, or omit --python to let the installer find it."
+            )
+        # The import probe runs from an isolated temporary working directory.
+        # Make an explicit relative path independent of that cwd before either
+        # validation or the probe uses it.  ``absolute()`` is lexical here:
+        # ``resolve()`` would follow a venv's bin/python symlink to its base
+        # interpreter and lose the selected virtual environment.
+        wrapper_python = Path(selected).expanduser().absolute()
     if not wrapper_python.is_file():
         raise FileNotFoundError(f"Python interpreter not found: {wrapper_python}")
     import_timeout = _validated_import_timeout(import_timeout)
@@ -1530,7 +1580,8 @@ def _validated_wrapper_environment(
     )
     if not import_ok:
         raise RuntimeError(
-            f"Selected Python environment cannot import mnemosyne_hermes: {import_error}"
+            "Selected Python environment cannot import required mnemosyne core "
+            f"(mnemosyne.core.beam): {import_error}"
         )
     return wrapper_python, site_packages
 
@@ -1760,7 +1811,7 @@ def install_plugin(
     *,
     hermes_home_path: str | Path | None = None,
     force: bool = False,
-    mode: str = "symlink",
+    mode: str | None = None,
     python: str | Path | None = None,
     import_timeout: float = DEFAULT_WRAPPER_IMPORT_TIMEOUT,
     migrate_wrapper_to_symlink: bool = False,
@@ -1776,6 +1827,8 @@ def install_plugin(
     opted-in profile fan-out by default; set it False to install only at the
     selected Hermes home.
     """
+    if mode is None:
+        mode = default_install_mode()
     if mode not in {"symlink", "wrapper"}:
         raise ValueError("mode must be 'symlink' or 'wrapper'")
     if migrate_wrapper_to_symlink and (mode != "symlink" or not force):
@@ -2081,8 +2134,12 @@ def _parser() -> argparse.ArgumentParser:
     install.add_argument(
         "--mode",
         choices=("symlink", "wrapper"),
-        default="symlink",
-        help="Install mode: symlink (default) or persistent wrapper shim.",
+        default=None,
+        help=(
+            "Install mode. Defaults to symlink, except on native Windows where "
+            "it defaults to the persistent wrapper shim because symbolic links "
+            "there require Developer Mode or an elevated shell."
+        ),
     )
     install.add_argument(
         "--python",
@@ -2153,7 +2210,7 @@ def run_install(
     force: bool = False,
     hermes_home_path: str | Path | None = None,
     no_bootstrap: bool = False,
-    mode: str = "symlink",
+    mode: str | None = None,
     python: str | Path | None = None,
     import_timeout: float = DEFAULT_WRAPPER_IMPORT_TIMEOUT,
     migrate_wrapper_to_symlink: bool = False,
@@ -2165,9 +2222,18 @@ def run_install(
     Can be called from the CLI ``install`` subcommand or programmatically
     (e.g., from ``upgrade.py`` after upgrading the pip package).
     """
-    # Check core library first (installer's own Python)
-    core_ok = check_mnemosyne_core()
-    if not core_ok:
+    if mode is None:
+        mode = default_install_mode()
+
+    # Validate supplied input before the symlink-mode installer preflight. A
+    # blank value is explicit, not an omitted --python request, and must never
+    # be hidden by an earlier preflight return.
+    _validate_explicit_python(python)
+
+    # Wrapper validation belongs to its selected environment, including the
+    # interpreter discovered when --python is omitted. Only symlink installs
+    # retain the installer-Python core preflight and bootstrap path.
+    if mode == "symlink" and not check_mnemosyne_core():
         print(
             "  mnemosyne-memory NOT found in this Python. Install it first:\n"
             "    pip install mnemosyne-hermes[all]",
@@ -2175,9 +2241,18 @@ def run_install(
         )
         return 1
 
-    # Symlink installs need Hermes' own Python to contain the package. Wrapper
-    # installs validate the explicitly selected interpreter in install_plugin().
-    hermes_python = _find_hermes_python(explicit_python=python) if mode == "symlink" else None
+    # Both install modes need a Hermes interpreter. Symlink installs bootstrap
+    # it when needed; wrapper installs validate it and record its metadata. An
+    # explicit --python remains authoritative through _find_hermes_python().
+    hermes_python = _find_hermes_python(explicit_python=python)
+    if mode == "wrapper" and hermes_python is None:
+        print(
+            "\n  ⚠ Could not identify Hermes' Python for wrapper mode.\n"
+            "     Pass --python /path/to/hermes/venv/bin/python to select the "
+            "environment the wrapper must import from.",
+            file=sys.stderr,
+        )
+        return 1
     if mode == "symlink" and hermes_python is None:
         # Discovery found no validated Hermes runtime, so there is nothing safe
         # to bootstrap into. Before #618 this path guessed at the launcher's
@@ -2203,7 +2278,7 @@ def run_install(
     # to its base interpreter, so resolving both sides reports a venv and the
     # base install as the same runtime and skips the check that bootstraps
     # Hermes' venv (#618).
-    if hermes_python and hermes_python != Path(sys.executable):
+    if mode == "symlink" and hermes_python and hermes_python != Path(sys.executable):
         hermes_core = check_mnemosyne_core_for_hermes_python(hermes_python)
         if hermes_core is None:
             print(f"\n  ⚠ Hermes' Python at {hermes_python} can't import mnemosyne core.")
@@ -2232,7 +2307,7 @@ def run_install(
             hermes_home_path=hermes_home_path,
             force=force,
             mode=mode,
-            python=python,
+            python=hermes_python if mode == "wrapper" else python,
             import_timeout=import_timeout,
             migrate_wrapper_to_symlink=migrate_wrapper_to_symlink,
             link_profiles=link_profiles,
@@ -2240,9 +2315,11 @@ def run_install(
     except _WindowsSymlinkPrivilegeError:
         print(
             "\n  ⚠ Windows symbolic-link privilege is unavailable (WinError 1314).\n"
-            "     Enable Developer Mode or run with an account granted the "
-            "symbolic-link privilege.\n"
-            "     The installer did not switch install modes automatically.\n",
+            "     Symlink mode was requested explicitly, so the installer did not\n"
+            "     switch modes on your behalf. Either enable Developer Mode or run\n"
+            "     with an account granted the symbolic-link privilege, or install in\n"
+            "     persistent wrapper mode, which needs no privilege and is the\n"
+            "     default on Windows when no mode is given.\n",
             file=sys.stderr,
         )
         if hermes_python is not None:
@@ -2293,10 +2370,30 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if command == "install":
+            # argparse leaves --mode as None when the user did not choose one, so
+            # resolve it here, before anything reads it. Every downstream path
+            # (dry-run reporting included) then sees a concrete mode.
+            if getattr(args, "mode", None) is None:
+                args.mode = default_install_mode()
+                if args.mode == DEFAULT_INSTALL_MODE_WINDOWS and _is_windows_platform():
+                    print(
+                        "  Native Windows detected: installing in persistent wrapper mode.\n"
+                        "  Symbolic links need Developer Mode or an elevated shell here, so\n"
+                        "  wrapper mode is the default. Pass --mode symlink to override."
+                    )
+
             # Dry-run: just show what would happen
             hermes_python = _find_hermes_python(
                 explicit_python=getattr(args, "python", None)
             )
+            if args.mode == "wrapper" and hermes_python is None:
+                print(
+                    "\n  ⚠ Could not identify Hermes' Python for wrapper mode.\n"
+                    "     Pass --python /path/to/hermes/venv/bin/python to select "
+                    "the environment the wrapper must import from.",
+                    file=sys.stderr,
+                )
+                return 1
             target = plugin_target_dir(args.hermes_home)
             if getattr(args, "dry_run", False):
                 invalid_wrapper_migration_args = (
@@ -2327,7 +2424,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  Skill state: {skill.status}")
                 print(f"  Skill action: {skill_plan.message}")
                 if getattr(args, "mode", "symlink") == "wrapper":
-                    wrapper_python = Path(getattr(args, "python", None) or sys.executable).expanduser()
+                    # Match run_install(): wrapper metadata and validation use
+                    # the discovered Hermes runtime unless --python selected one.
+                    # Preserve a venv's python symlink; absolute() is lexical.
+                    assert hermes_python is not None
+                    wrapper_python = hermes_python.absolute()
                     print(f"  Wrapper Python: {wrapper_python}")
                     if wrapper_python.is_file():
                         print(

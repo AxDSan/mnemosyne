@@ -473,14 +473,42 @@ def test_tool_whitelist_null_without_yaml_exposes_all_tools(
             _filtered_schemas(module, PROVIDER_TOOL_NAMES)
         )
         assert provider.has_tool("mnemosyne_remember") is True
-        assert json.loads(
-            provider.handle_tool_call("mnemosyne_remember", {"content": "x"})
-        ) == {
-            "status": "memory_unavailable",
-            "tool": "mnemosyne_remember",
-            "reason": "Mnemosyne not initialized",
-            "error": "Mnemosyne unavailable: Mnemosyne not initialized",
-        }
+
+
+def test_uninitialized_primary_tool_call_diverges_by_provider(
+    tmp_path, monkeypatch, provider_modules
+):
+    """Intentional divergence: only mnemosyne_hermes lazy-inits on first tool call.
+
+    The previous shared-loop assertion required memory_unavailable from both
+    providers. hermes_memory_provider still returns that uninitialized response.
+    mnemosyne_hermes lazy-initializes on a primary-context tool call when Hermes
+    never called initialize(), so it must not return memory_unavailable.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+
+    root = _provider_for_config(provider_modules["hermes_memory_provider"], tmp_path)
+    assert json.loads(
+        root.handle_tool_call("mnemosyne_remember", {"content": "x"})
+    ) == {
+        "status": "memory_unavailable",
+        "tool": "mnemosyne_remember",
+        "reason": "Mnemosyne not initialized",
+        "error": "Mnemosyne unavailable: Mnemosyne not initialized",
+    }
+
+    packaged = _provider_for_config(provider_modules["mnemosyne_hermes"], tmp_path)
+    try:
+        result = json.loads(
+            packaged.handle_tool_call("mnemosyne_remember", {"content": "x"})
+        )
+        assert result.get("status") != "memory_unavailable", result
+        assert "not initialized" not in str(result).lower()
+        assert result.get("status") == "stored"
+        assert result.get("memory_id")
+    finally:
+        packaged.shutdown()
 
 
 @pytest.mark.parametrize(

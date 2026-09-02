@@ -557,53 +557,82 @@ def _detect_vec_type(conn: sqlite3.Connection) -> str:
     return "float32"
 
 
-def _existing_vec_dim(conn: sqlite3.Connection) -> Optional[int]:
-    """Return the embedding dimension already declared by a sqlite-vec table in
-    this database, or ``None`` if no ``vec0`` table exists yet.
+_VEC_TABLE_NAMES = ("vec_episodes", "vec_working", "vec_facts")
 
-    A ``vec0`` virtual table fixes its dimension at creation time, encoded in its
-    DDL as ``embedding <type>[<dim>]``. When a store already holds vectors, that
-    declared dimension -- not the process's configured ``EMBEDDING_DIM`` -- is the
-    source of truth for what the stored data actually is. Reads only
-    ``sqlite_master`` (no extension required) so it is safe to call before the
-    sqlite-vec tables are (re)created.
+
+def _existing_vec_dims_strict(conn: sqlite3.Connection) -> Tuple[Tuple[str, int], ...]:
+    """Per-table stored dimensions, propagating SQLite errors.
+
+    Same read as ``_existing_vec_dims``, for callers on an error path where a
+    failed catalog read must surface instead of degrading to empty guidance.
     """
-    try:
-        rows = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' "
-            "AND name IN ('vec_episodes', 'vec_working', 'vec_facts')"
-        ).fetchall()
-    except sqlite3.Error:
-        return None
-    for row in rows:
-        sql = row[0] if row else None
+    rows = conn.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
+        "AND name IN ('vec_episodes', 'vec_working', 'vec_facts')"
+    ).fetchall()
+
+    declared_dims = {}
+    for name, sql in rows:
         if not sql:
             continue
-        match = re.search(r"\[(\d+)\]", sql)
-        if match:
-            return int(match.group(1))
-    return None
+        dim = _dim_from_ddl(sql)
+        if dim is not None:
+            declared_dims[name] = dim
+    return tuple((name, declared_dims[name]) for name in _VEC_TABLE_NAMES if name in declared_dims)
 
 
-def _dim_mismatch_message(existing_dim: int, configured_dim: int) -> str:
-    """Build the embedding-dimension-mismatch message.
+def _existing_vec_dims(conn: sqlite3.Connection) -> Tuple[Tuple[str, int], ...]:
+    """Return immutable stored dimensions for each recognized vector table.
 
-    Extracted as a pure function so the wording -- explicitly NOT corruption plus
-    the exact self-heal commands -- is unit-testable without a sqlite-vec
-    database. The phrasing matters: 'dimension mismatch' is otherwise misread as
-    'database corrupt', and users (and agent frameworks) abandon the store
-    instead of reindexing.
+    A ``vec0`` virtual table fixes its dimension at creation time, encoded in its
+    DDL as ``embedding <type>[<dim>]``. Read every known table in a fixed order:
+    legacy databases can contain a mixed index, and returning the first
+    ``sqlite_master`` row would make its status depend on catalog row order.
+    Reads only ``sqlite_master`` (no extension required), so it is safe before
+    sqlite-vec tables are (re)created. A failed read degrades to ``()``.
     """
+    try:
+        return _existing_vec_dims_strict(conn)
+    except sqlite3.Error:
+        return ()
+
+
+def _existing_vec_dim(conn: sqlite3.Connection) -> Optional[int]:
+    """Return a dimension only when all stored vector tables agree.
+
+    Kept as a narrow compatibility helper for callers that only need a uniform
+    stored dimension. Mixed indexes have no honest scalar representation.
+    """
+    stored_dims = _existing_vec_dims(conn)
+    dimensions = {dim for _, dim in stored_dims}
+    return dimensions.pop() if len(dimensions) == 1 else None
+
+
+def _dim_mismatch_message(
+    stored_dims: Tuple[Tuple[str, int], ...], configured_dim: int
+) -> str:
+    """Build an actionable message for uniform or mixed vector-index dimensions."""
+    stored_description = ", ".join(f"{table}={dim}" for table, dim in stored_dims)
+    dimensions = {dim for _, dim in stored_dims}
+    if len(dimensions) == 1:
+        existing_dim = next(iter(dimensions))
+        recovery_hint = (
+            f"  * Keep the existing {existing_dim}-dim vectors: relaunch with "
+            f"MNEMOSYNE_EMBEDDING_DIM={existing_dim} (and the matching model).\n"
+        )
+        index_description = f"This database stores {existing_dim}-dim vectors"
+    else:
+        recovery_hint = ""
+        index_description = f"This database has mixed vector-index dimensions ({stored_description})"
+
     return (
         f"Embedding dimension mismatch — NOT database corruption: your memories "
         f"are intact, only the vector index is affected (recall falls back to "
-        f"keyword search until this is fixed). This database stores "
-        f"{existing_dim}-dim vectors but this process is configured for "
-        f"{configured_dim}-dim (MNEMOSYNE_EMBEDDING_DIM / "
+        f"keyword search until this is fixed). {index_description} but this "
+        f"process is configured for {configured_dim}-dim (MNEMOSYNE_EMBEDDING_DIM / "
         f"MNEMOSYNE_EMBEDDING_MODEL); sqlite-vec tables were left untouched. To "
         f"self-heal, choose ONE:\n"
-        f"  * Keep the existing {existing_dim}-dim vectors: relaunch with "
-        f"MNEMOSYNE_EMBEDDING_DIM={existing_dim} (and the matching model).\n"
+        f"{recovery_hint}"
         f"  * Re-embed all memories at {configured_dim}-dim: run "
         f"`MNEMOSYNE_EMBEDDING_DIM={configured_dim} mnemosyne reindex` (it backs "
         f"up first).\n"
@@ -611,8 +640,25 @@ def _dim_mismatch_message(existing_dim: int, configured_dim: int) -> str:
     )
 
 
-def init_beam(db_path: Path = None):
-    """Initialize BEAM schema."""
+@dataclass(frozen=True)
+class BeamInitResult:
+    """Outcome of BEAM schema initialization.
+
+    This is additive status only: callers that ignore ``init_beam()``'s return
+    value retain the historical initialization behavior. ``stored_dims`` is a
+    fixed-order immutable ``(table, dimension)`` tuple; ``existing_dim`` is set
+    only when those stored tables have one uniform dimension. A mismatch remains
+    recoverable and does not prevent the non-vector schema from being initialized.
+    """
+
+    vec_dim_mismatch: bool
+    existing_dim: Optional[int]
+    configured_dim: int
+    stored_dims: Tuple[Tuple[str, int], ...] = ()
+
+
+def init_beam(db_path: Path = None) -> BeamInitResult:
+    """Initialize BEAM schema and return its vector-index status."""
     conn = _get_connection(db_path)
     cursor = conn.cursor()
 
@@ -816,13 +862,14 @@ def init_beam(db_path: Path = None):
     # environment as the writer. Refuse to create mismatched tables, leave any
     # existing ones untouched, and surface one actionable error instead of
     # per-row insert noise; recall falls back to the float-JSON voice meanwhile.
-    vec_dim_mismatch = False
+    stored_dims = _existing_vec_dims(conn)
+    dimensions = {dim for _, dim in stored_dims}
+    existing_dim = dimensions.pop() if len(dimensions) == 1 else None
+    vec_dim_mismatch = any(dim != EMBEDDING_DIM for _, dim in stored_dims)
+    if vec_dim_mismatch:
+        logger.error(_dim_mismatch_message(stored_dims, EMBEDDING_DIM))
     if _SQLITE_VEC_AVAILABLE:
-        existing_dim = _existing_vec_dim(conn)
-        if existing_dim is not None and existing_dim != EMBEDDING_DIM:
-            vec_dim_mismatch = True
-            logger.error(_dim_mismatch_message(existing_dim, EMBEDDING_DIM))
-        else:
+        if not vec_dim_mismatch:
             try:
                 cursor.execute(f"""
                     CREATE VIRTUAL TABLE IF NOT EXISTS vec_episodes USING vec0(
@@ -1128,7 +1175,7 @@ def init_beam(db_path: Path = None):
         WHERE superseded_by IS NULL""")
     cursor.execute("""CREATE INDEX IF NOT EXISTS idx_mem_emb_type
         ON memory_embeddings(memory_id, model)""")
-    if not vec_dim_mismatch:
+    if _SQLITE_VEC_AVAILABLE and not vec_dim_mismatch:
         try:
             _backfill_vec_working_from_memory_embeddings(conn)
         except NameError:
@@ -1237,7 +1284,7 @@ def init_beam(db_path: Path = None):
     # Vector table for facts (sqlite-vec). Skipped on a dimension mismatch for the
     # same reason as vec_episodes / vec_working above (see the guard in the
     # sqlite-vec VIRTUAL TABLES block).
-    if not vec_dim_mismatch:
+    if _SQLITE_VEC_AVAILABLE and not vec_dim_mismatch:
         try:
             cursor.execute(f"""
                 CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts USING vec0(
@@ -1258,6 +1305,13 @@ def init_beam(db_path: Path = None):
     _add_column_if_missing(conn, "episodic_memory", "corrected_by", "INTEGER DEFAULT NULL")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_wm_event_date ON working_memory(event_date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_em_event_date ON episodic_memory(event_date)")
+
+    return BeamInitResult(
+        vec_dim_mismatch=vec_dim_mismatch,
+        existing_dim=existing_dim,
+        configured_dim=EMBEDDING_DIM,
+        stored_dims=stored_dims,
+    )
 
 
 class _BeamConnection(sqlite3.Connection):
@@ -2446,13 +2500,59 @@ def _effective_vec_type(conn: sqlite3.Connection, table: str = "vec_episodes") -
             "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
             (table,)
         ).fetchone()
-        if row and "int8" in row[0]:
-            return "int8"
-        if row and "bit" in row[0]:
-            return "bit"
+        return _vec_type_from_ddl(row)
     except Exception:
         logger.info("Regex extraction failed, skipping", exc_info=True)
     return "float32"
+
+
+def _vec_type_from_ddl(row) -> str:
+    """Classify a vec0 table's quantization type from its sqlite_master row."""
+    if row and "int8" in row[0]:
+        return "int8"
+    if row and "bit" in row[0]:
+        return "bit"
+    return "float32"
+
+
+def _vec_table_type_strict(conn: sqlite3.Connection, table: str = "vec_episodes") -> str:
+    """Read a vec0 table's declared quantization type, propagating errors.
+
+    Unlike ``_effective_vec_type`` (which swallows every lookup failure and
+    falls back to float32), this is for the episodic KNN path where only a
+    confirmed query-vector dimension mismatch may degrade: a lock, I/O, or
+    corruption failure while reading the schema must surface unchanged, not
+    resurface later as a misleading vector-type/dimension error.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    return _vec_type_from_ddl(row)
+
+
+def _dim_from_ddl(sql: str) -> Optional[int]:
+    """Parse a vec0 table's declared embedding dimension from its DDL."""
+    match = re.search(r"\[(\d+)\]", sql)
+    return int(match.group(1)) if match else None
+
+
+def _vec_table_dim_strict(conn: sqlite3.Connection, table: str = "vec_episodes") -> Optional[int]:
+    """Read a vec0 table's declared embedding dimension, propagating errors.
+
+    Unlike ``_existing_vec_dim`` (which swallows sqlite3.Error and returns
+    None), a failed schema read here surfaces: the episodic KNN's mismatch
+    classification must not silently discard a real storage failure behind
+    the KNN exception. Returns None when a successful read finds no table
+    or no declared dimension; only the read failure itself propagates.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    if not row or not row[0]:
+        return None
+    return _dim_from_ddl(row[0])
 
 
 def _vec_insert(
@@ -2911,6 +3011,66 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     return plan
 
 
+def _has_dim_mismatch_signal(exc: BaseException) -> bool:
+    """True when the error's own text is sqlite-vec's dimension-mismatch
+    signal. Shared by the early gate in ``_vec_search`` and the classifier so
+    the two can never drift apart: a mismatch the classifier would confirm
+    must always clear the gate, or confirmed mismatches would re-raise out of
+    recall() instead of degrading."""
+    return "dimension mismatch" in str(exc).lower()
+
+
+def _is_query_dim_mismatch(exc: BaseException, query_dim: int, existing_dim: Optional[int]) -> bool:
+    """True only when sqlite-vec actually rejected the query vector for its
+    dimension.
+
+    An unrelated ``OperationalError`` (locked database, missing table) must not
+    be dressed up as a dimension mismatch with self-heal guidance, even when
+    the submitted and stored dimensions happen to disagree: classify on the
+    error's own signal, not on the dimension coincidence alone.
+    """
+    return (
+        existing_dim is not None
+        and query_dim != existing_dim
+        and _has_dim_mismatch_signal(exc)
+    )
+
+
+def _query_dim_guidance(
+    query_dim: int,
+    existing_dim: int,
+    stored_dims: Tuple[Tuple[str, int], ...],
+) -> str:
+    """Self-heal guidance for a confirmed query-side dimension mismatch.
+
+    The reindex steps from ``_dim_mismatch_message`` are only correct when
+    the CONFIGURED dimension disagrees with the store. When config and store
+    agree, the embedding endpoint served a wrong-dim query vector and the
+    store needs nothing: reindex advice there would be false and destructive.
+    The full ``stored_dims`` tuple is passed through so a mixed store's
+    message names every table, not just the one under query; a mixed store
+    gets the reindex guidance even when vec_episodes happens to agree with
+    the configuration, because the stored vectors are not uniformly fine.
+    """
+    if not stored_dims:
+        # Defensive only: the strict catalog read raises on failure, so an
+        # empty tuple here means the read succeeded but yielded no declared
+        # dimension (a DDL rewrite racing the probes). Describe the one
+        # dimension that was confirmed rather than rendering an empty
+        # mixed-store description.
+        stored_dims = (("vec_episodes", existing_dim),)
+    if existing_dim != EMBEDDING_DIM or len({dim for _, dim in stored_dims}) != 1:
+        return _dim_mismatch_message(stored_dims, EMBEDDING_DIM)
+    return (
+        f"The store and the process configuration agree at "
+        f"{existing_dim}-dim; the embedding endpoint/model served "
+        f"a {query_dim}-dim query vector. Point "
+        f"MNEMOSYNE_EMBEDDING_API_URL / MNEMOSYNE_EMBEDDING_MODEL "
+        f"at a {existing_dim}-dim model. The stored vectors are "
+        f"fine; no reindex is needed."
+    )
+
+
 def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -> List[Dict]:
     """Search sqlite-vec and return rowids with distances.
 
@@ -2918,7 +3078,7 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
     distances are commensurate with the stored int8 vectors (which are also
     unit-normalized at insert time — see _vec_insert).
     """
-    vec_type = _effective_vec_type(conn)
+    vec_type = _vec_table_type_strict(conn)
     # Normalize to unit length before quantization
     # (sqlite-vec 0.1.9 'unit' param fails at 1024-dim)
     import numpy as _np
@@ -2932,21 +3092,56 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
     # can't resolve the parameter value. We inline k safely since it's
     # always an integer computed internally.
     k = int(k)
-    if vec_type == "bit":
-        rows = conn.execute(
-            f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_binary(?) AND k={k} ORDER BY distance",
-            (emb_json,)
-        ).fetchall()
-    elif vec_type == "int8":
-        rows = conn.execute(
-            f'SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_int8(?, "unit") AND k={k} ORDER BY distance',
-            (emb_json,)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH ? AND k={k} ORDER BY distance",
-            (emb_json,)
-        ).fetchall()
+    try:
+        if vec_type == "bit":
+            rows = conn.execute(
+                f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_binary(?) AND k={k} ORDER BY distance",
+                (emb_json,)
+            ).fetchall()
+        elif vec_type == "int8":
+            rows = conn.execute(
+                f'SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_int8(?, "unit") AND k={k} ORDER BY distance',
+                (emb_json,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH ? AND k={k} ORDER BY distance",
+                (emb_json,)
+            ).fetchall()
+    except sqlite3.Error as exc:
+        # Degrade only on a confirmed sqlite-vec query dimension mismatch
+        # (see _is_query_dim_mismatch); every other sqlite3.Error (locked
+        # database, corruption, disk I/O) propagates unchanged, so a real
+        # storage failure is never silently converted into a loss of the
+        # vector voice. Classify the original KNN error first, by its own
+        # text, BEFORE any further schema probe: when an unrelated failure
+        # (a lock) is followed by a failing probe, the original must be
+        # the one that propagates, never the probe's error. Only an actual
+        # sqlite-vec dimension-mismatch signal earns the strict dimension
+        # probe, which classifies against the query vector actually
+        # submitted and against vec_episodes' own DDL: mixed or partially
+        # migrated stores can carry vec tables at different dimensions.
+        if not _has_dim_mismatch_signal(exc):
+            raise
+        query_dim = len(embedding)
+        # Strict: a failed dimension probe propagates (it names the real
+        # storage problem); a successful read with no declared dimension
+        # leaves the mismatch unconfirmed, so the KNN error re-raises below.
+        existing_dim = _vec_table_dim_strict(conn)
+        if not _is_query_dim_mismatch(exc, query_dim, existing_dim):
+            raise
+        # The guidance's all-tables catalog read is strict too: after a
+        # confirmed mismatch, a diagnostic lock/I/O/corruption failure must
+        # surface, not be swallowed into degraded guidance plus [].
+        logger.error(
+            "Dimension mismatch querying vec_episodes (query vector is "
+            "%s-dim, table is %s-dim, process configured %s-dim); vector "
+            "recall disabled for this call, falling back to other recall "
+            "voices. %s",
+            query_dim, existing_dim, EMBEDDING_DIM,
+            _query_dim_guidance(query_dim, existing_dim, _existing_vec_dims_strict(conn)),
+        )
+        return []
     return [{"rowid": r["rowid"], "distance": r["distance"]} for r in rows]
 
 
@@ -3453,7 +3648,7 @@ class BeamMemory:
         self._extraction_buffer = []  # Buffer for batch extraction
         self._event_emitter = event_emitter  # Streaming event callback
         self.conn = _get_connection(self.db_path)
-        init_beam(self.db_path)
+        self.init_result = init_beam(self.db_path)
 
         # E6: ensure schema split + auto-migrate legacy TripleStore rows
         # to AnnotationStore. Honors MNEMOSYNE_AUTO_MIGRATE=0 for operators
@@ -5219,7 +5414,7 @@ class BeamMemory:
             'preference': r'(?:(?:Я(?: |\')?(?:люблю|ненавижу|предпочитаю|терпеть не могу|не люблю|не нравится|использую|пользуюсь|остаюсь на|перешёл на|переключился на|хочу|нуждаюсь|обычно|скорее|предпочитаю не|стараюсь избегать|привык|надоело|устал от|доволен|устраивает))|мне\s+(?:нравится|не нравится|проще|удобнее|лень|надоело)|терпеть не могу|надоело|привык|устраивает)\s+([^.,;!?\n]{3,200})',
             'event_keywords': ['встреча', 'созвон', 'запланировано', 'состоялось', 'произошло', 'планирую', 'будет', 'дедлайн', 'релиз', 'запуск', 'деплой', 'опубликовано', 'начал', 'начался', 'закончил', 'завершил', 'событие', 'конференция', 'воркшоп', 'встреча'],
             'named_months': r'((?:(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря|янв|фев|мар|апр|май|июн|июл|авг|сен|окт|ноя|дек)\s+\d{1,2}(?:-го)?,?\s*(?:\d{4})?)|(?:\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)(?:\s+\d{4})?))',
-            'instruction': r'\b(?:всегда|никогда|должен|не должен|нужно|не нужно|обязательно|нельзя|не забывай|запомни|помни|следует|стоит)\\s+([^.,;!?\\n]{6,200})',
+            'instruction': r'\b(?:всегда|никогда|должен|не должен|нужно|не нужно|обязательно|нельзя|не забывай|запомни|помни|следует|стоит)\s+([^.,;!?\n]{6,200})',
         },
         'it': {
             'negation': r"((?:Non(?: |')?(?:ho|ho mai|mai|non)\s+[^.,;!?\n]{15,120}))",
@@ -5242,10 +5437,10 @@ class BeamMemory:
             'named_months': r'((?:(?:Gennaio|Febbraio|Marzo|Aprile|Maggio|Giugno|Luglio|Agosto|Settembre|Ottobre|Novembre|Dicembre|gen|feb|mar|apr|mag|giu|lug|ago|set|ott|nov|dic)\s+\d{1,2}(?:°)?,?\s*(?:\d{4})?))',
         },
         'es': {
-            'negation': r'(nunca|jamás|tampoco|ni\s+(?:siquiera|de coña|loc[ao]|de broma|hablar)|no\s+(?:me\s+(?:gusta|convence|interesa|molesta|duele)|lo\s+(?:hag[ao]s|haré|haría)|hace\s+falta|quiero|voy\s+a|sé|sabía|puedo|debo|es\s+(?:para\s+tanto|plan|momento)|tiene\s+sentido|estoy\s+(?:de\s+acuerdo|seguro)|hay\s+(?:derecho|manera|tipo|quien)|teng[ao]\s+(?:ni\s+idea|claro)|pienso|creo|son|era|está|estaba|será|está\s+mal|vamos\s+mal))\s+([^.,;!?¿¡\\n]{15,120})',
-            'decision': r'(?:decid(?:í|ió|imos|iste|isteis|ieron|o|es|e|en)|opt(?:é|ó|amos|aste|asteis|aron|o|a|an)\s+por|cambi(?:é|ó|amos|aste|asteis|aron|o|a|an)\s+(?:de|a)|eleg(?:í|ió|imos|iste|isteis|ieron|o|es|e|en)|seleccion(?:é|ó|amos|aste|asteis|aron|o|a|an)|me\s+(?:pas|decant|escog)(?:é|ó|amos|o|a|an)\s+(?:a|por)|migr(?:é|ó|amos|aste|asteis|aron|o|a|an)\s+(?:de|a)|actualic(?:é|ó|amos|aste|asteis|aron|o|a|an)\s+(?:de|a)|sustitu(?:í|yó|imos|iste|isteis|yeron|yo|yes|ye|yen)\s+por|elimin(?:é|ó|amos|aste|asteis|aron|o|a|an)|descart(?:é|ó|amos|aste|asteis|aron|o|a|an)|y\s+si\s+[^.,;!?¿¡\\n]{10,200}|mejor\s+(?:si|así))\s+([^.,;!?¿¡\\n]{10,120})',
-            'entity': r'(el|la|mi|tu|su|nuestr[oa]|vuestr[oa]|mis|tus|sus|los|las)\s+(servidor|maquina|vm|contenedor|docker|nodo|clúster|cluster|router|enrutador|gateway|puerta\s+de\s+enlace|switch|ap|punto\s+de\s+acceso|firewall|cortafuegos|vpn|vlan|dns|dhcp|api|endpoint|función|funcio|módulo|modulo|servicio|proceso|script|plugin|tool|skill|base\s+de\s+datos|bd|tabla|query|consulta|log|backup|snapshot|sensor|cámara|camara|luz|interruptor|alarma|estación\s+meteorológica|estacion\s+meteorologica|automatización|automatizacion|puerta|repo|repositorio|rama|branch|pr|issue|tarea|workflow|pipeline|config|configuración|configuracion|ajuste|carpeta|opciones|archivo|fichero|dashboard|interfaz|sistema|actualización|actualizacion|versión|versio|despliegue|deploy|release|entorno)(?:\s+(?:\w+))?\s+(?:necesita|requiere|debería|deberia|podría|podria|puede|tiene\s+que|usa|utiliza|ejecuta|gestiona|maneja|procesa|soporta|funciona\s+con|depende\s+de|contiene|implementa|despliega|actualiza|configura|corre\s+(?:en|sobre)|monitoriza|notifica|está|esta)\s+([^.,;!?¿¡\\n]{10,80})',
-            'sequence': r'((?:primero|primeramente|en\s+primer\s+lugar|segundo|en\s+segundo\s+lugar|tercero|en\s+tercer\s+lugar|para\s+empezar|yo\s+empezaría\s+por|yo\s+empezaria\s+por|por\s+mi\s+parte|por\s+otro\s+lado|luego|después|despues|a\s+continuación|a\s+continuacion|mientras\s+tanto|al\s+mismo\s+tiempo|finalmente|por\s+último|por\s+ultimo|para\s+terminar|antes\s+de|acto\s+seguido|por\s+una\s+parte|por\s+otra\s+parte|posteriormente)[^.,;!?¿¡\\n]{15,120})',
+            'negation': r'(nunca|jamás|tampoco|ni\s+(?:siquiera|de coña|loc[ao]|de broma|hablar)|no\s+(?:me\s+(?:gusta|convence|interesa|molesta|duele)|lo\s+(?:hag[ao]s|haré|haría)|hace\s+falta|quiero|voy\s+a|sé|sabía|puedo|debo|es\s+(?:para\s+tanto|plan|momento)|tiene\s+sentido|estoy\s+(?:de\s+acuerdo|seguro)|hay\s+(?:derecho|manera|tipo|quien)|teng[ao]\s+(?:ni\s+idea|claro)|pienso|creo|son|era|está|estaba|será|está\s+mal|vamos\s+mal))\s+([^.,;!?¿¡\n]{15,120})',
+            'decision': r'(?:decid(?:í|ió|imos|iste|isteis|ieron|o|es|e|en)|opt(?:é|ó|amos|aste|asteis|aron|o|a|an)\s+por|cambi(?:é|ó|amos|aste|asteis|aron|o|a|an)\s+(?:de|a)|eleg(?:í|ió|imos|iste|isteis|ieron|o|es|e|en)|seleccion(?:é|ó|amos|aste|asteis|aron|o|a|an)|me\s+(?:pas|decant|escog)(?:é|ó|amos|o|a|an)\s+(?:a|por)|migr(?:é|ó|amos|aste|asteis|aron|o|a|an)\s+(?:de|a)|actualic(?:é|ó|amos|aste|asteis|aron|o|a|an)\s+(?:de|a)|sustitu(?:í|yó|imos|iste|isteis|yeron|yo|yes|ye|yen)\s+por|elimin(?:é|ó|amos|aste|asteis|aron|o|a|an)|descart(?:é|ó|amos|aste|asteis|aron|o|a|an)|y\s+si\s+[^.,;!?¿¡\n]{10,200}|mejor\s+(?:si|así))\s+([^.,;!?¿¡\n]{10,120})',
+            'entity': r'(el|la|mi|tu|su|nuestr[oa]|vuestr[oa]|mis|tus|sus|los|las)\s+(servidor|maquina|vm|contenedor|docker|nodo|clúster|cluster|router|enrutador|gateway|puerta\s+de\s+enlace|switch|ap|punto\s+de\s+acceso|firewall|cortafuegos|vpn|vlan|dns|dhcp|api|endpoint|función|funcio|módulo|modulo|servicio|proceso|script|plugin|tool|skill|base\s+de\s+datos|bd|tabla|query|consulta|log|backup|snapshot|sensor|cámara|camara|luz|interruptor|alarma|estación\s+meteorológica|estacion\s+meteorologica|automatización|automatizacion|puerta|repo|repositorio|rama|branch|pr|issue|tarea|workflow|pipeline|config|configuración|configuracion|ajuste|carpeta|opciones|archivo|fichero|dashboard|interfaz|sistema|actualización|actualizacion|versión|versio|despliegue|deploy|release|entorno)(?:\s+(?:\w+))?\s+(?:necesita|requiere|debería|deberia|podría|podria|puede|tiene\s+que|usa|utiliza|ejecuta|gestiona|maneja|procesa|soporta|funciona\s+con|depende\s+de|contiene|implementa|despliega|actualiza|configura|corre\s+(?:en|sobre)|monitoriza|notifica|está|esta)\s+([^.,;!?¿¡\n]{10,80})',
+            'sequence': r'((?:primero|primeramente|en\s+primer\s+lugar|segundo|en\s+segundo\s+lugar|tercero|en\s+tercer\s+lugar|para\s+empezar|yo\s+empezaría\s+por|yo\s+empezaria\s+por|por\s+mi\s+parte|por\s+otro\s+lado|luego|después|despues|a\s+continuación|a\s+continuacion|mientras\s+tanto|al\s+mismo\s+tiempo|finalmente|por\s+último|por\s+ultimo|para\s+terminar|antes\s+de|acto\s+seguido|por\s+una\s+parte|por\s+otra\s+parte|posteriormente)[^.,;!?¿¡\n]{15,120})',
             'instruction_false_positives': [
                 'evita perón', 'evita peron',
                 'goma de borrar',
@@ -5274,8 +5469,8 @@ class BeamMemory:
                 'nunca lo he', 'nunca lo había', 'nunca había',
             ],
             'instruction_imperative': 'siempre|nunca|recuerda|recordad|recuerde|recuerden|haz|haced|haga|hagan|usa|usad|use|usen|mantén|mantened|mantenga|mantengan|evita|evitad|evite|eviten|asegúrate|aseguraos|asegúrese|asegúrense|asegurate|aseguraos|asegurese|asegurense|verifica|verificad|verifique|verifiquen|comprueba|comprobad|compruebe|comprueben|revisa|revisad|revise|revisen|ejecuta|ejecutad|ejecute|ejecuten|prueba|probad|pruebe|prueben|pon|poned|ponga|pongan|configura|configurad|configure|configuren|instala|instalad|instale|instalen|actualiza|actualizad|actualice|actualicen|borra|borrad|borre|borren|guarda|guardad|guarde|guarden|busca|buscad|busque|busquen|despliega|desplegad|despliegue|desplieguen|crea|cread|cree|creen|memoriza|memorizad|memorice|memoricen|graba|grabad|grabe|graben|añade|añadid|añada|añadan|anade|anadid|anada|anadan|cambia|cambiad|cambie|cambien|arregla|arreglad|arregle|arreglen|sube|subid|suba|suban|baja|bajad|baje|bajen|carga|cargad|cargue|carguen|descarga|descargad|descargue|descarguen|comprime|comprimid|comprima|compriman|descomprime|descomprimid|descomprima|descompriman|copia|copiad|copie|copien|mueve|moved|mueva|muevan',
-            'instruction': r'\b(?:siempre|nunca|hay\s+que|deb(?:es|éis|e|en|o|emos|éis|en)\s+|tienes\s+que|tenéis\s+que|tiene\s+que|tienen\s+que|es\s+necesario|es\s+importante|es\s+mejor|es\s+aconsejable|asegúrate\s+de|asegurate\s+de|record(?:ad|a|e|en)\s+|no\s+olvid(?:es|éis|e|en|ad)\s+)([^.,;!?¿¡\\n]{10,200})',
-            'preference': r'(?:(?:yo|a mí|a mi)\s+)?(?:me\s+(?:gusta|encanta|mola|flipa|chifla|va\s+bien|resulta\s+(?:cómodo|comodo|útil|util|fácil|facil|mejor))|no\s+me\s+(?:gusta|mola|interesa|va|conviene)|prefiero|preferiría|preferiria|odian?|odio|detesto|no\s+soporto|me\s+molesta|me\s+duele|no\s+quiero|paso\s+de|estoy\s+(?:harto|cansado)\s+de|estoy\s+acostumbrado\s+a|suelo\s+usar|suelo\s+trabajar|me\s+siento\s+cómodo|comodo\s+con|no\s+soy\s+fan\s+de|he\s+(?:empezado|dejado|comenzado|terminado)\s+(?:a|de)|dejé|deje|descarte|descarté|eliminé|elimine|cambié|cambie|me\s+quedo\s+con|me\s+decanto\s+por|disfruto|me\s+hace\s+feliz|estoy\s+(?:a\s+gusto|probando))\s+([^.,;!?¿¡\\n]{10,200})',
+            'instruction': r'\b(?:siempre|nunca|hay\s+que|deb(?:es|éis|e|en|o|emos|éis|en)\s+|tienes\s+que|tenéis\s+que|tiene\s+que|tienen\s+que|es\s+necesario|es\s+importante|es\s+mejor|es\s+aconsejable|asegúrate\s+de|asegurate\s+de|record(?:ad|a|e|en)\s+|no\s+olvid(?:es|éis|e|en|ad)\s+)([^.,;!?¿¡\n]{10,200})',
+            'preference': r'(?:(?:yo|a mí|a mi)\s+)?(?:me\s+(?:gusta|encanta|mola|flipa|chifla|va\s+bien|resulta\s+(?:cómodo|comodo|útil|util|fácil|facil|mejor))|no\s+me\s+(?:gusta|mola|interesa|va|conviene)|prefiero|preferiría|preferiria|odian?|odio|detesto|no\s+soporto|me\s+molesta|me\s+duele|no\s+quiero|paso\s+de|estoy\s+(?:harto|cansado)\s+de|estoy\s+acostumbrado\s+a|suelo\s+usar|suelo\s+trabajar|me\s+siento\s+cómodo|comodo\s+con|no\s+soy\s+fan\s+de|he\s+(?:empezado|dejado|comenzado|terminado)\s+(?:a|de)|dejé|deje|descarte|descarté|eliminé|elimine|cambié|cambie|me\s+quedo\s+con|me\s+decanto\s+por|disfruto|me\s+hace\s+feliz|estoy\s+(?:a\s+gusto|probando))\s+([^.,;!?¿¡\n]{10,200})',
             'event_keywords': [
                 'reunión', 'reunion', 'llamada', 'cita', 'meeting', 'daily',
                 'sprint', 'planning', 'retro', 'review', 'revisión', 'revision',
@@ -6185,6 +6380,17 @@ class BeamMemory:
                         _tier_kept[_t] += 1
             for _t, _n in _tier_kept.items():
                 _recall_diag.record_tier_hits(_t, _n)
+            # [C4] Record degraded-path usage on the polyphonic path.
+            # The engine has no substring fallback tier (so wm stays
+            # False by design), but the vector voice degrades from the
+            # sqlite-vec fast path to a numpy full-scan when sqlite-vec
+            # is absent/fails or its top-K ANN hits all drop out. That
+            # is the polyphonic analogue of the linear path's EM
+            # fallback and alarms the same way: em_fallback_rate > 0
+            # means the vec index is not serving this recall.
+            _recall_diag.record_fallback_used(
+                em=bool(getattr(self, "_last_polyphonic_fallback", {}).get("em"))
+            )
             _recall_diag.record_call(truly_empty=(_kept == 0))
             if explain:
                 return {
@@ -6568,48 +6774,18 @@ class BeamMemory:
             """, (*tuple(entity_memory_ids), *wm_params))
             entity_rows = cursor.fetchall()
             
-            # Add entity-matched memories with boosted scores
-            existing_ids = {r["id"] for r in results}
+            # Entity matches can strengthen an existing query candidate, but
+            # must not introduce annotation-only rows with no query evidence.
+            existing_ids = {r["id"] for r in results if r.get("tier") == "working"}
             for row in entity_rows:
                 if row["id"] in existing_ids:
                     # Boost existing result
                     for r in results:
-                        if r["id"] == row["id"]:
+                        if r.get("tier") == "working" and r["id"] == row["id"]:
                             r["score"] = round(min(r["score"] * 1.3, 1.0), 4)
                             r["entity_match"] = True
                             break
-                else:
-                    decay = _recency_decay(row["timestamp"])
-                    score = (0.6 + row["importance"] * 0.2) * (0.7 + 0.3 * decay)
-                    score += _current_state_recency_bonus(query_words, row["content"])
-                    # Temporal boost (Phase 3)
-                    if temporal_weight > 0.0:
-                        t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
-                        score *= (1.0 + temporal_weight * t_boost)
-                    _track_literal_content("working", row["id"], row["content"])
-                    results.append({
-                        "id": row["id"],
-                        "content": row["content"][:500],
-                        "source": row["source"],
-                        "timestamp": row["timestamp"],
-                        "tier": "working",
-                        "score": round(score, 4),
-                        "keyword_score": 0.0,
-                        "dense_score": round(wm_vec_sims.get(row["id"], 0.0), 4),
-                        "fts_score": 0.0,
-                        "importance": row["importance"],
-                        "recall_count": row["recall_count"] or 0,
-                        "last_recalled": row["last_recalled"],
-                        "recency_decay": round(decay, 4),
-                        "scope": row["scope"] if "scope" in row.keys() else "session",
-                        "author_id": row["author_id"] if "author_id" in row.keys() else None,
-                        "author_type": row["author_type"] if "author_type" in row.keys() else None,
-                        "channel_id": row["channel_id"] if "channel_id" in row.keys() else None,
-                        "veracity": row["veracity"] if "veracity" in row.keys() else "unknown",
-                        "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
-                        "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None,
-                        "entity_match": True
-                    })
+
             
             # Also check episodic memory for entity matches
             em_placeholders = ",".join("?" * len(entity_memory_ids))
@@ -6633,54 +6809,6 @@ class BeamMemory:
             """, (*em_entity_params,))
             em_entity_rows = cursor.fetchall()
             
-            em_existing_ids = {r["id"] for r in results}
-            for row in em_entity_rows:
-                if row["id"] in em_existing_ids:
-                    for r in results:
-                        if r["id"] == row["id"]:
-                            r["score"] = round(min(r["score"] * 1.3, 1.0), 4)
-                            r["entity_match"] = True
-                            break
-                else:
-                    decay = _recency_decay(row["timestamp"])
-                    score = (0.6 + row["importance"] * 0.2) * (0.7 + 0.3 * decay)
-                    score += _current_state_recency_bonus(query_words, row["content"])
-                    # Temporal boost (Phase 3)
-                    if temporal_weight > 0.0:
-                        t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
-                        score *= (1.0 + temporal_weight * t_boost)
-                    _track_literal_content("episodic", row["id"], row["content"])
-                    results.append({
-                        "id": row["id"],
-                        "content": row["content"][:500],
-                        "source": row["source"],
-                        "timestamp": row["timestamp"],
-                        "tier": "episodic",
-                        "score": round(score, 4),
-                        "keyword_score": 0.0,
-                        # C30: episodic rows never key into wm_vec_sims
-                        # (that dict holds working_memory ids only). Set
-                        # 0.0 explicitly rather than lookup-that-always-
-                        # returns-default, so post-run analysis isn't
-                        # misled into thinking dense similarity was
-                        # computed. The entity/fact-matched episodic
-                        # paths don't compute ep dense sim themselves.
-                        "dense_score": 0.0,
-                        "fts_score": 0.0,
-                        "importance": row["importance"],
-                        "recall_count": row["recall_count"] or 0,
-                        "last_recalled": row["last_recalled"],
-                        "recency_decay": round(decay, 4),
-                        "scope": row["scope"] if "scope" in row.keys() else "session",
-                        "author_id": row["author_id"] if "author_id" in row.keys() else None,
-                        "author_type": row["author_type"] if "author_type" in row.keys() else None,
-                        "channel_id": row["channel_id"] if "channel_id" in row.keys() else None,
-                        "veracity": row["veracity"] if "veracity" in row.keys() else "unknown",
-                        "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
-                        "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None,
-                        "entity_match": True
-                    })
-
         # ---- Fact-aware recall ----
         fact_memory_ids = _find_memories_by_fact(self, query)
         if fact_memory_ids:
@@ -7150,6 +7278,20 @@ class BeamMemory:
                     fallback_used=True,
                 )
 
+        # Entity lookup runs before episodic candidate assembly, so apply its
+        # annotation only after both primary and fallback episodic candidates
+        # are present. Match the tier as well as the id: ids are not a
+        # cross-tier identity contract.
+        if entity_memory_ids:
+            episodic_entity_ids = {row["id"] for row in em_entity_rows}
+            for result in results:
+                if (
+                    result.get("tier") == "episodic"
+                    and result["id"] in episodic_entity_ids
+                ):
+                    result["score"] = round(min(result["score"] * 1.3, 1.0), 4)
+                    result["entity_match"] = True
+
         # --- Tiered degradation weighting: apply tier multiplier to episodic scores ---
         weight_map = {1: TIER1_WEIGHT, 2: TIER2_WEIGHT, 3: TIER3_WEIGHT}
         veracity_map = {"stated": STATED_WEIGHT, "inferred": INFERRED_WEIGHT,
@@ -7439,7 +7581,7 @@ class BeamMemory:
     # cached under an older digest are not reused. Part of the hashed payload;
     # the opaque key keeps the "v2:" prefix because QueryCache's opaque-path
     # recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
-    _ENHANCED_RECALL_CACHE_VERSION = 5
+    _ENHANCED_RECALL_CACHE_VERSION = 6
 
     def _enhanced_recall_cache_key(
         self,
@@ -7573,7 +7715,7 @@ class BeamMemory:
         # consolidated exclusion, #696 / #427), so pre-change opaque cache
         # entries could still contain dialog, honcho or consolidated dense
         # candidates. _ENHANCED_RECALL_CACHE_VERSION is part of the hashed
-        # payload; bumping it (4 -> 5) guarantees those entries are never
+        # payload; bumping it guarantees those entries are never
         # reused. The "v2:" prefix stays fixed — QueryCache's opaque-path
         # recognition keys off that exact prefix.
         return "v2:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
@@ -8079,7 +8221,17 @@ class BeamMemory:
             )
         except Exception as exc:
             logger.exception("polyphonic recall engine failed: %s", exc)
+            # Degraded path signal stays default on engine failure so
+            # diagnostics don't attribute a broken call to fallback.
+            self._last_polyphonic_fallback = {"em": False, "wm": False}
             return []
+
+        # [C4] Surface the engine's per-call degraded-path signal so
+        # recall()'s diagnostics block can record em_fallback_used
+        # (the vector voice's sqlite-vec -> numpy full-scan fallback).
+        self._last_polyphonic_fallback = dict(
+            getattr(engine, "last_call_fallback", {"em": False, "wm": False})
+        )
 
         # Map → recall's dict shape with filters + multipliers applied.
         weight_map = {"stated": STATED_WEIGHT, "inferred": INFERRED_WEIGHT,
@@ -9729,7 +9881,7 @@ class BeamMemory:
             "working_memory": {"inserted": 0, "skipped": 0, "overwritten": 0},
             "episodic_memory": {"inserted": 0, "skipped": 0, "overwritten": 0, "embeddings_inserted": 0},
             "scratchpad": {"inserted": 0, "updated": 0},
-            "consolidation_log": {"inserted": 0},
+            "consolidation_log": {"inserted": 0, "skipped": 0, "overwritten": 0},
         }
         cursor = self.conn.cursor()
 
@@ -9908,12 +10060,52 @@ class BeamMemory:
 
         # -- Consolidation log --
         for item in data.get("consolidation_log", []):
-            cursor.execute("""
-                INSERT INTO consolidation_log (session_id, items_consolidated, summary_preview, created_at)
-                VALUES (?, ?, ?, ?)
-            """, (item.get("session_id", "default"), item.get("items_consolidated", 0),
-                  item.get("summary_preview", ""), item.get("created_at")))
-            stats["consolidation_log"]["inserted"] += 1
+            log_id = item.get("id")
+            if log_id is not None:
+                exists = cursor.execute(
+                    "SELECT 1 FROM consolidation_log WHERE id = ?", (log_id,)
+                ).fetchone() is not None
+                if not force:
+                    cursor.execute(
+                        """
+                        INSERT OR IGNORE INTO consolidation_log
+                            (id, session_id, items_consolidated, summary_preview, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (log_id, item.get("session_id", "default"),
+                         item.get("items_consolidated", 0), item.get("summary_preview", ""),
+                         item.get("created_at")),
+                    )
+                    stats["consolidation_log"][
+                        "skipped" if cursor.rowcount == 0 else "inserted"
+                    ] += 1
+                else:
+                    cursor.execute(
+                        """
+                        INSERT INTO consolidation_log
+                            (id, session_id, items_consolidated, summary_preview, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            session_id=excluded.session_id,
+                            items_consolidated=excluded.items_consolidated,
+                            summary_preview=excluded.summary_preview,
+                            created_at=excluded.created_at
+                        """,
+                        (log_id, item.get("session_id", "default"),
+                         item.get("items_consolidated", 0), item.get("summary_preview", ""),
+                         item.get("created_at")),
+                    )
+                    stats["consolidation_log"]["overwritten" if exists else "inserted"] += 1
+            else:
+                # Pre-ID exports cannot be matched to an existing log entry;
+                # preserve their historical append behavior.
+                cursor.execute("""
+                    INSERT INTO consolidation_log
+                        (session_id, items_consolidated, summary_preview, created_at)
+                    VALUES (?, ?, ?, ?)
+                """, (item.get("session_id", "default"), item.get("items_consolidated", 0),
+                      item.get("summary_preview", ""), item.get("created_at")))
+                stats["consolidation_log"]["inserted"] += 1
         self.conn.commit()
 
         return stats
