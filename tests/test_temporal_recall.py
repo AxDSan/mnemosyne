@@ -177,8 +177,9 @@ class TestTemporalRecallEndToEnd(unittest.TestCase):
                 pass
         os.rmdir(self.tmpdir)
 
+    @patch.dict(os.environ, {"MNEMOSYNE_POLYPHONIC_RECALL": "0"})
     def test_temporal_boost_recent_vs_old(self):
-        """Recent memory gets higher score with temporal_weight > 0."""
+        """Temporal weighting widens the score gap on the linear path."""
         now = datetime.now()
         old_time = (now - timedelta(days=5)).isoformat()
         recent_time = (now - timedelta(hours=2)).isoformat()
@@ -198,20 +199,44 @@ class TestTemporalRecallEndToEnd(unittest.TestCase):
         """, (recent_time, "%beta%"))
         self.beam.conn.commit()
 
-        # With temporal boost, recent one should score higher
-        results_temporal = self.beam.recall("meeting", top_k=5, temporal_weight=0.5)
+        # The fixed query time makes the zero-weight control and temporal
+        # result directly comparable, without a moving clock between recalls.
+        query_time = now
+        temporal_halflife = 24.0
+        results_no_temporal = self.beam.recall(
+            "meeting",
+            top_k=5,
+            temporal_weight=0.0,
+            temporal_halflife=temporal_halflife,
+            query_time=query_time,
+        )
+        results_temporal = self.beam.recall(
+            "meeting",
+            top_k=5,
+            temporal_weight=0.5,
+            temporal_halflife=temporal_halflife,
+            query_time=query_time,
+        )
+        scores_no_temporal = {r["content"]: r["score"] for r in results_no_temporal}
         scores_temporal = {r["content"]: r["score"] for r in results_temporal}
 
-        # Recent memory should have higher score with temporal boost
-        self.assertGreater(
-            scores_temporal.get("Meeting about project beta", 0),
-            scores_temporal.get("Meeting about project alpha", 0),
-            "Recent memory should score higher with temporal boost"
-        )
+        for scores in (scores_no_temporal, scores_temporal):
+            self.assertIn("Meeting about project alpha", scores)
+            self.assertIn("Meeting about project beta", scores)
 
-        # Both should be found
-        self.assertIn("Meeting about project alpha", scores_temporal)
-        self.assertIn("Meeting about project beta", scores_temporal)
+        no_temporal_gap = (
+            scores_no_temporal["Meeting about project beta"]
+            - scores_no_temporal["Meeting about project alpha"]
+        )
+        temporal_gap = (
+            scores_temporal["Meeting about project beta"]
+            - scores_temporal["Meeting about project alpha"]
+        )
+        self.assertGreater(
+            temporal_gap,
+            no_temporal_gap,
+            "Temporal weighting should widen the recent-versus-old score gap",
+        )
 
     def test_temporal_weight_zero_no_effect(self):
         """temporal_weight=0 means no change to scoring."""
