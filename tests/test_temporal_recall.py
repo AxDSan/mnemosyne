@@ -20,6 +20,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -328,6 +329,7 @@ class TestTemporalRecallEndToEnd(unittest.TestCase):
             "Memory should be found either via fact extraction or fallback search"
         )
 
+    @patch.dict(os.environ, {"MNEMOSYNE_POLYPHONIC_RECALL": "0"})
     def test_performance_overhead(self):
         """Temporal scoring stays bounded relative to the same-process control."""
         for i in range(10):
