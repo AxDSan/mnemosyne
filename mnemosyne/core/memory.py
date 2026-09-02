@@ -386,6 +386,7 @@ class Mnemosyne:
                                author_id=author_id, author_type=author_type,
                                channel_id=channel_id,
                                event_emitter=self._stream_emit)
+        self.init_result = self.beam.init_result
         # ``self.conn`` remains the core module cache. _get_connection
         # coordinates it with BEAM, preserving core connection identity while
         # direct wrappers dual-write through one transaction-capable handle.

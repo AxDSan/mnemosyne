@@ -411,6 +411,11 @@ def test_check_wrapper_import_accepts_direct_package_without_dist_metadata(tmp_p
     package = site_packages / "mnemosyne_hermes"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("__version__ = 'test'\n", encoding="utf-8")
+    core = site_packages / "mnemosyne" / "core"
+    core.mkdir(parents=True)
+    (core.parent / "__init__.py").write_text("", encoding="utf-8")
+    (core / "__init__.py").write_text("", encoding="utf-8")
+    (core / "beam.py").write_text("", encoding="utf-8")
 
     ok, error, invalid_runtime = install._check_wrapper_import(site_packages, Path(sys.executable))
 

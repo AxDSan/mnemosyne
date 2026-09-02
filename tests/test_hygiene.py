@@ -1205,7 +1205,7 @@ def test_hygiene_suite_does_not_leak_config_into_subagent_provider(tmp_path, mon
     process: the autouse cleanup must discard that singleton before a subagent
     provider resolves its temporary data-directory configuration.
     """
-    from conftest import _close_cached_connections
+    from tests.conftest import _close_cached_connections
     from hermes_memory_provider import MnemosyneMemoryProvider
     from mnemosyne.core.config import MnemosyneConfig
 
