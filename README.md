@@ -323,7 +323,7 @@ results = beam.recall("editor preferences", top_k=5)
 
 | Feature | Mnemosyne | Detail |
 |---------|-----------|--------|
-| **Local-first by default** | ✅ | No data ever leaves your machine unless you enable sync or use remote embedding or LLM services; remote embeddings (via `MNEMOSYNE_EMBEDDING_API_URL`, an API-shaped model, or `MNEMOSYNE_EMBEDDINGS_VIA_API`) send the text of your memories and recall queries for vectorization |
+| **Local-first by default** | ✅ | No data ever leaves your machine unless you enable sync or use remote embedding or LLM services; remote embeddings (via `MNEMOSYNE_EMBEDDING_API_URL`, an API-shaped model, or `MNEMOSYNE_EMBEDDINGS_VIA_API`) send the text of your memories and recall queries for vectorization, to the default OpenRouter endpoint when no URL is set |
 | **No telemetry** | ✅ | Zero tracking, zero analytics, zero cloud dependency |
 | **Optional sync** | ✅ | Bidirectional delta sync between desktop and VPS |
 | **Client-side encryption (sync)** | ✅ | Authenticated encryption via Fernet (AES-128-CBC) or PyNaCl SecretBox (XSalsa20-Poly1305). Key never leaves your machine. |
