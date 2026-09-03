@@ -34,7 +34,7 @@ its own Python environment, or where symbolic links are privileged operations:
 | Linux or macOS, pip or source install | default (symlink) | The Hermes venv is yours and persists. |
 | Docker image | **wrapper** | The venv is rebuilt on every image update. |
 | Desktop binary installer | **wrapper** | The bundled Python environment is wiped and rebuilt on update. |
-| Native Windows | **wrapper** | Creating a symbolic link needs Developer Mode or an elevated shell, so the default fails with `WinError 1314`. |
+| Native Windows | **wrapper** | The native default is the persistent wrapper install; a symbolic link needs Developer Mode or an elevated shell, so `WinError 1314` appears only when explicitly requesting `--mode symlink`. |
 | WSL | default (symlink) | Behaves like Linux. |
 
 The three wrapper rows are the same mechanism for the same underlying reason:
@@ -238,12 +238,13 @@ pip install -e "integrations/hermes[dev]"
 
 ### Native Windows local install and recovery
 
-> **Prefer persistent wrapper mode on native Windows.** The default install mode
-> creates a symbolic link, which Windows permits only with Developer Mode enabled
-> or an elevated shell. Without one of those it fails with `WinError 1314`, which
-> is why native Windows installs are reported as working for some people and not
-> others. Wrapper mode creates a real plugin directory and never needs the
-> privilege. Tracked in
+> **Prefer persistent wrapper mode on native Windows.** The native default is
+> the persistent wrapper install, which creates a real plugin directory and
+> never needs elevated privileges. A symbolic link, requested explicitly with
+> `--mode symlink`, is what Windows permits only with Developer Mode enabled or
+> an elevated shell; without one of those it fails with `WinError 1314`, which
+> is why explicit symlink installs are reported as working for some people and
+> not others. Tracked in
 > [#857](https://github.com/mnemosyne-oss/mnemosyne/issues/857).
 >
 > Advice circulating in the community suggests linking a Mnemosyne **source
@@ -278,8 +279,9 @@ if ($LASTEXITCODE -ne 0) {
     & $HermesPython -m pip install "mnemosyne-memory[embeddings]" mnemosyne-hermes
 }
 
-# Symlink is the normal local install mode. --python is the safe fallback when
-# discovery is not applicable to this Hermes layout.
+# Native Windows defaults to persistent wrapper mode (symlink needs an explicit
+# --mode and elevated privileges). --python is the safe fallback when discovery
+# is not applicable to this Hermes layout.
 & $MnemosyneHermes install --python $HermesPython --no-profile-links
 ```
 
@@ -296,11 +298,12 @@ choice for an unusual layout.
 
 #### Windows WinError 1314 recovery
 
-If the normal symlink install fails specifically with **WinError 1314**, the
-current process lacks effective symbolic-link privilege. Enable Windows Developer
-Mode or use an account that has that effective privilege; administrator-group
-membership alone does not guarantee it. The installer intentionally does not
-switch modes automatically, and this guide does not use junctions as a workaround.
+If an explicit `--mode symlink` install fails specifically with **WinError
+1314**, the current process lacks effective symbolic-link privilege. Enable
+Windows Developer Mode or use an account that has that effective privilege;
+administrator-group membership alone does not guarantee it. The installer
+intentionally does not switch modes automatically, and this guide does not use
+junctions as a workaround.
 
 A wrapper retry avoids the plugin symlink and records the selected interpreter.
 Use the same selected Hermes Python:
@@ -345,7 +348,7 @@ succeed.
 |---|---|
 | `No module named pip` from `<hermes-python>` | Use `uv pip install --python "<hermes-python>" "mnemosyne-memory[embeddings]" mnemosyne-hermes`, then repeat the normal installer command. |
 | `[all]` fails while installing local-LLM dependencies | Keep `[embeddings]` for local semantic search, or resolve compatible wheels/build-toolchain requirements before retrying `[all]`. |
-| WinError 1314 during symlink install | Enable Developer Mode/effective symlink privilege, or retry wrapper mode with the selected Hermes Python. Do not use a junction or expect an automatic mode switch. |
+| WinError 1314 during an explicit `--mode symlink` install | Enable Developer Mode/effective symlink privilege, or retry wrapper mode (the native default) with the selected Hermes Python. Do not use a junction or expect an automatic mode switch. |
 | Wrapper validation times out | `--import-timeout` defaults to 60 and affects installer validation only. A larger positive finite value can retry that install probe, but `mnemosyne-hermes status` always validates with its fixed 60-second policy; investigate the selected interpreter if status still fails. |
 | Hermes update or venv replacement leaves a missing/stale provider | Reinstall into the replacement Hermes interpreter for a symlink install. For a persistent-side-venv wrapper, refresh the wrapper against its retained selected interpreter, then restart Hermes and rerun both status commands. |
 

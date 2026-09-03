@@ -12,7 +12,7 @@
 Mnemosyne is built on three security principles:
 
 1. **User sovereignty** &mdash; You own your data. Mnemosyne has no telemetry, no tracking, no cloud dependency. The database file is yours.
-2. **Privacy by design** &mdash; The default configuration stores everything locally. No data ever leaves your machine unless you explicitly enable sync.
+2. **Privacy by design** &mdash; The default configuration stores everything locally. No data ever leaves your machine unless you explicitly enable sync or configure a remote embedding or LLM endpoint; a remote embedding endpoint receives the text of your memories and recall queries for vectorization.
 3. **Minimal trust in remote infrastructure** &mdash; When sync is enabled, optional client-side encryption ensures that even the remote server cannot read your memory contents. The remote side sees only routing metadata (timestamps, event IDs, device IDs).
 
 ---

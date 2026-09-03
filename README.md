@@ -323,7 +323,7 @@ results = beam.recall("editor preferences", top_k=5)
 
 | Feature | Mnemosyne | Detail |
 |---------|-----------|--------|
-| **Local-first by default** | ✅ | No data ever leaves your machine unless you enable sync |
+| **Local-first by default** | ✅ | No data ever leaves your machine unless you enable sync or configure a remote embedding or LLM endpoint; a remote embedding endpoint receives the text of your memories and recall queries for vectorization |
 | **No telemetry** | ✅ | Zero tracking, zero analytics, zero cloud dependency |
 | **Optional sync** | ✅ | Bidirectional delta sync between desktop and VPS |
 | **Client-side encryption (sync)** | ✅ | Authenticated encryption via Fernet (AES-128-CBC) or PyNaCl SecretBox (XSalsa20-Poly1305). Key never leaves your machine. |
@@ -354,8 +354,8 @@ When client-side encryption is enabled, the remote sync server sees **only metad
 | `MNEMOSYNE_WM_MAX_ITEMS` | `10000` | Working memory limit |
 | `MNEMOSYNE_RECENCY_HALFLIFE` | `168` | Decay halflife in hours |
 | `MNEMOSYNE_CONTEXT_INCLUDE_CONSOLIDATED` | *(unset)* | Include consolidated working-memory rows in `get_context()` prompt injection. Default: excluded. Truthy values: `1`, `true`, `yes`, `on`. Does not affect `recall()`. |
-| `MNEMOSYNE_EMBEDDING_API_URL` | `${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}` | Preferred name for custom embedding API endpoint (OpenAI-compatible). Falls back to `OPENROUTER_BASE_URL`. |
-| `MNEMOSYNE_EMBEDDING_API_KEY` | `${OPENROUTER_API_KEY:-${OPENAI_API_KEY:-}}` | Preferred name for embedding API key. Falls back to `OPENROUTER_API_KEY`, then `OPENAI_API_KEY`. |
+| `MNEMOSYNE_EMBEDDING_API_URL` | `https://openrouter.ai/api/v1` | Custom embedding API endpoint (OpenAI-compatible). When unset, the OpenRouter default is used directly; there is no `OPENROUTER_BASE_URL` fallback. |
+| `MNEMOSYNE_EMBEDDING_API_KEY` | `${OPENAI_API_KEY:-}` | Embedding API key. Falls back to `OPENAI_API_KEY`; there is no `OPENROUTER_API_KEY` fallback (set `MNEMOSYNE_EMBEDDING_API_KEY` explicitly if your chat key differs). |
 | `MNEMOSYNE_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model. Low-resource multilingual: `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`; larger FastEmbed E5 option: `intfloat/multilingual-e5-large`; `BAAI/bge-m3` is another multilingual option. |
 | `MNEMOSYNE_EMBEDDING_DIM` | *(unset)* | Optional embedding dimension override (positive integer); takes precedence over the built-in model table. Blank/whitespace-only is treated as unset. |
 
