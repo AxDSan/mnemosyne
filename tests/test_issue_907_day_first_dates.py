@@ -41,7 +41,16 @@ def test_remember_extracts_complete_english_named_date(
     assert values == [expected_value]
 
 
-@pytest.mark.parametrize("invalid_date_text", ["12 marching", "312 March 2024"])
+@pytest.mark.parametrize(
+    "invalid_date_text",
+    [
+        "12 marching",
+        "312 March 2024",
+        "x12 March 2024",
+        "March 12x",
+        "12 March 2024x",
+    ],
+)
 def test_remember_does_not_extract_named_date_from_invalid_boundary(
     tmp_path, invalid_date_text
 ):
