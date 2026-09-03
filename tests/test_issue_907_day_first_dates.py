@@ -10,6 +10,9 @@ from mnemosyne.core.memory import Mnemosyne
 @pytest.mark.parametrize(
     ("date_text", "expected_value"),
     [
+        ("March 29, 2024", "March 29, 2024"),
+        ("March 29 2024", "March 29 2024"),
+        ("12 Mar 2024", "12 Mar 2024"),
         ("March 12, 1985", "March 12, 1985"),
         ("12 March 1985", "12 March 1985"),
         ("21st February 1999", "21st February 1999"),
@@ -48,6 +51,10 @@ def test_remember_extracts_complete_english_named_date(
         "312 March 2024",
         "x12 March 2024",
         "March 12x",
+        "xMarch 12, 1985",
+        "March 12, 1985x",
+        "March 292024",
+        "12 March 292024",
         "12 March 2024x",
     ],
 )
