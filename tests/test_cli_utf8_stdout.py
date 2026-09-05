@@ -67,10 +67,7 @@ def test_run_cli_stderr_reconfigured_for_utf8(monkeypatch):
 
 
 def test_run_cli_stderr_replacement_instead_of_crash(monkeypatch):
-    """A non-UTF-8-encodable error message degrades to '?' instead of raising."""
-    monkeypatch.setattr(
-        cli, "_get_memory", lambda: pytest.fail("recall must not be called")
-    )
+    """Unknown command echoes non-ASCII text through stderr instead of raising."""
     stderr = _cp1252_stream()
     monkeypatch.setattr(sys, "stderr", stderr)
     # Unknown command: run_cli prints the error (with the non-ASCII command
@@ -82,3 +79,6 @@ def test_run_cli_stderr_replacement_instead_of_crash(monkeypatch):
 
     assert excinfo.value.code == 2
     assert stderr.encoding.lower().replace("-", "") == "utf8"
+    output = stderr.buffer.getvalue().decode("utf-8")
+    assert "Unknown command" in output
+    assert "b\u00e5dcommand" in output
