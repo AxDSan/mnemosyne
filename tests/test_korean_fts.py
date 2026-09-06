@@ -835,6 +835,17 @@ BANANA_POOL_TARGET = '바나나는 노란 과일로 아침에 하나씩 먹는�
 # truncation is ever reached, and the failure would look identical.
 BANANA_POOL_QUERY = '바나나'
 BANANA_POOL_DISTRACTOR = '바나{i:02d}는 unrelated'
+# The same flood one syllable wider. `바나NN는` above is only reached by the
+# *stem* `"바나"*`, so a stage keyed on the raw `"바나나"*` clears it without
+# proving anything: a distractor sharing the whole raw query surface is still
+# a prefix hit, and 61 of them exhaust the reserved slice exactly as the stem
+# flood exhausted the whole pool. Only an exact-phrase term separates these --
+# unicode61 indexes `바나나01` as one glued token, which `"바나나"` cannot
+# reach. The target carries `바나나` as a bare token for the same reason: an
+# inflected `바나나는` would be invisible to that term and would test the
+# widened stage over again.
+SAME_PREFIX_POOL_TARGET = '바나나 노란 과일이다'
+SAME_PREFIX_POOL_DISTRACTOR = '바나나{i:02d} unrelated'
 # `가` is part of the distractor, not decoration: the target's only Hangul is
 # the same particle, so a row carrying it used to tie the target through the
 # CJK character-overlap fallback even with no word in common.
@@ -939,6 +950,64 @@ def test_banana_pool_exhaustion_public_episodic(banana_pool_episodic):
     assert 't01' in got, (
         f"'{BANANA_POOL_QUERY}' lost its target to the 61 prefix distractors; "
         f"recall returned {got}"
+    )
+
+
+@pytest.fixture
+def same_prefix_pool_working(tmp_path):
+    """Same-surface-prefix flood on the working layer; target inserted last."""
+    return _pool_exhausting_working_memory(
+        tmp_path,
+        "same_prefix_pool_w.db",
+        SAME_PREFIX_POOL_TARGET,
+        SAME_PREFIX_POOL_DISTRACTOR,
+    )
+
+
+@pytest.fixture
+def same_prefix_pool_episodic(tmp_path):
+    """Same-surface-prefix flood on the episodic layer; target inserted last."""
+    return _pool_exhausting_episodic_memory(
+        tmp_path,
+        "same_prefix_pool_e.db",
+        SAME_PREFIX_POOL_TARGET,
+        SAME_PREFIX_POOL_DISTRACTOR,
+    )
+
+
+def test_same_prefix_pool_exhaustion_public_working(same_prefix_pool_working):
+    """A literal token must not be displaced by longer tokens sharing it.
+
+    The `바나NN는` fixtures above are cleared by any stage keyed on the raw
+    query token, because the stem `바나` is what reaches them. These rows
+    share the entire raw surface, so they are admitted by `"바나나"*` too and
+    fill whatever slice that stage reserves. Passing this requires a term no
+    longer token can match at all, which is why the exact phrase runs first.
+    """
+    got = [
+        row.get("content")
+        for row in same_prefix_pool_working.recall(BANANA_POOL_QUERY, top_k=5)
+    ]
+    assert SAME_PREFIX_POOL_TARGET in got, (
+        f"'{BANANA_POOL_QUERY}' lost its literal-token target to the 61 "
+        f"same-prefix distractors; recall returned {got}"
+    )
+
+
+def test_same_prefix_pool_exhaustion_public_episodic(same_prefix_pool_episodic):
+    """Same displacement against the smaller episodic budget.
+
+    The episodic pool is `max(top_k * 3, 20)`, so the exact reservation is a
+    handful of rows there. Asserting the layer separately keeps a fix sized
+    to the 50-row working budget from passing while episodic still floods.
+    """
+    got = [
+        row.get("id")
+        for row in same_prefix_pool_episodic.recall(BANANA_POOL_QUERY, top_k=5)
+    ]
+    assert 't01' in got, (
+        f"'{BANANA_POOL_QUERY}' lost its literal-token target to the 61 "
+        f"same-prefix distractors; recall returned {got}"
     )
 
 
