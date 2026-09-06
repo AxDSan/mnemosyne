@@ -811,3 +811,204 @@ def test_prefix_distractors_do_not_exhaust_the_candidate_cap(bounded_prefix_memo
     assert BOUNDED_PREFIX_TARGET in got, (
         f"target truncated out of the candidate pool; recall returned {got}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Public-path pool-exhaustion regressions (upstream review of #896)
+#
+# The suite above pins the *working*-memory truncation for the `AI가` case.
+# The review asks for the same guarantees on the public paths for both P1
+# defects, on both layers: a query whose exact form is part of the corpus
+# must still retrieve its target even when more than a full candidate pool of
+# prefix distractors precede it in rowid order.
+# ---------------------------------------------------------------------------
+
+# 61 > the 50-row working-memory budget (`max(top_k * 3, 50)`) and also > the
+# 20-row episodic budget (`max(top_k * 3, 20)`), so one count reproduces the
+# exhaustion on both layers at `top_k=5`.
+POOL_EXHAUSTING_DISTRACTOR_COUNT = 61
+BANANA_POOL_TARGET = '바나나는 노란 과일로 아침에 하나씩 먹는다'
+# The uninflected base form on its own, which is the query the review reported.
+# A multi-word query would hide the defect: a second term retrieves the target
+# through a path the flooded one does not, so the pool never runs out. It also
+# has to share a token with the target or the relevance gate drops it before
+# truncation is ever reached, and the failure would look identical.
+BANANA_POOL_QUERY = '바나나'
+BANANA_POOL_DISTRACTOR = '바나{i:02d}는 unrelated'
+# `가` is part of the distractor, not decoration: the target's only Hangul is
+# the same particle, so a row carrying it used to tie the target through the
+# CJK character-overlap fallback even with no word in common.
+AI_POOL_DISTRACTOR = 'air{i:02d} 가 unrelated'
+
+
+def _pool_exhausting_working_memory(tmp_path, name, target, distractor):
+    """Working memory holding > cap prefix distractors, target written last.
+
+    The distractors are written first so they hold the lower rowids and win
+    the rank tiebreak, putting the target past the candidate cap. Writing the
+    target first would let it survive the truncation these tests exist to
+    force.
+
+    ``distractor`` is a format string taking ``i`` so each P1 supplies the
+    flood that its own query widens into. Hard-coding one shape here made the
+    `AI가` fixtures fill with `바나NN` rows, which their query never reaches --
+    the tests passed without exercising anything.
+    """
+    memory = BeamMemory(session_id="default", db_path=tmp_path / name)
+    for i in range(POOL_EXHAUSTING_DISTRACTOR_COUNT):
+        memory.remember(distractor.format(i=i), source="test")
+    memory.remember(target, source="test")
+    return memory
+
+
+def _pool_exhausting_episodic_memory(tmp_path, name, target, distractor):
+    """Episodic memory holding > cap prefix distractors, target written last.
+
+    The episodic layer is fed through direct row insertion, matching the
+    ``episodic_memory`` fixture, so the same insertion-order argument as the
+    working fixture applies to the episodic budget as well.
+    """
+    db = tmp_path / name
+    beam.init_beam(db)
+    memory = BeamMemory(session_id="default", db_path=db)
+    conn = beam._get_connection(db)
+    for i in range(POOL_EXHAUSTING_DISTRACTOR_COUNT):
+        conn.execute(
+            "INSERT INTO episodic_memory"
+            " (id, content, source, session_id, importance)"
+            " VALUES (?, ?, 'test', 'default', 0.5)",
+            (f'pd{i:02d}', distractor.format(i=i)),
+        )
+    conn.execute(
+        "INSERT INTO episodic_memory"
+        " (id, content, source, session_id, importance)"
+        " VALUES (?, ?, 'test', 'default', 0.5)",
+        ('t01', target),
+    )
+    conn.commit()
+    return memory
+
+
+@pytest.fixture
+def banana_pool_working(tmp_path):
+    """P1 바나나 case on the working layer; the target is inserted last."""
+    return _pool_exhausting_working_memory(
+        tmp_path, "banana_pool_w.db", BANANA_POOL_TARGET, BANANA_POOL_DISTRACTOR
+    )
+
+
+@pytest.fixture
+def banana_pool_episodic(tmp_path):
+    """P1 바나나 case on the episodic layer; the target is inserted last."""
+    return _pool_exhausting_episodic_memory(
+        tmp_path, "banana_pool_e.db", BANANA_POOL_TARGET, BANANA_POOL_DISTRACTOR
+    )
+
+
+def test_banana_pool_exhaustion_public_working(banana_pool_working):
+    """P1-1 (working): an uninflected stem must find itself past the cap.
+
+    `바나나` is part of the corpus as an exact token, but on this branch the
+    query widens to the `바나*` prefix only. The 61 `바나NN` distractors
+    inserted before the target fill the 50-row working candidate pool, so the
+    target never reaches ranking. On base `a943a7d` the exact `바나나` term
+    kept the target alive, which is why this is a regression and not a new
+    requirement. Presence is asserted, not rank: recall itself is broken, so
+    "in the results" is the weaker and correct bar.
+    """
+    got = [
+        row.get("content")
+        for row in banana_pool_working.recall(BANANA_POOL_QUERY, top_k=5)
+    ]
+    assert BANANA_POOL_TARGET in got, (
+        f"'{BANANA_POOL_QUERY}' lost its target to the 61 prefix distractors; "
+        f"recall returned {got}"
+    )
+
+
+def test_banana_pool_exhaustion_public_episodic(banana_pool_episodic):
+    """P1-1 (episodic): same exhaustion against the 20-row episodic budget.
+
+    The episodic budget is `max(top_k * 3, 20)` at `top_k=5`, one quarter of
+    the working one. A fix sized to the working path could pass there while
+    the episodic pool still floods, so the layer is asserted separately.
+    """
+    got = [
+        row.get("id") for row in banana_pool_episodic.recall(BANANA_POOL_QUERY, top_k=5)
+    ]
+    assert 't01' in got, (
+        f"'{BANANA_POOL_QUERY}' lost its target to the 61 prefix distractors; "
+        f"recall returned {got}"
+    )
+
+
+@pytest.fixture
+def ai_pool_working(tmp_path):
+    """P1-2 (working): `airNN` distractors fill the pool, target written last."""
+    return _pool_exhausting_working_memory(
+        tmp_path, "ai_pool_w.db", BOUNDED_PREFIX_TARGET, AI_POOL_DISTRACTOR
+    )
+
+
+@pytest.fixture
+def ai_pool_episodic(tmp_path):
+    """P1-2 (episodic): same rows on the episodic layer, target written last."""
+    return _pool_exhausting_episodic_memory(
+        tmp_path, "ai_pool_e.db", BOUNDED_PREFIX_TARGET, AI_POOL_DISTRACTOR
+    )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        BOUNDED_PREFIX_TARGET,   # 'AI가 target meaning'
+        'AI가',                  # the bare mixed-script identifier
+    ],
+)
+def test_ai_pool_exhaustion_public_working(ai_pool_working, query):
+    """P1-2 (working): the `ai` prefix flood must not hide the target.
+
+    Both spellings are asserted because the review requires the exact/symbolic
+    identifier fallback to stay reachable for mixed Hangul queries: the
+    inflected form and the bare identifier must each return the target, not
+    just the one that happens to share more surface form with the distractors.
+    """
+    got = [
+        row.get("content")
+        for row in ai_pool_working.recall(query, top_k=5)
+    ]
+    assert BOUNDED_PREFIX_TARGET in got, (
+        f"'{query}' lost its target to the 61 `airNN` prefix distractors; "
+        f"recall returned {got}"
+    )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        BOUNDED_PREFIX_TARGET,
+        'AI가',
+    ],
+)
+def test_ai_pool_exhaustion_public_episodic(ai_pool_episodic, query):
+    """P1-2 (episodic): the identifier fallback on the 20-row budget."""
+    got = [
+        row.get("id") for row in ai_pool_episodic.recall(query, top_k=5)
+    ]
+    assert 't01' in got, (
+        f"'{query}' lost its target to the 61 `airNN` prefix distractors; "
+        f"recall returned {got}"
+    )
+
+
+def test_benchmark_corpus_is_not_shrunk():
+    """The frozen counts cannot become easier through corpus shrinkage.
+
+    The R@1/R@5 figures in this file are exact against 60 memories and 49
+    queries. Deleting a hard memory or a hard query would make the frozen
+    numbers hold with less work, which reads as a pass and hides the loss.
+    Upstream review of #896 asks for the corpus size to be asserted
+    explicitly so a shrinkage cannot pass silently.
+    """
+    assert len(MEMORIES) == 60
+    assert len(QUERIES) == 49
