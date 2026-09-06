@@ -3502,6 +3502,54 @@ def _strip_ko_josa(token: str) -> str:
             return token
 
 
+def _fts_precise_terms(query: str) -> List[str]:
+    """FTS terms built from the raw query tokens, before particle stripping.
+
+    ``_fts_query_terms()`` runs every term through ``_strip_ko_josa()`` first,
+    and the trim is fixed-point, so the *surface form the user typed* is not
+    reachable from its output: ``바나나`` leaves as ``"바나"*`` because the
+    final ``나`` is itself a particle, and ``AI가`` leaves as ``"ai"*``. Both
+    stems match a large family of unrelated rows -- ``바나00는``, ``air07`` --
+    and with a bounded candidate pool that flood is admitted first, so the
+    target is truncated before ranking ever sees it.
+
+    Keeping the raw token is enough to separate the two: ``"바나나"*`` still
+    reaches the inflected ``바나나는`` a Korean document actually stores, but
+    no longer reaches ``바나00는``; ``"ai가"*`` reaches the glued index token
+    ``ai가`` but not ``air07``. That is why this stays a prefix term rather
+    than an exact phrase -- Korean inflects by suffixing, so an exact phrase
+    would only match an uninflected document and would fix nothing.
+
+    Tokens outside the widening rule keep the exact-phrase form they already
+    had, which makes this list identical to ``_fts_query_terms()`` for any
+    query without Hangul. The caller uses that equality to skip the second
+    stage entirely, so non-Korean recall pays nothing for this.
+
+    Synonym expansion is deliberately absent: widening recall is the second
+    stage's job.
+    """
+    terms: List[str] = []
+    seen: Set[str] = set()
+    symbolic = set(_symbolic_code_tokens(query))
+    query_has_hangul = _has_hangul(query)
+    for token in _RECALL_TOKEN_RE.findall(query.lower()):
+        if not _is_meaningful_recall_token(token):
+            continue
+        if token in symbolic:
+            # Same reason as in _fts_query_terms(): unicode61 shreds these
+            # into bare characters, so an FTS term would only add noise.
+            continue
+        token = token.replace('"', '""').strip()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        if _has_hangul(token) or query_has_hangul:
+            terms.append(f'"{token}"*')
+        else:
+            terms.append(f'"{token}"')
+    return terms
+
+
 def _fts_query_terms(query: str) -> List[str]:
     """FTS-safe meaningful terms for natural-language recall queries.
 
@@ -3792,6 +3840,83 @@ def _cyrillic_like_search(
     return [{result_key: rid, "rank": -score} for rid, score in scored[:k]]
 
 
+def _fts_staged_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    id_col: str,
+    query: str,
+    k: int,
+    expansion_terms: List[str],
+) -> List[Dict]:
+    """Fill the bounded candidate budget with exact hits before expansions.
+
+    The pool handed to Python is capped (``LIMIT k``), so a single MATCH over
+    ``exact OR prefix`` lets the prefix branch spend the whole budget on rows
+    that share nothing but an opening substring. Reserving part of the budget
+    rather than raising it keeps recall cost independent of how many
+    near-prefix rows the corpus happens to hold.
+
+    The second stage is skipped when it would repeat the first: a query with
+    no Hangul produces identical term lists, and running the same MATCH twice
+    would be a pure cost regression for every non-Korean caller.
+
+    Ranks come from one final pass over the expansion terms, never from the
+    precise stage. bm25 scores two different MATCH expressions on two
+    different scales, and the callers min/max-normalize ``rank`` across the
+    whole candidate set -- mixing scales silently reweights every row.
+
+    Staging decides *membership* only. The returned rows are re-sorted onto
+    the single expansion-term scale, exactly the order a plain
+    ``ORDER BY rank, {id_col}`` produced before, so reserving budget cannot
+    quietly promote an exact hit over a better-ranked row.
+
+    The first stage is capped at half the budget because it can flood too: a
+    raw token is still a prefix term, so ``시스템의`` matches a family of rows
+    just as ``시스템`` does, and letting it take every slot only moves the
+    starvation to the other stage. Half is the split that needs no per-corpus
+    constant, and it costs nothing when the precise stage returns fewer rows
+    than its share -- the remainder falls through to the expansion stage.
+    """
+    match_sql = (
+        f"SELECT {id_col}, rank FROM {table} WHERE {table} MATCH ?"
+        f" ORDER BY rank, {id_col} LIMIT ?"
+    )
+    precise_terms = _fts_precise_terms(query)
+    if not precise_terms or precise_terms == expansion_terms:
+        rows = conn.execute(match_sql, (" OR ".join(expansion_terms), k)).fetchall()
+        return [{id_col: r[id_col], "rank": r["rank"]} for r in rows]
+
+    ordered_ids: List[Any] = []
+    seen_ids: Set[Any] = set()
+    for terms, budget in ((precise_terms, max(1, k // 2)), (expansion_terms, k)):
+        if len(ordered_ids) >= budget:
+            continue
+        for r in conn.execute(match_sql, (" OR ".join(terms), budget)).fetchall():
+            rid = r[id_col]
+            if rid in seen_ids:
+                continue
+            seen_ids.add(rid)
+            ordered_ids.append(rid)
+            if len(ordered_ids) >= budget:
+                break
+    if not ordered_ids:
+        return []
+
+    placeholders = ",".join("?" * len(ordered_ids))
+    rank_rows = conn.execute(
+        f"SELECT {id_col}, rank FROM {table}"
+        f" WHERE {table} MATCH ? AND {id_col} IN ({placeholders})",
+        (" OR ".join(expansion_terms), *ordered_ids),
+    ).fetchall()
+    ranks = {r[id_col]: r["rank"] for r in rank_rows}
+    # An exact hit the expansion terms cannot reach keeps the pool slot but
+    # scores last, so it never displaces a row the ranking actually measured.
+    worst = max(ranks.values()) if ranks else 0.0
+    rows = [{id_col: rid, "rank": ranks.get(rid, worst)} for rid in ordered_ids]
+    rows.sort(key=lambda r: (r["rank"], r[id_col]))
+    return rows
+
+
 def _fts_search(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]:
     """Search FTS5 episodes and return rowids with ranks.
 
@@ -3813,16 +3938,12 @@ def _fts_search(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]
         if _has_cyrillic(query):
             return _cyrillic_like_search(conn, query, k=k, working=False)
         return []
-    fts_query = " OR ".join(terms)
-    rows = conn.execute(
-        "SELECT rowid, rank FROM fts_episodes WHERE fts_episodes MATCH ? ORDER BY rank, rowid LIMIT ?",
-        (fts_query, k)
-    ).fetchall()
+    rows = _fts_staged_rows(conn, "fts_episodes", "rowid", query, k, terms)
     if not rows and _has_cjk(query):
         return _cjk_like_search(conn, query, k=k, working=False)
     if not rows and _has_cyrillic(query):
         return _cyrillic_like_search(conn, query, k=k, working=False)
-    return [{"rowid": r["rowid"], "rank": r["rank"]} for r in rows]
+    return rows
 
 
 def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]:
@@ -3834,16 +3955,12 @@ def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> Li
         if _has_cyrillic(query):
             return _cyrillic_like_search(conn, query, k=k, working=True)
         return []
-    fts_query = " OR ".join(terms)
-    rows = conn.execute(
-        "SELECT id, rank FROM fts_working WHERE fts_working MATCH ? ORDER BY rank, id LIMIT ?",
-        (fts_query, k)
-    ).fetchall()
+    rows = _fts_staged_rows(conn, "fts_working", "id", query, k, terms)
     if not rows and _has_cjk(query):
         return _cjk_like_search(conn, query, k=k, working=True)
     if not rows and _has_cyrillic(query):
         return _cyrillic_like_search(conn, query, k=k, working=True)
-    return [{"id": r["id"], "rank": r["rank"]} for r in rows]
+    return rows
 
 
 def _wm_vec_search(conn: sqlite3.Connection, query_embedding, k: int = 20,
