@@ -3502,7 +3502,7 @@ def _strip_ko_josa(token: str) -> str:
             return token
 
 
-def _fts_precise_terms(query: str) -> List[str]:
+def _fts_precise_terms(query: str, *, widen: bool = True) -> List[str]:
     """FTS terms built from the raw query tokens, before particle stripping.
 
     ``_fts_query_terms()`` runs every term through ``_strip_ko_josa()`` first,
@@ -3513,19 +3513,29 @@ def _fts_precise_terms(query: str) -> List[str]:
     and with a bounded candidate pool that flood is admitted first, so the
     target is truncated before ranking ever sees it.
 
-    Keeping the raw token is enough to separate the two: ``"바나나"*`` still
-    reaches the inflected ``바나나는`` a Korean document actually stores, but
-    no longer reaches ``바나00는``; ``"ai가"*`` reaches the glued index token
-    ``ai가`` but not ``air07``. That is why this stays a prefix term rather
-    than an exact phrase -- Korean inflects by suffixing, so an exact phrase
-    would only match an uninflected document and would fix nothing.
+    Neither form alone is sufficient, which is why the caller asks for both.
 
-    Tokens outside the widening rule keep the exact-phrase form they already
-    had, which makes this list identical to ``_fts_query_terms()`` for any
-    query without Hangul. The caller uses that equality to skip the second
-    stage entirely, so non-Korean recall pays nothing for this.
+    ``widen=True`` keeps the raw token as a prefix term. It narrows the stem
+    flood -- ``"바나나"*`` no longer reaches ``바나00는``, ``"ai가"*`` no longer
+    reaches ``air07`` -- and it is the only form that reaches the inflected
+    ``바나나는`` a Korean document actually stores, because Korean inflects by
+    suffixing. But it is still a prefix, so a token that shares the *whole*
+    raw query surface stays reachable: ``바나나01`` matches ``"바나나"*``, and
+    61 such rows exhaust a bounded pool exactly as the stem flood did. A
+    widened term therefore cannot be the reservation for a literal token.
 
-    Synonym expansion is deliberately absent: widening recall is the second
+    ``widen=False`` emits the exact phrase. ``"바나나"`` matches only a
+    document that carries ``바나나`` as its own index token, which no
+    ``바나나NN`` row does -- unicode61 tokenizes those as single glued tokens.
+    That makes it the one form a longer same-prefix token cannot displace,
+    and it is why the caller spends its first slice of budget here.
+
+    Tokens outside the widening rule keep the exact-phrase form either way,
+    which makes both lists identical to ``_fts_query_terms()`` for any query
+    without Hangul. The caller uses that equality to skip the extra stages
+    entirely, so non-Korean recall pays nothing for this.
+
+    Synonym expansion is deliberately absent: widening recall is the last
     stage's job.
     """
     terms: List[str] = []
@@ -3543,7 +3553,7 @@ def _fts_precise_terms(query: str) -> List[str]:
         if not token or token in seen:
             continue
         seen.add(token)
-        if _has_hangul(token) or query_has_hangul:
+        if widen and (_has_hangul(token) or query_has_hangul):
             terms.append(f'"{token}"*')
         else:
             terms.append(f'"{token}"')
@@ -3870,12 +3880,22 @@ def _fts_staged_rows(
     ``ORDER BY rank, {id_col}`` produced before, so reserving budget cannot
     quietly promote an exact hit over a better-ranked row.
 
-    The first stage is capped at half the budget because it can flood too: a
-    raw token is still a prefix term, so ``시스템의`` matches a family of rows
-    just as ``시스템`` does, and letting it take every slot only moves the
-    starvation to the other stage. Half is the split that needs no per-corpus
-    constant, and it costs nothing when the precise stage returns fewer rows
-    than its share -- the remainder falls through to the expansion stage.
+    Every stage needs a cap of its own, including the first, because a term
+    can flood at any width. A raw prefix term floods two ways: downward, as
+    ``시스템의`` matches the family ``시스템`` does, and sideways, as
+    ``"바나나"*`` matches 61 rows of ``바나나NN``. Even the exact phrase can
+    flood, on a corpus where many documents legitimately carry the literal
+    token -- letting it take every slot would starve the inflected forms that
+    only the widened term reaches. Capping each stage below the total means
+    no single failure mode can consume the pool.
+
+    The budgets are cumulative, not per-stage, so a stage that returns fewer
+    rows than its share gives the remainder to the next one. Exact and
+    widened together still stop at half the pool, unchanged from when they
+    were one stage, because exact matches are a strict subset of what the
+    widened term reaches -- reserving for them shifts *membership* toward
+    literal hits without enlarging the pool. Thirds and halves need no
+    per-corpus constant.
     """
     match_sql = (
         f"SELECT {id_col}, rank FROM {table} WHERE {table} MATCH ?"
@@ -3885,10 +3905,15 @@ def _fts_staged_rows(
     if not precise_terms or precise_terms == expansion_terms:
         rows = conn.execute(match_sql, (" OR ".join(expansion_terms), k)).fetchall()
         return [{id_col: r[id_col], "rank": r["rank"]} for r in rows]
+    exact_terms = _fts_precise_terms(query, widen=False)
 
     ordered_ids: List[Any] = []
     seen_ids: Set[Any] = set()
-    for terms, budget in ((precise_terms, max(1, k // 2)), (expansion_terms, k)):
+    for terms, budget in (
+        (exact_terms, max(1, k // 3)),
+        (precise_terms, max(1, k // 2)),
+        (expansion_terms, k),
+    ):
         if len(ordered_ids) >= budget:
             continue
         for r in conn.execute(match_sql, (" OR ".join(terms), budget)).fetchall():
