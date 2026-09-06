@@ -2470,6 +2470,18 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
         # word (query_lower="_force" -> "force") is not double-counted.
         query_tokens = [*query_tokens, *_leading_hyphen_fragments(query_lower)]
         query_tokens = list(dict.fromkeys(query_tokens))
+    if query_tokens:
+        # Keep only the CJK characters some meaningful token still carries.
+        # The character-overlap fallback at the bottom exists for spaceless
+        # text that `_recall_tokens()` cannot cut into units; a character it
+        # already discarded is not that. `AI가 target meaning` tokenizes to
+        # `ai/target/meaning` and leaves `가` behind as a bare particle, so
+        # the unfiltered set is `{가}` and *any* row containing that one
+        # syllable scored a full 1.0 -- `air55 가 unrelated` tied the target
+        # it shares no word with. Chinese and Japanese are unaffected: their
+        # characters live inside the tokens, so nothing is dropped.
+        token_chars = {ch for token in query_tokens for ch in token}
+        query_cjk &= token_chars
     if not query_tokens and not query_cjk:
         return 0.0
     # Callers pass raw _recall_tokens() output. Count each compound's
@@ -2615,12 +2627,6 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
     score = (exact + partial + full_match) / max(lexical_unit_count, 1)
 
     if score == 0.0:
-        query_cjk = {
-            ch for ch in query_lower
-            if "\u4e00" <= ch <= "\u9fff"
-            or "\u3040" <= ch <= "\u30ff"
-            or "\uac00" <= ch <= "\ud7af"
-        }
         if query_cjk:
             content_cjk = {
                 ch for ch in content_lower
