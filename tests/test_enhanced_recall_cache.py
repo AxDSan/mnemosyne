@@ -99,6 +99,13 @@ def test_staged_fts_candidate_version_bump_invalidates_old_entries(
     fresh = _call(memory, "alpha query")
     assert len(calls) == 2  # base recall ran; the stale entry was not reused
     assert not any(r.get("id") == stale_id for r in fresh)
+    assert memory._query_cache is not None
+    cache_keys = [
+        row[0]
+        for row in memory._query_cache._conn.execute("SELECT normalized FROM query_cache")
+    ]
+    assert len(cache_keys) == 2
+    assert all(key.startswith("v2:") for key in cache_keys)
 
     # The current-version entry is now cached and reused.
     again = _call(memory, "alpha query")
