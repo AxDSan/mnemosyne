@@ -2160,6 +2160,13 @@ def _is_meaningful_recall_token(token: str) -> bool:
     )
 
 
+from mnemosyne.core.verbatim_ledger import (
+    ExclusionSnapshot,
+    exclusion_sql,
+    resolve_exclusions,
+)
+
+
 def _recall_tokens(text: str) -> List[str]:
     """Meaningful lexical tokens for precision gates and fallback scoring.
 
@@ -7010,7 +7017,8 @@ class BeamMemory:
                importance_weight: float = None,
                explain: bool = False,
                _cross_session: Optional[bool] = None,
-               _resolved_weights: Optional[_RecallWeightSnapshot] = None) -> List[Dict]:
+               _resolved_weights: Optional[_RecallWeightSnapshot] = None,
+               exclude_captures: Optional[ExclusionSnapshot] = None) -> List[Dict]:
         """
         Hybrid recall across working_memory + episodic_memory.
         Uses sqlite-vec + FTS5 for episodic, FTS5 for working.
@@ -7050,6 +7058,12 @@ class BeamMemory:
             Working memory uses a derived split: keyword gets (1 - importance_weight) * 0.6,
             recency gets (1 - importance_weight) * 0.4.
 
+        Self-echo exclusion:
+            exclude_captures: Optional revocable provider-owned capture proofs.
+                Only unchanged, freshly marked working rows can be excluded.
+                No content-global/session-global exclusion or time window.
+                Explicit recall without this opt-in argument is unchanged.
+
         Polyphonic recall (E5, gated by MNEMOSYNE_POLYPHONIC_RECALL=1):
             When the env flag is set to "1", recall delegates to
             PolyphonicRecallEngine (mnemosyne/core/polyphonic_recall.py).
@@ -7079,6 +7093,7 @@ class BeamMemory:
                 channel_id=channel_id,
                 veracity=veracity, memory_type=memory_type,
                 cross_session=cross_session,
+                exclude_captures=exclude_captures,
             )
             # [C4] Polyphonic path diagnostics. The linear-path recording
             # below (record_call / record_tier_hits at the end of recall())
@@ -7246,8 +7261,14 @@ class BeamMemory:
         _em_had_candidates = False
 
         # ---- Working memory (FTS5 fast path) ----
+        # A proof resolves to ONE owned row ID, never every equal-content
+        # row. Overfetch by excluded ROWS bounds all possible FTS dropouts.
+        _excluded_wm_ids = resolve_exclusions(self.conn, exclude_captures)
+        _echo_overfetch = len(_excluded_wm_ids)
         try:
-            wm_fts = _fts_search_working(self.conn, query, k=max(top_k * 3, 50))
+            wm_fts = _fts_search_working(
+                self.conn, query, k=max(top_k * 3, 50) + _echo_overfetch
+            )
         except Exception:
             wm_fts = []
         _wm_fts_raw_count = len(wm_fts)
@@ -7274,7 +7295,11 @@ class BeamMemory:
         else:
             wm_where_clauses.append(_session_scope_filter(cross_session=cross_session))
             wm_params.extend(_session_scope_params(self.session_id, cross_session=cross_session))
-        
+
+        _echo_clause, _echo_params = exclusion_sql(_excluded_wm_ids)
+        if _echo_clause:
+            wm_where_clauses.append(_echo_clause.removeprefix(" AND "))
+            wm_params.extend(_echo_params)
         if from_date:
             wm_where_clauses.append("timestamp >= ?")
             wm_params.append(f"{from_date}T00:00:00")
@@ -8129,8 +8154,8 @@ class BeamMemory:
                         _ph = ",".join("?" * len(_source_ids))
                         _src_rows = self.conn.execute(
                             f"SELECT id, content, source, timestamp, importance, scope, veracity "
-                            f"FROM working_memory WHERE id IN ({_ph})",
-                            _source_ids,
+                            f"FROM working_memory WHERE id IN ({_ph}) AND {wm_where}",
+                            (*_source_ids, *wm_params),
                         ).fetchall()
                         for _row in _src_rows:
                             memoria_source_id = f"memoria_source_{_row['id']}"
@@ -8894,7 +8919,8 @@ class BeamMemory:
                            channel_id: Optional[str] = None,
                            veracity: Optional[str] = None,
                            memory_type: Optional[str] = None,
-                           cross_session: Optional[bool] = None) -> List[Dict]:
+                           cross_session: Optional[bool] = None,
+                           exclude_captures: Optional[ExclusionSnapshot] = None) -> List[Dict]:
         """[E5] Polyphonic recall path.
 
         Delegates to PolyphonicRecallEngine when MNEMOSYNE_POLYPHONIC_RECALL=1.
@@ -8948,6 +8974,13 @@ class BeamMemory:
                 default_dense_source_filter=not (source or topic),
                 source=source,
                 topic=topic,
+                # Shared revocable ownership contract; the engine removes
+                # proven WM contributions before limits/dedup/fusion.
+                **(
+                    {"exclude_captures": exclude_captures}
+                    if exclude_captures
+                    else {}
+                ),
             )
         except Exception as exc:
             logger.exception("polyphonic recall engine failed: %s", exc)
@@ -8977,7 +9010,9 @@ class BeamMemory:
             memory_id = r.memory_id
             if memory_id.startswith("cf_"):
                 continue
-            row_dict = self._fetch_polyphonic_row(cursor, memory_id)
+            row_dict = self._fetch_polyphonic_row(
+                cursor, memory_id, tier=r.metadata.get("_self_echo_tier")
+            )
             if row_dict is None:
                 continue
 
@@ -9175,36 +9210,25 @@ class BeamMemory:
 
         return True
 
-    def _fetch_polyphonic_row(self, cursor, memory_id: str) -> Optional[Dict]:
-        """Resolve a memory_id from the polyphonic engine to a row
-        dict matching recall()'s existing return shape. Tries episodic
-        first, then working_memory; returns None if neither table
-        has the row (engine returned a stale or synthetic id).
+    def _fetch_polyphonic_row(self, cursor, memory_id: str, tier=None) -> Optional[Dict]:
+        """Hydrate the producing tier, never replace an episodic hit with WM.
 
-        Includes session_id in the SELECT so the filter pass can
-        enforce session-scope isolation post-fetch.
+        Untyped legacy engines keep their existing episodic-first fallback.
+        A typed result must not fall through to a different tier if deleted.
         """
-        cursor.execute("""
-            SELECT id, content, source, timestamp, session_id, importance,
-                   recall_count, last_recalled, valid_until,
-                   superseded_by, scope, author_id, author_type,
-                   channel_id, veracity, memory_type, tier
-            FROM episodic_memory WHERE id = ?
-        """, (memory_id,))
-        row = cursor.fetchone()
-        if row is not None:
-            return self._polyphonic_row_to_dict(row, tier_label="episodic")
-        cursor.execute("""
-            SELECT id, content, source, timestamp, session_id, importance,
-                   recall_count, last_recalled, valid_until,
-                   superseded_by, scope, author_id, author_type,
-                   channel_id, veracity, memory_type
-            FROM working_memory WHERE id = ?
-        """, (memory_id,))
-        row = cursor.fetchone()
-        if row is None:
-            return None
-        return self._polyphonic_row_to_dict(row, tier_label="working")
+        tiers = (tier,) if tier in ("working", "episodic") else ("episodic", "working")
+        for label in tiers:
+            table = "episodic_memory" if label == "episodic" else "working_memory"
+            columns = ("id, content, source, timestamp, session_id, importance, "
+                       "recall_count, last_recalled, valid_until, superseded_by, "
+                       "scope, author_id, author_type, channel_id, veracity, memory_type")
+            if label == "episodic":
+                columns += ", tier"
+            cursor.execute(f"SELECT {columns} FROM {table} WHERE id = ?", (memory_id,))
+            row = cursor.fetchone()
+            if row is not None:
+                return self._polyphonic_row_to_dict(row, tier_label=label)
+        return None
 
     def _polyphonic_row_to_dict(self, row, *, tier_label: str) -> Dict:
         """Shared row → recall-dict mapper. /review caught the

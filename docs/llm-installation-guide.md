@@ -319,3 +319,31 @@ If the `hermes_plugin` hook uses a different session ID than the MemoryProvider,
 ### Memory survives gateway restarts, machine reboots, and Fly.io VM recycles
 
 By default, the main database lives at `~/.hermes/mnemosyne/data/mnemosyne.db`; named banks live under `~/.hermes/mnemosyne/data/banks/<name>/`. No Docker, no PostgreSQL, no required network calls.
+
+## Optional self-echo suppression
+
+Self-echo suppression is **off by default**. To opt in, set
+`MNEMOSYNE_SELF_ECHO_ENABLED=1` in the environment of the process running Hermes,
+then start a new provider instance (normally by restarting that process). Unset
+it or set it to `0` to disable the feature. This option applies to both Hermes
+provider packages; it does not change explicit memory-tool recall.
+
+The integration uses Hermes' existing `on_pre_compress(messages, **kwargs)`
+callback automatically; users should not call it manually. Merely enabling the
+flag is not sufficient: until the provider has actually observed the callback,
+automatic recall remains ordinary recall. Hosts without the callback, or cores
+without the optional ledger capability, continue ordinary capture and recall.
+
+Every callback releases **all** previous exclusions, even if compression keeps
+some text, does nothing, or fails. Newly captured, unchanged provider-owned rows
+can be suppressed only when the sync transcript proves they follow the observed
+boundary. Missing or ambiguous transcript evidence means ordinary recall, not
+dropped memories. Imported/legacy rows are not retroactively marked or rewritten.
+Python 3.10 is supported with a conservative SQLite parameter budget; exceeding
+that budget or losing proof also means ordinary recall.
+
+This is best-effort duplicate reduction, **not** exact live-context tracking or
+a durable v2 checkpoint guarantee. A provider restart discards suppression state.
+An already-returned per-turn prefetch string cannot be rewritten by the plugin;
+released memories become available on the next user-turn prefetch. No Hermes
+host modification or database migration is required.

@@ -1409,6 +1409,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._agent_context = "primary"
         self._turn_count = 0
         self._sync_turn_lock = threading.Lock()
+        # Optional compression-boundary suppression; default off, fail open
+        # until a callback is observed. No live-context/checkpoint guarantee.
+        from ._verbatim_compat import make_verbatim_ledger
+        self._verbatim_ledger = make_verbatim_ledger()
+        self._active_session_id = ""
         # Serialize all Beam/SQLite access between the main thread and the
         # auto_sleep daemon thread.  Without this, concurrent connections to
         # the same WAL database can trigger a NULL-pointer SEGV in
@@ -1918,6 +1923,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._hermes_home = kwargs.get("hermes_home", "")
         self._agent_identity = kwargs.get("agent_identity", None) or ""
 
+        # Re-init rebinds the verbatim ledger: entries recorded under a
+        # previous session must never leak their exclusion into the new one.
+        _prev_active = getattr(self, "_active_session_id", "") or ""
+        self._active_session_id = str(session_id or "").strip()
+        if _prev_active and _prev_active != self._active_session_id:
+            self._verbatim_ledger.reset_session(_prev_active)
+
         # Apply provider-specific config from kwargs (Hermes-passed) or config.yaml fallback
         self._apply_provider_config(kwargs)
 
@@ -2254,8 +2266,21 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             # sessions) should never bypass session scoping.
             if author_id:
                 recall_kwargs["author_id"] = author_id
+            # Revocable provider-owned capture proofs; explicit tools do not
+            # pass this optimization to recall.
+            _ledger_key = str(session_id or "").strip() or getattr(
+                self, "_active_session_id", ""
+            ) or ""
+            if _ledger_key and self._verbatim_ledger.enabled:
+                _echo_snapshot = self._verbatim_ledger.snapshot_for(_ledger_key)
+                if _echo_snapshot:
+                    recall_kwargs["exclude_captures"] = _echo_snapshot
             with self._ensure_beam_access_lock():
                 results = self._beam.recall(**recall_kwargs)
+                snapshot = recall_kwargs.get("exclude_captures")
+                if snapshot is not None and not snapshot.generation.valid:
+                    recall_kwargs.pop("exclude_captures", None)
+                    results = self._beam.recall(**recall_kwargs)
             if not results:
                 return ""
             # Filter out low-relevance results to prevent context pollution.
@@ -2350,10 +2375,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         """Bound error detail without including user/assistant content."""
         return f"{type(exc).__name__}: <redacted>"
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", messages=None) -> None:
         """Persist the turn to Mnemosyne episodic memory."""
         if not self._beam or self._agent_context in self._skip_contexts:
             return
+        ledger_session_id = str(session_id or "").strip()
+        ledger = getattr(self, "_verbatim_ledger", None)
+        active_session = getattr(self, "_active_session_id", "")
+        ticket = (ledger.begin(ledger_session_id, messages)
+                  if ledger and active_session == ledger_session_id else None)
         started = time.perf_counter()
         self._ensure_sync_turn_telemetry()
         with self._sync_turn_lock:
@@ -2369,11 +2399,17 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             )
         try:
             with self._ensure_beam_access_lock():
+                ledger_session_id = str(session_id or "").strip()
+                if ledger_session_id and not getattr(self, "_active_session_id", ""):
+                    self._active_session_id = ledger_session_id
                 if "user" in self._sync_roles and user_content and len(user_content) > 5 and not self._should_filter(user_content):
                     user_limit = _sync_turn_user_limit()
                     uc = user_content[:user_limit] if user_limit > 0 else user_content
-                    self._beam.remember(
-                        content=f"[USER] {uc}",
+                    stored_user = f"[USER] {uc}"
+                    capture = ledger.capture if ledger else None
+                    remember = (lambda **kw: capture(ledger_session_id, ticket, self._beam, user_content, **kw)) if capture else self._beam.remember
+                    remember(
+                        content=stored_user,
                         source="conversation",
                         importance=0.5,
                         scope=self._default_scope,
@@ -2383,8 +2419,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10 and not self._should_filter(assistant_content):
                     assistant_limit = _sync_turn_assistant_limit()
                     ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
-                    self._beam.remember(
-                        content=f"[ASSISTANT] {ac}",
+                    stored_assistant = f"[ASSISTANT] {ac}"
+                    capture = ledger.capture if ledger else None
+                    remember = (lambda **kw: capture(ledger_session_id, ticket, self._beam, assistant_content, **kw)) if capture else self._beam.remember
+                    remember(
+                        content=stored_assistant,
                         source="conversation",
                         importance=0.15,
                         scope=self._default_scope,
@@ -2423,6 +2462,45 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     snapshot["failed"],
                     snapshot["pending_queue_length"],
                 )
+
+    def on_pre_compress(self, messages, **kwargs):
+        """Release all exclusions before ANY compression attempt.
+
+        Best-effort v1 bookkeeping, not issue #872 durable checkpoints or v2.
+        A no-op, retained tail or failure deliberately permits extra echo.
+        """
+        del kwargs
+        ledger = getattr(self, "_verbatim_ledger", None)
+        session_key = getattr(self, "_active_session_id", "") or ""
+        if ledger is not None:
+            ledger.release(session_key, messages)
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """Track session rotation for the verbatim ledger.
+
+        Reset/rewound drops the session's context: clear the ledger for
+        both the previous and the new session key so stale verbatim entries
+        never suppress recall after the host rewinds.
+        """
+        del parent_session_id, kwargs
+        ledger = getattr(self, "_verbatim_ledger", None)
+        previous = getattr(self, "_active_session_id", "") or ""
+        self._active_session_id = str(new_session_id or "").strip()
+        if ledger is None or not ledger.enabled:
+            return
+        if reset or rewound:
+            if previous:
+                ledger.reset_session(previous)
+            if self._active_session_id:
+                ledger.reset_session(self._active_session_id)
 
     # Identity-significant expressions the user may voice about themselves or
     # their relationship to their work. When a match is found, the memory is

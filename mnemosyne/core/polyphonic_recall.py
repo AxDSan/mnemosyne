@@ -31,7 +31,7 @@ import json
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,6 +41,7 @@ except ImportError:  # numpy is required by other voices too; guard for parity
     np = None
 
 from mnemosyne.core.episodic_graph import EpisodicGraph
+from mnemosyne.core.verbatim_ledger import ExclusionSnapshot, exclusion_sql, resolve_exclusions
 from mnemosyne.core.veracity_consolidation import (
     VeracityConsolidator,
     compute_fact_id,
@@ -146,7 +147,8 @@ class PolyphonicRecallEngine:
                top_k: int = 10, context_budget: int = 4000,
                *, default_dense_source_filter: bool = True,
                source: Optional[str] = None,
-               topic: Optional[str] = None) -> List[PolyphonicResult]:
+               topic: Optional[str] = None,
+               exclude_captures: Optional[ExclusionSnapshot] = None) -> List[PolyphonicResult]:
         """
         Polyphonic recall: all 4 voices in parallel, then combine.
 
@@ -169,25 +171,52 @@ class PolyphonicRecallEngine:
             topic: Same as ``source`` -- topics are stored in the source
                 field for now (pending a dedicated topic column), exactly as
                 beam._wm_search does.
+            exclude_captures: Revocable provider-owned WM capture proofs.
+                Exclude working contributions before ranking/dedup/fusion.
+                Untyped graph/fact hits with dual-tier IDs abstain rather than
+                borrowing a working score for an episodic representation.
 
         Returns:
             List of PolyphonicResult, sorted by combined score
         """
-        # Run all 4 voices
+        excluded = set()
+        if exclude_captures is not None:
+            if self.conn is not None:
+                excluded = resolve_exclusions(self.conn, exclude_captures)
+            else:
+                conn = sqlite3.connect(str(self.db_path))
+                try:
+                    excluded = resolve_exclusions(conn, exclude_captures)
+                finally:
+                    conn.close()
+        graph_results = self._graph_voice(query)
+        fact_results = self._fact_voice(query)
+        if excluded:
+            # These voices carry no producing-tier evidence. An ambiguous
+            # dual-tier hit must fail open, not rescue a WM score as episodic.
+            ambiguous = {r.memory_id for r in graph_results + fact_results} & excluded
+            excluded -= ambiguous
         vector_results = self._vector_voice(
             query_embedding,
             default_dense_source_filter=default_dense_source_filter,
             source=source,
             topic=topic,
+            **({"excluded_wm_ids": excluded} if excluded else {}),
         )
-        graph_results = self._graph_voice(query)
-        fact_results = self._fact_voice(query)
-        temporal_results = self._temporal_voice(query)
-        
-        # Combine results
+        # Preserve the producing tier of surviving episodic vector hits when
+        # their WM twin was excluded BEFORE vector dedup. This is provenance,
+        # not post-fusion twin rescue. Ordinary explicit recall is unchanged.
+        for result in vector_results:
+            if (result.memory_id in excluded
+                    and result.metadata.get("embedding_tier") == "episodic"):
+                result.metadata["_self_echo_tier"] = "episodic"
+        temporal_results = self._temporal_voice(
+            query, **({"excluded_wm_ids": excluded} if excluded else {})
+        )
         combined = self._combine_voices(
             vector_results, graph_results, fact_results, temporal_results
         )
+
         self._hydrate_result_content(combined)
 
         # Diversity re-rank
@@ -197,10 +226,11 @@ class PolyphonicRecallEngine:
         context = self._assemble_context(reranked, context_budget)
         
         return context
-    
+
     def _vector_voice(self, query_embedding, default_dense_source_filter: bool = True,
                       source: Optional[str] = None,
-                      topic: Optional[str] = None) -> List[RecallResult]:
+                      topic: Optional[str] = None,
+                      excluded_wm_ids: Optional[Set[str]] = None) -> List[RecallResult]:
         """
         Voice 1: Dense semantic similarity over WM + EM.
 
@@ -509,6 +539,9 @@ class PolyphonicRecallEngine:
                     " AND wm.source <> 'honcho_message'))"
                     " AND wm.consolidated_at IS NULL"
                 )
+            echo_clause, echo_params = exclusion_sql(excluded_wm_ids, "wm.id")
+            wm_dense_predicate += echo_clause
+            wm_dense_params.extend(echo_params)
             try:
                 wm_rows = conn.execute(
                     f"""
@@ -691,7 +724,7 @@ class PolyphonicRecallEngine:
         
         return results
     
-    def _temporal_voice(self, query: str) -> List[RecallResult]:
+    def _temporal_voice(self, query: str, excluded_wm_ids=None) -> List[RecallResult]:
         """
         Voice 4: Time-aware scoring.
 
@@ -735,18 +768,28 @@ class PolyphonicRecallEngine:
 
             # Get memories from last 7 days
             week_ago = (datetime.now() - timedelta(days=7)).isoformat()
-            cursor.execute("""
+            echo_clause, echo_params = exclusion_sql(excluded_wm_ids)
+            cursor.execute(f"""
                 SELECT id, content, timestamp, importance
                 FROM working_memory
-                WHERE timestamp > ?
+                WHERE timestamp > ? {echo_clause}
                 ORDER BY timestamp DESC
                 LIMIT 20
-            """, (week_ago,))
+            """, (week_ago, *echo_params))
 
             results = []
             for row in cursor.fetchall():
-                # Calculate temporal score
-                age = datetime.now() - datetime.fromisoformat(row["timestamp"])
+                # Calculate temporal score. Timestamps may be naive-local
+                # (production writers) or aware-UTC (imports/migrations):
+                # normalize to naive before subtracting or fromisoformat
+                # raises 'can't subtract offset-naive and offset-aware'.
+                try:
+                    row_dt = datetime.fromisoformat(row["timestamp"])
+                except (TypeError, ValueError):
+                    continue
+                if row_dt.tzinfo is not None:
+                    row_dt = row_dt.astimezone().replace(tzinfo=None)
+                age = datetime.now() - row_dt
                 age_days = age.total_seconds() / 86400
                 temporal_score = np.exp(-age_days / 7)  # 7-day half-life
 
@@ -795,7 +838,9 @@ class PolyphonicRecallEngine:
                     continue
                 for row in rows:
                     result = results.get(row["id"])
-                    if result is not None and not result.content:
+                    tier = "working" if table == "working_memory" else "episodic"
+                    if (result is not None and not result.content
+                            and result.metadata.get("_self_echo_tier", tier) == tier):
                         result.content = row["content"] or ""
         finally:
             if own_conn:
