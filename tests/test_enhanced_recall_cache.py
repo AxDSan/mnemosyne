@@ -76,26 +76,27 @@ def _close_memory(memory: BeamMemory | None) -> None:
         memory.conn.close()
 
 
+@pytest.mark.parametrize("old_version", [6, 7])
 def test_staged_fts_candidate_version_bump_invalidates_old_entries(
-    enhanced, monkeypatch, tmp_path: Path
+    enhanced, monkeypatch, tmp_path: Path, old_version
 ):
     """#896 regression: staged FTS candidate membership/order changed.
 
-    An opaque entry made under version 6 can contain the old candidate set, so
-    version 7 must produce a distinct digest and execute the updated pipeline.
+    Versions 6 and 7 predate the current candidate and content-cap contracts.
+    Version 8 must produce a distinct digest and execute the updated pipeline.
     The ``v2:`` key prefix remains fixed for QueryCache's opaque-key path.
     """
     memory, calls = enhanced
-    assert memory._ENHANCED_RECALL_CACHE_VERSION == 7
+    assert memory._ENHANCED_RECALL_CACHE_VERSION == 8
 
     # Warm the persistent cache under the old candidate-selection version.
     with monkeypatch.context() as ctx:
-        ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 6)
+        ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", old_version)
         stale = _call(memory, "alpha query")
     assert len(calls) == 1
     stale_id = stale[0]["id"]
 
-    # The current-version digest differs from the stale v5 key: cache miss.
+    # The current-version digest differs from the stale version key: cache miss.
     fresh = _call(memory, "alpha query")
     assert len(calls) == 2  # base recall ran; the stale entry was not reused
     assert not any(r.get("id") == stale_id for r in fresh)

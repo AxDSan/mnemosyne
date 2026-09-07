@@ -9,6 +9,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Added
 
+- **Configurable recall content cap (#913).** `MNEMOSYNE_RECALL_CONTENT_CAP` lets operators override the per-result character limit while the default remains 500. The limit also covers enhanced associative results and cache hits. The enhanced-recall cache key now includes the cap, so cached results cannot cross between different configured limits.
 - **BEAM initialization status is now available through the additive public Python `BeamInitResult`.** It reports the configured embedding dimension, any dimension mismatch, and immutable stored dimensions for each vector table.
 - **Multimodal memory: images, video and audio can become recallable memories (RFCs 0002, 0003, 0004).** `BeamMemory.remember_media(ref)` takes a reference to a piece of media, registers it, describes it through a configured modality provider, and writes the description back as an ordinary memory that hybrid recall already understands. Nothing about text recall changes.
 
