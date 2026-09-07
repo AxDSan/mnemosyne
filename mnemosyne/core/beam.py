@@ -8332,11 +8332,11 @@ class BeamMemory:
 
         return final_results
 
-    # Bump whenever the enhanced-recall ranking algorithm changes so entries
-    # cached under an older digest are not reused. Part of the hashed payload;
-    # the opaque key keeps the "v2:" prefix because QueryCache's opaque-path
-    # recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
-    _ENHANCED_RECALL_CACHE_VERSION = 6
+    # Bump whenever the enhanced-recall candidate or ranking algorithm changes
+    # so entries cached under an older digest are not reused. Part of the
+    # hashed payload; the opaque key keeps the "v2:" prefix because QueryCache's
+    # opaque-path recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
+    _ENHANCED_RECALL_CACHE_VERSION = 7
 
     def _enhanced_recall_cache_key(
         self,
@@ -8466,12 +8466,11 @@ class BeamMemory:
             },
         }
         material = json.dumps(canonicalize(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        # The default dense candidate predicate changed (dialog / honcho /
-        # consolidated exclusion, #696 / #427), so pre-change opaque cache
-        # entries could still contain dialog, honcho or consolidated dense
-        # candidates. _ENHANCED_RECALL_CACHE_VERSION is part of the hashed
-        # payload; bumping it guarantees those entries are never
-        # reused. The "v2:" prefix stays fixed — QueryCache's opaque-path
+        # Staged FTS candidate membership/order changed (#896), so pre-change
+        # opaque cache entries can contain candidates the current pipeline
+        # would not select. _ENHANCED_RECALL_CACHE_VERSION is part of the
+        # hashed payload; bumping it guarantees those entries are never reused.
+        # The "v2:" prefix stays fixed because QueryCache's opaque-path
         # recognition keys off that exact prefix.
         return "v2:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
