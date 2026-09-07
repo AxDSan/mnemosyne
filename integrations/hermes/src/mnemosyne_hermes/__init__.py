@@ -60,7 +60,7 @@ def _stage_pending_write(payload: Dict[str, Any]) -> str:
     }
     (pending_dir / f"{pid}.json").write_text(json.dumps(record, indent=2))
     return pid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Mnemosyne core is installed via pip (mnemosyne-memory>=3.11.1 dependency),
 # but keep imports lazy so installer/status CLI commands still work in broken
@@ -1902,9 +1902,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Avoid spinning up a full sleep pass when no old unconsolidated rows
         # remain. This read belongs to the same session snapshot as the stats.
         cutoff = (
-            datetime.now()
+            datetime.now(timezone.utc).replace(tzinfo=None)
             - timedelta(hours=_get_working_memory_ttl_hours() // 2)
-        ).isoformat()
+        ).strftime("%Y-%m-%d %H:%M:%S")
         eligible = beam_ref._count_unconsolidated_before(cutoff)
         if eligible == 0:
             return None

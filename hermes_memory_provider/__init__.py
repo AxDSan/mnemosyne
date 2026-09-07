@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Ensure mnemosyne core is importable from this directory
 # MUST be before any `from mnemosyne.*` imports
@@ -2462,7 +2462,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             if working > self._auto_sleep_threshold:
                 # Cheap eligibility check: are there any unconsolidated
                 # working memories old enough to consolidate?
-                cutoff = (datetime.now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)).isoformat()
+                cutoff = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)).strftime("%Y-%m-%d %H:%M:%S")
                 eligible = self._beam._count_unconsolidated_before(cutoff)
                 if eligible == 0:
                     return

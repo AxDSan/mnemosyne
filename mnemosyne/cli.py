@@ -618,6 +618,7 @@ def cmd_import(args):
         renumbered = stats.get("imported_renumbered", 0)
         skipped = stats.get("skipped", 0)
         overwritten = stats.get("overwritten", 0)
+        bad_ts = stats.get("imported_bad_timestamp", 0)
         parts = []
         if new:
             parts.append(f"{new} new")
@@ -627,14 +628,19 @@ def cmd_import(args):
             parts.append(f"{overwritten} overwritten")
         if skipped:
             parts.append(f"{skipped} skipped")
+        if bad_ts:
+            # Quarantined rows are pinned with epoch timestamps: surface
+            # them so an operator knows to re-date instead of assuming a
+            # clean restore.
+            parts.append(f"{bad_ts} bad-timestamp quarantined")
         if not parts:
             return f"0 {label}"
         return f"{' + '.join(parts)} {label}"
 
     print(
         f"Imported "
-        f"{beam_stats.get('working_memory', {}).get('inserted', 0)} working, "
-        f"{beam_stats.get('episodic_memory', {}).get('inserted', 0)} episodic, "
+        f"{_format_store_stats(beam_stats.get('working_memory', {}), 'working')}, "
+        f"{_format_store_stats(beam_stats.get('episodic_memory', {}), 'episodic')}, "
         f"{result.get('legacy', {}).get('inserted', 0)} legacy, "
         f"{_format_store_stats(result.get('triples', {}), 'triples')}, "
         f"{_format_store_stats(result.get('annotations', {}), 'annotations')}"
