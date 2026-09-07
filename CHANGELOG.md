@@ -41,6 +41,8 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **Legacy Polyphonic dense recall now reads the episodic vector store populated by normal writes.** Unmarked float32, int8 and binary stores are scanned with representation-safe cosine scoring instead of raw-L2 KNN preselection or reliance on a missing JSON copy. Eligibility filters precede candidate selection, JSON-only episodic rows remain available, and existing records are not rewritten.
+
 - **Event timestamps and working-memory retention now use chronological UTC instants.** Mixed-offset and whitespace-padded timestamps are compared consistently for TTL and keep-newest limits. Consolidation preserves separately validated event dates, safely degrades invalid stored metadata, and does not strand source claims. Empty embedding results no longer roll back episodic summaries, including the non-sqlite-vec fallback. Existing records are not rewritten.
 
 - **The CLI no longer crashes on non-Windows-1252 memory content when its output is piped.** When `mnemosyne` is spawned by agent tooling with piped stdout on Windows, Python defaults `sys.stdout` to cp1252, and `recall` (or any command printing memory content) died with `UnicodeEncodeError: 'charmap' codec can't encode character '\u20b1'` the moment a stored memory contained a character outside cp1252, such as the peso sign, an emoji, or CJK text. `run_cli()` now reconfigures `sys.stdout` and `sys.stderr` to UTF-8 with `errors='replace'` at startup, so output stays correct when the environment provides UTF-8 (or supports it) and degrades to replacement characters instead of a traceback when it does not.

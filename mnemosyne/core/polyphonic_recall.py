@@ -227,6 +227,76 @@ class PolyphonicRecallEngine:
         
         return context
 
+    def _legacy_episodic_vector_voice(self, conn, query_unit, now_iso,
+                                     source=None, topic=None):
+        """Scan the populated vec store, retaining only eligible top-20 hits."""
+        import heapq
+        from mnemosyne.core.beam import (
+            EM_VEC_ADMIT,
+            _vec_bit_blob_cosine,
+            _vec_float32_blob_cosine,
+            _vec_int8_blob_cosine,
+            _vec_table_type_strict,
+        )
+
+        # Read the actual table representation, never infer it from blob length
+        # or the configured model. Unknown types must fall back, not misdecode.
+        vec_type = _vec_table_type_strict(conn)
+        emb_json = json.dumps(query_unit.tolist())
+        query_blob = b""
+        if vec_type == "int8":
+            query_blob = bytes(conn.execute(
+                "SELECT vec_quantize_int8(?, 'unit')", (emb_json,)
+            ).fetchone()[0])
+        elif vec_type == "bit":
+            query_blob = bytes(conn.execute(
+                "SELECT vec_quantize_binary(?)", (emb_json,)
+            ).fetchone()[0])
+        elif vec_type != "float32":
+            raise ValueError("Unknown episodic vector representation")
+
+        source_filter = source or topic
+        predicate = " AND em.source = ?" if source_filter else ""
+        params = (now_iso, source_filter) if source_filter else (now_iso,)
+        rows = conn.execute(
+            f"""
+            SELECT em.id AS memory_id, v.embedding
+            FROM vec_episodes v JOIN episodic_memory em ON em.rowid = v.rowid
+            WHERE em.superseded_by IS NULL
+              AND (em.valid_until IS NULL OR julianday(em.valid_until) > julianday(?))
+              {predicate}
+            """, params,
+        )
+
+        def candidates():
+            # No KNN or LIMIT: norms and ineligible rows must not hide a later
+            # survivor. nlargest bounds retained memory, not scanned coverage.
+            for row in rows:
+                blob = row["embedding"]
+                if vec_type == "int8":
+                    cosine = _vec_int8_blob_cosine(query_blob, blob)
+                elif vec_type == "bit":
+                    cosine = _vec_bit_blob_cosine(
+                        query_blob, blob, width=len(query_blob) * 8
+                    )
+                else:
+                    cosine = _vec_float32_blob_cosine(query_unit, blob)
+                if cosine < EM_VEC_ADMIT:
+                    continue
+                # Admission uses absolute cosine; keep the voice's existing
+                # numpy score scale for fusion and cross-tier deduplication.
+                sim = (cosine + 1.0) / 2.0
+                yield RecallResult(
+                    memory_id=row["memory_id"], score=sim, voice="vector",
+                    metadata={
+                        "similarity": sim, "cosine_similarity": cosine,
+                        "vec_type": vec_type, "embedding_tier": "episodic",
+                        "backend": "sqlite-vec",
+                    },
+                )
+
+        return heapq.nlargest(20, candidates(), key=lambda result: result.score)
+
     def _vector_voice(self, query_embedding, default_dense_source_filter: bool = True,
                       source: Optional[str] = None,
                       topic: Optional[str] = None,
@@ -251,8 +321,10 @@ class PolyphonicRecallEngine:
 
         EM tier prefers sqlite-vec's `vec_episodes` virtual table when
         available (same fast-path the linear scorer uses via
-        `beam._vec_search`); falls through to numpy cosine over
-        `memory_embeddings` on any failure. WM tier uses numpy cosine
+        `beam._vec_search`). Unmarked stores stream representation-safe
+        scores from that same table, with JSON-only rows supplemented from
+        `memory_embeddings`; failures retain the existing JSON fallback.
+        WM tier uses numpy cosine
         (matches the linear path -- no sqlite-vec WM index exists
         today).
 
@@ -318,12 +390,14 @@ class PolyphonicRecallEngine:
             # That confounds the BEAM-recovery experiment's
             # polyphonic-vs-linear latency comparison.
             em_consumed_via_vec_episodes = False
+            legacy_scanned = False
             try:
                 # Lazy import: avoids any module-load circular import
                 # with beam.py (which lazily imports
                 # PolyphonicRecallEngine inside _get_polyphonic_engine).
                 # Both directions are runtime-only.
                 from mnemosyne.core.beam import (
+                    _classify_vec_store_regime,
                     _vec_available,
                     _effective_vec_type,
                 )
@@ -343,6 +417,26 @@ class PolyphonicRecallEngine:
                     # ultimately returns). vec_limit (which controls
                     # the numpy fallback's full-scan budget under
                     # BEAM_MODE) is irrelevant here.
+                    # Boundary routing (mirrors the linear engine): an
+                    # unmarked/legacy store must not run raw-L2 KNN — it
+                    # buries un-normalized rows. Normal episodic writes have
+                    # no JSON copy, so scan vec_episodes itself instead.
+                    try:
+                        _poly_regime = _classify_vec_store_regime(
+                            conn, "vec_episodes"
+                        )
+                    except Exception:
+                        _poly_regime = "unknown"
+                    if _poly_regime != "pure":
+                        legacy_results = self._legacy_episodic_vector_voice(
+                            conn, query_unit, now_iso, source=source, topic=topic
+                        )
+                        by_id.update((r.memory_id, r) for r in legacy_results)
+                        legacy_scanned = True
+                        em_consumed_via_vec_episodes = bool(legacy_results)
+                        vec_rows = []
+                    else:
+                        vec_rows = None  # fall through to the KNN below
                     k_inline = 60
                     if vec_type == "bit":
                         rank_sql = (
@@ -362,7 +456,10 @@ class PolyphonicRecallEngine:
                             f"WHERE embedding MATCH ? AND k={k_inline} "
                             "ORDER BY distance"
                         )
-                    vec_rows = conn.execute(rank_sql, (emb_json,)).fetchall()
+                    if vec_rows is None:
+                        vec_rows = conn.execute(
+                            rank_sql, (emb_json,)
+                        ).fetchall()
                     if vec_rows:
                         rowid_to_dist = {
                             r["rowid"]: r["distance"] for r in vec_rows
@@ -455,18 +552,31 @@ class PolyphonicRecallEngine:
                 em_consumed_via_vec_episodes = False
 
             # --- EM tier -- numpy fallback (or when sqlite-vec absent) ---
-            if not em_consumed_via_vec_episodes:
+            if legacy_scanned or not em_consumed_via_vec_episodes:
+                # Preserve JSON-only rows in mixed stores, but never rescore
+                # an authoritative vec row (even one rejected by admission).
+                json_predicate = ""
+                json_params = []
+                if legacy_scanned:
+                    json_predicate = (
+                        " AND NOT EXISTS (SELECT 1 FROM vec_episodes v"
+                        " WHERE v.rowid = em.rowid)"
+                    )
+                    if source or topic:
+                        json_predicate += " AND em.source = ?"
+                        json_params.append(source or topic)
                 try:
                     em_rows = conn.execute(
-                        """
+                        f"""
                         SELECT em.id AS memory_id, me.embedding_json
                         FROM memory_embeddings me
                         JOIN episodic_memory em ON me.memory_id = em.id
                         WHERE em.superseded_by IS NULL
                           AND (em.valid_until IS NULL OR julianday(em.valid_until) > julianday(?))
+                          {json_predicate}
                         LIMIT ?
                         """,
-                        (now_iso, vec_limit),
+                        (now_iso, *json_params, vec_limit),
                     ).fetchall()
                 except sqlite3.OperationalError:
                     em_rows = []
