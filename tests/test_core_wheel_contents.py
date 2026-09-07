@@ -108,6 +108,7 @@ def test_core_wheel_keeps_package_integrations_and_excludes_repository_tree(tmp_
         members = archive.namelist()
         entry_points = _entry_points_from_wheel(archive, members)
 
+    assert "hermes_memory_provider/_verbatim_compat.py" in members
     assert "mnemosyne/__init__.py" in members
     expected_integrations = {
         "mnemosyne/integrations/memory_browser.py",
@@ -154,6 +155,7 @@ def test_standalone_hermes_wheel_keeps_plugin_manifest(tmp_path):
         metadata_version = _metadata_version_from_wheel(archive, members)
         entry_points = _entry_points_from_wheel(archive, members)
 
+    assert "mnemosyne_hermes/_verbatim_compat.py" in members
     assert "mnemosyne_hermes/plugin.yaml" in members
     assert manifest_version == runtime_version
     assert manifest_version == metadata_version
