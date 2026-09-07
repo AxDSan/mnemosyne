@@ -455,6 +455,373 @@ IMPORTED_WEIGHT = _env_float("MNEMOSYNE_IMPORTED_WEIGHT", _VW_DEFAULTS["imported
 UNKNOWN_WEIGHT = _env_float("MNEMOSYNE_UNKNOWN_WEIGHT", _VW_DEFAULTS["unknown"])
 
 
+# Saturation threshold for legacy int8 rows: per-dimension RMS of the
+# stored quantized bytes. Unit-normalized rows quantize to RMS ~3.6-3.7
+# per dim at typical embedding dims; rows written before normalization
+# was enforced saturate the int8 byte range (values pinned at +126/-128),
+# reaching RMS ~120+. Rows above the threshold have lost magnitude to
+# clipping, so the quantized L2 geometry no longer recains their cosine
+# (collinear saturated pairs recover only ~0.74); their surviving
+# directional signal is the sign pattern, scored by the sign-bit arm.
+_INT8_SATURATION_RMS = 50.0
+# Normalized-format marker for the episodic vec table (routing boundary,
+# see _classify_vec_store_regime). 0x10000000 remains reserved as the
+# historical legacy flag: read for continuity, never written.
+_VEC_NORM_BIT = 0x20000000
+# Max boost the sign arm may apply above the byte-dot cosine (round-5:
+# sign agreement alone cannot reconstruct a lost magnitude distribution).
+_SIGN_BOOST_CAP = 0.15
+
+
+def _vec_float32_blob_cosine(query_vec, row_blob) -> float:
+    """Exact cosine between the query vector and a float32 row's stored blob.
+
+    The float32 arm's blob IS the stored float data — no quantization loss —
+    so scoring from the blob recovers the exact angle even for legacy rows
+    written before normalization was enforced (the distance-only conversion
+    assumes unit norms and clamps those rows to 0).
+    """
+    import numpy as _np
+    if row_blob is None:
+        return 0.0
+    try:
+        r = _np.frombuffer(row_blob, dtype=_np.float32).astype(_np.float64)
+    except ValueError:
+        return 0.0
+    n_r = float(_np.linalg.norm(r))
+    if not math.isfinite(n_r) or n_r <= 0.0:
+        return 0.0
+    q = _np.asarray(query_vec, dtype=_np.float64)
+    if q.shape != r.shape:
+        return 0.0
+    n_q = float(_np.linalg.norm(q))
+    if not math.isfinite(n_q) or n_q <= 0.0:
+        return 0.0
+    cos = float(_np.dot(q, r)) / (n_q * n_r)
+    if not math.isfinite(cos):
+        return 0.0
+    return max(0.0, min(1.0, cos))
+
+
+def _vec_int8_blob_cosine(query_blob: bytes, row_blob: bytes) -> float:
+    """Absolute cosine between the int8-quantized query and a stored row.
+
+    Both vectors are taken from their quantized bytes (the stored blob and
+    the SQL quantizer output for the query), so the score depends only on
+    the two vectors — never on the KNN batch size or composition, and never
+    on an assumed quantization scale (truncation makes the effective norm
+    dimension- and distribution-dependent, so no single constant is safe).
+    Saturated legacy rows (byte clipping from pre-normalization writes)
+    fall back to sign-bit cosine: scaling does not change signs, so
+    collinear saturated rows still score ~1.0. Zero-norm, missing or
+    mismatched-length blobs and non-finite inputs score 0.0 (abstain).
+    """
+    import numpy as _np
+    if not query_blob or not row_blob or len(query_blob) != len(row_blob):
+        logger.debug(
+            "vec candidate abstained: blob length mismatch "
+            "(query=%d row=%d) — row not scoreable, dropped from recall",
+            len(query_blob or b""), len(row_blob or b""),
+        )
+        return 0.0
+    try:
+        q = _np.frombuffer(query_blob, dtype=_np.int8).astype(_np.float64)
+        r = _np.frombuffer(row_blob, dtype=_np.int8).astype(_np.float64)
+    except ValueError:
+        return 0.0
+    n_r = float(_np.linalg.norm(r))
+    if not math.isfinite(n_r) or n_r <= 0.0:
+        return 0.0
+    n_q = float(_np.linalg.norm(q))
+    if not math.isfinite(n_q) or n_q <= 0.0:
+        return 0.0
+    dim = float(len(r))
+    cos = float(_np.dot(q, r)) / (n_q * n_r)
+    if not math.isfinite(cos):
+        return 0.0
+    cos = max(0.0, min(1.0, cos))
+    # Saturated legacy rows: magnitude is lost to byte clipping, so the dot
+    # cosine under-reads direction there. The sign-bit arm is only trusted
+    # when the ROW itself shows clipping (clip fraction, not a fixed RMS
+    # threshold — e5-shaped rows clip at different scales than gaussian).
+    # Round-4 dplush: an all-126 row vs a zero-heavy synthetic query is
+    # byte-identical to a legitimate legacy row; the discriminator is the
+    # QUERY's zero fraction, so the sign weight ramps off as the query's
+    # zero fraction grows (98%-zero query -> w=0 -> byte-dot 0.125 stands).
+    q_zero_frac = float(_np.count_nonzero(q == 0)) / dim
+    row_clip_frac = float(_np.count_nonzero(_np.abs(_np.frombuffer(row_blob, dtype=_np.int8)) >= 126)) / dim
+    row_zero_frac = float(_np.count_nonzero(_np.frombuffer(row_blob, dtype=_np.int8) == 0)) / dim
+    # Row-side validity: the row must show real clipping (the arm exists
+    # for it) and be essentially zero-free (stray quantization zeros don't
+    # invalidate the sign pattern, but pervasive zeros do).
+    if row_clip_frac >= 0.10 and row_zero_frac <= 0.01:
+        # Zero-aware sign Hamming: signbit(0) is False, so query-zero dims
+        # would count as agreeing with a positive byte half the time; the
+        # denominator keeps only dims where the query has an opinion.
+        q_sign = _np.signbit(q)
+        r_sign = _np.signbit(r)
+        q_zero = q == 0
+        # Exclude query-zero dims from numerator AND denominator: signbit(0)
+        # counts as False, so including them in the numerator paired ~half of
+        # them against a positive saturated byte — a systematic down-bias
+        # that under-credited honest 0.74-0.80 matches by up to 0.03
+        # (round-5 audit F5-6, probe p11).
+        differing = float(_np.count_nonzero((q_sign != r_sign) & ~q_zero))
+        decided = dim - float(_np.count_nonzero(q_zero))
+        if decided > 0:
+            sign_cos = max(0.0, math.cos(math.pi * differing / decided))
+        else:
+            sign_cos = 0.0
+        # Query-zero-fraction step weight (round-5 calibration): full trust
+        # below 35% zeros, none above 90%, linear ramp between.
+        if q_zero_frac <= 0.35:
+            w = 1.0
+        elif q_zero_frac >= 0.90:
+            w = 0.0
+        else:
+            w = (0.90 - q_zero_frac) / 0.55
+        # Conservative estimator: the sign arm can boost the byte-dot by
+        # at most _SIGN_BOOST_CAP — it is a lower bound, not a reconstruction
+        # of the true cosine. A uniform saturated row's sign pattern matches
+        # every query equally, so an unbounded sign arm manufactures perfect
+        # scores (dplush: [50,1,…,1] vs [126]*384 → true 0.41, sign 1.0).
+        return max(cos, min(w * sign_cos, cos + _SIGN_BOOST_CAP))
+    return cos
+
+
+
+def _binary_bonus(query_bv, bv) -> float:
+    """Hamming-based binary-vector bonus in [0, 0.08].
+
+    Sigmoid: max bonus at distance 0, ~0 at distance = live bit width.
+    The distance is divided by the LIVE bit width (len(xor_arr) * 8 —
+    xor_arr holds PACKED BYTES while h_dist counts BITS). Dividing by the
+    byte count inflates the distance 8x and zeroes the bonus; the
+    configured EMBEDDING_DIM only matches when it equals the table dim.
+    """
+    try:
+        import numpy as _np
+        q_arr = _np.frombuffer(query_bv, dtype=_np.uint8)
+        m_arr = _np.frombuffer(bv, dtype=_np.uint8)
+        xor_arr = _np.bitwise_xor(q_arr, m_arr)
+        popcount_table = _np.array(_popcount_table_256(), dtype=_np.uint32)
+        h_dist = int(_np.sum(popcount_table[xor_arr]))
+        normalized_dist = h_dist / max(1, len(xor_arr) * 8)
+        return 0.08 * (1.0 - _np.tanh(normalized_dist * 3.0))
+    except Exception:
+        return 0.0
+
+
+_POPCOUNT_TABLE_256 = None
+
+
+def _popcount_table_256():
+    """256-entry popcount lookup, built once per process. The streaming
+    legacy scan calls the bit scorer once per row: rebuilding the table
+    per call was 256 bin() operations per candidate."""
+    global _POPCOUNT_TABLE_256
+    if _POPCOUNT_TABLE_256 is None:
+        _POPCOUNT_TABLE_256 = [bin(i).count("1") for i in range(256)]
+    return _POPCOUNT_TABLE_256
+
+
+def _vec_bit_blob_cosine(query_blob: bytes, row_blob: bytes,
+                         width: "Optional[int]" = None) -> float:
+    """Absolute cosine between binary-quantized query and stored row.
+
+    Bit blobs are packed bits; the Hamming distance (popcount of the XOR)
+    over the live width approximates the angle: cos = cos(pi * d / D).
+    This mirrors the _vec_distance_sim bit arm but computes d from the
+    actual packed blobs — required on the legacy-scan path, whose
+    distance placeholders (0.0) would otherwise collapse every row to
+    cos(0) = 1.0 (round-7 F7-1b).
+    """
+    import numpy as _np
+    if not query_blob or not row_blob or len(query_blob) != len(row_blob):
+        return 0.0
+    try:
+        q = _np.frombuffer(query_blob, dtype=_np.uint8)
+        r = _np.frombuffer(row_blob, dtype=_np.uint8)
+        popcount_table = _np.array(_popcount_table_256(), dtype=_np.uint32)
+        d = int(_np.sum(popcount_table[_np.bitwise_xor(q, r)]))
+    except Exception:
+        return 0.0
+    if width is None:
+        width = len(query_blob) * 8
+    if width <= 0:
+        return 0.0
+    if d > width:  # defensive: XOR of equal-length blobs caps at len*8
+        d = width
+    return max(0.0, min(1.0, math.cos(math.pi * float(d) / float(width))))
+
+def _vec_distance_sim(distance: float, vec_type: "Optional[str]" = None,
+                      bit_width: "Optional[int]" = None) -> float:
+    """Convert a vector-arm distance into an ABSOLUTE cosine-like [0, 1] score.
+
+    The distance semantics differ per arm:
+
+    * ``int8``    -- abstain (0.0): the quantization scale is dimension-
+                     and distribution-dependent, so an int8 distance alone
+                     cannot yield an absolute cosine. Callers with blob
+                     access score via _vec_int8_blob_cosine instead.
+    * ``float32`` -- sqlite-vec float32: raw L2 over unit vectors, d in [0, 2].
+                     cos = 1 - d^2 / 2 (d > 2 clamps to 0).
+    * ``bit``     -- sqlite-vec bit: sign-bit Hamming approximates the angle
+                     (P(flip) ~ theta/pi): cos = cos(pi * d / D). Matches
+                     float cosine for isotropic vectors; real e5 embeddings
+                     are anisotropic, biasing scores upward ~+0.1 (ranking
+                     preserved, Pearson ~-0.98) — treat bit scores as a
+                     monotone proxy, not exact cosine.
+    * ``None`` (in-memory fallback): distance = 1 - cosine in [0, 2].
+                     cos = 1 - d, clamped to >= 0.
+
+    Unknown arms and non-finite/negative distances degrade to 0.0 (abstain)
+    rather than collapsing toward 1.0.
+    """
+    try:
+        d = float(distance)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(d) or d < 0.0:
+        return 0.0
+    if vec_type == "float32":
+        d = min(2.0, d)
+        return max(0.0, 1.0 - (d * d) / 2.0)
+    if vec_type == "bit":
+        # Sign-bit disagreement d over D bits approximates the angle:
+        # P(flip) ~= theta/pi, so cos = cos(pi * d / D). The linear chord
+        # 1 - 2d/D underestimates similarity in the useful range (true cos
+        # 0.90 scored ~0.71-0.79 and was wrongly rejected). The arc relation
+        # is exact for isotropic vectors; anisotropic embeddings (e5) bias
+        # it upward ~+0.1 — a monotone proxy, see the docstring.
+        # Live bit width, not the configured EMBEDDING_DIM: the table's
+        # width is pinned at DDL and init refuses mismatches, but a direct
+        # call with a drifted config must still normalize by the actual
+        # bit width (round-3 hardening; 384-bit table + config 1024 gave
+        # 0.896 for a true 0.337). Callers with the bit blob pass
+        # bit_width = len(blob) * 8; None falls back to the config.
+        width = max(1.0, float(bit_width)) if bit_width \
+            else max(1.0, float(EMBEDDING_DIM))
+        frac = min(1.0, d / width)
+        return max(0.0, math.cos(math.pi * frac))
+    if vec_type == "int8":
+        # An int8 distance alone cannot yield an absolute cosine: the
+        # quantization scale is dimension- and distribution-dependent.
+        # Callers with blob access score via _vec_int8_blob_cosine; this
+        # arm (no blobs available) abstains rather than guessing a scale.
+        return 0.0
+    if vec_type in (None, "in_memory", ""):
+        # in-memory fallback: distance = 1 - cosine
+        return max(0.0, 1.0 - min(2.0, d))
+    # unknown arm: abstain rather than collapsing to ~1.0
+    return 0.0
+
+
+def _classify_vec_store_regime(conn, table: str = "vec_episodes") -> str:
+    """Route the episodic vec table by FORMAT BOUNDARY, not sampling.
+
+    Maintainer P1: a probabilistic verdict is not a retrieval guarantee.
+    The reliable boundary is the normalized-format marker
+    (PRAGMA user_version bit 0x20000000, ``_VEC_NORM_BIT``), set when a
+    vec table is CREATED by the current code and after every successful
+    reindex_vectors(). Rows written by the current code are always
+    normalized before quantization, so a marked store is safe for
+    raw-L2 KNN. Any store WITHOUT the marker may contain pre-format
+    un-normalized rows, whose norms inflate L2 distances regardless of
+    direction — it routes conservatively through the exact-cosine
+    full scan (the legacy path). No sampling, no per-recall writes, no
+    probabilistic verdicts.
+
+    The legacy bit (0x10000000) from earlier revisions is still READ:
+    stores flagged by older code keep routing conservatively until a
+    reindex (which clears it). New code never writes it.
+    """
+    try:
+        uv = conn.execute("PRAGMA user_version").fetchone()[0]
+    except Exception:
+        return "unknown"
+    if uv & 0x10000000:
+        return "legacy"
+    if uv & _VEC_NORM_BIT:
+        return "pure"
+    # Unmarked: pre-format store (created before normalized writes were
+    # guaranteed, or raw-SQL-created) — conservative by default.
+    return "legacy"
+
+
+def _mark_vec_store_norm_bit(conn) -> None:
+    """Mark a vec store as normalized-format (safe for raw-L2 KNN).
+
+    Called at vec table creation and after reindex_vectors(). The marker
+    is the routing boundary; failing to write it only keeps the store on
+    the conservative path — never a retrieval hazard.
+    """
+    try:
+        uv = conn.execute("PRAGMA user_version").fetchone()[0]
+    except Exception:
+        return
+    if uv & _VEC_NORM_BIT:
+        # Already marked: skip the PRAGMA write entirely (a no-op write
+        # still acquires the write lock and bumps other connections'
+        # data_version, invalidating their caches).
+        return
+    try:
+        conn.execute(f"PRAGMA user_version = {(uv & ~0x10000000) | _VEC_NORM_BIT}")
+    except Exception:
+        pass
+
+
+
+_legacy_warning_emitted = False
+
+
+def _warn_vec_store_legacy_once() -> None:
+    """One warning per process: the store predates the normalized-format
+    marker and routes through the conservative exact-cosine full scan.
+    Remediation: run reindex_vectors() once to normalize all rows and
+    set the marker, after which recall uses the fast KNN path."""
+    global _legacy_warning_emitted
+    if _legacy_warning_emitted:
+        return
+    _legacy_warning_emitted = True
+    logger.warning(
+        "vec store predates the normalized-format marker: using the "
+        "conservative full-scan exact-cosine route for episodic vector "
+        "candidates. Run reindex_vectors() once to normalize stored "
+        "rows and switch to the fast KNN path."
+    )
+
+
+def _env_vec_admit() -> float:
+    """Resolve MNEMOSYNE_EM_VEC_ADMIT once at import: finite and within
+    (0, 1]; NaN, Inf or out-of-range values fall back to 0.80 with a warning.
+    NaN would otherwise make `sim < threshold` always False and admit every
+    vector candidate."""
+    v = _env_float("MNEMOSYNE_EM_VEC_ADMIT", 0.80)
+    if not math.isfinite(v) or not (0.0 < v <= 1.0):
+        logger.warning("MNEMOSYNE_EM_VEC_ADMIT=%r out of range; using 0.80", v)
+        return 0.80
+    return v
+
+
+# Episodic vector admission threshold on the absolute cosine scale.
+# The int8 arm scores cosine from the stored quantized bytes vs the
+# query's quantized bytes (exact for non-saturated rows); float32 is
+# exact; the bit arm is a monotone proxy (~+0.1 upward bias on
+# anisotropic embeddings). The gate is a coarse sanity floor — it rejects
+# random vectors and degenerate distances — not a relevance filter:
+# relevance discrimination comes from lexical corroboration, ranking and
+# top_k. Real-text pairs from the same domain can score high cosine
+# (embedding models compress same-register text), so topical relevance is
+# never decided by this threshold alone.
+# Resolved once at import: changing MNEMOSYNE_EM_VEC_ADMIT in a deployment
+# env (.env / gateway config) requires restarting the gateway process to
+# take effect. Calibration note: 0.80 is the default on the absolute-cosine
+# scale. Deployments on e5-style stores that need the full 0.74-0.80
+# paraphrase band can lower the threshold via the env var.
+EM_VEC_ADMIT = _env_vec_admit()
+
+
 def _detect_veracity_weight_overrides() -> List[str]:
     """C32: return a list of `MNEMOSYNE_*_WEIGHT` env vars set to a
     non-empty value. Filters out empty-string values (`export
@@ -952,6 +1319,10 @@ def init_beam(db_path: Path = None) -> BeamInitResult:
     if _SQLITE_VEC_AVAILABLE:
         if not vec_dim_mismatch:
             try:
+                _ep_exists_before = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='vec_episodes'"
+                ).fetchone() is not None
                 cursor.execute(f"""
                     CREATE VIRTUAL TABLE IF NOT EXISTS vec_episodes USING vec0(
                         embedding {effective_vec_type}[{EMBEDDING_DIM}]
@@ -962,6 +1333,12 @@ def init_beam(db_path: Path = None) -> BeamInitResult:
                         embedding {effective_vec_type}[{EMBEDDING_DIM}]
                     )
                 """)
+                if not _ep_exists_before:
+                    # Brand-new table: every row written into it will be
+                    # normalized, so it is safe for raw-L2 KNN from row 1.
+                    # Pre-existing (upgraded) stores stay unmarked and
+                    # route conservatively until reindex_vectors().
+                    _mark_vec_store_norm_bit(conn)
             except sqlite3.OperationalError as e:
                 if getattr(conn, "_mnemosyne_vec_loaded", False):
                     logger.warning(
@@ -2742,7 +3119,7 @@ def _in_memory_vec_search(conn: sqlite3.Connection, query_embedding: np.ndarray,
     cursor = conn.cursor()
     # Join with episodic_memory (not memories) since that's where BEAM stores consolidated data
     cursor.execute("""
-        SELECT em.rowid, me.memory_id, me.embedding_json
+        SELECT em.rowid AS rowid, me.memory_id, me.embedding_json
         FROM memory_embeddings me
         JOIN episodic_memory em ON me.memory_id = em.id
         LIMIT 10000
@@ -2764,8 +3141,12 @@ def _in_memory_vec_search(conn: sqlite3.Connection, query_embedding: np.ndarray,
             if vec_norm == 0:
                 continue
             sim = float(np.dot(query_unit, vec / vec_norm))
-            # Convert similarity to distance-like metric (1 - sim) for consistent ranking
-            results.append({"rowid": row["rowid"], "distance": 1.0 - sim})
+            # Convert similarity to distance-like metric (1 - sim) for
+            # consistent ranking. Clamp at 0: float error on near-identical
+            # vectors can push sim a hair above 1.0, and a negative distance
+            # would be rejected as non-finite/negative by _vec_distance_sim
+            # (abstain 0.0) — silently zeroing the best match.
+            results.append({"rowid": row["rowid"], "distance": max(0.0, 1.0 - sim)})
         except Exception:
             continue
 
@@ -3118,6 +3499,32 @@ def repair_vec_working(conn: sqlite3.Connection, *, dry_run: bool = False) -> Di
     return result
 
 
+def _invalidate_query_cache_for_conn(conn, operation: str) -> None:
+    """Best-effort enhanced-recall query-cache invalidation for a raw
+    connection (no BeamMemory instance available). Resolves the main DB
+    path from the connection and clears the sibling query_cache.db."""
+    try:
+        db_rows = conn.execute("PRAGMA database_list").fetchall()
+        main_path = next((r[2] for r in db_rows if r[1] == "main"), None)
+        if not main_path:
+            return
+        if QueryCache is None:
+            return
+        cache_db = Path(main_path).parent / "query_cache.db"
+        if not cache_db.exists():
+            return
+        cache = QueryCache(db_path=cache_db)
+        try:
+            cache.invalidate()
+        finally:
+            cache.close()
+    except Exception as exc:
+        logger.warning(
+            "%s: query-cache invalidation failed (%s): %s",
+            operation, type(exc).__name__, exc,
+        )
+
+
 def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
                     dry_run: bool = False, progress=None) -> Dict[str, Any]:
     """Rebuild every vector representation from source text with the ACTIVE
@@ -3236,6 +3643,20 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
 
     # 1) Recreate the sqlite-vec tables at the active dimension. vec_facts has no
     #    writer yet but is recreated so its declared dim can't mismatch a query.
+    #    Clear the normalized-format marker BEFORE the drop: mid-rebuild and
+    #    failed-rebuild readers must route conservatively (the table is
+    #    partial), never on a stale pure verdict. The marker is re-set on
+    #    success below.
+    try:
+        _uv = conn.execute("PRAGMA user_version").fetchone()[0]
+        if _uv & _VEC_NORM_BIT:
+            conn.execute(f"PRAGMA user_version = {_uv & ~_VEC_NORM_BIT}")
+    except Exception:
+        logger.warning(
+            "reindex_vectors: could not clear the normalized-format "
+            "marker before rebuild; the store may route pure on partial "
+            "data if the rebuild fails.", exc_info=True,
+        )
     if vec_ok:
         for table in ("vec_episodes", "vec_working", "vec_facts"):
             conn.execute(f"DROP TABLE IF EXISTS {table}")
@@ -3297,6 +3718,26 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     plan["status"] = "reindexed"
     plan["working_memory_reindexed"] = wm_done
     plan["episodic_memory_reindexed"] = ep_done
+    # The rebuild can change the live vec type/dimension and re-quantizes
+    # every row: warmed enhanced-recall entries must not survive it
+    # (the cache key hashes the process-level VEC_TYPE, which can stay
+    # unchanged while the live table type changes).
+    _invalidate_query_cache_for_conn(conn, "reindex_vectors")
+    # The store was just re-quantized: every row is normalized now, so the
+    # normalized-format marker can be set (this also clears the historical
+    # legacy bit). A failure must be operator-visible: the store keeps
+    # routing conservatively until the marker lands.
+    try:
+        uv = conn.execute("PRAGMA user_version").fetchone()[0]
+        conn.execute(f"PRAGMA user_version = {(uv & ~0x10000000) | _VEC_NORM_BIT}")
+    except Exception:
+        logger.warning(
+            "reindex_vectors: store rebuilt but the normalized-format "
+            "marker could not be written; episodic vector recall keeps "
+            "using the conservative full-scan route. Re-run "
+            "reindex_vectors() when the database is writable.",
+            exc_info=True,
+        )
     return plan
 
 
@@ -3432,6 +3873,177 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
         )
         return []
     return [{"rowid": r["rowid"], "distance": r["distance"]} for r in rows]
+
+
+def _vec_legacy_scan_with_blobs(
+    conn: sqlite3.Connection, embedding: List[float], k: int = 20
+):
+    """Candidate strategy for legacy (pre-normalization) vec stores.
+
+    Raw-L2 KNN buries un-normalized rows: their norms inflate L2
+    distances regardless of direction, so a collinear legacy target can
+    fall outside any k-cutoff and never reach the per-row blob scorer.
+    For a legacy store the candidate set is therefore a FULL scan of the
+    vec table (no MATCH), scored inline by the exact per-type blob cosine
+    while streaming; only the top-k candidates are retained (bounded
+    heap), so large stores neither materialize every blob nor drop
+    high-scoring rows past an arbitrary prefix. Returns (rows, q_blob)
+    with the same shapes as _vec_search_with_blobs; row distances are
+    0.0 placeholders because scoring is blob-based in every arm.
+    """
+    vec_type = _vec_table_type_strict(conn)  # may raise; caller handles
+    import numpy as _np
+    emb_arr = _np.array(embedding, dtype=_np.float32)
+    norm = _np.linalg.norm(emb_arr)
+    if norm > 0:
+        emb_arr = emb_arr / norm
+    emb_json = json.dumps(emb_arr.tolist())
+    k = max(1, int(k))
+    try:
+        if vec_type == "int8":
+            q_blob = bytes(conn.execute(
+                'SELECT vec_quantize_int8(?, "unit")', (emb_json,)
+            ).fetchone()[0])
+        elif vec_type == "bit":
+            q_blob = bytes(conn.execute(
+                "SELECT vec_quantize_binary(?)", (emb_json,)
+            ).fetchone()[0])
+        else:
+            q_blob = None
+
+        # Stream the FULL table (no LIMIT): an unordered LIMIT prefix would
+        # both exclude valid high-scoring rows beyond the cut (they never
+        # reach the blob scorer) and materialize megabytes of blobs per
+        # recall on large legacy stores. Score every row with the exact
+        # blob scorer while streaming and retain only a bounded top-k heap
+        # — same winners as score-all-then-truncate, bounded memory.
+        import heapq as _heapq
+        heap = []  # min-heap of (sim, -rowid, rowdict): -rowid breaks ties
+
+        def _consider(sim, rowid, rowdict):
+            if len(heap) < k:
+                _heapq.heappush(heap, (sim, -rowid, rowdict))
+            elif sim > heap[0][0]:
+                _heapq.heapreplace(heap, (sim, -rowid, rowdict))
+
+        cursor = conn.execute(
+            "SELECT rowid, embedding FROM vec_episodes"
+        )
+        if vec_type == "int8":
+            while True:
+                r = cursor.fetchone()
+                if r is None:
+                    break
+                row_blob = bytes(r[1]) if r[1] is not None else b""
+                _consider(_vec_int8_blob_cosine(q_blob, row_blob), r[0],
+                          {"rowid": r[0], "distance": 0.0, "blob": r[1]})
+        elif vec_type == "bit":
+            _bit_width = len(q_blob) * 8 if q_blob else None
+            while True:
+                r = cursor.fetchone()
+                if r is None:
+                    break
+                row_blob = bytes(r[1]) if r[1] is not None else b""
+                _consider(_vec_bit_blob_cosine(q_blob, row_blob,
+                                               width=_bit_width), r[0],
+                          {"rowid": r[0], "distance": 0.0, "blob": r[1]})
+        else:  # float32: score from the stored floats vs the query vector
+            while True:
+                r = cursor.fetchone()
+                if r is None:
+                    break
+                row_blob = r[1]
+                _consider(_vec_float32_blob_cosine(emb_arr, row_blob), r[0],
+                          {"rowid": r[0], "distance": 0.0, "blob": r[1]})
+        rows = [h[2] for h in sorted(heap, reverse=True)]
+        return rows, q_blob
+    except sqlite3.Error:
+        logger.warning(
+            "legacy vec scan failed; no vector candidates this call",
+            exc_info=True,
+        )
+        return [], None
+
+
+def _vec_search_with_blobs(
+    conn: sqlite3.Connection, embedding: List[float], k: int = 20
+):
+    """KNN search returning rowid, distance AND the stored blob per row,
+    plus the quantized query blob, in one round trip per arm.
+
+    The single-query form returns rows in KNN order with the embedding
+    blob inline, eliminating the ordering hazard of a separate
+    WHERE rowid IN (...) fetch (IN() returns rowid order, not KNN order).
+    The query blob comes from the same SQL quantizer the MATCH clause
+    uses, so per-row scoring sees exactly the vectors the search compared.
+    Falls back to (plain _vec_search results without blobs, None) on any
+    sqlite error — callers treat a missing query blob as "score by
+    distance arm" and missing row blobs as per-row abstain. A vec-table
+    type detection failure propagates to the caller, which handles it as
+    the unknown-arm case (abstain).
+    """
+    vec_type = _vec_table_type_strict(conn)  # may raise; caller handles
+    import numpy as _np
+    emb_arr = _np.array(embedding, dtype=_np.float32)
+    norm = _np.linalg.norm(emb_arr)
+    if norm > 0:
+        emb_arr = emb_arr / norm
+    emb_json = json.dumps(emb_arr.tolist())
+    k = int(k)
+    try:
+        if vec_type == "int8":
+            q_blob = conn.execute(
+                'SELECT vec_quantize_int8(?, "unit")', (emb_json,)
+            ).fetchone()[0]
+            rows = conn.execute(
+                f'SELECT rowid, distance, embedding FROM vec_episodes '
+                f'WHERE embedding MATCH vec_quantize_int8(?, "unit") AND k={k} '
+                f'ORDER BY distance',
+                (emb_json,),
+            ).fetchall()
+            return (
+                [{"rowid": r[0], "distance": r[1], "blob": r[2]} for r in rows],
+                bytes(q_blob),
+            )
+        if vec_type == "bit":
+            q_blob = conn.execute(
+                "SELECT vec_quantize_binary(?)", (emb_json,)
+            ).fetchone()[0]
+            rows = conn.execute(
+                f"SELECT rowid, distance, embedding FROM vec_episodes "
+                f"WHERE embedding MATCH vec_quantize_binary(?) AND k={k} "
+                f"ORDER BY distance",
+                (emb_json,),
+            ).fetchall()
+            return (
+                [{"rowid": r[0], "distance": r[1], "blob": r[2]} for r in rows],
+                bytes(q_blob),
+            )
+        # float32 arm: query passes through unquantized
+        rows = conn.execute(
+            f"SELECT rowid, distance, embedding FROM vec_episodes "
+            f"WHERE embedding MATCH ? AND k={k} ORDER BY distance",
+            (emb_json,),
+        ).fetchall()
+        return (
+            [{"rowid": r[0], "distance": r[1], "blob": r[2]} for r in rows],
+            None,
+        )
+    except sqlite3.Error:
+        logger.warning(
+            "blob-bearing vec search failed (%s arm); falling back to the "
+            "distance-only search (int8 rows will abstain: no query blob)",
+            vec_type,
+            exc_info=True,
+        )
+        try:
+            return _vec_search(conn, embedding, k=k), None
+        except sqlite3.Error:
+            logger.warning(
+                "vec fallback search also failed; no vector candidates",
+                exc_info=True,
+            )
+            return [], None
 
 
 # --- Korean (Hangul) query handling ----------------------------------------
@@ -5262,18 +5874,7 @@ class BeamMemory:
         if cache is not None:
             cache.invalidate()
             return
-        if QueryCache is None:
-            return
-
-        cache_db = self.db_path.parent / "query_cache.db"
-        if not cache_db.exists():
-            return
-
-        cache = QueryCache(db_path=cache_db)
-        try:
-            cache.invalidate()
-        finally:
-            cache.close()
+        _invalidate_query_cache_for_conn(self.conn, "beam")
 
     def _invalidate_query_cache_after_remember_commit(self) -> None:
         """Best-effort cache invalidation after ``remember()`` has committed."""
@@ -7697,20 +8298,170 @@ class BeamMemory:
 
         # ---- Episodic memory (vec + FTS5 hybrid) ----
         vec_results = {}
-        max_distance = 0.0
         if embeddings_available:
             emb_result = _get_query_embedding()
             if emb_result is not None:
-                if _vec_available(self.conn):
-                    vec_rows = _vec_search(self.conn, emb_result.tolist(), k=max(top_k * 3, 20))
+                _vec_type = None
+                _q_blob = None
+                _regime = "unknown"
+                try:
+                    _regime = _classify_vec_store_regime(self.conn, "vec_episodes")
+                except Exception:
+                    logger.debug("vec regime classification failed", exc_info=True)
+                if _regime == "legacy":
+                    # Conservative route: the store predates the
+                    # normalized-format marker (raw-L2 KNN preselection
+                    # buries un-normalized rows — their norms inflate L2
+                    # distances regardless of direction), so candidates
+                    # come from a full scan of the vec table with
+                    # per-row blobs; the blob scorer below ranks by exact
+                    # cosine and the legacy branch truncates to k
+                    # afterwards. The vec type stays the table's own so
+                    # the matching scorer arm runs.
+                    _warn_vec_store_legacy_once()
+                    logger.info(
+                        "vec store regime=legacy: episodic candidates via "
+                        "full-scan blob scoring this call"
+                    )
+                    try:
+                        vec_rows, _q_blob = _vec_legacy_scan_with_blobs(
+                            self.conn, emb_result.tolist(), k=max(top_k * 3, 20)
+                        )
+                        _vec_type = _vec_table_type_strict(self.conn)
+                    except Exception:
+                        logger.warning(
+                            "legacy vec scan failed; no vector candidates "
+                            "this call",
+                            exc_info=True,
+                        )
+                        vec_rows, _q_blob = [], None
+                elif _vec_available(self.conn):
+                    try:
+                        vec_rows, _q_blob = _vec_search_with_blobs(
+                            self.conn, emb_result.tolist(), k=max(top_k * 3, 20)
+                        )
+                        _vec_type = _vec_table_type_strict(self.conn)
+                    except Exception:
+                        # Unknown arm -> abstain (0.0): fail toward
+                        # under-admission, but say so. NOTE: the sentinel
+                        # must NOT be None — None selects the in-memory
+                        # (1 - cosine) conversion, which would misread
+                        # native-table distances as high scores.
+                        logger.warning(
+                            "vec search or table type detection failed; "
+                            "vector candidates will not be admitted this call",
+                            exc_info=True,
+                        )
+                        _vec_type = "unknown"
+                        try:
+                            # _vec_search re-detects the table type; if the
+                            # original failure was persistent (lock,
+                            # corruption), this re-raises — degrade to no
+                            # vector candidates instead of crashing recall.
+                            vec_rows, _q_blob = _vec_search(
+                                self.conn, emb_result.tolist(), k=max(top_k * 3, 20)
+                            ), None
+                        except Exception:
+                            logger.warning(
+                                "vec fallback search also failed; no "
+                                "vector candidates this call",
+                                exc_info=True,
+                            )
+                            vec_rows, _q_blob = [], None
                 else:
                     # Fallback: in-memory cosine similarity search
                     vec_rows = _in_memory_vec_search(self.conn, emb_result, k=max(top_k * 3, 20))
                 if vec_rows:
-                    max_distance = max(vr["distance"] for vr in vec_rows)
+                    # Legacy stores were routed above: regime=legacy sends
+                    # candidate selection through the in-memory exact-
+                    # cosine scan (raw-L2 KNN would bury un-normalized
+                    # rows). Regime=pure keeps the native KNN path; the
+                    # per-row blob scorer below then recovers saturated
+                    # int8 rows whose quantized direction survives.
+                    # Absolute cosine per row. int8 rows are scored from
+                    # their own stored quantized bytes against the query's
+                    # quantized bytes (see _vec_int8_blob_cosine): the
+                    # score depends only on the two vectors — never on the
+                    # KNN batch size or composition, never on an assumed
+                    # quantization scale — and saturated legacy rows fall
+                    # back to sign-bit cosine. float32/bit arms convert
+                    # from their distance in their own domain (see
+                    # _vec_distance_sim); the in-memory fallback (distance
+                    # = 1 - cosine) converts accordingly.
+                    # CR3 (coderabbit): resolve the bit width ONCE before the
+                    # loop — _vec_table_dim_strict propagates sqlite3.Error and
+                    # must not run per-candidate inside recall. Unknown width
+                    # -> abstain (no candidates) rather than normalizing by
+                    # the configured EMBEDDING_DIM (the mis-scale this branch
+                    # exists to avoid).
+                    _bit_width = None
+                    if _vec_type == "bit":
+                        if _q_blob:
+                            _bit_width = len(_q_blob) * 8
+                        else:
+                            try:
+                                _bit_width = _vec_table_dim_strict(
+                                    self.conn, "vec_episodes"
+                                )
+                            except sqlite3.Error:
+                                logger.warning(
+                                    "bit width lookup failed; bit candidates "
+                                    "will not be admitted this call",
+                                    exc_info=True,
+                                )
+                                _bit_width = None
+                        if _bit_width is None:
+                            vec_rows = []
                     for vr in vec_rows:
-                        sim = max(0.0, 1.0 - (vr["distance"] / max_distance)) if max_distance > 0 else 1.0
+                        if _vec_type == "int8" and _q_blob is not None:
+                            sim = _vec_int8_blob_cosine(
+                                _q_blob, vr.get("blob") or b""
+                            )
+                        elif _vec_type == "float32" and vr.get("blob") is not None:
+                            # Exact cosine from the stored floats — covers
+                            # legacy un-normalized rows (see
+                            # _vec_float32_blob_cosine).
+                            sim = _vec_float32_blob_cosine(
+                                emb_result, vr["blob"]
+                            )
+                        elif _vec_type == "bit":
+                            if vr.get("blob") is not None and _q_blob is not None:
+                                # Blob-based Hamming (round-7 F7-1b): the
+                                # legacy scan carries distance 0.0
+                                # placeholders; scoring the packed blobs
+                                # directly keeps the bit arm exact on both
+                                # the KNN and scan paths.
+                                sim = _vec_bit_blob_cosine(
+                                    _q_blob, vr["blob"], width=_bit_width,
+                                )
+                            else:
+                                sim = _vec_distance_sim(
+                                    vr["distance"], _vec_type,
+                                    bit_width=_bit_width,
+                                )
+                        else:
+                            sim = _vec_distance_sim(vr["distance"], _vec_type)
                         vec_results[vr["rowid"]] = sim
+                if explain and _explain_trace is not None:
+                    if _regime == "legacy":
+                        _explain_trace.set_vec_mode("legacy_scan")
+                    elif _vec_type == "bit":
+                        _explain_trace.set_vec_mode("knn_bit")
+                    elif _vec_type == "float32":
+                        _explain_trace.set_vec_mode("knn_float32")
+                    elif _vec_type == "int8":
+                        _explain_trace.set_vec_mode("knn_int8")
+                    else:
+                        _explain_trace.set_vec_mode("in_memory")
+                if _regime == "legacy" and len(vec_results) > max(top_k * 3, 20):
+                    # Legacy full-scan produced more candidates than the
+                    # KNN path ever would: keep the top-k by exact cosine
+                    # so downstream IN() hydration stays bounded.
+                    _keep = set(sorted(
+                        vec_results, key=vec_results.get, reverse=True
+                    )[:max(top_k * 3, 20)])
+                    vec_results = {r: v for r, v in vec_results.items()
+                                   if r in _keep}
 
         fts_results = {}
         fts_rows = _fts_search(self.conn, query, k=max(top_k * 3, 20))
@@ -7817,7 +8568,7 @@ class BeamMemory:
             # candidate answers a broad natural-language query. Require enough
             # lexical coverage before admitting FTS-only episodic rows, while
             # still allowing genuinely strong vector-only hits through.
-            if lexical < min_relevance and sim < 0.65:
+            if lexical < min_relevance and sim < EM_VEC_ADMIT:
                 continue
             if self.episodic_graph is not None and not _env_disabled("MNEMOSYNE_GRAPH_BONUS"):
                 try:
@@ -7850,19 +8601,7 @@ class BeamMemory:
             # backfilled for all episodic entries. ITS discriminability improves at
             # scale (1033 entries); clustering concern was for small synthetic sets.
             if query_bv is not None and bv is not None and not _env_disabled("MNEMOSYNE_BINARY_BONUS"):
-                try:
-                    # Compute hamming distance via XOR + popcount
-                    q_arr = np.frombuffer(query_bv, dtype=np.uint8)
-                    m_arr = np.frombuffer(bv, dtype=np.uint8)
-                    xor_arr = np.bitwise_xor(q_arr, m_arr)
-                    popcount_table = np.array([bin(i).count('1') for i in range(256)], dtype=np.uint32)
-                    h_dist = int(np.sum(popcount_table[xor_arr]))
-                    # Sigmoid: max bonus at distance=0, bonus ~0 at distance=EMBEDDING_DIM
-                    # Use tanh for smooth falloff; bonus range [0, 0.08]
-                    normalized_dist = h_dist / EMBEDDING_DIM  # 0.0 (identical) to 1.0 (opposite)
-                    binary_bonus = 0.08 * (1.0 - np.tanh(normalized_dist * 3.0))
-                except Exception:
-                    binary_bonus = 0.0
+                binary_bonus = _binary_bonus(query_bv, bv)
             else:
                 binary_bonus = 0.0
 
@@ -8336,7 +9075,10 @@ class BeamMemory:
     # cached under an older digest are not reused. Part of the hashed payload;
     # the opaque key keeps the "v2:" prefix because QueryCache's opaque-path
     # recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
-    _ENHANCED_RECALL_CACHE_VERSION = 6
+    _ENHANCED_RECALL_CACHE_VERSION = 7
+    # NOTE: the key carries the env MNEMOSYNE_VEC_TYPE, not the table's
+    # live DDL type — a reindex under a different type without a version
+    # bump serves stale admission/ranking. Reindex flows must bump.
 
     def _enhanced_recall_cache_key(
         self,
@@ -8403,9 +9145,35 @@ class BeamMemory:
         if "temporal_halflife" in effective_recall_kwargs:
             effective_recall_kwargs["temporal_halflife"] = temporal_halflife
 
+        # The vec store's durable regime (user_version legacy bit) belongs
+        # in the key material: recall() routes legacy stores through the
+        # full-scan blob path with different candidate admission than the
+        # KNN path, and a pure-store result must not be replayed after the
+        # store is classified legacy (or after a reindex clears the bit).
+        # A marker read failure must BYPASS caching entirely (None), never
+        # fall back to a bit-less key that collides with a pure-store one.
+        try:
+            _uv = self.conn.execute("PRAGMA user_version").fetchone()[0]
+            # The routing boundary is the normalized-format marker: its
+            # ABSENCE means recall() routes through the conservative
+            # full-scan path (different candidate admission than KNN).
+            # Same predicate as _classify_vec_store_regime: conservative
+            # when the historical legacy bit is set OR the marker is
+            # absent — key material and routing can never drift.
+            _vec_store_legacy = bool(_uv & 0x10000000) or not bool(
+                _uv & _VEC_NORM_BIT
+            )
+        except Exception as exc:
+            logger.warning(
+                "enhanced-recall cache: user_version read failed (%s); "
+                "caching disabled for this call", type(exc).__name__,
+            )
+            return None
+
         db_namespace = str(self.db_path.resolve())
         payload = {
             "version": self._ENHANCED_RECALL_CACHE_VERSION,
+            "vec_store_legacy": _vec_store_legacy,
             "db_namespace": hashlib.sha256(db_namespace.encode("utf-8")).hexdigest(),
             "query": {"original": original_query, "expanded": expanded_query},
             "scope": {
@@ -8445,6 +9213,7 @@ class BeamMemory:
                 "synonym_module": expand_query is not None,
                 "associative_graph": self.episodic_graph is not None,
                 "embeddings_available": _embeddings.available(),
+                "em_vec_admit": EM_VEC_ADMIT,
                 "embedding_model": getattr(_embeddings, "_DEFAULT_MODEL", None),
                 "embedding_dimension": getattr(_embeddings, "EMBEDDING_DIM", None),
                 "embedding_query_prefix": os.environ.get("MNEMOSYNE_EMBEDDING_QUERY_PREFIX", ""),
@@ -8580,7 +9349,8 @@ class BeamMemory:
             weights=weight_snapshot.as_tuple(),
         )
         cached = None
-        if use_cache and not explain and QueryCache is not None:
+        if (cache_key is not None and use_cache and not explain
+                and QueryCache is not None):
             if not hasattr(self, '_query_cache'):
                 cache_db = self.db_path.parent / "query_cache.db"
                 self._query_cache = QueryCache(db_path=cache_db)
@@ -8685,8 +9455,9 @@ class BeamMemory:
             except Exception:
                 logger.info("Regex extraction failed, skipping", exc_info=True)
 
-        # 9. Cache results
-        if use_cache and not explain and hasattr(self, '_query_cache') and self._query_cache is not None:
+        # 9. Cache results (skip entirely when the key could not be built)
+        if (cache_key is not None and use_cache and not explain
+                and hasattr(self, '_query_cache') and self._query_cache is not None):
             self._query_cache.put_opaque(cache_key, results)
 
         return results
