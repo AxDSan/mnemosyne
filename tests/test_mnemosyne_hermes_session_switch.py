@@ -8,6 +8,10 @@ from unittest.mock import Mock
 
 import mnemosyne_hermes
 import pytest
+from datetime import datetime as _real_dt
+from datetime import timedelta as _real_td
+from datetime import timezone as _real_tz
+from mnemosyne_hermes import _get_working_memory_ttl_hours
 from mnemosyne.core.config import MnemosyneConfig
 from mnemosyne_hermes import MnemosyneMemoryProvider
 
@@ -1574,3 +1578,56 @@ def test_auto_sleep_disabled_via_auto_sleep_enabled_config_key(
     provider._apply_provider_config({})
 
     assert provider._auto_sleep_enabled is False
+
+
+class TestAutoSleepGateCutoffUtc:
+    """Twin of the root provider's cutoff-format pin for the packaged
+    mnemosyne_hermes auto-sleep gate: the eligibility cutoff must be the
+    SPACE-form naive UTC instant derived from the AWARE UTC clock (F11-2,
+    CodeRabbit 3942181776 parity across both provider copies)."""
+
+    def test_snapshot_gate_receives_naive_utc_space_form_cutoff(self, monkeypatch):
+        captured = {}
+
+        class _SourceBeam:
+            session_id = "hermes_SESS-TWIN"
+            db_path = "memory.db"
+            author_id = "author"
+            author_type = "agent"
+            channel_id = "channel"
+
+            def get_working_stats(self):
+                return {"total": 50}
+
+            def _count_unconsolidated_before(self, cutoff):
+                captured["cutoff"] = cutoff
+                return 0  # below-threshold result: gate returns before any worker
+
+        provider = mnemosyne_hermes.MnemosyneMemoryProvider()
+        provider._beam = _SourceBeam()
+        provider._auto_sleep_threshold = 10
+
+        # UTC+2 host shape: naive wall clock 14:30, aware UTC 12:30Z.
+        fixed_utc = _real_dt(2026, 4, 1, 12, 30, 0, tzinfo=_real_tz.utc)
+
+        class _Frozen(_real_dt):
+            @classmethod
+            def now(cls, tz=None):
+                if tz is not None:
+                    return fixed_utc.astimezone(tz)
+                return cls(2026, 4, 1, 14, 30, 0)
+
+        monkeypatch.setattr(mnemosyne_hermes, "datetime", _Frozen)
+
+        result = provider._auto_sleep_snapshot_locked()
+        assert result is None  # eligible == 0 -> no snapshot
+        cutoff = captured.get("cutoff")
+        assert cutoff is not None, "eligibility gate was never called"
+        expected = (
+            fixed_utc.replace(tzinfo=None)
+            - _real_td(hours=_get_working_memory_ttl_hours() // 2)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        assert cutoff == expected, (
+            f"packaged gate must receive the naive UTC cutoff derived from "
+            f"the aware UTC clock, got {cutoff!r}, expected {expected!r}"
+        )

@@ -34,7 +34,87 @@ from typing import List, Dict, Optional, Any, Set, Union, Tuple, Callable
 from pathlib import Path
 
 
-logger = logging.getLogger(__name__)
+class MemoryTransactionStateError(RuntimeError):
+    """consolidate_to_episodic() was asked to emit MEMORY_CONSOLIDATED while
+    a caller-owned transaction is open: the event cannot be ordered after
+    the outer commit, so the call is rejected before any write."""
+
+
+def _event_date_valid(value: str) -> bool:
+    """True when value is a real calendar date in strict ASCII YYYY-MM-DD.
+
+    Shape alone accepts 2026-02-31, and permissive parsers accept
+    non-padded or non-ASCII forms that sort wrong under the lexicographic
+    date filters — so validity is shape AND calendar. Single definition
+    shared by the sanitizer (import), the public validator
+    (consolidate_to_episodic) and the degrade path (sleep aggregation).
+    """
+    import re as _re
+    import datetime as _dt
+    if not _re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+        return False
+    try:
+        _dt.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _sanitize_import_event_date(value, precision):
+    """Sanitize an imported event_date/precision pair. Invalid dates are
+    sanitized to (None, 'unknown') + warning — the row survives, only the
+    derived field is reset (consistent with the consolidation-side policy:
+    the row's chronology is preserved even when the derived date is
+    garbage)."""
+    # JSON payloads can carry any type in this field (number, list, dict):
+    # a non-string must degrade, not raise mid-import (post-commit).
+    if isinstance(value, str):
+        value = value.strip()
+    else:
+        if value is not None:
+            logger.warning(
+                "import_from_dict: event_date %r is not a string; "
+                "sanitized to undated", value,
+            )
+        return None, "unknown"
+    if not _event_date_valid(value):
+        logger.warning(
+            "import_from_dict: event_date %r is not a real calendar date "
+            "(strict YYYY-MM-DD); sanitized to undated", value,
+        )
+        return None, "unknown"
+    # Single source of truth: _EVENT_DATE_PRECISIONS is defined later in
+    # the module; read at call time.
+    if not isinstance(precision, str) or precision not in _EVENT_DATE_PRECISIONS:
+        logger.warning(
+            "import_from_dict: event_date_precision %r invalid; "
+            "sanitized to 'unknown'", precision,
+        )
+        precision = "unknown"
+    return value, precision or "unknown"
+
+
+def _import_timestamp_ok(value) -> bool:
+    """An imported row timestamp must place the row in time. None/blank/
+    unparseable values would otherwise epoch-degrade into immediate trim
+    candidates (round-4 probe: 1 valid + 1 None row -> 1 row after trim)."""
+    if value is None:
+        return False
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        # _parse_iso_datetime_utc accepts the Z suffix on every supported
+        # Python (bare fromisoformat rejects it before 3.11, quarantining
+        # valid UTC stamps on 3.10). Defined later in the module; call-time
+        # resolution.
+        _parse_iso_datetime_utc(value.strip())
+        return True
+    except (ValueError, TypeError, OverflowError):
+        # OverflowError: edge offsets (9999-12-31T00:01:00-23:59,
+        # 0001-01-01T00:00:00+14:00) parse but overflow in astimezone —
+        # quarantine them like any other unplaceable value.
+        return False
+
 
 # Typed memory classification (Phase 1 -- zero overhead, pattern-based)
 try:
@@ -772,7 +852,7 @@ def init_beam(db_path: Path = None) -> BeamInitResult:
         cursor.execute(
             "UPDATE working_memory SET consolidated_at = ? "
             "WHERE consolidated_at IS NULL",
-            (datetime.now().isoformat(),),
+            (datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),),
         )
 
     try:
@@ -1600,6 +1680,93 @@ def _parse_iso_datetime_utc(value: str) -> datetime:
     return _normalize_datetime_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
 
 
+
+# Accepted event_date_precision values (content-derived date precision).
+_EVENT_DATE_PRECISIONS = {"day", "month", "week", "year", "unknown"}
+
+
+def _utc_cutoff_sql(cutoff: str) -> str:
+    """Normalize a cutoff timestamp for the chronological SQL predicates.
+
+    The SQL side compares ``COALESCE(datetime(timestamp), epoch)`` against
+    this value as a plain string, so it must arrive in exactly the shape
+    ``datetime()`` emits: naive UTC ``YYYY-MM-DD HH:MM:SS``. Normalizing in
+    Python (never via SQL ``datetime(?)``) also sidesteps a SQLite version
+    dependence: boundary values like ``9999-12-31T23:59:59.999999`` (the
+    force-consolidation sentinel) overflow the julian-day range under
+    SQL-side parsing on some SQLite builds and come back NULL, which would
+    silently make every row ineligible. Unparseable cutoffs fall back to the
+    raw string (lexicographic, the pre-chronology behavior).
+    """
+    try:
+        dt = _parse_iso_datetime_utc(cutoff)
+        return dt.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError, OverflowError):
+        return cutoff
+
+
+# Shared timestamp SQL fragments. sleep()'s claim, its blocked counter,
+# _count_unconsolidated_before(), sleep_all_sessions() eligibility and
+# trim() must judge timestamp placeability and chronology IDENTICALLY;
+# these predicates drifted apart three times and each drift produced a
+# starvation or miscount bug, so they now have one definition each.
+_SQL_PLACEABLE_TS = (
+    "(lower(trim(timestamp)) IN ('now', 'subsec') "
+    "OR (datetime(trim(timestamp)) IS NOT NULL "
+    "AND date(substr(trim(timestamp), 1, 10)) = substr(trim(timestamp), 1, 10)))"
+)
+_SQL_CHRONO_TS = (
+    "CASE WHEN lower(trim(timestamp)) IN ('now', 'subsec') "
+    "OR datetime(trim(timestamp)) IS NULL "
+    "THEN '1970-01-01 00:00:00' ELSE datetime(trim(timestamp)) END"
+)
+
+def _latest_iso_string(values, *, normalized: bool = False) -> "Optional[str]":
+    """Return the chronologically latest ISO timestamp string from an iterable.
+
+    Each value is parsed with _parse_iso_datetime_utc (naive values treated
+    as UTC; mixed offsets normalized), so selection is by instant, not by
+    lexicographic order of the serialized forms. Invalid/empty values are
+    skipped with a warning (they cannot influence selection, but silently
+    dropping a newer row would stamp the summary with an older instant).
+
+    With ``normalized=False`` the ORIGINAL string of the winner is returned.
+    With ``normalized=True`` the winner is returned as a NAIVE UTC ISO string
+    (offset stripped after conversion) — REQUIRED for storage in
+    ``episodic_memory.timestamp``, because recall's date filters compare
+    that column lexicographically: an offset-bearing string sorts wrong on
+    both boundaries of its day, and even a "+00:00" suffix breaks parity
+    with the naive forms every other producer writes.
+
+    Producer contract (post round-4): in-repo producers stamp
+    datetime.now(timezone.utc).replace(tzinfo=None) — naive-UTC — so new
+    rows compare exactly against these cutoffs on any host. Rows written
+    by pre-fix producers are naive-LOCAL wall time: they skew by the
+    writing host's offset (up to ±14h, DST makes it offset±1), bounded
+    but not corrected — no data migration. Operators running non-UTC
+    hosts should expect trim/consolidation windows on legacy rows to be
+    off by the host offset in the direction of the offset's sign.
+    """
+    latest_dt = None
+    latest_raw = None
+    for raw in values:
+        if not raw:
+            continue
+        try:
+            dt = _parse_iso_datetime_utc(str(raw))
+        except (OverflowError, TypeError, ValueError):
+            logger.warning(
+                "sleep: skipping unparseable source timestamp %r during "
+                "latest-instant selection",
+                raw,
+            )
+            continue
+        if latest_dt is None or dt > latest_dt:
+            latest_dt = dt
+            latest_raw = dt.replace(tzinfo=None).isoformat() if normalized else raw
+    return latest_raw
+
+
 _DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -1615,13 +1782,26 @@ def _normalize_valid_until(value: Optional[str]) -> Optional[str]:
     separator or ``Z`` suffix is normalized too. Unparseable values pass
     through unchanged.
     """
+    if value is None:
+        return value
+    if not isinstance(value, str):
+        # Stored/foreign rows can carry non-text valid_until (BLOB or
+        # numeric via legacy writers) — including FALSY non-strings
+        # (b'', 0, [], {}). _DATE_ONLY_RE.match() raises TypeError on
+        # those — AFTER the claim commit in the sleep loop, stranding
+        # the whole group; [] and {} also break the import bindings. A
+        # non-text value is unparseable by definition: map it to
+        # no-expiry instead of raising or passing through.
+        return None
     if not value:
         return value
     if _DATE_ONLY_RE.match(value):
         return value
     try:
         return _parse_iso_datetime_utc(value).isoformat()
-    except (ValueError, TypeError):
+    except (OverflowError, ValueError, TypeError):
+        # year-9999 offset values overflow the datetime arithmetic; treat
+        # as unparseable like every other bad value (never raise post-claim)
         return value
 
 
@@ -1638,7 +1818,7 @@ def _valid_until_active(valid_until: str, now_iso: str) -> bool:
     """
     try:
         return _parse_iso_datetime_utc(valid_until) > _parse_iso_datetime_utc(now_iso)
-    except (ValueError, TypeError):
+    except (OverflowError, ValueError, TypeError):
         return False
 
 
@@ -1703,7 +1883,7 @@ def _parse_ts_fast(ts: str) -> Optional[datetime]:
         return cached
     try:
         dt = _parse_iso_datetime_utc(ts)
-    except (ValueError, TypeError):
+    except (OverflowError, ValueError, TypeError):
         return None
     if len(_TS_CACHE) >= _TS_CACHE_MAX:
         _TS_CACHE.clear()
@@ -3981,7 +4161,7 @@ class BeamMemory:
                     consolidated_at = NULL,
                     consolidation_claimed_at = NULL
                 WHERE id = ? AND session_id = ?
-            """, (importance, datetime.now().isoformat(), source,
+            """, (importance, datetime.now(timezone.utc).replace(tzinfo=None).isoformat(), source,
                   valid_until, scope,
                   self.author_id, self.author_type, self.channel_id,
                   memory_type,
@@ -4021,7 +4201,7 @@ class BeamMemory:
                 self._invalidate_query_cache_after_remember_commit()
 
         memory_id = memory_id or _generate_id(content)
-        timestamp = datetime.now().isoformat()
+        timestamp = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         cursor = self.conn.cursor()
         cursor.execute("""
             INSERT INTO working_memory
@@ -4210,7 +4390,7 @@ class BeamMemory:
         # python -O where the prior `assert mid_check == memory_id`
         # would have stripped).
         meta_by_id: Dict[str, Tuple[str, str]] = {}  # mid → (source, veracity)
-        timestamp = datetime.now().isoformat()
+        timestamp = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         # Clamp the method-level default once, not per row -- operators
         # who pass a bad default should see one warning, not N.
         default_veracity = clamp_veracity(
@@ -4583,17 +4763,37 @@ class BeamMemory:
         the additive promise expires at WORKING_MEMORY_TTL_HOURS and
         the experiment Arm B's "ADD-only" guarantee collapses at 24h.
         """
-        cutoff = (datetime.now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS)).isoformat()
-        self.conn.execute("""
+        # dplush P1: build the cutoff at the UTC instant. datetime() has
+        # already normalized offset-bearing ROWS to UTC in this predicate;
+        # pairing them with a local-wall-as-UTC cutoff deleted aware rows
+        # up to one host-offset early. Current producers stamp naive-UTC
+        # (round-4 conversion); legacy naive-local rows keep wall-as-UTC
+        # semantics and skew by the writing host's offset (see the
+        # producer-contract note in _latest_iso_string).
+        cutoff = _utc_cutoff_sql(
+            (
+                datetime.now(timezone.utc)
+                - timedelta(hours=WORKING_MEMORY_TTL_HOURS)
+            ).isoformat()
+        )
+        # Chronological boundaries (see sleep()): datetime() normalizes
+        # offset-bearing timestamps to UTC before comparison, so mixed-
+        # offset rows are trimmed on their true schedule and the
+        # keep-newest-N survivor set is the true newest by instant.
+        # Pinned rows are exempt from trim (matching sleep()'s exemption):
+        # they are neither TTL-deleted nor displaced from the survivor set.
+        self.conn.execute(f"""
             DELETE FROM working_memory
             WHERE session_id = ?
               AND consolidated_at IS NULL
+              AND (pinned IS NULL OR pinned = 0)
               AND (
-                timestamp < ? OR
+                {_SQL_CHRONO_TS} < ? OR
                 id NOT IN (
                     SELECT id FROM working_memory
                     WHERE session_id = ? AND consolidated_at IS NULL
-                    ORDER BY timestamp DESC
+                      AND (pinned IS NULL OR pinned = 0)
+                    ORDER BY {_SQL_CHRONO_TS} DESC
                     LIMIT ?
                 )
               )
@@ -4662,7 +4862,7 @@ class BeamMemory:
         # provider mode).
         # Per-row bump logic preserved: each row gets min(now, parsed +
         # bump_delta) so stale items aren't fully reset by a single call.
-        now_dt = datetime.now()
+        now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
         bump_delta = timedelta(hours=WM_BUMP_CAP_HOURS)
         updates = {}  # iso_timestamp -> [ids]
         for row in rows:
@@ -4671,11 +4871,23 @@ class BeamMemory:
                 new_last = now_dt
             else:
                 try:
-                    parsed = datetime.fromisoformat(old_ts)
-                except (ValueError, TypeError):
+                    # Normalize to naive UTC before comparing: the
+                    # polyphonic recall arm stamps '+00:00'-aware values,
+                    # and comparing an aware parsed value against the naive
+                    # now_dt raises TypeError on the hot prompt path.
+                    # The +bump_delta arithmetic sits INSIDE the guard:
+                    # values near datetime.max (year-9999 imports are stored
+                    # raw, unvalidated) overflow on the addition and must
+                    # self-heal, not crash the hot path. AttributeError:
+                    # SQLite NUMERIC affinity converts numeric-looking
+                    # last_recalled values to int/float on storage, and
+                    # _parse_iso_datetime_utc's .replace() then fails.
+                    parsed = _parse_iso_datetime_utc(old_ts).replace(tzinfo=None)
+                    bumped = parsed + bump_delta
+                except (AttributeError, ValueError, TypeError, OverflowError):
                     new_last = now_dt
                 else:
-                    new_last = min(now_dt, parsed + bump_delta)
+                    new_last = min(now_dt, bumped)
             ts = new_last.isoformat()
             updates.setdefault(ts, []).append(row["id"])
 
@@ -4930,7 +5142,7 @@ class BeamMemory:
                     hours_diff = abs((ts_b - ts_a).total_seconds()) / 3600.0
                     if hours_diff < 1.0:
                         continue
-                except (ValueError, TypeError):
+                except (OverflowError, ValueError, TypeError):
                     continue
 
                 # --- Heuristic 2: cosine similarity > threshold ---
@@ -4986,12 +5198,18 @@ class BeamMemory:
 
         unconsolidated = total - consolidated
 
+        pinned_where = (f"{where_str} AND pinned = 1 AND consolidated_at IS NULL" if where_str
+                        else " WHERE pinned = 1 AND consolidated_at IS NULL")
+        cursor.execute(f"SELECT COUNT(*) FROM working_memory{pinned_where}", params)
+        pinned_unconsolidated = cursor.fetchone()[0]
+
         cursor.execute(f"SELECT timestamp FROM working_memory{where_str} ORDER BY timestamp DESC LIMIT 1", params)
         last = cursor.fetchone()
         return {
             "total": total,
             "consolidated": consolidated,
             "unconsolidated": unconsolidated,
+            "pinned_unconsolidated": pinned_unconsolidated,
             "last": last[0] if last else None,
         }
 
@@ -5002,9 +5220,11 @@ class BeamMemory:
         with longer TTLs after a prior auto-sleep already consolidated everything."""
         cursor = self.conn.cursor()
         cursor.execute(
-            "SELECT COUNT(*) FROM working_memory "
-            "WHERE timestamp < ? AND consolidated_at IS NULL "
-            "AND (pinned IS NULL OR pinned = 0)",
+            f"SELECT COUNT(*) FROM working_memory "
+            f"WHERE {_SQL_CHRONO_TS} < ? "
+            f"AND {_SQL_PLACEABLE_TS} "
+            f"AND consolidated_at IS NULL "
+            f"AND (pinned IS NULL OR pinned = 0)",
             (cutoff,),
         )
         return cursor.fetchone()[0]
@@ -5015,12 +5235,18 @@ class BeamMemory:
         return self.get_working_stats()
 
     def update_working(self, memory_id: str, content: str = None,
-                       importance: float = None) -> bool:
+                       importance: float = None, pinned: int = None,
+                       timestamp: str = None) -> bool:
         """Update a working_memory entry.
 
         After updating content, reindexes FTS5 (via wm_au trigger) and
         recomputes the vector embedding in memory_embeddings so recall()
         returns the corrected content instead of stale derived state.
+
+        pinned/timestamp are the quarantine remediation path (round-7
+        R7-A2): quarantined import rows are stored epoch-dated and
+        pinned=1; the operator re-dates or unpins them explicitly
+        through this API — no raw SQL required.
         """
         cursor = self.conn.cursor()
         updates = []
@@ -5033,6 +5259,21 @@ class BeamMemory:
         if importance is not None:
             updates.append("importance = ?")
             params.append(importance)
+        if pinned is not None:
+            updates.append("pinned = ?")
+            params.append(1 if pinned else 0)
+        if timestamp is not None:
+            if not _import_timestamp_ok(timestamp):
+                raise ValueError(
+                    f"update_working: timestamp {timestamp!r} is not a "
+                    "parseable ISO-8601 value"
+                )
+            updates.append("timestamp = ?")
+            # Store naive UTC: the column is compared lexicographically by
+            # recall's date filters and get_context's ORDER BY.
+            params.append(
+                _parse_iso_datetime_utc(timestamp.strip()).replace(tzinfo=None).isoformat()
+            )
         if not updates:
             return False
         params.extend([memory_id, self.session_id])
@@ -5058,6 +5299,12 @@ class BeamMemory:
                 )
 
         self.conn.commit()
+        if affected > 0:
+            # timestamp/pinned mutations change the row's position under
+            # recall()'s date filters and trim/sleep eligibility; warmed
+            # enhanced-recall entries must not serve the pre-remediation
+            # result set.
+            self._invalidate_query_cache_after_commit("update_working")
         return affected > 0
 
     def get(self, memory_id: str) -> Optional[Dict]:
@@ -5097,7 +5344,8 @@ class BeamMemory:
         # Episodic memory (fallback)
         cursor.execute("""
             SELECT id, content, source, timestamp, session_id,
-                   importance, metadata_json, veracity, created_at
+                   importance, metadata_json, veracity, created_at,
+                   event_date, event_date_precision
             FROM episodic_memory
             WHERE id = ? AND (session_id = ? OR scope = 'global')
         """, (memory_id, self.session_id))
@@ -5113,6 +5361,8 @@ class BeamMemory:
                 "metadata": row[6],
                 "veracity": row[7],
                 "created_at": row[8],
+                "event_date": row[9],
+                "event_date_precision": row[10],
                 "memory_store": "episodic",
             }
 
@@ -5175,9 +5425,23 @@ class BeamMemory:
                                 source: str = "consolidation", importance: float = 0.6,
                                 metadata: Dict = None, valid_until: str = None,
                                 scope: str = "session",
-                                veracity: Optional[str] = None) -> str:
+                                veracity: Optional[str] = None,
+                                event_timestamp: 'Optional[str]' = None,
+                                event_date: 'Optional[str]' = None,
+                                event_date_precision: 'Optional[str]' = None,
+                                emit_event: bool = True) -> str:
         """
         Store a consolidated summary into episodic_memory with optional embedding.
+
+        Post-insert field overrides (applied atomically before the committing
+        vector write; never manufacture fields the caller did not supply):
+          - `event_timestamp`: propagates the source-row INGEST time into
+            `timestamp`. The caller is responsible for selecting the value
+            (sleep() picks the chronologically latest source timestamp).
+          - `event_date` / `event_date_precision`: carry a CONTENT-derived
+            event date. This method never derives event_date from
+            event_timestamp — ingest time and event time are distinct
+            contracts (see sleep()'s aggregation rule).
 
         E4.a.1: `veracity` kwarg threads the aggregated source-row veracity
         into the episodic INSERT. Pre-fix the INSERT didn't include the
@@ -5188,8 +5452,73 @@ class BeamMemory:
         values and pass it here. `None` falls back to 'unknown' (matches
         legacy behavior + schema default).
         """
+        # Caller-owned transaction gate (round-4): the MEMORY_CONSOLIDATED
+        # event must never precede the commit that persists the row. Under
+        # a caller-owned transaction this method cannot observe the outer
+        # commit, so emission there is a phantom event (rollback twin:
+        # event fired, row gone). Raise BEFORE any write so a catching
+        # caller sees no partial effect; pass emit_event=False to opt out.
+        _caller_owns_txn = self.conn.in_transaction
+        _emitter_registered = self._event_emitter is not None
+        if emit_event and _caller_owns_txn and _emitter_registered:
+            raise MemoryTransactionStateError(
+                "consolidate_to_episodic(): event emission requested while a"
+                " caller-owned transaction is open; the MEMORY_CONSOLIDATED"
+                " event would fire before the outer commit (phantom event on"
+                " rollback). Pass emit_event=False, or commit before"
+                " consolidating."
+            )
+
+        # Public-contract validation (before any work, including the
+        # embed() call): explicit overrides are caller-supplied values, so
+        # malformed input is a caller bug and raises. sleep() sanitizes its
+        # aggregated values before calling and never trips these.
+        if event_timestamp is not None:
+            if not isinstance(event_timestamp, str):
+                raise ValueError(
+                    f"event_timestamp must be a string, got "
+                    f"{type(event_timestamp).__name__}: {event_timestamp!r}"
+                ) from None
+            if event_timestamp:
+                try:
+                    _parse_iso_datetime_utc(event_timestamp)
+                except (OverflowError, ValueError, TypeError):
+                    raise ValueError(
+                        f"event_timestamp not a parseable ISO-8601 "
+                        f"datetime: {event_timestamp!r}"
+                    ) from None
+        if event_date is not None:
+            # Strict ASCII YYYY-MM-DD real calendar date: non-padded forms
+            # (2020-1-2), non-ASCII digits (Arabic-Indic ٢٠٢٦) and
+            # impossible dates (2026-02-31) all fail _event_date_valid.
+            # ANY non-string value (including falsy ones like b'', 0, [],
+            # {}) is a caller contract violation and raises ValueError —
+            # never TypeError from the shape regex or the set lookup.
+            # None alone means "not provided".
+            if not isinstance(event_date, str):
+                raise ValueError(
+                    f"event_date must be a string, got "
+                    f"{type(event_date).__name__}: {event_date!r}"
+                ) from None
+            if event_date and not _event_date_valid(event_date):
+                raise ValueError(
+                    f"event_date not a real calendar date (strict "
+                    f"YYYY-MM-DD): {event_date!r}"
+                ) from None
+        if event_date_precision is not None and not isinstance(event_date_precision, str):
+            raise ValueError(
+                f"event_date_precision must be a string, got "
+                f"{type(event_date_precision).__name__}: "
+                f"{event_date_precision!r}"
+            ) from None
+        if event_date_precision and event_date_precision not in _EVENT_DATE_PRECISIONS:
+            raise ValueError(
+                f"event_date_precision must be one of "
+                f"{sorted(_EVENT_DATE_PRECISIONS)}, got {event_date_precision!r}"
+            )
+
         memory_id = _generate_id(summary)
-        timestamp = datetime.now().isoformat()
+        timestamp = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         # Typed memory classification
         ep_type = None
         if classify_memory is not None:
@@ -5220,6 +5549,8 @@ class BeamMemory:
         if _embeddings.available():
             try:
                 vec = _embeddings.embed([summary])
+                if vec is not None and np.asarray(vec).size == 0:
+                    vec = None
             except Exception as exc:
                 logger.warning(
                     "consolidate_to_episodic: embedding failed, storing "
@@ -5227,34 +5558,70 @@ class BeamMemory:
                     type(exc).__name__, exc,
                 )
         cursor = self.conn.cursor()
-        cursor.execute("""
-            INSERT INTO episodic_memory
-            (id, content, source, timestamp, session_id, importance, metadata_json, summary_of, valid_until, scope,
-             author_id, author_type, channel_id, memory_type, veracity)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (memory_id, _sanitize_utf8(summary), source, timestamp, self.session_id, importance,
-              json.dumps(metadata or {}), ",".join(source_wm_ids), valid_until, scope,
-              self.author_id, self.author_type, self.channel_id, ep_type, row_veracity))
-        rowid = cursor.lastrowid
+        # The episodic row, its metadata overrides and the vector write form
+        # one transaction: a failure anywhere between the INSERT and the
+        # commit rolls the whole row back (no partial episodic row can
+        # persist from this path). _vec_insert runs with commit=False so
+        # the committing step is the guarded transaction's own. A caller
+        # with an already-open transaction keeps ownership: the guarded
+        # block takes a savepoint, and the trailing commit fires only when
+        # this method opened the transaction itself.
+        _owned_txn = not self.conn.in_transaction
+        with _guarded_transaction(self.conn):
+            cursor.execute("""
+                INSERT INTO episodic_memory
+                (id, content, source, timestamp, session_id, importance, metadata_json, summary_of, valid_until, scope,
+                 author_id, author_type, channel_id, memory_type, veracity)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (memory_id, _sanitize_utf8(summary), source, timestamp, self.session_id, importance,
+                  json.dumps(metadata or {}), ",".join(source_wm_ids), valid_until, scope,
+                  self.author_id, self.author_type, self.channel_id, ep_type, row_veracity))
+            rowid = cursor.lastrowid
 
-        if vec is not None:
-            if _vec_available(self.conn):
+            # Apply post-insert field overrides inside the same transaction.
+            # Contract: `event_timestamp` propagates the source-row INGEST
+            # time into `timestamp`. `event_date`/`event_date_precision`
+            # carry a CONTENT-derived event date supplied by the caller
+            # (sleep() only passes one when the source rows agree); this
+            # method never manufactures an event date from an ingest
+            # timestamp. Values were validated at the top of this method.
+            if event_timestamp:
+                # Store naive-UTC (offset stripped after conversion): recall
+                # date filters compare this column lexicographically, and an
+                # offset-bearing string sorts wrong on both day boundaries
+                # (the same contract sleep()'s selection enforces).
+                _norm_ts = _parse_iso_datetime_utc(event_timestamp)
+                _norm_ts = _norm_ts.replace(tzinfo=None).isoformat()
+                cursor.execute(
+                    "UPDATE episodic_memory SET timestamp = ? WHERE id = ?",
+                    (_norm_ts, memory_id),
+                )
+            if event_date:
+                cursor.execute(
+                    "UPDATE episodic_memory SET event_date = ?, event_date_precision = ? WHERE id = ?",
+                    (event_date, event_date_precision or "unknown", memory_id),
+                )
+
+            if vec is not None and _vec_available(self.conn):
                 try:
-                    _vec_insert(self.conn, rowid, np.asarray(vec[0]).tolist())
+                    _vec_insert(
+                        self.conn, rowid, np.asarray(vec[0]).tolist(), commit=False
+                    )
                 except Exception as _vec_exc:
                     logger.warning(
                         "vec_episodes insert failed (rowid=%s): %s",
                         rowid, _vec_exc,
                     )
-            else:
-                # Fallback: store in memory_embeddings table for in-memory search
+            elif vec is not None:
+                # Fallback: store in memory_embeddings table for in-memory
+                # search (still inside the guarded transaction)
                 cursor.execute("""
                     INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model)
                     VALUES (?, ?, ?)
                 """, (memory_id, _embeddings.serialize(np.asarray(vec[0])), _embeddings._DEFAULT_MODEL))
 
             # Binary vector compression (Phase 2 -- 32x reduction)
-            if _mib is not None:
+            if vec is not None and _mib is not None:
                 try:
                     bv = _mib(np.asarray(vec[0]))
                     cursor.execute(
@@ -5265,9 +5632,19 @@ class BeamMemory:
                     pass  # Non-blocking
 
         try:
-            self.conn.commit()
+            if _owned_txn:
+                self.conn.commit()
 
-            # Phase 3-4: Graph + veracity for consolidated episodic memory
+            # Phase 3-4: Graph + veracity for consolidated episodic memory.
+            # NOTE: enrichment helpers (episodic_graph.store_gist et al.)
+            # commit internally on the shared connection; under a CALLER-
+            # owned transaction (which the guarded block above deliberately
+            # left open) those bare commits would steal the caller's
+            # writes. Enrichment is derived and rebuildable (rerun
+            # extraction rebuilds gists/facts), so under a caller-owned
+            # transaction it is skipped this call rather than stealing the
+            # transaction; the production path (sleep) commits its claim
+            # before calling here and always enriches.
             # E4.a.1 review fix (H2): thread the aggregated row_veracity into
             # graph + fact extraction so Bayesian compounding on consolidated
             # facts uses the source-aggregated signal, not a hardcoded
@@ -5275,18 +5652,28 @@ class BeamMemory:
             # the consolidator's `consolidate_fact` then used as the veracity
             # weight in its confidence update -- undermining the very signal
             # we just preserved in the episodic INSERT.
-            self._ingest_graph_and_veracity(memory_id, summary, source, veracity=row_veracity)
+            if _owned_txn:
+                self._ingest_graph_and_veracity(memory_id, summary, source, veracity=row_veracity)
 
-            self._emit_event("MEMORY_CONSOLIDATED", memory_id, content=summary,
-                             source=source, importance=importance,
-                             metadata={"summary_of": source_wm_ids, **(metadata or {})})
+            if emit_event:
+                self._emit_event(
+                    "MEMORY_CONSOLIDATED", memory_id, content=summary,
+                    source=source, importance=importance,
+                    metadata={"summary_of": source_wm_ids, **(metadata or {})},
+                )
         finally:
-            # The new episodic row, its embeddings, and the graph/fact
-            # mutations all change dense-pool eligibility for enhanced recall;
-            # drop warmed cache entries after every write path, even if the
-            # enrichment step fails (another worker could otherwise refill the
-            # cache between the commit and the graph writes).
-            self._invalidate_query_cache_after_commit("consolidate_to_episodic")
+            if _owned_txn:
+                # The new episodic row, its embeddings, and the graph/fact
+                # mutations all change dense-pool eligibility for enhanced
+                # recall; drop warmed cache entries after every write path,
+                # even if the enrichment step fails (another worker could
+                # otherwise refill the cache between the commit and the
+                # graph writes).
+                self._invalidate_query_cache_after_commit("consolidate_to_episodic")
+            # Caller-owned transaction: the row is not yet visible to other
+            # connections, so an invalidation now would let a concurrent
+            # reader repopulate the cache from the pre-consolidation state;
+            # the caller owns the commit and must invalidate after it.
         return memory_id
 
     # ------------------------------------------------------------------
@@ -7470,7 +7857,7 @@ class BeamMemory:
         final_results = results[:top_k]
 
         # --- Recall tracking: increment counts + set last_recalled ---
-        now_iso = datetime.now().isoformat()
+        now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         wm_ids = [r["id"] for r in final_results if r.get("tier") == "working"]
         em_ids = [r["id"] for r in final_results if r.get("tier") == "episodic"]
         cursor = self.conn.cursor()
@@ -8894,7 +9281,11 @@ class BeamMemory:
         degrade_batch_size = get_config().get_int("degrade_batch", DEGRADE_BATCH_SIZE)
 
         cursor = self.conn.cursor()
-        now = datetime.now()
+        # created_at is UTC by schema default (CURRENT_TIMESTAMP) and no
+        # in-repo producer writes it otherwise: the tier cutoffs must be
+        # UTC too, else on a UTC+ host rows are demoted (content-rewriting
+        # re-summarization) up to the host offset early.
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         results = {"status": "dry_run" if dry_run else "degraded",
                    "tier1_to_tier2": 0, "tier2_to_tier3": 0}
 
@@ -9079,7 +9470,10 @@ class BeamMemory:
         """)
         error_count = cursor.fetchone()["err_count"]
 
-        now = datetime.now()
+        # UTC-stripped: consolidation_log timestamps are written
+        # naive-UTC (round-6 producers); a naive-LOCAL here inflates
+        # stale_hours by the host offset.
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
 
         # Determine status
         if last_ts_str is None:
@@ -9137,9 +9531,15 @@ class BeamMemory:
         ``episodic_memory.summary_of`` CSV token and clears the marker so a
         later sleep pass can summarize them.
         """
-        stale_after_seconds = max(0, int(stale_after_seconds))
+        # Clamp to a finite, overflow-safe window (round-7 R7-I): inf/nan
+        # or 10**12 would otherwise escape as OverflowError/ValueError from
+        # the timedelta arithmetic below.
+        import math as _math
+        if isinstance(stale_after_seconds, float) and not _math.isfinite(stale_after_seconds):
+            raise ValueError("stale_after_seconds must be a finite number")
+        stale_after_seconds = max(0, min(int(stale_after_seconds), 10**9))
         limit = max(0, int(limit))
-        cutoff = (datetime.now() - timedelta(seconds=stale_after_seconds)).isoformat()
+        cutoff = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=stale_after_seconds)).isoformat()
         if limit == 0:
             return {
                 "status": "dry_run" if dry_run else "no_op",
@@ -9244,10 +9644,17 @@ class BeamMemory:
         from mnemosyne.core import local_llm
 
         cursor = self.conn.cursor()
-        cutoff = (datetime.now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)).isoformat()
+        _cutoff_raw = (
+            datetime.now(timezone.utc)
+            - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)
+        ).isoformat()
         if force:
             # Skip age cutoff: consolidate all non-consolidated working memories
-            cutoff = datetime.max.isoformat()
+            _cutoff_raw = datetime.max.isoformat()
+        # Naive-UTC normalized for the chronological SQL predicate (see
+        # _utc_cutoff_sql: SQL-side datetime(?) on the 9999 sentinel is
+        # NULL on some SQLite builds, which would make force a silent no-op).
+        cutoff = _utc_cutoff_sql(_cutoff_raw)
         # COALESCE(session_id, 'default') so a "default"-session beam also
         # consolidates rows with literal NULL session_id (which can land
         # via imports or schema migrations). Without the COALESCE these
@@ -9258,19 +9665,85 @@ class BeamMemory:
         # consolidated_at IS NULL filters out rows already processed by
         # a prior sleep so we don't re-summarize the same originals.
         # pinned = 1 items survive consolidation and stay in working memory.
+        # Chronological selection: datetime() parses ISO-8601 including
+        # UTC offsets and normalizes to UTC, so offset-bearing rows hit the
+        # right side of the cutoff (a raw TEXT compare misclassifies them
+        # at day boundaries). Unparseable values — and datetime() keyword
+        # inputs like 'now'/'subsec', which would otherwise read the live
+        # clock and become immortal — degrade to the epoch so every poison
+        # form stays eligible (never stranded, never immortal) and sorts
+        # earliest, the same degradation contract as the Python side in
+        # _row_sort_key.
         cursor.execute(f"""
-            SELECT id, content, source, timestamp, importance, metadata_json, scope, valid_until, veracity
+            SELECT id, content, source, timestamp, importance, metadata_json, scope, valid_until, veracity, event_date, event_date_precision
             FROM working_memory
             WHERE COALESCE(session_id, 'default') = ?
-              AND timestamp < ?
+              AND {_SQL_CHRONO_TS} < ?
+              -- Round-7 R7-B1: exclude rows whose timestamp cannot be
+              -- placed on the timeline BEFORE the LIMIT window. Without
+              -- this, a backlog of unplaceable rows fills the whole
+              -- batch every pass (they sort first) and eligible rows
+              -- behind them never consolidate. The Python filter below
+              -- stays as a second validation gate.
+              AND {_SQL_PLACEABLE_TS}
               AND consolidated_at IS NULL
               AND (pinned IS NULL OR pinned = 0)
-            ORDER BY timestamp ASC
+            ORDER BY {_SQL_CHRONO_TS} ASC
             LIMIT {SLEEP_BATCH_SIZE}
         """, (self.session_id, cutoff))
         rows = cursor.fetchall()
+        # Skip rows whose timestamp cannot actually be placed on the
+        # timeline (round-6 F3a): consolidating an all-bad group stamped
+        # the summary 1970 and excluded it from every date window. The
+        # 'now'/'subsec' producer sentinels ARE placeable (the SQL
+        # predicate epoch-degrades them to the current instant by
+        # design), so only genuinely unplaceable values are skipped;
+        # they stay unclaimed and trim's epoch-degrade collects them.
+        rows = [r for r in rows
+                if (isinstance(r["timestamp"], str)
+                    and r["timestamp"].strip().lower() in ("now", "subsec"))
+                or _import_timestamp_ok(r["timestamp"])]
         if not rows:
-            return {"status": "no_op", "message": "No old working memories to consolidate"}
+            # Round-7 R7-B2: make a poisoned backlog visible instead of a
+            # bare no_op — unplaceable-timestamp rows are excluded by the
+            # SQL predicate above; surface the count so operators can act.
+            cursor.execute(f"""
+                SELECT COUNT(*) AS n
+                FROM working_memory
+                WHERE COALESCE(session_id, 'default') = ?
+                  AND NOT {_SQL_PLACEABLE_TS}
+                  AND consolidated_at IS NULL
+                  AND (pinned IS NULL OR pinned = 0)
+            """, (self.session_id,))
+            blocked = cursor.fetchone()["n"]
+            result = {"status": "no_op", "message": "No old working memories to consolidate"}
+            if blocked:
+                result["filtered_unplaceable"] = blocked
+                result["message"] = (
+                    f"No eligible rows; {blocked} row(s) have unparseable "
+                    "timestamps and are excluded from consolidation"
+                )
+            else:
+                # Pinned rows (import-quarantine backlog: epoch + pinned=1)
+                # are exempt from sleep by design; surface them so a
+                # growing quarantine set is visible instead of a bare
+                # no_op (they are reclaimable only via update_working).
+                cursor.execute("""
+                    SELECT COUNT(*) AS n
+                    FROM working_memory
+                    WHERE COALESCE(session_id, 'default') = ?
+                      AND pinned = 1
+                      AND consolidated_at IS NULL
+                """, (self.session_id,))
+                pinned_exempt = cursor.fetchone()["n"]
+                if pinned_exempt:
+                    result["pinned_exempt"] = pinned_exempt
+                    result["message"] = (
+                        f"No eligible rows; {pinned_exempt} pinned row(s) "
+                        "are exempt from consolidation (import quarantine); "
+                        "re-date or unpin via update_working"
+                    )
+            return result
 
         # Atomic claim: mark rows consolidated_at BEFORE writing the
         # episodic summary, gated on consolidated_at IS STILL NULL.
@@ -9288,7 +9761,7 @@ class BeamMemory:
         # The dry_run branch skips the claim entirely so it stays
         # side-effect-free.
         if not dry_run:
-            now_iso = datetime.now().isoformat()
+            now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
             ids_to_claim = [row["id"] for row in rows]
             placeholders = ",".join("?" * len(ids_to_claim))
             cursor.execute(
@@ -9475,10 +9948,102 @@ class BeamMemory:
                 # the claim survives -- the rows show as consolidated but
                 # without a summary. That's preferable to a phantom-summary-
                 # without-claim race the previous ordering allowed.
+                # Summary inherits the chronologically latest source-row
+                # INGEST timestamp (parsed as UTC instants; original string
+                # preserved). See _latest_iso_string.
+                _event_ts = None
+                try:
+                    _event_ts = _latest_iso_string(
+                        (item.get("timestamp") for item in items),
+                        normalized=True,
+                    )
+                except Exception:
+                    _event_ts = None
+                # Content-derived event date: propagate ONLY when EVERY row
+                # in this group carries an event_date and all dates agree
+                # (agreement is on the date string; precision is carried from
+                # any dated row). A single dated row among undated ones does
+                # NOT stamp the whole summary — the group's other rows may
+                # describe different events. Otherwise the episodic
+                # event_date stays unknown rather than being manufactured
+                # from ingest time.
+                _agg_event_date = None
+                _agg_event_date_precision = None
+
+                def _wm_event_date_text(item):
+                    # Stored rows can carry non-text event_date values
+                    # (legacy/foreign writes: BLOB, number, dict). The
+                    # rows are ALREADY claimed and committed at this
+                    # point, so a raise here would strand them with claim
+                    # markers set and no episodic summary. Degrade any
+                    # non-text value to undated instead.
+                    v = item.get("event_date")
+                    if v is None:
+                        return ""
+                    if not isinstance(v, str):
+                        logger.warning(
+                            "sleep: group row %r has non-text event_date "
+                            "%r; treated as undated", item.get("id"), v,
+                        )
+                        return ""
+                    return v.strip()
+
+                _dated = [
+                    item
+                    for item in items
+                    if _wm_event_date_text(item)
+                ]
+                if len(_dated) == len(items) and len(items) > 0:
+                    _distinct_dates = {
+                        _wm_event_date_text(item)
+                        for item in _dated
+                    }
+                    if len(_distinct_dates) == 1:
+                        _agg_event_date = _distinct_dates.pop()
+                        # carry precision from the NEWEST dated row, matching
+                        # the timestamp selection rule. PARSE-TOLERANT: an
+                        # unparseable row sorts as the epoch instead of
+                        # raising — one poison timestamp must never abort
+                        # the whole consolidation batch (rows are already
+                        # claimed at this point).
+                        def _row_sort_key(it):
+                            try:
+                                return _parse_iso_datetime_utc(str(it.get("timestamp")))
+                            except (TypeError, ValueError):
+                                return _parse_iso_datetime_utc("1970-01-01T00:00:00")
+                        _newest = max(_dated, key=_row_sort_key)
+                        _newest_precision = _newest.get("event_date_precision")
+                        if isinstance(_newest_precision, str):
+                            _agg_event_date_precision = (
+                                _newest_precision.strip() or "unknown"
+                            )
+                        else:
+                            _agg_event_date_precision = "unknown"
+                # Sanitize aggregated values: they come from stored
+                # working-memory rows (import/export can carry arbitrary
+                # strings), and a raise here would strand the already-
+                # claimed group with no summary. Invalid -> undated group /
+                # unknown precision; direct public callers of
+                # consolidate_to_episodic still get the ValueError contract.
+                if _agg_event_date:
+                    if not _event_date_valid(_agg_event_date):
+                        logger.warning(
+                            "sleep: group event_date %r is not a real "
+                            "YYYY-MM-DD calendar date; storing summary "
+                            "without an event date",
+                            _agg_event_date[:40],
+                        )
+                        _agg_event_date = None
+                        _agg_event_date_precision = "unknown"
+                if _agg_event_date_precision not in _EVENT_DATE_PRECISIONS:
+                    _agg_event_date_precision = "unknown"
                 self.consolidate_to_episodic(
                     summary=summary,
                     source_wm_ids=ids,
                     source="sleep_consolidation",
+                    event_timestamp=_event_ts,
+                    event_date=_agg_event_date,
+                    event_date_precision=_agg_event_date_precision,
                     importance=0.6,
                     scope=aggregated_scope,
                     valid_until=aggregated_valid_until,
@@ -9491,7 +10056,7 @@ class BeamMemory:
                 )
                 if proposals:
                     from mnemosyne.core import model_refresh
-                    proposal_ts = datetime.now().isoformat()
+                    proposal_ts = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
                     for proposal in proposals:
                         metadata = model_refresh.prepare_proposal_metadata(proposal, source_wm_ids=ids)
                         proposal_id = self.remember(
@@ -9548,7 +10113,7 @@ class BeamMemory:
                 self.session_id,
                 len(consolidated_ids),
                 f"{summaries_created} summaries ({method}) from {len(consolidated_ids)} items",
-                datetime.now().isoformat(),
+                datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
             ))
             self.conn.commit()
 
@@ -9591,18 +10156,24 @@ class BeamMemory:
         non-consolidated working memories across all sessions immediately.
         """
         cursor = self.conn.cursor()
-        cutoff = (datetime.now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)).isoformat()
+        _cutoff_raw = (
+            datetime.now(timezone.utc)
+            - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)
+        ).isoformat()
         if force:
-            cutoff = datetime.max.isoformat()
+            _cutoff_raw = datetime.max.isoformat()
+        cutoff = _utc_cutoff_sql(_cutoff_raw)
         # Mirror sleep()'s filter: only count rows that haven't been
         # consolidated yet, so we don't redo work on every maintenance pass.
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT session_id, COUNT(*) AS eligible
             FROM working_memory
-            WHERE timestamp < ?
+            WHERE {_SQL_CHRONO_TS} < ?
+              AND {_SQL_PLACEABLE_TS}
               AND consolidated_at IS NULL
+              AND (pinned IS NULL OR pinned = 0)
             GROUP BY session_id
-            ORDER BY MIN(timestamp) ASC
+            ORDER BY MIN({_SQL_CHRONO_TS}) ASC
         """, (cutoff,))
         session_rows = cursor.fetchall()
         if not session_rows:
@@ -9816,7 +10387,8 @@ class BeamMemory:
             SELECT id, content, source, timestamp, session_id, importance,
                    metadata_json, valid_until, superseded_by, scope,
                    recall_count, last_recalled, created_at, veracity,
-                   consolidated_at, consolidation_claimed_at
+                   consolidated_at, consolidation_claimed_at,
+                   event_date, event_date_precision, pinned
             FROM working_memory
             ORDER BY session_id, timestamp
         """)
@@ -9826,7 +10398,8 @@ class BeamMemory:
         cursor.execute("""
             SELECT rowid, id, content, source, timestamp, session_id, importance,
                    metadata_json, summary_of, valid_until, superseded_by, scope,
-                   recall_count, last_recalled, created_at
+                   recall_count, last_recalled, created_at,
+                   event_date, event_date_precision
             FROM episodic_memory
             ORDER BY session_id, timestamp
         """)
@@ -9889,15 +10462,51 @@ class BeamMemory:
         # -- Working memory --
         for item in data.get("working_memory", []):
             mid = item.get("id")
+            # Quarantine policy for rows with unusable timestamps: the row
+            # is preserved (not dropped — a restore must not be lossy) with
+            # the epoch timestamp actually bound below, and pinned=1 so
+            # neither trim nor sleep collects it. The operator re-dates or
+            # unpins explicitly; nothing happens to the row silently.
+            _ts_for_insert = item.get("timestamp")
+            _pin_for_insert = item.get("pinned", 0)
+            if not isinstance(_pin_for_insert, int) or isinstance(_pin_for_insert, bool):
+                _pin_for_insert = 1 if _pin_for_insert else 0
+            if not _import_timestamp_ok(item.get("timestamp")):
+                _ts_for_insert = "1970-01-01T00:00:00"
+                _pin_for_insert = 1
+                stats["working_memory"]["imported_bad_timestamp"] = (
+                    stats["working_memory"].get("imported_bad_timestamp", 0) + 1
+                )
+                logger.warning(
+                    "import_from_dict: working row %r has unusable timestamp"
+                    " %r; preserved with epoch timestamp and pinned=1"
+                    " (exempt from trim and sleep until re-dated/unpinned)",
+                    mid, item.get("timestamp"),
+                )
+            else:
+                # Accepted values may carry an offset or Z suffix (RFC 3339);
+                # store naive UTC so recall()'s lexicographic date filters
+                # and the UTC cutoffs place the row on the right day.
+                _ts_for_insert = _parse_iso_datetime_utc(
+                    item.get("timestamp").strip()
+                ).replace(tzinfo=None).isoformat()
             cursor.execute("SELECT 1 FROM working_memory WHERE id = ?", (mid,))
             exists = cursor.fetchone() is not None
             if exists and not force:
                 stats["working_memory"]["skipped"] += 1
                 continue
+            _existing_pinned = 0
             if exists and force:
                 existing_row = cursor.execute(
-                    "SELECT rowid FROM working_memory WHERE id = ?", (mid,)
+                    "SELECT rowid, pinned FROM working_memory WHERE id = ?", (mid,)
                 ).fetchone()
+                if existing_row is not None:
+                    _existing_pinned = existing_row["pinned"] or 0
+                    # Pin monotone on overwrite (round-7 R7-A1): a force
+                    # re-import whose payload lacks `pinned` (older
+                    # export) must not silently lift the live row's pin —
+                    # including a pin from a previous quarantine.
+                    _pin_for_insert = max(_pin_for_insert, _existing_pinned)
                 if existing_row is not None and _wm_vec_available(self.conn):
                     try:
                         cursor.execute("DELETE FROM vec_working WHERE rowid = ?", (int(existing_row["rowid"]),))
@@ -9920,10 +10529,11 @@ class BeamMemory:
                 INSERT INTO working_memory
                 (id, content, source, timestamp, session_id, importance, metadata_json,
                  valid_until, superseded_by, scope, recall_count, last_recalled, created_at,
-                 veracity, consolidated_at, consolidation_claimed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 veracity, consolidated_at, consolidation_claimed_at,
+                 event_date, event_date_precision, pinned)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                mid, item.get("content"), item.get("source"), item.get("timestamp"),
+                mid, item.get("content"), item.get("source"), _ts_for_insert,
                 item.get("session_id", "default"), item.get("importance", 0.5),
                 item.get("metadata_json", "{}"), _normalize_valid_until(item.get("valid_until")),
                 item.get("superseded_by"), item.get("scope", "session"),
@@ -9934,6 +10544,11 @@ class BeamMemory:
                 # cycle on the importing DB processes them normally.
                 item.get("consolidated_at"),
                 item.get("consolidation_claimed_at"),
+                # content-derived event date survives backup/restore so a
+                # restored row can still be consolidated with its date;
+                # pinned rows keep their consolidation/trim exemption.
+                *_sanitize_import_event_date(item.get("event_date"), item.get("event_date_precision")),
+                _pin_for_insert,
             ))
         self.conn.commit()
         try:
@@ -10000,18 +10615,41 @@ class BeamMemory:
                 stats["episodic_memory"]["overwritten"] += 1
             else:
                 stats["episodic_memory"]["inserted"] += 1
+            # Same quarantine contract as the working-memory loop: an
+            # unusable timestamp is stored as the epoch (pinned has no
+            # episodic equivalent; recall's date filters treat the epoch
+            # row as out-of-window rather than crashing on junk).
+            _ts_for_insert = item.get("timestamp")
+            if not _import_timestamp_ok(item.get("timestamp")):
+                _ts_for_insert = "1970-01-01T00:00:00"
+                stats["episodic_memory"]["imported_bad_timestamp"] = (
+                    stats["episodic_memory"].get("imported_bad_timestamp", 0) + 1
+                )
+                logger.warning(
+                    "import_from_dict: episodic row %r has unusable "
+                    "timestamp %r; preserved with epoch timestamp",
+                    mid, item.get("timestamp"),
+                )
+            else:
+                # Accepted values may carry an offset or Z suffix (RFC 3339);
+                # store naive UTC so date filters and cutoffs stay aligned.
+                _ts_for_insert = _parse_iso_datetime_utc(
+                    item.get("timestamp").strip()
+                ).replace(tzinfo=None).isoformat()
             cursor.execute("""
                 INSERT INTO episodic_memory
                 (id, content, source, timestamp, session_id, importance, metadata_json,
-                 summary_of, valid_until, superseded_by, scope, recall_count, last_recalled, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 summary_of, valid_until, superseded_by, scope, recall_count, last_recalled, created_at,
+                 event_date, event_date_precision)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                mid, item.get("content"), item.get("source"), item.get("timestamp"),
+                mid, item.get("content"), item.get("source"), _ts_for_insert,
                 item.get("session_id", "default"), item.get("importance", 0.5),
                 item.get("metadata_json", "{}"), item.get("summary_of", ""),
                 _normalize_valid_until(item.get("valid_until")), item.get("superseded_by"),
                 item.get("scope", "session"), item.get("recall_count", 0),
-                item.get("last_recalled"), item.get("created_at")
+                item.get("last_recalled"), item.get("created_at"),
+                *_sanitize_import_event_date(item.get("event_date"), item.get("event_date_precision")),
             ))
             new_rowid = cursor.lastrowid
             old_to_new_rowid[item.get("rowid")] = new_rowid

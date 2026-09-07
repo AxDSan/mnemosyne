@@ -123,7 +123,8 @@ def test_export_manifest_reports_omitted_and_partial_persisted_data(tmp_path):
             ("omitted-fact", "default", "portable", "has", "omitted fact", 1.0),
         )
         conn.execute(
-            "UPDATE working_memory SET pinned = 1, author_id = 'export-owner'"
+            "UPDATE working_memory SET pinned = 1, author_id = 'export-owner', "
+            "event_date = '2026-04-01', event_date_precision = 'day'"
         )
 
     export_path = tmp_path / "partial.json"
@@ -133,7 +134,6 @@ def test_export_manifest_reports_omitted_and_partial_persisted_data(tmp_path):
     assert "facts (1)" in export_result.stdout
     assert "working_memory missing" in export_result.stdout
     assert "author_id (1)" in export_result.stdout
-    assert "pinned (1)" in export_result.stdout
 
     manifest = json.loads(export_path.read_text(encoding="utf-8"))["mnemosyne_export"]["completeness"]
     assert manifest["complete"] is False
@@ -141,7 +141,9 @@ def test_export_manifest_reports_omitted_and_partial_persisted_data(tmp_path):
     partial = {surface["section"]: surface for surface in manifest["partial_surfaces"]}
     fields = {field["field"]: field for field in partial["working_memory"]["omitted_fields"]}
     assert fields["author_id"]["affected_rows"] == 1
-    assert fields["pinned"]["affected_rows"] == 1
+    # pinned survives the portable round-trip since the event-date/pinned
+    # export fix; the manifest no longer reports it as omitted.
+    assert "pinned" not in fields
 
     import_result = run_cli(["import", str(export_path)], target_dir)
     assert import_result.returncode == 0, import_result.stderr
@@ -149,7 +151,11 @@ def test_export_manifest_reports_omitted_and_partial_persisted_data(tmp_path):
     target_db = target_dir / "mnemosyne-data" / "mnemosyne.db"
     with sqlite3.connect(target_db) as conn:
         assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
-        assert conn.execute("SELECT pinned, author_id FROM working_memory").fetchone() == (0, None)
+        # pinned=1 + event_date survive the portable round-trip
+        # (event-date/pinned export fix); author_id stays omitted.
+        assert conn.execute(
+            "SELECT pinned, author_id, event_date, event_date_precision FROM working_memory"
+        ).fetchone() == (1, None, "2026-04-01", "day")
 
 
 def test_export_warning_omits_invalid_partial_affected_row_counts(monkeypatch, capsys):
@@ -232,7 +238,10 @@ def test_import_reports_actual_imported_memory_counts(tmp_path):
     # (e.g. "2 new annotations") instead of the bare count, so the
     # imported_renumbered count from an id-collision import isn't
     # silently dropped from the summary.
-    assert "Imported 1 working, 0 episodic, 1 legacy" in result.stdout
+    # CR-A (round-7): working/episodic summaries flow through
+    # _format_store_stats, so counts carry their bucket label
+    # ("1 new working") and a quarantined count would surface here too.
+    assert "Imported 1 new working, 0 episodic, 1 legacy" in result.stdout
     assert "0 triples" in result.stdout
     assert "2 new annotations" in result.stdout
     assert "Imported 0 memories" not in result.stdout

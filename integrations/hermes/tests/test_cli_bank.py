@@ -301,7 +301,9 @@ def test_file_export_and_import_warn_about_partial_portable_data(tmp_path, monke
     assert "facts (1)" in export_output
     assert "working_memory missing" in export_output
     assert "author_id (1)" in export_output
-    assert "pinned (1)" in export_output
+    # pinned survives the portable round-trip since the event-date/pinned
+    # export fix; the manifest no longer reports it as omitted.
+    assert "pinned" not in export_output
 
     monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(target_data))
     assert mnemosyne_command(_file_import_args(export_path)) == 0
@@ -310,7 +312,15 @@ def test_file_export_and_import_warn_about_partial_portable_data(tmp_path, monke
     assert "facts (1)" in import_output
     assert "working_memory missing" in import_output
     assert "author_id (1)" in import_output
-    assert "pinned (1)" in import_output
+    # pinned now round-trips; the import manifest no longer reports it.
+    assert "pinned" not in import_output
+    # Round-trip proof at the data level: the exported pinned=1 row must
+    # persist as pinned=1 in the imported DB (output text alone cannot
+    # catch a manifest regression that silently drops the field).
+    with sqlite3.connect(target_data / "mnemosyne.db") as conn:
+        assert conn.execute(
+            "SELECT pinned FROM working_memory"
+        ).fetchone() == (1,)
 
 
 def test_completeness_details_omits_invalid_partial_affected_row_counts():
