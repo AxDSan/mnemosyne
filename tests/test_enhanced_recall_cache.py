@@ -76,23 +76,21 @@ def _close_memory(memory: BeamMemory | None) -> None:
         memory.conn.close()
 
 
-def test_dense_predicate_version_bump_invalidates_old_entries(
+def test_staged_fts_candidate_version_bump_invalidates_old_entries(
     enhanced, monkeypatch, tmp_path: Path
 ):
-    """#696/#427 regression: the default dense candidate predicate changed
-    (dialog / honcho / consolidated exclusion), so an opaque cache entry
-    created under the pre-change algorithm version (4, upstream literal-flag
-    schema without our dense predicate) must never be reused — it could
-    still contain dialog, honcho or consolidated dense candidates. The
-    version bump (5 -> 6) lives inside the hashed payload; the ``v2:`` key
-    prefix stays fixed."""
-    memory, calls = enhanced
-    assert memory._ENHANCED_RECALL_CACHE_VERSION >= 6
+    """#896 regression: staged FTS candidate membership/order changed.
 
-    # Warm the cache under the OLD algorithm version so it holds a
-    # pre-predicate ranked result, keyed through the real request path.
+    An opaque entry made under version 6 can contain the old candidate set, so
+    version 7 must produce a distinct digest and execute the updated pipeline.
+    The ``v2:`` key prefix remains fixed for QueryCache's opaque-key path.
+    """
+    memory, calls = enhanced
+    assert memory._ENHANCED_RECALL_CACHE_VERSION == 7
+
+    # Warm the persistent cache under the old candidate-selection version.
     with monkeypatch.context() as ctx:
-        ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 5)
+        ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 6)
         stale = _call(memory, "alpha query")
     assert len(calls) == 1
     stale_id = stale[0]["id"]
