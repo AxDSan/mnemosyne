@@ -2145,17 +2145,36 @@ _RECALL_SYNONYMS: Dict[str, tuple[str, ...]] = {
 
 
 def _is_meaningful_recall_token(token: str) -> bool:
-    """Return whether a token is eligible for lexical recall matching."""
-    return len(token) >= 3 and token not in _FACT_MATCH_STOPWORDS and not token.isdigit()
+    """Return whether a token is eligible for lexical recall matching.
+
+    Non-Hangul tokens need >= 3 characters: a shorter English token is almost
+    always a function word. Hangul is the opposite — a two-syllable 어절 is a
+    complete, high-information noun (백업, 캐시, 포트), so the English rule
+    discards exactly the terms a Korean user searches by.
+    """
+    minimum = 2 if _has_hangul(token) else 3
+    return (
+        len(token) >= minimum
+        and token not in _FACT_MATCH_STOPWORDS
+        and not token.isdigit()
+    )
 
 
 def _recall_tokens(text: str) -> List[str]:
-    """Meaningful lexical tokens for precision gates and fallback scoring."""
-    return [
-        token
-        for token in _RECALL_TOKEN_RE.findall(text.lower())
-        if _is_meaningful_recall_token(token)
-    ]
+    """Meaningful lexical tokens for precision gates and fallback scoring.
+
+    Hangul tokens are particle-stripped here, not at the call sites, so that
+    candidate generation and final admission share one normalization contract.
+    unicode61 indexes Hangul at whitespace granularity, so a particle stays
+    glued to its stem; normalizing only the query side lets ``_fts_search()``
+    return a row that ``recall()`` then scores at zero.
+    """
+    tokens: List[str] = []
+    for token in _RECALL_TOKEN_RE.findall(text.lower()):
+        if not _is_meaningful_recall_token(token):
+            continue
+        tokens.append(_strip_ko_josa(token) if _has_hangul(token) else token)
+    return tokens
 
 
 def _hyphen_components(token: str) -> List[str]:
@@ -2451,6 +2470,18 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
         # word (query_lower="_force" -> "force") is not double-counted.
         query_tokens = [*query_tokens, *_leading_hyphen_fragments(query_lower)]
         query_tokens = list(dict.fromkeys(query_tokens))
+    if query_tokens:
+        # Keep only the CJK characters some meaningful token still carries.
+        # The character-overlap fallback at the bottom exists for spaceless
+        # text that `_recall_tokens()` cannot cut into units; a character it
+        # already discarded is not that. `AI가 target meaning` tokenizes to
+        # `ai/target/meaning` and leaves `가` behind as a bare particle, so
+        # the unfiltered set is `{가}` and *any* row containing that one
+        # syllable scored a full 1.0 -- `air55 가 unrelated` tied the target
+        # it shares no word with. Chinese and Japanese are unaffected: their
+        # characters live inside the tokens, so nothing is dropped.
+        token_chars = {ch for token in query_tokens for ch in token}
+        query_cjk &= token_chars
     if not query_tokens and not query_cjk:
         return 0.0
     # Callers pass raw _recall_tokens() output. Count each compound's
@@ -2482,14 +2513,54 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
             if _is_meaningful_recall_token(part)
         )
     content_tokens = expanded_content_tokens
+    # `_recall_tokens()` reads its length floor off the surface form and then
+    # strips the particle that earned it: `AI가` clears the two-character
+    # Hangul floor and leaves `ai`, while a standalone `AI` in the content is
+    # measured against the three-character Latin floor and dropped. The two
+    # sides disagree about the same word. `_fts_query_terms()` emits `"ai"*`
+    # either way, so admission has to be able to credit a stem the query
+    # actually asked for -- otherwise `_fts_search()` returns the row as its
+    # top candidate and `recall()` scores it below the gate. Only stems the
+    # query names are admitted, so the global precision gates that share
+    # `_recall_tokens()` keep their current floor.
+    short_stems = {
+        token for token in query_tokens
+        if len(token) < 3 and not _has_hangul(token)
+    }
+    if short_stems:
+        content_tokens.update(
+            short_stems.intersection(_RECALL_TOKEN_RE.findall(content_lower))
+        )
     if not content_tokens and not query_cjk:
         return 0.0
 
-    exact = 0
+    exact = 0.0
     partial = 0.0
     for token, components in zip(query_tokens, component_groups, strict=True):
         if token in content_tokens:
             exact += _component_unit_weight(components)
+            continue
+        if _has_hangul(token) and any(
+            ctoken.startswith(token) for ctoken in content_tokens
+        ):
+            # Korean inflects by suffixing, and `_strip_ko_josa()` trims only
+            # particles -- verb and adjective endings stay attached, so a
+            # document says `보관한다` where the query says `보관`. FTS already
+            # matches those via the `"stem"*` prefix term; admission has to use
+            # the same rule, or `_fts_search()` returns the row as its top
+            # candidate and `recall()` then scores it below the gate.
+            #
+            # A prefix hit must NOT earn the same credit as a normalized exact
+            # hit. `_strip_ko_josa()` is fixed-point, so the uninflected query
+            # `바나나` normalizes to `바나`: the intended row (`바나나` ->
+            # `바나`) lands on the exact branch above, while `바나나우유` and
+            # `바나나맛` only prefix-match here. Paying both in full tied the
+            # distractors with the target at relevance 1.0 and ranked them
+            # ahead of it (upstream review of #896). Discounting this branch
+            # restores the ordering without dropping the row: the discounted
+            # score still clears every `_minimum_recall_relevance()` floor
+            # (0.15 / 0.3 / 0.5), so `보관` still admits `보관한다`.
+            exact += _component_unit_weight(components) * _HANGUL_PREFIX_MATCH_WEIGHT
             continue
 
         component_hits = sum(part in content_tokens for part in components)
@@ -2509,23 +2580,53 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
         if synonyms and any(syn in content_tokens for syn in synonyms):
             partial += 0.75
             continue
-        if len(token) >= 4 and any(
-            token in ctoken or ctoken in token
-            for ctoken in content_tokens
-            if len(ctoken) >= 4
+        if (
+            len(token) >= 4
+            # A Hangul-bearing query widens every term to a `"stem"*` prefix
+            # in `_fts_query_terms()`, because unicode61 glues the particle
+            # onto a Latin word too (`ModelForge가` is one index token). That
+            # is candidate generation only. Admission must not follow it: the
+            # recall tokenizer splits on the script boundary, so a document
+            # saying `ModelForge가` already yields the token `modelforge` and
+            # lands on the exact branch above. The only thing this substring
+            # test adds for a pure Latin stem is normally an unrelated
+            # longer word -- `ModelForgeXYZ` scored 0.2 against the 0.15
+            # floor and surfaced as a false hit for `ModelForge가`
+            # (upstream review of #896). Closing it is safe rather than
+            # free: `_RECALL_TOKEN_RE` joins on `[_.:/+-]`, so a stem like
+            # `lifecycle` reaches `lifecycle.log` only here. FTS5 does cut
+            # on those characters, so candidate generation still returns
+            # the row and its remaining tokens carry it over the gate.
+            and not (_has_hangul(query_lower) and not _has_hangul(token))
+            and any(
+                token in ctoken or ctoken in token
+                for ctoken in content_tokens
+                if len(ctoken) >= 4
+            )
         ):
             partial += 0.4
 
-    full_match = 1.0 if query_lower and query_lower in content_lower else 0.0
+    if _has_hangul(query_lower):
+        # A raw substring test has no token boundary, so `바나나` "fully
+        # matches" `바나나우유` and the bonus alone saturates `score` at the
+        # 1.0 cap -- hiding the prefix discount above and tying the compound
+        # with the word the query named (upstream review of #896).
+        #
+        # For Hangul this term is either redundant or wrong. `_strip_ko_josa()`
+        # is fixed-point, so when the query string really does appear as a word
+        # the content token normalizes to the same stem, the exact branch
+        # already fires, and `exact / lexical_unit_count` is 1.0 on its own.
+        # The only case the substring test adds is a match landing mid-token.
+        # Requiring the normalized tokens instead keeps the bonus where it was
+        # earned and drops it where it was an artifact.
+        full_match = (
+            1.0 if query_tokens and set(query_tokens) <= content_tokens else 0.0
+        )
+    else:
+        full_match = 1.0 if query_lower and query_lower in content_lower else 0.0
     score = (exact + partial + full_match) / max(lexical_unit_count, 1)
 
     if score == 0.0:
-        query_cjk = {
-            ch for ch in query_lower
-            if "\u4e00" <= ch <= "\u9fff"
-            or "\u3040" <= ch <= "\u30ff"
-            or "\uac00" <= ch <= "\ud7af"
-        }
         if query_cjk:
             content_cjk = {
                 ch for ch in content_lower
@@ -3326,8 +3427,146 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
     return [{"rowid": r["rowid"], "distance": r["distance"]} for r in rows]
 
 
+# --- Korean (Hangul) query handling ----------------------------------------
+#
+# Two query-side filters independently drop Korean terms before they reach
+# FTS5, and fixing either one alone leaves the other hole open.
+#
+# 1. `_is_meaningful_recall_token` requires len(token) >= 3. A two-syllable
+#    Korean 어절 is a whole word -- "여권" (passport), "백업" (backup),
+#    "캐시" (cache), "포트" (port) -- so the most informative query terms are
+#    discarded before matching.
+#
+# 2. FTS5's unicode61 tokenizer indexes Hangul at whitespace-token
+#    granularity, not per syllable. Particles (조사) stay glued to the stem,
+#    so "여권은 언제 갱신하나" is indexed as "여권은" / "언제" / "갱신하나".
+#    Quoting a query term as an exact phrase can never match a
+#    differently-inflected stored form.
+#
+# Both fixes are query-side only. The stored index is untouched, so no
+# migration is required, and non-Hangul queries take a byte-identical path to
+# before. See tests/test_korean_fts.py for the ablation that motivates
+# shipping them together.
+
+_KO_JOSA = (
+    "으로부터", "에게서", "에서부터", "이라고", "라고", "에서", "에게", "한테",
+    "부터", "까지", "으로", "이나", "라도", "처럼", "보다", "마다", "조차",
+    "이란", "이든", "은", "는", "이", "가", "을", "를", "에", "의", "도",
+    "로", "만", "랑", "야", "여", "나", "와", "과",
+)
+
+
+def _has_hangul(text: str) -> bool:
+    """True if text contains at least one precomposed Hangul syllable."""
+    return any("가" <= ch <= "힣" for ch in text)
+
+
+_KO_JOSA_LONGEST_FIRST = tuple(sorted(_KO_JOSA, key=len, reverse=True))
+
+# Credit for a Hangul prefix-only admission hit, relative to a normalized exact
+# hit. Ordering the two branches only needs a value below 1.0, so this is set
+# for headroom on both sides rather than at either limit: the worst case for
+# admission is a 3-token query whose tokens are all prefix-only, which scores
+# exactly this weight against a 0.5 gate (`_minimum_recall_relevance()`), and
+# the worst case for ranking is the 0.3 gap left to the exact branch. 0.5 sits
+# on the admission cliff -- it left two gold pairs in the 49-query Korean
+# benchmark at exactly 0.000 margin, and moving to 0.7 clears all of them
+# without changing which rows pass the gate (14/49 below it either way).
+_HANGUL_PREFIX_MATCH_WEIGHT = 0.7
+
+
+def _strip_ko_josa(token: str) -> str:
+    """Strip trailing Korean particles (조사) from a whitespace token.
+
+    Suffix trimming, not morphological analysis. Trimming repeats to a fixed
+    point so the function is idempotent, which the recall path requires: a
+    query token and the same word inflected inside a document must normalize
+    to the same string or they can never match. A single pass does not
+    guarantee that — ``바나나`` trims to ``바나`` because the final ``나`` is
+    itself a particle, while ``바나나를`` trims only to ``바나나``.
+
+    At least two syllables are always left behind, and a token carrying no
+    particle is returned unchanged.
+
+        갱신은 -> 갱신    회사에서 -> 회사    바나나를 -> 바나    백업 -> 백업
+
+    Single-syllable particles are also verb endings, so ``갱신하나`` trims to
+    ``갱신하``.
+    """
+    while True:
+        for josa in _KO_JOSA_LONGEST_FIRST:
+            if len(token) > len(josa) + 1 and token.endswith(josa):
+                token = token[: -len(josa)]
+                break
+        else:
+            return token
+
+
+def _fts_precise_terms(query: str, *, widen: bool = True) -> List[str]:
+    """FTS terms built from the raw query tokens, before particle stripping.
+
+    ``_fts_query_terms()`` runs every term through ``_strip_ko_josa()`` first,
+    and the trim is fixed-point, so the *surface form the user typed* is not
+    reachable from its output: ``바나나`` leaves as ``"바나"*`` because the
+    final ``나`` is itself a particle, and ``AI가`` leaves as ``"ai"*``. Both
+    stems match a large family of unrelated rows -- ``바나00는``, ``air07`` --
+    and with a bounded candidate pool that flood is admitted first, so the
+    target is truncated before ranking ever sees it.
+
+    Neither form alone is sufficient, which is why the caller asks for both.
+
+    ``widen=True`` keeps the raw token as a prefix term. It narrows the stem
+    flood -- ``"바나나"*`` no longer reaches ``바나00는``, ``"ai가"*`` no longer
+    reaches ``air07`` -- and it is the only form that reaches the inflected
+    ``바나나는`` a Korean document actually stores, because Korean inflects by
+    suffixing. But it is still a prefix, so a token that shares the *whole*
+    raw query surface stays reachable: ``바나나01`` matches ``"바나나"*``, and
+    61 such rows exhaust a bounded pool exactly as the stem flood did. A
+    widened term therefore cannot be the reservation for a literal token.
+
+    ``widen=False`` emits the exact phrase. ``"바나나"`` matches only a
+    document that carries ``바나나`` as its own index token, which no
+    ``바나나NN`` row does -- unicode61 tokenizes those as single glued tokens.
+    That makes it the one form a longer same-prefix token cannot displace,
+    and it is why the caller spends its first slice of budget here.
+
+    Tokens outside the widening rule keep the exact-phrase form either way,
+    which makes both lists identical to ``_fts_query_terms()`` for any query
+    without Hangul. The caller uses that equality to skip the extra stages
+    entirely, so non-Korean recall pays nothing for this.
+
+    Synonym expansion is deliberately absent: widening recall is the last
+    stage's job.
+    """
+    terms: List[str] = []
+    seen: Set[str] = set()
+    symbolic = set(_symbolic_code_tokens(query))
+    query_has_hangul = _has_hangul(query)
+    for token in _RECALL_TOKEN_RE.findall(query.lower()):
+        if not _is_meaningful_recall_token(token):
+            continue
+        if token in symbolic:
+            # Same reason as in _fts_query_terms(): unicode61 shreds these
+            # into bare characters, so an FTS term would only add noise.
+            continue
+        token = token.replace('"', '""').strip()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        if widen and (_has_hangul(token) or query_has_hangul):
+            terms.append(f'"{token}"*')
+        else:
+            terms.append(f'"{token}"')
+    return terms
+
+
 def _fts_query_terms(query: str) -> List[str]:
     """FTS-safe meaningful terms for natural-language recall queries.
+
+    Hangul terms are emitted as ``stem*`` prefix terms rather than quoted
+    phrases, because unicode61 keeps the particle glued to the stem and an
+    exact phrase can therefore never match a differently-inflected stored
+    form. Every other language keeps the quoted-phrase behaviour below.
 
     Terms are quoted so FTS5 treats them as literal phrases. A term must
     never start with ``-``: FTS5 parses a leading hyphen as the NOT /
@@ -3343,6 +3582,12 @@ def _fts_query_terms(query: str) -> List[str]:
     terms: List[str] = []
     seen: Set[str] = set()
     symbolic = set(_symbolic_code_tokens(query))
+    # unicode61 glues a Korean particle onto whatever precedes it, including
+    # a Latin word: `ModelForge가` is one index token, and so is `honcho는`.
+    # An exact phrase term can never match either, so every term in a
+    # Hangul-bearing query must take the prefix form -- even the ones that
+    # `_recall_tokens()` has already stripped down to pure Latin.
+    query_has_hangul = _has_hangul(query)
     for term in _expanded_query_tokens(_recall_tokens(query)):
         if term.startswith("-"):
             # FTS5-only terms never reach MATCH verbatim. The fragment's
@@ -3353,7 +3598,20 @@ def _fts_query_terms(query: str) -> List[str]:
             # only; never emit an FTS5 term for them.
             continue
         term = term.replace('"', '""').strip()
-        if term and term not in seen:
+        if not term:
+            continue
+        if _has_hangul(term) or query_has_hangul:
+            stem = _strip_ko_josa(term)
+            if len(stem) >= 2:
+                if stem not in seen:
+                    seen.add(stem)
+                    # Quote before the wildcard. A bare `stem*` is parsed as
+                    # FTS5 syntax, so a stem carrying `/`, `:` or `-` raises
+                    # (`syntax error near "/"`, `no such column: ...`) and
+                    # kills the whole MATCH before any fallback can run.
+                    terms.append(f'"{stem}"*')
+                continue
+        if term not in seen:
             seen.add(term)
             terms.append(f'"{term}"')
     for component in _hyphen_fragment_tokens(query):
@@ -3592,6 +3850,98 @@ def _cyrillic_like_search(
     return [{result_key: rid, "rank": -score} for rid, score in scored[:k]]
 
 
+def _fts_staged_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    id_col: str,
+    query: str,
+    k: int,
+    expansion_terms: List[str],
+) -> List[Dict]:
+    """Fill the bounded candidate budget with exact hits before expansions.
+
+    The pool handed to Python is capped (``LIMIT k``), so a single MATCH over
+    ``exact OR prefix`` lets the prefix branch spend the whole budget on rows
+    that share nothing but an opening substring. Reserving part of the budget
+    rather than raising it keeps recall cost independent of how many
+    near-prefix rows the corpus happens to hold.
+
+    The second stage is skipped when it would repeat the first: a query with
+    no Hangul produces identical term lists, and running the same MATCH twice
+    would be a pure cost regression for every non-Korean caller.
+
+    Ranks come from one final pass over the expansion terms, never from the
+    precise stage. bm25 scores two different MATCH expressions on two
+    different scales, and the callers min/max-normalize ``rank`` across the
+    whole candidate set -- mixing scales silently reweights every row.
+
+    Staging decides *membership* only. The returned rows are re-sorted onto
+    the single expansion-term scale, exactly the order a plain
+    ``ORDER BY rank, {id_col}`` produced before, so reserving budget cannot
+    quietly promote an exact hit over a better-ranked row.
+
+    Every stage needs a cap of its own, including the first, because a term
+    can flood at any width. A raw prefix term floods two ways: downward, as
+    ``시스템의`` matches the family ``시스템`` does, and sideways, as
+    ``"바나나"*`` matches 61 rows of ``바나나NN``. Even the exact phrase can
+    flood, on a corpus where many documents legitimately carry the literal
+    token -- letting it take every slot would starve the inflected forms that
+    only the widened term reaches. Capping each stage below the total means
+    no single failure mode can consume the pool.
+
+    The budgets are cumulative, not per-stage, so a stage that returns fewer
+    rows than its share gives the remainder to the next one. Exact and
+    widened together still stop at half the pool, unchanged from when they
+    were one stage, because exact matches are a strict subset of what the
+    widened term reaches -- reserving for them shifts *membership* toward
+    literal hits without enlarging the pool. Thirds and halves need no
+    per-corpus constant.
+    """
+    match_sql = (
+        f"SELECT {id_col}, rank FROM {table} WHERE {table} MATCH ?"
+        f" ORDER BY rank, {id_col} LIMIT ?"
+    )
+    precise_terms = _fts_precise_terms(query)
+    if not precise_terms or precise_terms == expansion_terms:
+        rows = conn.execute(match_sql, (" OR ".join(expansion_terms), k)).fetchall()
+        return [{id_col: r[id_col], "rank": r["rank"]} for r in rows]
+    exact_terms = _fts_precise_terms(query, widen=False)
+
+    ordered_ids: List[Any] = []
+    seen_ids: Set[Any] = set()
+    for terms, budget in (
+        (exact_terms, max(1, k // 3)),
+        (precise_terms, max(1, k // 2)),
+        (expansion_terms, k),
+    ):
+        if len(ordered_ids) >= budget:
+            continue
+        for r in conn.execute(match_sql, (" OR ".join(terms), budget)).fetchall():
+            rid = r[id_col]
+            if rid in seen_ids:
+                continue
+            seen_ids.add(rid)
+            ordered_ids.append(rid)
+            if len(ordered_ids) >= budget:
+                break
+    if not ordered_ids:
+        return []
+
+    placeholders = ",".join("?" * len(ordered_ids))
+    rank_rows = conn.execute(
+        f"SELECT {id_col}, rank FROM {table}"
+        f" WHERE {table} MATCH ? AND {id_col} IN ({placeholders})",
+        (" OR ".join(expansion_terms), *ordered_ids),
+    ).fetchall()
+    ranks = {r[id_col]: r["rank"] for r in rank_rows}
+    # An exact hit the expansion terms cannot reach keeps the pool slot but
+    # scores last, so it never displaces a row the ranking actually measured.
+    worst = max(ranks.values()) if ranks else 0.0
+    rows = [{id_col: rid, "rank": ranks.get(rid, worst)} for rid in ordered_ids]
+    rows.sort(key=lambda r: (r["rank"], r[id_col]))
+    return rows
+
+
 def _fts_search(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]:
     """Search FTS5 episodes and return rowids with ranks.
 
@@ -3613,16 +3963,12 @@ def _fts_search(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]
         if _has_cyrillic(query):
             return _cyrillic_like_search(conn, query, k=k, working=False)
         return []
-    fts_query = " OR ".join(terms)
-    rows = conn.execute(
-        "SELECT rowid, rank FROM fts_episodes WHERE fts_episodes MATCH ? ORDER BY rank, rowid LIMIT ?",
-        (fts_query, k)
-    ).fetchall()
+    rows = _fts_staged_rows(conn, "fts_episodes", "rowid", query, k, terms)
     if not rows and _has_cjk(query):
         return _cjk_like_search(conn, query, k=k, working=False)
     if not rows and _has_cyrillic(query):
         return _cyrillic_like_search(conn, query, k=k, working=False)
-    return [{"rowid": r["rowid"], "rank": r["rank"]} for r in rows]
+    return rows
 
 
 def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]:
@@ -3634,16 +3980,12 @@ def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> Li
         if _has_cyrillic(query):
             return _cyrillic_like_search(conn, query, k=k, working=True)
         return []
-    fts_query = " OR ".join(terms)
-    rows = conn.execute(
-        "SELECT id, rank FROM fts_working WHERE fts_working MATCH ? ORDER BY rank, id LIMIT ?",
-        (fts_query, k)
-    ).fetchall()
+    rows = _fts_staged_rows(conn, "fts_working", "id", query, k, terms)
     if not rows and _has_cjk(query):
         return _cjk_like_search(conn, query, k=k, working=True)
     if not rows and _has_cyrillic(query):
         return _cyrillic_like_search(conn, query, k=k, working=True)
-    return [{"id": r["id"], "rank": r["rank"]} for r in rows]
+    return rows
 
 
 def _wm_vec_search(conn: sqlite3.Connection, query_embedding, k: int = 20,
